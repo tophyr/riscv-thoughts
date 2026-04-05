@@ -1,35 +1,24 @@
-"""Training utilities for the T0→T1 compressor.
-
-Execution distance computation, ranking loss, and training loop.
-"""
+"""Training loop and loss functions for the T0→T1 compressor."""
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
-from emulator import Instruction, Executor, random_regs
-from datagen import generate_sequence
+from emulator import Instruction
 from tokenizer import encode_instruction, PAD, VOCAB_SIZE
 
 from .model import T1Compressor
+from datagen import ParallelProducer
 
 
 # ---------------------------------------------------------------------------
-# Tokenization helpers
+# Tokenization
 # ---------------------------------------------------------------------------
 
-def tokenize_batch(
-    instructions: list[Instruction],
-    device: torch.device = torch.device('cpu'),
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Tokenize a batch of single instructions into padded tensors.
-
-    Returns:
-        (token_ids, padding_mask) where token_ids is (B, max_len) and
-        padding_mask is (B, max_len) with True at padding positions.
-    """
+def tokenize_batch(instructions, device=torch.device('cpu')):
+    """Tokenize a batch of instructions into padded tensors."""
     encoded = [encode_instruction(instr) for instr in instructions]
     max_len = max(len(e) for e in encoded)
-
     token_ids = torch.full((len(encoded), max_len), PAD, dtype=torch.long,
                            device=device)
     padding_mask = torch.ones(len(encoded), max_len, dtype=torch.bool,
@@ -37,221 +26,71 @@ def tokenize_batch(
     for i, enc in enumerate(encoded):
         token_ids[i, :len(enc)] = torch.tensor(enc, dtype=torch.long)
         padding_mask[i, :len(enc)] = False
-
     return token_ids, padding_mask
-
-
-# ---------------------------------------------------------------------------
-# Execution distance
-# ---------------------------------------------------------------------------
-
-def _exec_one_input_state(args):
-    """Worker: execute all instructions on one input state. Returns (B, 32)."""
-    instructions, input_regs = args
-    exe = Executor(mem_size=64)  # one per worker process, reused across instructions
-    results = np.zeros((len(instructions), 32), dtype=np.int64)
-    for i, instr in enumerate(instructions):
-        state = exe.run([instr], initial_regs=input_regs)
-        results[i, :] = state.regs.astype(np.int64)
-    return results
-
-
-def make_pool(n_workers: int) -> 'multiprocessing.pool.Pool':
-    """Create a reusable process pool with spawn context."""
-    import multiprocessing
-    ctx = multiprocessing.get_context('spawn')
-    return ctx.Pool(processes=n_workers)
-
-
-# Destination register penalty for the computed-value distance metric.
-# C=16 ≈ log(1 + 8.9M), meaning a dest register mismatch is as significant
-# as two instructions whose computed values differ by ~8.9 million.
-_DEST_MISMATCH_PENALTY = 16.0
-
-
-def compute_exec_distance_matrix(
-    instructions: list[Instruction],
-    n_inputs: int = 32,
-    rng: np.random.Generator | None = None,
-    pool: 'multiprocessing.pool.Pool | None' = None,
-) -> np.ndarray:
-    """Compute pairwise execution distances for a batch of instructions.
-
-    Compares the *computed value* (output[rd]) rather than the full
-    register state. Distance is:
-        mean_over_inputs(log(1 + |val_A - val_B|)) + C * (rd_A != rd_B)
-
-    This balances computational similarity against destination register
-    identity, avoiding the ~10^6x scale gap that raw L1 register distance
-    produces.
-
-    Args:
-        pool: Reusable process pool. If None, runs sequentially.
-
-    Returns:
-        (B, B) float64 array of distances.
-    """
-    if rng is None:
-        rng = np.random.default_rng()
-
-    B = len(instructions)
-
-    # Extract destination register for each instruction.
-    # For all ALU instructions (R-type and I-type), rd is args[0].
-    rds = np.array([instr.args[0] for instr in instructions])
-
-    # Execute all instructions on all input states.
-    input_states = [random_regs(rng) for _ in range(n_inputs)]
-    work = [(instructions, regs) for regs in input_states]
-
-    if pool is not None:
-        results = pool.map(_exec_one_input_state, work)
-    else:
-        results = [_exec_one_input_state(w) for w in work]
-
-    # results: list of n_inputs × (B, 32) arrays of full register states.
-    output_states = np.stack(results, axis=1)  # (B, n_inputs, 32)
-
-    # Extract the computed value: output[rd] for each instruction.
-    # computed_vals[i, s] = output_states[i, s, rd_i]
-    computed_vals = output_states[np.arange(B), :, rds]  # (B, n_inputs)
-
-    # Pairwise computed-value distance: mean of log(1 + |diff|) over inputs.
-    dist_matrix = np.zeros((B, B), dtype=np.float64)
-    for s in range(n_inputs):
-        vals_s = computed_vals[:, s].astype(np.float64)  # (B,)
-        diff = np.abs(vals_s[:, None] - vals_s[None, :])  # (B, B)
-        dist_matrix += np.log1p(diff)
-    dist_matrix /= n_inputs
-
-    # Add destination register mismatch penalty.
-    dest_mismatch = (rds[:, None] != rds[None, :]).astype(np.float64)
-    dist_matrix += _DEST_MISMATCH_PENALTY * dest_mismatch
-
-    return dist_matrix
 
 
 # ---------------------------------------------------------------------------
 # Loss
 # ---------------------------------------------------------------------------
 
-def correlation_loss(
-    t1_vecs: torch.Tensor,
-    exec_dist_matrix: torch.Tensor,
-) -> torch.Tensor:
-    """Pearson correlation loss over pairwise distances.
-
-    Measures 1 - correlation(T1_distances, exec_distances) over all
-    unique pairs in the batch. Reaches 0 when T1 distances are any
-    positive linear function of exec distances — meaning the T1 space
-    preserves proportional distance relationships, not just ordering.
-
-    Args:
-        t1_vecs: (B, d_out) T1 vectors from the compressor.
-        exec_dist_matrix: (B, B) pairwise execution distances.
-
-    Returns:
-        Scalar loss in [0, 2]. 0 = perfect positive correlation,
-        1 = no correlation, 2 = perfect negative correlation.
-    """
-    # Pairwise T1 distances: (B, B)
+def correlation_loss(t1_vecs, exec_dist_matrix):
+    """1 - Pearson correlation between T1 and execution pairwise distances."""
     t1_dists = torch.cdist(t1_vecs, t1_vecs)
 
-    # Extract upper triangle (unique pairs, excluding self-distances).
     B = t1_vecs.shape[0]
     idx = torch.triu_indices(B, B, offset=1, device=t1_vecs.device)
     t1_flat = t1_dists[idx[0], idx[1]]
     exec_flat = exec_dist_matrix[idx[0], idx[1]]
 
-    # Pearson correlation.
     t1_centered = t1_flat - t1_flat.mean()
     exec_centered = exec_flat - exec_flat.mean()
 
     num = (t1_centered * exec_centered).sum()
     denom = (t1_centered.norm() * exec_centered.norm()).clamp(min=1e-8)
-
     return 1.0 - num / denom
 
 
+def combined_loss(t1_vecs, dt_logits, dr_logits,
+                  exec_dists, dt_targets, dr_targets):
+    """Correlation + destination classification loss."""
+    corr = correlation_loss(t1_vecs, exec_dists)
+    type_loss = F.cross_entropy(dt_logits, dt_targets)
+
+    reg_mask = (dt_targets == 0)
+    if reg_mask.any():
+        reg_loss = F.cross_entropy(dr_logits[reg_mask], dr_targets[reg_mask])
+    else:
+        reg_loss = torch.tensor(0.0, device=t1_vecs.device)
+
+    return corr + type_loss + reg_loss
+
+
 # ---------------------------------------------------------------------------
-# Random instruction generation (single instructions, not sequences)
+# GPU distance computation
 # ---------------------------------------------------------------------------
 
-def random_instruction(rng: np.random.Generator) -> Instruction:
-    """Generate a single random straight-line RV32I instruction."""
-    return generate_sequence(1, rng, r_type_prob=0.5)[0]
+def exec_distance(data_vals, pc_vals, device):
+    """Two-component pairwise distance on GPU.
+
+    Distance = mean_over_inputs(log(1 + |data_diff|) + log(1 + |pc_diff|)).
+    """
+    dv = torch.tensor(data_vals, dtype=torch.float64, device=device)
+    pv = torch.tensor(pc_vals, dtype=torch.float64, device=device)
+    B, S = dv.shape
+
+    dist = torch.zeros(B, B, dtype=torch.float64, device=device)
+    for s in range(S):
+        d_diff = (dv[:, s].unsqueeze(1) - dv[:, s].unsqueeze(0)).abs()
+        p_diff = (pv[:, s].unsqueeze(1) - pv[:, s].unsqueeze(0)).abs()
+        dist += torch.log1p(d_diff) + torch.log1p(p_diff)
+    dist /= S
+
+    return dist.float()
 
 
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
-
-def _batch_producer(out_queue, n_batches, batch_size, n_inputs, seed):
-    """Producer process: generates instructions, runs emulator, builds arrays.
-
-    Sends raw computed values and rd indices through the queue. The main
-    process computes the pairwise distance matrix on GPU, avoiding the B²
-    numpy computation that dominates producer time at large batch sizes.
-    """
-    rng = np.random.default_rng(seed)
-    exe = Executor(mem_size=64)
-
-    for _ in range(n_batches):
-        instructions = [random_instruction(rng) for _ in range(batch_size)]
-        B = len(instructions)
-        rds = np.array([instr.args[0] for instr in instructions], dtype=np.int64)
-
-        # Execute all instructions on all input states.
-        input_states = [random_regs(rng) for _ in range(n_inputs)]
-        computed_vals = np.zeros((B, n_inputs), dtype=np.int64)
-        for s, input_regs in enumerate(input_states):
-            for i, instr in enumerate(instructions):
-                state = exe.run([instr], initial_regs=input_regs)
-                computed_vals[i, s] = state.regs[rds[i]]
-
-        # Tokenize.
-        encoded = [encode_instruction(instr) for instr in instructions]
-        max_len = max(len(e) for e in encoded)
-        token_ids = np.full((B, max_len), PAD, dtype=np.int64)
-        padding_mask = np.ones((B, max_len), dtype=np.bool_)
-        for i, enc in enumerate(encoded):
-            token_ids[i, :len(enc)] = enc
-            padding_mask[i, :len(enc)] = False
-
-        out_queue.put((token_ids, padding_mask, computed_vals, rds))
-    out_queue.put(None)  # sentinel
-
-
-def _exec_distance_from_vals(computed_vals, rds, device):
-    """Compute pairwise distance matrix on GPU from computed values and rd indices.
-
-    Args:
-        computed_vals: (B, n_inputs) int64 tensor of computed output values.
-        rds: (B,) int64 tensor of destination register indices.
-        device: torch device.
-
-    Returns:
-        (B, B) float32 tensor of pairwise distances.
-    """
-    vals = torch.tensor(computed_vals, dtype=torch.float64, device=device)
-    B, n_inputs = vals.shape
-
-    # Pairwise distance: mean of log(1 + |diff|) over input states.
-    # vals[:, s] is (B,). Pairwise diff is (B, B) per input state.
-    dist = torch.zeros(B, B, dtype=torch.float64, device=device)
-    for s in range(n_inputs):
-        v = vals[:, s]
-        diff = (v.unsqueeze(1) - v.unsqueeze(0)).abs()
-        dist += torch.log1p(diff)
-    dist /= n_inputs
-
-    # Destination register mismatch penalty.
-    rds_t = torch.tensor(rds, dtype=torch.long, device=device)
-    dest_mismatch = (rds_t.unsqueeze(1) != rds_t.unsqueeze(0)).float()
-    dist += _DEST_MISMATCH_PENALTY * dest_mismatch
-
-    return dist.float()
-
 
 def train(
     batch_size: int,
@@ -270,104 +109,67 @@ def train(
     log_every: int,
     seed: int,
 ):
-    """Train the T0→T1 compressor.
-
-    Uses a pipelined architecture: producer processes generate and prepare
-    batches (instruction generation, emulator execution, tokenization)
-    while the main process runs forward/backward/step. Each producer does
-    its own emulation sequentially — parallelism comes from running
-    multiple producers, not from parallelizing within one.
-
-    Args:
-        batch_size: Number of instructions per batch.
-        n_steps: Total training steps.
-        n_inputs: Random input states per instruction for exec distance.
-        n_producers: Producer processes preparing batches in parallel.
-        prefetch: Max batches queued ahead.
-        torch_threads: Threads for torch BLAS operations.
-        lr: Learning rate.
-        d_model: Transformer hidden dimension.
-        n_heads: Number of attention heads.
-        n_layers: Number of transformer layers.
-        d_out: T1 vector dimension.
-        device: 'cpu', 'cuda', or 'auto'.
-        log_every: Print loss every N steps.
-        seed: Random seed.
-
-    Returns:
-        Trained model and loss history.
-    """
-    import multiprocessing
-    ctx = multiprocessing.get_context('spawn')
-
-    torch.set_num_threads(torch_threads)
-
-    if device == 'auto':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    device = torch.device(device)
-
+    """Train the T0→T1 compressor on all RV32I instruction types."""
     rng = np.random.default_rng(seed)
 
-    model = T1Compressor(
-        vocab_size=VOCAB_SIZE,
-        d_model=d_model,
-        n_heads=n_heads,
-        n_layers=n_layers,
-        d_out=d_out,
-    ).to(device)
+    # Fork producers BEFORE initializing CUDA or torch threads.
+    with ParallelProducer(
+        batch_size=batch_size, n_inputs=n_inputs,
+        n_batches=n_steps, seed=int(rng.integers(0, 2**63)),
+        n_workers=n_producers, prefetch=prefetch,
+    ) as producer:
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=n_steps, eta_min=lr_min)
-    losses = []
+        torch.set_num_threads(torch_threads)
 
-    # Launch producer processes, each with its own RNG seed.
-    batch_queue = ctx.Queue(maxsize=prefetch)
-    producers = []
-    steps_remaining = n_steps
-    for p in range(n_producers):
-        n = steps_remaining // (n_producers - p)
-        steps_remaining -= n
-        producer_seed = int(rng.integers(0, 2**63))
-        proc = ctx.Process(
-            target=_batch_producer,
-            args=(batch_queue, n, batch_size, n_inputs, producer_seed),
-            daemon=True,
-        )
-        proc.start()
-        producers.append(proc)
+        if device == 'auto':
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        device = torch.device(device)
 
-    # Main training loop: consume prepared batches.
-    sentinels_seen = 0
-    step = 0
-    while sentinels_seen < n_producers:
-        item = batch_queue.get()
-        if item is None:
-            sentinels_seen += 1
-            continue
+        model = T1Compressor(
+            vocab_size=VOCAB_SIZE,
+            d_model=d_model,
+            n_heads=n_heads,
+            n_layers=n_layers,
+            d_out=d_out,
+        ).to(device)
 
-        token_ids_np, padding_mask_np, computed_vals_np, rds_np = item
-        token_ids = torch.from_numpy(token_ids_np).to(device)
-        padding_mask = torch.from_numpy(padding_mask_np).to(device)
-        exec_dists = _exec_distance_from_vals(computed_vals_np, rds_np, device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=n_steps, eta_min=lr_min)
+        import time
+        losses = []
+        t_start = time.monotonic()
 
-        t1_vecs = model(token_ids, padding_mask)
-        loss = correlation_loss(t1_vecs, exec_dists)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
+        for step, batch in enumerate(producer):
+            token_ids = torch.from_numpy(batch.token_ids).to(device)
+            padding_mask = torch.from_numpy(batch.padding_mask).to(device)
+            exec_dists = exec_distance(batch.data_vals, batch.pc_vals, device)
+            dt_targets = torch.from_numpy(batch.dest_types).to(device)
+            dr_targets = torch.from_numpy(batch.dest_regs).to(device)
 
-        loss_val = loss.item()
-        losses.append(loss_val)
+            t1_vecs, dt_logits, dr_logits = model(token_ids, padding_mask)
+            loss = combined_loss(t1_vecs, dt_logits, dr_logits,
+                                 exec_dists, dt_targets, dr_targets)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
 
-        if step % log_every == 0:
-            current_lr = optimizer.param_groups[0]['lr']
-            print(f'step {step:5d}  loss={loss_val:.4f}  lr={current_lr:.2e}')
-        step += 1
+            loss_val = loss.item()
+            losses.append(loss_val)
 
-    for proc in producers:
-        proc.join()
+            if step % log_every == 0:
+                elapsed = time.monotonic() - t_start
+                current_lr = optimizer.param_groups[0]['lr']
+                if step > 0:
+                    remaining = elapsed / step * (n_steps - step)
+                    m, s = divmod(int(remaining), 60)
+                    h, m = divmod(m, 60)
+                    eta = f'{h}h{m:02d}m' if h else f'{m}m{s:02d}s'
+                else:
+                    eta = '...'
+                print(f'step {step:5d}  loss={loss_val:.4f}  '
+                      f'lr={current_lr:.2e}  eta={eta}')
 
     return model, losses
 

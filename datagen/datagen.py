@@ -1,515 +1,240 @@
-"""Data generation for RV32I thought compression training.
+"""Training data producers for the T0→T1 compressor.
 
-Generates random instruction sequences, semantic-preserving transformations
-(equivalence pairs), and controlled mutations (near-equivalence pairs with
-known execution-state distances).
+Two implementations of the same iterator interface:
+- InlineProducer: synchronous, single-threaded. For tests and debugging.
+- ParallelProducer: fans out across processes. For real training.
 
-Currently limited to straight-line arithmetic/logic/shift code (no branches,
-jumps, or memory operations) to keep generation simple and deterministic.
+Both yield Batch objects.
 """
 
-import numpy as np
-from emulator import Instruction, RV32IState, execute, random_regs
+from dataclasses import dataclass
+from collections import deque
 
-# Opcodes used for random generation. Straight-line, no memory, no control flow.
+import numpy as np
+
+from emulator import (
+    Instruction, run as run_instruction, random_regs,
+    R_TYPE, I_TYPE, B_TYPE, LOAD_TYPE, STORE_TYPE, MEM_WIDTH,
+)
+from tokenizer import encode_instruction, PAD
+
+
+# ---------------------------------------------------------------------------
+# Batch data container
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Batch:
+    instructions: list         # list of Instruction objects
+    token_ids: np.ndarray      # (B, max_len) int64
+    padding_mask: np.ndarray   # (B, max_len) bool
+    data_vals: np.ndarray      # (B, n_inputs) int64
+    pc_vals: np.ndarray        # (B, n_inputs) int64
+    dest_types: np.ndarray     # (B,) int64
+    dest_regs: np.ndarray      # (B,) int64
+
+
+# ---------------------------------------------------------------------------
+# Instruction generation — all RV32I types
+# ---------------------------------------------------------------------------
+
+_DEST_REGS = list(range(1, 32))
+_SRC_REGS = list(range(0, 32))
+
 _ALU_R_OPS = ['ADD', 'SUB', 'XOR', 'OR', 'AND', 'SLL', 'SRL', 'SRA', 'SLT', 'SLTU']
 _ALU_I_OPS = ['ADDI', 'XORI', 'ORI', 'ANDI', 'SLLI', 'SRLI', 'SRAI', 'SLTI', 'SLTIU']
 _SHIFT_I_OPS = {'SLLI', 'SRLI', 'SRAI'}
-
-# Registers available for generation. Skip x0 as destination (writes are
-# discarded). We use x1-x15 to keep the register space small enough that
-# data dependencies form naturally in short sequences.
-_DEST_REGS = list(range(1, 16))
-_SRC_REGS = list(range(0, 16))  # x0 is valid as a source (reads as 0)
-
-# Immediate ranges
-_IMM12_RANGE = (-2048, 2047)
-_SHIFT_RANGE = (0, 31)
-
-# Strength reduction pairs: (single_op, equivalent_pair_fn)
-# add rd, rs, rs  <->  slli rd, rs, 1
-_STRENGTH_PAIRS = {
-    'ADD': lambda rd, rs1, rs2: (
-        Instruction('SLLI', rd, rs1, 1) if rs1 == rs2 else None
-    ),
-    'SLLI': lambda rd, rs1, imm: (
-        Instruction('ADD', rd, rs1, rs1) if imm == 1 else None
-    ),
-}
-
-# Opcode mutation groups: mutating within a group produces semantically
-# different but structurally similar code.
-_R_MUTATION_GROUPS = [
-    ['ADD', 'SUB'],
-    ['XOR', 'OR', 'AND'],
-    ['SLL', 'SRL', 'SRA'],
-    ['SLT', 'SLTU'],
-]
-_I_MUTATION_GROUPS = [
-    ['ADDI'],
-    ['XORI', 'ORI', 'ANDI'],
-    ['SLLI', 'SRLI', 'SRAI'],
-    ['SLTI', 'SLTIU'],
-]
+_LOAD_OPS = ['LB', 'LBU', 'LH', 'LHU', 'LW']
+_STORE_OPS = ['SB', 'SH', 'SW']
+_BRANCH_OPS = ['BEQ', 'BNE', 'BLT', 'BGE', 'BLTU', 'BGEU']
 
 
-def _random_r_instruction(rng: np.random.Generator) -> Instruction:
-    op = rng.choice(_ALU_R_OPS)
-    rd = rng.choice(_DEST_REGS)
-    rs1 = rng.choice(_SRC_REGS)
-    rs2 = rng.choice(_SRC_REGS)
-    return Instruction(op, int(rd), int(rs1), int(rs2))
+def random_instruction(rng: np.random.Generator) -> Instruction:
+    """Generate a single random RV32I instruction of any type."""
+    roll = rng.random()
 
-
-def _random_i_instruction(rng: np.random.Generator) -> Instruction:
-    op = rng.choice(_ALU_I_OPS)
-    rd = rng.choice(_DEST_REGS)
-    rs1 = rng.choice(_SRC_REGS)
-    if op in _SHIFT_I_OPS:
-        imm = int(rng.integers(*_SHIFT_RANGE, endpoint=True))
+    if roll < 0.25:
+        op = rng.choice(_ALU_R_OPS)
+        return Instruction(op, int(rng.choice(_DEST_REGS)),
+                           int(rng.choice(_SRC_REGS)),
+                           int(rng.choice(_SRC_REGS)))
+    elif roll < 0.50:
+        op = rng.choice(_ALU_I_OPS)
+        rd = int(rng.choice(_DEST_REGS))
+        rs1 = int(rng.choice(_SRC_REGS))
+        imm = int(rng.integers(0, 32)) if op in _SHIFT_I_OPS else int(rng.integers(-2048, 2048))
+        return Instruction(op, rd, rs1, imm)
+    elif roll < 0.625:
+        op = rng.choice(_LOAD_OPS)
+        return Instruction(op, int(rng.choice(_DEST_REGS)),
+                           int(rng.integers(-2048, 2048)),
+                           int(rng.choice(_SRC_REGS)))
+    elif roll < 0.70:
+        op = rng.choice(_STORE_OPS)
+        return Instruction(op, int(rng.choice(_SRC_REGS)),
+                           int(rng.integers(-2048, 2048)),
+                           int(rng.choice(_SRC_REGS)))
+    elif roll < 0.85:
+        op = rng.choice(_BRANCH_OPS)
+        return Instruction(op, int(rng.choice(_SRC_REGS)),
+                           int(rng.choice(_SRC_REGS)),
+                           int(rng.integers(-2048, 2048)) * 2)
+    elif roll < 0.925:
+        op = rng.choice(['LUI', 'AUIPC'])
+        return Instruction(op, int(rng.choice(_DEST_REGS)),
+                           int(rng.integers(0, 0x100000)))
+    elif roll < 0.9625:
+        return Instruction('JAL', int(rng.choice(_DEST_REGS)),
+                           int(rng.integers(-524288, 524288)) * 2)
     else:
-        imm = int(rng.integers(*_IMM12_RANGE, endpoint=True))
-    return Instruction(op, int(rd), int(rs1), imm)
-
-
-def generate_sequence(
-    length: int,
-    rng: np.random.Generator | None = None,
-    r_type_prob: float = 0.5,
-) -> list[Instruction]:
-    """Generate a random straight-line RV32I instruction sequence.
-
-    Args:
-        length: Number of instructions.
-        rng: Random generator (created if None).
-        r_type_prob: Probability of R-type vs I-type for each instruction.
-
-    Returns:
-        List of Instructions.
-    """
-    if rng is None:
-        rng = np.random.default_rng()
-    seq = []
-    for _ in range(length):
-        if rng.random() < r_type_prob:
-            seq.append(_random_r_instruction(rng))
-        else:
-            seq.append(_random_i_instruction(rng))
-    return seq
+        return Instruction('JALR', int(rng.choice(_DEST_REGS)),
+                           int(rng.choice(_SRC_REGS)),
+                           int(rng.integers(-2048, 2048)))
 
 
 # ---------------------------------------------------------------------------
-# Semantic-preserving transformations
+# Destination / data-value extraction
 # ---------------------------------------------------------------------------
 
-def rename_registers(
-    seq: list[Instruction],
-    rng: np.random.Generator,
-) -> tuple[list[Instruction], list[int]]:
-    """Rename registers via a random permutation of x1-x15.
-
-    x0 is left unchanged (hardwired zero).
-
-    Returns:
-        (renamed_sequence, permutation) where permutation[old_reg] = new_reg.
-        Use permute_regs() to apply the permutation to a register state.
-    """
-    perm = list(range(16))
-    # Shuffle x1-x15
-    subset = perm[1:]
-    rng.shuffle(subset)
-    perm[1:] = subset
-
-    def remap(reg: int) -> int:
-        return perm[reg] if reg < 16 else reg
-
-    result = []
-    for instr in seq:
-        op = instr.opcode
-        args = instr.args
-        if op in ('ADD', 'SUB', 'XOR', 'OR', 'AND', 'SLL', 'SRL', 'SRA',
-                   'SLT', 'SLTU'):
-            result.append(Instruction(op, remap(args[0]), remap(args[1]),
-                                      remap(args[2])))
-        elif op in ('ADDI', 'XORI', 'ORI', 'ANDI', 'SLLI', 'SRLI', 'SRAI',
-                     'SLTI', 'SLTIU'):
-            result.append(Instruction(op, remap(args[0]), remap(args[1]),
-                                      args[2]))
-        else:
-            result.append(instr)
-    return result, perm
+def dest_type(instr: Instruction) -> int:
+    """0 = register destination, 1 = memory destination."""
+    return 1 if instr.opcode in STORE_TYPE else 0
 
 
-def permute_regs(regs: np.ndarray, perm: list[int]) -> np.ndarray:
-    """Apply a register permutation to a register state array.
-
-    perm[old_reg] = new_reg: value that was in old_reg moves to new_reg.
-    """
-    result = regs.copy()
-    for old, new in enumerate(perm):
-        result[new] = regs[old]
-    return result
+def dest_reg(instr: Instruction) -> int:
+    """Destination register number. 0 for stores and branches."""
+    if instr.opcode in STORE_TYPE or instr.opcode in B_TYPE:
+        return 0
+    return instr.args[0]
 
 
-def _get_reads_writes(instr: Instruction) -> tuple[set[int], set[int]]:
-    """Return (registers_read, registers_written) for an instruction."""
-    op = instr.opcode
-    args = instr.args
-    if op in ('ADD', 'SUB', 'XOR', 'OR', 'AND', 'SLL', 'SRL', 'SRA',
-               'SLT', 'SLTU'):
-        return {args[1], args[2]}, {args[0]}
-    elif op in ('ADDI', 'XORI', 'ORI', 'ANDI', 'SLLI', 'SRLI', 'SRAI',
-                 'SLTI', 'SLTIU'):
-        return {args[1]}, {args[0]}
-    return set(), set()
-
-
-def _are_independent(a: Instruction, b: Instruction) -> bool:
-    """Check if two instructions can be safely swapped."""
-    a_reads, a_writes = _get_reads_writes(a)
-    b_reads, b_writes = _get_reads_writes(b)
-    # No WAR, WAW, or RAW hazards
-    return (not (a_writes & b_reads)
-            and not (b_writes & a_reads)
-            and not (a_writes & b_writes))
-
-
-def reorder_independent(
-    seq: list[Instruction],
-    rng: np.random.Generator,
-    n_swaps: int | None = None,
-) -> list[Instruction]:
-    """Randomly swap adjacent independent instructions.
-
-    Args:
-        seq: Instruction sequence.
-        rng: Random generator.
-        n_swaps: Number of swap attempts. Defaults to len(seq).
-    """
-    if len(seq) < 2:
-        return list(seq)
-    result = list(seq)
-    if n_swaps is None:
-        n_swaps = len(seq)
-    for _ in range(n_swaps):
-        i = int(rng.integers(0, len(result) - 1))
-        if _are_independent(result[i], result[i + 1]):
-            result[i], result[i + 1] = result[i + 1], result[i]
-    return result
-
-
-def insert_nops(
-    seq: list[Instruction],
-    rng: np.random.Generator,
-    count: int = 1,
-) -> list[Instruction]:
-    """Insert no-op instructions (add x0, x0, x0) at random positions."""
-    nop = Instruction('ADD', 0, 0, 0)
-    result = list(seq)
-    for _ in range(count):
-        pos = int(rng.integers(0, len(result) + 1))
-        result.insert(pos, nop)
-    return result
-
-
-def remove_nops(seq: list[Instruction]) -> list[Instruction]:
-    """Remove no-op instructions from a sequence."""
-    return [instr for instr in seq
-            if not (instr.opcode == 'ADD' and instr.args == (0, 0, 0))]
-
-
-def strength_reduce(
-    seq: list[Instruction],
-    rng: np.random.Generator,
-) -> list[Instruction] | None:
-    """Apply a random strength reduction if possible. Returns None if no
-    reduction is applicable."""
-    candidates = []
-    for i, instr in enumerate(seq):
-        if instr.opcode in _STRENGTH_PAIRS:
-            alt = _STRENGTH_PAIRS[instr.opcode](*instr.args)
-            if alt is not None:
-                candidates.append((i, alt))
-    if not candidates:
-        return None
-    i, alt = candidates[int(rng.integers(len(candidates)))]
-    result = list(seq)
-    result[i] = alt
-    return result
-
-
-def decompose_immediate(
-    seq: list[Instruction],
-    rng: np.random.Generator,
-) -> list[Instruction] | None:
-    """Replace an ADDI with two ADDIs that sum to the same value.
-
-    Only applies to ADDI instructions where the immediate can be split
-    into two values that each fit in 12 bits.
-    """
-    candidates = []
-    for i, instr in enumerate(seq):
-        if instr.opcode == 'ADDI' and abs(instr.args[2]) >= 2:
-            candidates.append(i)
-    if not candidates:
-        return None
-    i = candidates[int(rng.integers(len(candidates)))]
-    instr = seq[i]
-    rd, rs1, imm = instr.args
-
-    # Split the immediate into two parts
-    lo = int(rng.integers(max(imm - 2047, -2048), min(imm + 1, 2048)))
-    hi = imm - lo
-    # Verify both halves fit in 12 bits
-    if not (-2048 <= lo <= 2047 and -2048 <= hi <= 2047):
-        return None
-
-    result = list(seq)
-    result[i:i+1] = [
-        Instruction('ADDI', rd, rs1, lo),
-        Instruction('ADDI', rd, rd, hi),
-    ]
-    return result
+def extract_data_val(instr: Instruction, final_regs: np.ndarray,
+                     final_mem) -> int:
+    """Extract the data output value from execution results."""
+    if instr.opcode in B_TYPE:
+        return 0
+    if instr.opcode in STORE_TYPE:
+        rs2, imm, rs1 = instr.args
+        addr = int(final_regs[rs1]) + imm
+        width = MEM_WIDTH[instr.opcode]
+        val = 0
+        for i in range(width):
+            val |= int(final_mem[addr + i]) << (8 * i)
+        return val
+    return int(final_regs[instr.args[0]])
 
 
 # ---------------------------------------------------------------------------
-# Controlled mutations (near-equivalence)
+# Single-batch production (the core logic, no threading)
 # ---------------------------------------------------------------------------
 
-def mutate_immediate(
-    seq: list[Instruction],
-    rng: np.random.Generator,
-) -> list[Instruction] | None:
-    """Change one immediate value by a small amount."""
-    candidates = [i for i, instr in enumerate(seq)
-                  if instr.opcode in _ALU_I_OPS]
-    if not candidates:
-        return None
-    i = candidates[int(rng.integers(len(candidates)))]
-    instr = seq[i]
-    rd, rs1, imm = instr.args
+def produce_batch(batch_size: int, n_inputs: int,
+                  rng: np.random.Generator) -> Batch:
+    """Generate one batch of training data. Pure, synchronous, no side effects."""
+    instructions = [random_instruction(rng) for _ in range(batch_size)]
+    B = len(instructions)
 
-    if instr.opcode in _SHIFT_I_OPS:
-        delta = int(rng.choice([-1, 1]))
-        new_imm = max(0, min(31, imm + delta))
-        if new_imm == imm:
-            return None
-    else:
-        delta = int(rng.integers(-10, 11))
-        if delta == 0:
-            delta = 1
-        new_imm = imm + delta
-        if not (-2048 <= new_imm <= 2047):
-            return None
+    dt = np.array([dest_type(instr) for instr in instructions], dtype=np.int64)
+    dr = np.array([dest_reg(instr) for instr in instructions], dtype=np.int64)
 
-    result = list(seq)
-    result[i] = Instruction(instr.opcode, rd, rs1, new_imm)
-    return result
+    data_vals = np.zeros((B, n_inputs), dtype=np.int64)
+    pc_vals = np.zeros((B, n_inputs), dtype=np.int64)
+
+    for s in range(n_inputs):
+        regs = random_regs(rng)
+        pc = int(rng.integers(0, 1024)) * 4
+        for i, instr in enumerate(instructions):
+            state, final_pc, final_mem = run_instruction(
+                [instr], regs=regs, pc=pc, rng=rng)
+            data_vals[i, s] = extract_data_val(instr, state.regs, final_mem)
+            pc_vals[i, s] = final_pc
+
+    encoded = [encode_instruction(instr) for instr in instructions]
+    max_len = max(len(e) for e in encoded)
+    token_ids = np.full((B, max_len), PAD, dtype=np.int64)
+    padding_mask = np.ones((B, max_len), dtype=np.bool_)
+    for i, enc in enumerate(encoded):
+        token_ids[i, :len(enc)] = enc
+        padding_mask[i, :len(enc)] = False
+
+    return Batch(instructions, token_ids, padding_mask, data_vals, pc_vals, dt, dr)
 
 
-def mutate_opcode(
-    seq: list[Instruction],
-    rng: np.random.Generator,
-) -> list[Instruction] | None:
-    """Change one opcode to a related but different operation."""
-    candidates = []
-    for i, instr in enumerate(seq):
-        groups = _R_MUTATION_GROUPS if instr.opcode in _ALU_R_OPS else _I_MUTATION_GROUPS
-        for group in groups:
-            if instr.opcode in group and len(group) > 1:
-                alts = [op for op in group if op != instr.opcode]
-                candidates.append((i, alts))
-                break
-    if not candidates:
-        return None
-    i, alts = candidates[int(rng.integers(len(candidates)))]
-    new_op = alts[int(rng.integers(len(alts)))]
-    result = list(seq)
-    result[i] = Instruction(new_op, *seq[i].args)
-    return result
+def _produce_batch_from_seed(args):
+    """Entry point for ProcessPoolExecutor. Unpacks args and calls produce_batch."""
+    seed, batch_size, n_inputs = args
+    return produce_batch(batch_size, n_inputs, np.random.default_rng(seed))
 
 
 # ---------------------------------------------------------------------------
-# Training sample generation
+# Producer implementations
 # ---------------------------------------------------------------------------
 
-def generate_equivalence_pair(
-    length: int = 10,
-    rng: np.random.Generator | None = None,
-) -> dict:
-    """Generate a pair of execution-equivalent instruction sequences.
+class InlineProducer:
+    """Synchronous batch producer. Yields Batch objects one at a time.
 
-    Returns dict with keys: seq_a, seq_b, initial_regs, state_a, state_b,
-    transformation.
+    No threading, no multiprocessing. Suitable for tests and debugging.
     """
-    if rng is None:
-        rng = np.random.default_rng()
 
-    seq_a = generate_sequence(length, rng)
-    initial_regs = random_regs(rng)
+    def __init__(self, batch_size: int, n_inputs: int,
+                 n_batches: int, seed: int):
+        self._batch_size = batch_size
+        self._n_inputs = n_inputs
+        self._n_batches = n_batches
+        self._rng = np.random.default_rng(seed)
 
-    # Pick a random transformation.
-    # rename_registers returns (seq, perm) and needs special handling:
-    # the initial register state must be permuted to match the renaming,
-    # so the renamed sequence reads the same values from renamed locations.
-    initial_regs_b = initial_regs
-    perm = None
-
-    transforms = [
-        'reorder_independent',
-        'insert_nops',
-        'rename_registers',
-    ]
-    optional = [
-        'strength_reduce',
-        'decompose_immediate',
-    ]
-    rng.shuffle(transforms)
-    rng.shuffle(optional)
-    all_names = list(optional) + list(transforms)
-
-    seq_b = None
-    transform_name = None
-    for name in all_names:
-        if name == 'rename_registers':
-            seq_b, perm = rename_registers(seq_a, rng)
-            initial_regs_b = permute_regs(initial_regs, perm)
-            transform_name = name
-            break
-        elif name == 'reorder_independent':
-            seq_b = reorder_independent(seq_a, rng)
-            transform_name = name
-            break
-        elif name == 'insert_nops':
-            seq_b = insert_nops(seq_a, rng)
-            transform_name = name
-            break
-        elif name == 'strength_reduce':
-            result = strength_reduce(seq_a, rng)
-            if result is not None:
-                seq_b = result
-                transform_name = name
-                break
-        elif name == 'decompose_immediate':
-            result = decompose_immediate(seq_a, rng)
-            if result is not None:
-                seq_b = result
-                transform_name = name
-                break
-
-    if seq_b is None:
-        # Fallback: always-applicable transform
-        seq_b, perm = rename_registers(seq_a, rng)
-        initial_regs_b = permute_regs(initial_regs, perm)
-        transform_name = 'rename_registers'
-
-    state_a = execute(seq_a, initial_regs=initial_regs)
-    state_b = execute(seq_b, initial_regs=initial_regs_b)
-
-    # For register renaming, map state_b back to the original register
-    # namespace so that state_a and state_b are directly comparable.
-    if perm is not None:
-        inv_perm = [0] * len(perm)
-        for old, new in enumerate(perm):
-            inv_perm[new] = old
-        state_b = RV32IState(permute_regs(state_b.regs, inv_perm))
-
-    return {
-        'seq_a': seq_a,
-        'seq_b': seq_b,
-        'initial_regs': initial_regs,
-        'state_a': state_a,
-        'state_b': state_b,
-        'transformation': transform_name,
-    }
+    def __iter__(self):
+        for _ in range(self._n_batches):
+            yield produce_batch(self._batch_size, self._n_inputs, self._rng)
 
 
-def generate_near_equivalence_pair(
-    length: int = 10,
-    rng: np.random.Generator | None = None,
-) -> dict:
-    """Generate a pair of nearly-equivalent sequences with known distance.
+class ParallelProducer:
+    """Asynchronous batch producer backed by a ProcessPoolExecutor.
 
-    Returns dict with keys: seq_a, seq_b, initial_regs, state_a, state_b,
-    distance, mutation.
+    Maintains a prefetch queue of futures so the training loop never
+    waits for data. Must be closed after use.
+
+    Fork the pool BEFORE initializing CUDA or torch threads.
     """
-    if rng is None:
-        rng = np.random.default_rng()
 
-    seq_a = generate_sequence(length, rng)
-    initial_regs = random_regs(rng)
+    def __init__(self, batch_size: int, n_inputs: int,
+                 n_batches: int, seed: int,
+                 n_workers: int, prefetch: int):
+        from concurrent.futures import ProcessPoolExecutor
 
-    mutations = [
-        ('mutate_immediate', lambda s: mutate_immediate(s, rng)),
-        ('mutate_opcode', lambda s: mutate_opcode(s, rng)),
-    ]
-    rng.shuffle(mutations)
+        self._batch_size = batch_size
+        self._n_inputs = n_inputs
+        self._rng = np.random.default_rng(seed)
+        self._remaining = n_batches
+        self._pool = ProcessPoolExecutor(max_workers=n_workers)
+        self._pending = deque()
 
-    seq_b = None
-    mutation_name = None
-    for name, fn in mutations:
-        result = fn(seq_a)
-        if result is not None:
-            seq_b = result
-            mutation_name = name
-            break
+        for _ in range(min(prefetch, n_batches)):
+            self._submit()
 
-    if seq_b is None:
-        # Force a mutation: change the first I-type immediate
-        for i, instr in enumerate(seq_a):
-            if instr.opcode in _ALU_I_OPS:
-                rd, rs1, imm = instr.args
-                new_imm = imm + 1
-                if instr.opcode in _SHIFT_I_OPS:
-                    new_imm = min(31, imm + 1)
-                elif new_imm > 2047:
-                    new_imm = imm - 1
-                seq_b = list(seq_a)
-                seq_b[i] = Instruction(instr.opcode, rd, rs1, new_imm)
-                mutation_name = 'mutate_immediate_forced'
-                break
-        if seq_b is None:
-            # All R-type: change first opcode
-            seq_b = list(seq_a)
-            for group in _R_MUTATION_GROUPS:
-                if seq_a[0].opcode in group:
-                    alt = [op for op in group if op != seq_a[0].opcode][0]
-                    seq_b[0] = Instruction(alt, *seq_a[0].args)
-                    mutation_name = 'mutate_opcode_forced'
-                    break
+    def _submit(self):
+        seed = int(self._rng.integers(0, 2**63))
+        self._pending.append(
+            self._pool.submit(_produce_batch_from_seed,
+                              (seed, self._batch_size, self._n_inputs)))
+        self._remaining -= 1
 
-    state_a = execute(seq_a, initial_regs=initial_regs)
-    state_b = execute(seq_b, initial_regs=initial_regs)
-    distance = state_a.distance(state_b)
+    def __iter__(self):
+        return self
 
-    return {
-        'seq_a': seq_a,
-        'seq_b': seq_b,
-        'initial_regs': initial_regs,
-        'state_a': state_a,
-        'state_b': state_b,
-        'distance': distance,
-        'mutation': mutation_name,
-    }
+    def __next__(self):
+        if not self._pending:
+            raise StopIteration
+        batch = self._pending.popleft().result()
+        if self._remaining > 0:
+            self._submit()
+        return batch
 
+    def close(self):
+        self._pool.shutdown()
 
-def generate_training_sample(
-    length: int = 10,
-    rng: np.random.Generator | None = None,
-    equiv_prob: float = 0.5,
-) -> dict:
-    """Generate a single training sample: either an equivalence pair or a
-    near-equivalence pair.
+    def __enter__(self):
+        return self
 
-    Returns dict with 'label' key ('equivalent' or 'near_equivalent') plus
-    the keys from the respective generator.
-    """
-    if rng is None:
-        rng = np.random.default_rng()
-    if rng.random() < equiv_prob:
-        sample = generate_equivalence_pair(length, rng)
-        sample['label'] = 'equivalent'
-    else:
-        sample = generate_near_equivalence_pair(length, rng)
-        sample['label'] = 'near_equivalent'
-    return sample
+    def __exit__(self, *exc):
+        self.close()

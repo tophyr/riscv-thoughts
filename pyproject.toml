@@ -1,2 +1,5 @@
 [tool.pytest.ini_options]
 testpaths = ["emulator/tests", "tokenizer/tests", "datagen/tests", "compressor/tests"]
+filterwarnings = [
+    "ignore:overflow:RuntimeWarning:tinyfive",
+]

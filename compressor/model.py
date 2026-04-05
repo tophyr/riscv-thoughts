@@ -1,7 +1,8 @@
 """T0→T1 compressor model.
 
 Takes an instruction's tokens (4-7 of them) and produces a single T1
-vector. Trained jointly — no frozen encoder, no pre-training.
+vector plus destination classification logits. Trained jointly — no
+frozen encoder, no pre-training.
 """
 
 import torch
@@ -13,17 +14,23 @@ class T1Compressor(nn.Module):
 
     Architecture: token embeddings + learned positional embeddings →
     transformer encoder → mean pooling → linear projection → T1 vector.
+
+    Classification heads read from the T1 vector to predict the
+    instruction's destination type (register/memory) and destination
+    register number.
     """
 
     def __init__(
         self,
-        vocab_size: int = 89,
-        d_model: int = 128,
-        n_heads: int = 4,
-        n_layers: int = 2,
-        d_out: int = 32,
+        vocab_size: int,
+        d_model: int,
+        n_heads: int,
+        n_layers: int,
+        d_out: int,
         max_seq_len: int = 10,
         dropout: float = 0.0,
+        n_dest_types: int = 2,
+        n_regs: int = 32,
     ):
         super().__init__()
         self.d_model = d_model
@@ -39,22 +46,29 @@ class T1Compressor(nn.Module):
             dropout=dropout,
             batch_first=True,
         )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers,
+                                              enable_nested_tensor=False)
         self.output_proj = nn.Linear(d_model, d_out)
+
+        self.dest_type_head = nn.Linear(d_out, n_dest_types)
+        self.dest_reg_head = nn.Linear(d_out, n_regs)
 
     def forward(
         self,
         token_ids: torch.Tensor,
         padding_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Encode tokens to T1 vectors.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Encode tokens to T1 vectors and destination predictions.
 
         Args:
             token_ids: (batch, seq_len) int tensor of token IDs.
             padding_mask: (batch, seq_len) bool tensor, True = padding.
 
         Returns:
-            (batch, d_out) float tensor of T1 vectors.
+            (t1_vecs, dest_type_logits, dest_reg_logits):
+                t1_vecs: (batch, d_out) T1 vectors.
+                dest_type_logits: (batch, n_dest_types) classification logits.
+                dest_reg_logits: (batch, n_regs) classification logits.
         """
         B, L = token_ids.shape
         positions = torch.arange(L, device=token_ids.device).unsqueeze(0)
@@ -69,4 +83,5 @@ class T1Compressor(nn.Module):
         else:
             x = x.mean(dim=1)
 
-        return self.output_proj(x)
+        t1 = self.output_proj(x)
+        return t1, self.dest_type_head(t1), self.dest_reg_head(t1)

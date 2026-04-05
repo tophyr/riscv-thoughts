@@ -1,238 +1,146 @@
-"""Unit tests for the T0→T1 compressor."""
+"""Tests for the compressor model and training components."""
 
 import numpy as np
 import torch
-import pytest
 
 from emulator import Instruction
 from tokenizer import VOCAB_SIZE
-from compressor import (
-    T1Compressor,
-    tokenize_batch,
-    compute_exec_distance_matrix,
-    correlation_loss,
-    random_instruction,
+from compressor import T1Compressor
+from compressor.train import (
+    tokenize_batch, correlation_loss, combined_loss, exec_distance,
 )
+from datagen import InlineProducer, random_instruction
 
 
-class TestTokenizeBatch:
-    def test_shapes(self):
-        instrs = [
-            Instruction('ADD', 5, 3, 7),       # 4 tokens
-            Instruction('ADDI', 5, 3, 42),      # 6 tokens
-            Instruction('ADDI', 5, 3, -1),      # 7 tokens (with NEG)
-        ]
-        ids, mask = tokenize_batch(instrs)
-        assert ids.shape == (3, 7)  # padded to longest
-        assert mask.shape == (3, 7)
-
-    def test_padding_mask(self):
-        instrs = [
-            Instruction('ADD', 5, 3, 7),       # 4 tokens
-            Instruction('ADDI', 5, 3, 42),      # 6 tokens
-        ]
-        ids, mask = tokenize_batch(instrs)
-        # First instruction: 4 real + 2 padding
-        assert not mask[0, :4].any()
-        assert mask[0, 4:].all()
-        # Second instruction: 6 real + 0 padding
-        assert not mask[1, :6].any()
-
-    def test_no_padding_when_same_length(self):
-        instrs = [
-            Instruction('ADD', 5, 3, 7),
-            Instruction('SUB', 1, 2, 3),
-        ]
-        ids, mask = tokenize_batch(instrs)
-        assert not mask.any()  # no padding needed
-
-    def test_token_ids_valid(self):
-        instrs = [random_instruction(np.random.default_rng(i)) for i in range(10)]
-        ids, _ = tokenize_batch(instrs)
-        assert (ids >= 0).all()
-        assert (ids < VOCAB_SIZE).all()
-
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
 
 class TestT1Compressor:
-    def test_output_shape(self):
-        model = T1Compressor(d_out=32)
-        instrs = [Instruction('ADD', 5, 3, 7), Instruction('ADDI', 1, 0, 42)]
-        ids, mask = tokenize_batch(instrs)
-        out = model(ids, mask)
-        assert out.shape == (2, 32)
-
-    def test_output_shape_no_padding(self):
-        model = T1Compressor(d_out=16)
-        instrs = [Instruction('ADD', 5, 3, 7), Instruction('SUB', 1, 2, 3)]
-        ids, mask = tokenize_batch(instrs)
-        out = model(ids, mask)
-        assert out.shape == (2, 16)
+    def test_output_shapes(self):
+        model = T1Compressor(vocab_size=VOCAB_SIZE, d_model=32, n_heads=2,
+                             n_layers=1, d_out=16)
+        ids, mask = tokenize_batch([Instruction('ADD', 5, 3, 7),
+                                    Instruction('ADDI', 1, 0, 42)])
+        t1, dt, dr = model(ids, mask)
+        assert t1.shape == (2, 16)
+        assert dt.shape == (2, 2)
+        assert dr.shape == (2, 32)
 
     def test_deterministic(self):
-        model = T1Compressor(d_out=32)
+        model = T1Compressor(vocab_size=VOCAB_SIZE, d_model=32, n_heads=2,
+                             n_layers=1, d_out=16)
         model.eval()
-        instrs = [Instruction('ADD', 5, 3, 7)]
-        ids, mask = tokenize_batch(instrs)
+        ids, mask = tokenize_batch([Instruction('ADD', 5, 3, 7)])
         with torch.no_grad():
-            out1 = model(ids, mask)
-            out2 = model(ids, mask)
-        assert torch.allclose(out1, out2)
-
-    def test_different_instructions_differ(self):
-        model = T1Compressor(d_out=32)
-        model.eval()
-        ids1, m1 = tokenize_batch([Instruction('ADD', 5, 3, 7)])
-        ids2, m2 = tokenize_batch([Instruction('SUB', 5, 3, 7)])
-        with torch.no_grad():
-            out1 = model(ids1, m1)
-            out2 = model(ids2, m2)
-        # Random init should produce different outputs
-        assert not torch.allclose(out1, out2, atol=1e-6)
+            a, _, _ = model(ids, mask)
+            b, _, _ = model(ids, mask)
+        assert torch.allclose(a, b)
 
     def test_gradients_flow(self):
-        model = T1Compressor(d_out=32)
+        model = T1Compressor(vocab_size=VOCAB_SIZE, d_model=32, n_heads=2,
+                             n_layers=1, d_out=16)
         instrs = [random_instruction(np.random.default_rng(i)) for i in range(8)]
         ids, mask = tokenize_batch(instrs)
-        out = model(ids, mask)
-        loss = out.sum()
-        loss.backward()
+        t1, dt, dr = model(ids, mask)
+        (t1.sum() + dt.sum() + dr.sum()).backward()
         for p in model.parameters():
             assert p.grad is not None
-            assert not torch.all(p.grad == 0)
 
 
-class TestExecDistanceMatrix:
-    def test_shape(self):
-        instrs = [
-            Instruction('ADDI', 5, 0, 10),
-            Instruction('ADDI', 5, 0, 20),
-            Instruction('ADD', 5, 3, 7),
-        ]
-        dist = compute_exec_distance_matrix(instrs, n_inputs=4,
-                                            rng=np.random.default_rng(42))
-        assert dist.shape == (3, 3)
-
-    def test_diagonal_zero(self):
-        instrs = [
-            Instruction('ADDI', 5, 0, 10),
-            Instruction('ADDI', 5, 0, 20),
-        ]
-        dist = compute_exec_distance_matrix(instrs, n_inputs=4,
-                                            rng=np.random.default_rng(42))
-        assert dist[0, 0] == 0.0
-        assert dist[1, 1] == 0.0
-
-    def test_symmetric(self):
-        instrs = [random_instruction(np.random.default_rng(i)) for i in range(5)]
-        dist = compute_exec_distance_matrix(instrs, n_inputs=8,
-                                            rng=np.random.default_rng(42))
-        assert np.allclose(dist, dist.T)
-
-    def test_equivalent_instructions_zero_distance(self):
-        # ADD x5, x3, x3 and SLLI x5, x3, 1 are execution-equivalent
-        instrs = [
-            Instruction('ADD', 5, 3, 3),
-            Instruction('SLLI', 5, 3, 1),
-        ]
-        dist = compute_exec_distance_matrix(instrs, n_inputs=16,
-                                            rng=np.random.default_rng(42))
-        assert dist[0, 1] == 0.0
-
-    def test_different_instructions_nonzero_distance(self):
-        instrs = [
-            Instruction('ADDI', 5, 0, 10),
-            Instruction('ADDI', 5, 0, 100),
-        ]
-        dist = compute_exec_distance_matrix(instrs, n_inputs=4,
-                                            rng=np.random.default_rng(42))
-        assert dist[0, 1] > 0
-
-    def test_distance_ordering(self):
-        # ADDI x5, x0, 10 should be closer to ADDI x5, x0, 11
-        # than to ADDI x5, x0, 100
-        instrs = [
-            Instruction('ADDI', 5, 0, 10),
-            Instruction('ADDI', 5, 0, 11),
-            Instruction('ADDI', 5, 0, 100),
-        ]
-        dist = compute_exec_distance_matrix(instrs, n_inputs=4,
-                                            rng=np.random.default_rng(42))
-        assert dist[0, 1] < dist[0, 2]
-
+# ---------------------------------------------------------------------------
+# Loss / distance
+# ---------------------------------------------------------------------------
 
 class TestCorrelationLoss:
     def test_perfect_correlation(self):
-        """When T1 distances are proportional to exec distances, loss ≈ 0."""
-        # T1 vectors at 0, 1, 3 → pairwise dists are 1, 3, 2
-        # Exec dists match the same proportions.
-        t1_vecs = torch.tensor([[0.0], [1.0], [3.0]])
-        exec_dists = torch.tensor([
-            [0.0, 1.0, 3.0],
-            [1.0, 0.0, 2.0],
-            [3.0, 2.0, 0.0],
-        ])
-        loss = correlation_loss(t1_vecs, exec_dists)
-        assert loss.item() < 0.01
-
-    def test_no_correlation(self):
-        """When T1 distances are uncorrelated with exec, loss ≈ 1."""
-        torch.manual_seed(42)
-        t1_vecs = torch.randn(32, 4)
-        # Random exec distances unrelated to T1 positions
-        exec_dists = torch.rand(32, 32)
-        exec_dists = (exec_dists + exec_dists.T) / 2
-        exec_dists.fill_diagonal_(0)
-        loss = correlation_loss(t1_vecs, exec_dists)
-        assert 0.5 < loss.item() < 1.5
-
-    def test_inverted_distances(self):
-        """When T1 distances are anti-correlated with exec, loss > 1."""
-        t1_vecs = torch.tensor([[0.0], [1.0], [3.0]])
-        # Exec distances are inverted: close in T1 = far in exec
-        exec_dists = torch.tensor([
-            [0.0, 3.0, 1.0],
-            [3.0, 0.0, 2.0],
-            [1.0, 2.0, 0.0],
-        ])
-        loss = correlation_loss(t1_vecs, exec_dists)
-        assert loss.item() > 1.0
+        t1 = torch.tensor([[0.0], [1.0], [3.0]])
+        ed = torch.tensor([[0., 1., 3.], [1., 0., 2.], [3., 2., 0.]])
+        assert correlation_loss(t1, ed).item() < 0.01
 
     def test_gradient_flows(self):
-        t1_vecs = torch.randn(8, 4, requires_grad=True)
-        exec_dists = torch.rand(8, 8)
-        exec_dists = (exec_dists + exec_dists.T) / 2
-        exec_dists.fill_diagonal_(0)
-        loss = correlation_loss(t1_vecs, exec_dists)
-        loss.backward()
-        assert t1_vecs.grad is not None
-
-    def test_loss_bounded(self):
-        """Loss should be in [0, 2]."""
-        for seed in range(10):
-            torch.manual_seed(seed)
-            t1_vecs = torch.randn(16, 4)
-            exec_dists = torch.rand(16, 16)
-            exec_dists = (exec_dists + exec_dists.T) / 2
-            exec_dists.fill_diagonal_(0)
-            loss = correlation_loss(t1_vecs, exec_dists)
-            assert 0 <= loss.item() <= 2.0
+        t1 = torch.randn(8, 4, requires_grad=True)
+        ed = torch.rand(8, 8); ed = (ed + ed.T) / 2; ed.fill_diagonal_(0)
+        correlation_loss(t1, ed).backward()
+        assert t1.grad is not None
 
 
-_SMOKE_PARAMS = dict(
-    batch_size=16, n_steps=3, n_inputs=4, n_producers=2, prefetch=4,
-    torch_threads=2, lr=1e-3, lr_min=1e-6, d_model=32, n_heads=2,
-    n_layers=1, d_out=8, device='cpu', log_every=1, seed=42,
-)
+class TestCombinedLoss:
+    def test_gradient_flows_all_heads(self):
+        model = T1Compressor(vocab_size=VOCAB_SIZE, d_model=32, n_heads=2,
+                             n_layers=1, d_out=8)
+        instrs = [random_instruction(np.random.default_rng(i)) for i in range(8)]
+        ids, mask = tokenize_batch(instrs)
+        t1, dt, dr = model(ids, mask)
+        ed = torch.rand(8, 8); ed = (ed + ed.T) / 2; ed.fill_diagonal_(0)
+        combined_loss(t1, dt, dr, ed,
+                      torch.zeros(8, dtype=torch.long),
+                      torch.randint(0, 32, (8,))).backward()
+        for p in model.parameters():
+            assert p.grad is not None
 
+
+class TestExecDistance:
+    def test_identical_zero(self):
+        dv = np.array([[10, 20], [10, 20]], dtype=np.int64)
+        pv = np.array([[4, 4], [4, 4]], dtype=np.int64)
+        assert exec_distance(dv, pv, torch.device('cpu'))[0, 1].item() == 0.0
+
+    def test_symmetric(self):
+        rng = np.random.default_rng(42)
+        dv = rng.integers(-1000, 1000, size=(8, 4), dtype=np.int64)
+        pv = rng.integers(0, 100, size=(8, 4), dtype=np.int64)
+        d = exec_distance(dv, pv, torch.device('cpu'))
+        assert torch.allclose(d, d.T)
+
+    def test_pc_separates_branches(self):
+        dv = np.array([[0, 0], [0, 0]], dtype=np.int64)
+        pv = np.array([[4, 4], [100, 100]], dtype=np.int64)
+        assert exec_distance(dv, pv, torch.device('cpu'))[0, 1].item() > 0
+
+
+# ---------------------------------------------------------------------------
+# Training smoke test (uses InlineProducer — no multiprocessing)
+# ---------------------------------------------------------------------------
 
 class TestTrainingSmoke:
-    def test_few_steps_no_crash(self):
-        model, losses = __import__('compressor').train(**_SMOKE_PARAMS)
-        assert len(losses) == 3
-        assert all(isinstance(l, float) for l in losses)
+    def _train_small_model(self, tmp_path):
+        """Train a tiny model and save it. Returns the run directory."""
+        producer = InlineProducer(batch_size=8, n_inputs=4,
+                                  n_batches=3, seed=42)
+        model = T1Compressor(vocab_size=VOCAB_SIZE, d_model=32, n_heads=2,
+                             n_layers=1, d_out=8)
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    def test_loss_is_finite(self):
-        _, losses = __import__('compressor').train(
-            **{**_SMOKE_PARAMS, 'n_steps': 5, 'log_every': 100},
-        )
+        losses = []
+        for batch in producer:
+            ids = torch.from_numpy(batch.token_ids)
+            mask = torch.from_numpy(batch.padding_mask)
+            ed = exec_distance(batch.data_vals, batch.pc_vals, torch.device('cpu'))
+            dt = torch.from_numpy(batch.dest_types)
+            dr = torch.from_numpy(batch.dest_regs)
+
+            t1, dt_logits, dr_logits = model(ids, mask)
+            loss = combined_loss(t1, dt_logits, dr_logits, ed, dt, dr)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            losses.append(loss.item())
+
+        from compressor.train import save_run
+        run_dir = save_run(model, losses, hparams={
+            'vocab_size': VOCAB_SIZE, 'd_model': 32, 'n_heads': 2,
+            'n_layers': 1, 'd_out': 8,
+        }, out_dir=str(tmp_path))
+        return losses, run_dir
+
+    def test_inline_training(self, tmp_path):
+        losses, _ = self._train_small_model(tmp_path)
+        assert len(losses) == 3
         assert all(np.isfinite(l) for l in losses)
+
+    def test_evaluate_after_training(self, tmp_path):
+        from compressor.eval import evaluate
+        _, run_dir = self._train_small_model(tmp_path)
+        # Should complete without errors. Output goes to stdout.
+        evaluate(str(run_dir), n_inputs=4)

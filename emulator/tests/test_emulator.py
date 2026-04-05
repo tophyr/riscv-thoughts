@@ -2,7 +2,13 @@
 
 import numpy as np
 import pytest
-from emulator import Instruction, RV32IState, execute, random_regs
+from emulator import Instruction, RV32IState, run, random_regs
+
+
+def execute(instructions, initial_regs=None, max_steps=None):
+    """Test helper: run instructions, return only register state."""
+    state, _, _ = run(instructions, regs=initial_regs, max_steps=max_steps)
+    return state
 
 
 class TestInstruction:
@@ -342,3 +348,55 @@ class TestRandomRegs:
         regs = random_regs()
         assert regs.shape == (32,)
         assert regs.dtype == np.int32
+
+
+class TestRunAllInstructionTypes:
+    """Tests for run() with all RV32I instruction types, including
+    SparseMemory, arbitrary addresses, and random PC."""
+
+    def test_alu(self):
+        regs = np.zeros(32, dtype=np.int32)
+        regs[3] = 10; regs[7] = 20
+        state, pc, _ = run([Instruction('ADD', 5, 3, 7)], regs=regs)
+        assert state.regs[5] == 30 and pc == 4
+
+    def test_load_arbitrary_address(self):
+        regs = np.zeros(32, dtype=np.int32)
+        regs[3] = 1000000
+        s1, _, _ = run([Instruction('LW', 5, 4, 3)], regs=regs,
+                       rng=np.random.default_rng(42))
+        s2, _, _ = run([Instruction('LW', 5, 4, 3)], regs=regs,
+                       rng=np.random.default_rng(42))
+        assert s1.regs[5] == s2.regs[5]
+
+    def test_store_arbitrary_address(self):
+        regs = np.zeros(32, dtype=np.int32)
+        regs[3] = -500000
+        regs[5] = np.int32(-559038737)
+        _, pc, mem = run([Instruction('SW', 5, 8, 3)], regs=regs)
+        assert pc == 4
+        addr = -500000 + 8
+        val = (int(mem[addr]) | (int(mem[addr+1]) << 8)
+               | (int(mem[addr+2]) << 16) | (int(mem[addr+3]) << 24))
+        assert val == 0xDEADBEEF
+
+    def test_branch(self):
+        regs = np.zeros(32, dtype=np.int32)
+        regs[1] = 5; regs[2] = 5
+        _, pc, _ = run([Instruction('BEQ', 1, 2, 16)], regs=regs, pc=100)
+        assert pc == 116
+
+    def test_jal(self):
+        state, pc, _ = run([Instruction('JAL', 1, 100)], pc=500)
+        assert state.regs[1] == 504 and pc == 600
+
+    def test_auipc_vs_lui(self):
+        s1, _, _ = run([Instruction('AUIPC', 5, 1)], pc=1000)
+        s2, _, _ = run([Instruction('LUI', 5, 1)], pc=1000)
+        assert s1.regs[5] != s2.regs[5]
+
+    def test_mem_returned(self):
+        regs = np.zeros(32, dtype=np.int32)
+        regs[3] = 42
+        _, _, mem = run([Instruction('SB', 3, 0, 0)], regs=regs)
+        assert int(mem[0]) == 42

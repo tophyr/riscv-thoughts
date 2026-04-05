@@ -1,7 +1,13 @@
 """Unit tests for the RV32I structural tokenizer."""
 
 import pytest
-from emulator import Instruction, execute
+from emulator import Instruction, run
+
+
+def execute(instructions, initial_regs=None):
+    """Test helper: run instructions, return only register state."""
+    state, _, _ = run(instructions, regs=initial_regs)
+    return state
 from tokenizer import (
     PAD, BOS, EOS, NEG, VOCAB, VOCAB_SIZE,
     encode_instruction, decode_instruction,
