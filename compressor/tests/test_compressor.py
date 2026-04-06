@@ -73,9 +73,11 @@ class TestCombinedLoss:
         ids, mask = tokenize_batch(instrs)
         t1, dt, dr = model(ids, mask)
         ed = torch.rand(8, 8); ed = (ed + ed.T) / 2; ed.fill_diagonal_(0)
+        data_ranges = torch.rand(8) * 1e9
         combined_loss(t1, dt, dr, ed,
                       torch.zeros(8, dtype=torch.long),
-                      torch.randint(0, 32, (8,))).backward()
+                      torch.randint(0, 32, (8,)),
+                      data_ranges).backward()
         for p in model.parameters():
             assert p.grad is not None
 
@@ -119,9 +121,11 @@ class TestTrainingSmoke:
             ed = exec_distance(batch.data_vals, batch.pc_vals, torch.device('cpu'))
             dt = torch.from_numpy(batch.dest_types)
             dr = torch.from_numpy(batch.dest_regs)
+            dv_range = batch.data_vals.max(axis=1) - batch.data_vals.min(axis=1)
+            data_ranges = torch.tensor(dv_range, dtype=torch.float32)
 
             t1, dt_logits, dr_logits = model(ids, mask)
-            loss = combined_loss(t1, dt_logits, dr_logits, ed, dt, dr)
+            loss = combined_loss(t1, dt_logits, dr_logits, ed, dt, dr, data_ranges)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()

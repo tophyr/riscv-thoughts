@@ -209,6 +209,40 @@ non-equivalent pair with the same dest (minimum ~1.0).
 
 ---
 
+### Key Finding: d_out Controls the Equivalence/Correlation Tradeoff
+
+Comparing d_out=32 (500K steps) to d_out=128 (50K and 100K steps):
+
+| Metric | d_out=32 (500K) | d_out=128 (100K) |
+|--------|-----------------|------------------|
+| Pearson r | 0.985 | 0.995 |
+| ADD x5,x3,x3 vs SLLI | 0.48 | 1.29 |
+| ADD x5,x3,x0 vs ADDI | 0.19 | 0.36 |
+| ADD commutative | — | 0.80 |
+
+Larger d_out gives better global correlation but WORSE equivalence
+collapse. The model has more room to keep equivalent instructions
+apart while still maintaining excellent proportional distances. The
+correlation loss doesn't specifically penalize nonzero distance for
+equivalent pairs — it only measures the global linear relationship.
+
+### Key Finding: Correlation Loss Is Structurally Blind to Equivalence
+
+The correlation loss computes Pearson r over ~8.4M pairwise distances
+per batch. One pair with (exec_dist=0, T1_dist=55) is a single outlier
+among millions of correctly-proportioned pairs. It barely moves the
+Pearson r. The model has essentially zero gradient incentive to collapse
+execution-equivalent instructions.
+
+For equivalence collapse to work, equivalent pairs need to appear in
+the same batch (probability near zero for specific pairs in 189M
+instruction space), AND the loss needs per-pair sensitivity (which
+Pearson correlation does not have).
+
+This finding motivates the weighted equivalence loss in Phase 2.
+
+---
+
 ## Phase 1 Summary
 
 **What worked**:
@@ -224,14 +258,77 @@ non-equivalent pair with the same dest (minimum ~1.0).
 - Full register-state L1 distance (dest register dominated by 10^6x).
 - Large d_out without equivalence-specific loss (equivalence collapse
   regressed relative to smaller d_out).
+- Correlation loss alone cannot drive equivalence collapse (structurally
+  insensitive to individual pair violations).
 
-**Open questions for Phase 2**:
-- Execution equivalence collapse requires either equivalence injection
-  into batches, a dedicated equivalence loss term, or multi-task training.
-- Extending beyond ALU requires a distance metric that handles memory
-  and control-flow effects — the register-array approach cannot represent
-  stores or branches. A structured effect representation (destination +
-  value expression) is needed.
-- Multi-task training with shared T1 space (opcode head, dest head,
-  source head, immediate head, plus execution equivalence) is the
-  proposed next architecture.
+---
+
+## Phase 2: All RV32I Instruction Types
+
+Goal: generalize the compressor from 19 ALU opcodes to all 37 RV32I
+instruction types (loads, stores, branches, jumps, LUI, AUIPC).
+Full 32-register space (x0-x31).
+
+Architecture changes:
+- Two-component execution comparison (data_val + pc_val) replaces
+  single computed-value metric
+- Destination classification heads (dest_type: reg/mem, dest_reg:
+  which register) provide structural gradient signal
+- SparseMemory for arbitrary 32-bit addressing with random registers
+- Random PC per input state (distinguishes AUIPC from LUI)
+- Full x0-x31 register space (~189M possible instructions)
+
+### Experiment 7: First all-types run (log-scaled distance)
+
+d_out=128, batch=4096, lr=3e-4, 100K steps. Distance metric:
+mean_over_inputs(log(1 + |data_diff|) + log(1 + |pc_diff|)).
+
+**Result: Pearson r=0.998, Spearman r=0.973. Best correlation yet.**
+
+Opcode structure showed real cross-type clustering:
+
+| Pair | Distance |
+|------|----------|
+| SLT/SLTU | 0.4 |
+| SRL/SRA | 19.2 |
+| SLT/BEQ | 3.5 |
+| BEQ/BLT | 4.6 |
+| LUI/AUIPC | 11.9 |
+| JAL/JALR | 66.2 |
+
+But two problems emerged:
+
+**Metric artifact: SLT/BEQ/LW clustering.** SLT (outputs 0/1),
+BEQ (data output always 0), and LW (loads random bytes) clustered
+together at distances 3.5-16.5. These are computationally unrelated
+but log-scaling compressed their small output magnitudes to look
+similar. After log, "always outputs small numbers" looks the same
+regardless of what the instruction actually computes.
+
+**Equivalence collapse still poor.** ADD-to-self vs SLLI-by-1 at
+55.97 (vs 1.29 in ALU-only model). Commutativity at 43.30 (vs 0.80).
+The classification heads encode opcode identity and argument structure
+into the T1 vector, creating large distances between syntactically
+different instructions. The correlation loss provides negligible
+counterpressure because equivalent pairs rarely co-occur in batches
+and Pearson r is insensitive to individual pair violations.
+
+**Root cause of log artifact:** log(1+|diff|) was introduced in
+Phase 1 to prevent dest-register identity from dominating the
+computed-value metric (billion-scale diffs from wrong-register reads
+vs small computational diffs). Phase 2 replaced the single-value
+metric with classification heads for dest identity. The log no longer
+solved any active problem and was actively causing the SLT/BEQ/LW
+clustering artifact.
+
+**Root cause of equivalence failure:** Pearson correlation is a global
+measure over ~8.4M pairs per batch. One pair with exec_dist=0 and
+T1_dist=55.97 is invisible among millions of correctly-proportioned
+pairs. The model has no gradient incentive to collapse equivalences.
+
+**Fixes applied for next run:**
+- Remove log scaling: raw |diff| for both data and PC components
+- Add weighted equivalence loss: weight = max(range_i, range_j) /
+  (1 + exec_dist). High-range instructions that agree get massive
+  weight; low-range instructions (SLT, BEQ) that trivially agree
+  get negligible weight.

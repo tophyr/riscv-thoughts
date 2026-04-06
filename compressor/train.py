@@ -50,10 +50,37 @@ def correlation_loss(t1_vecs, exec_dist_matrix):
     return 1.0 - num / denom
 
 
+def equiv_loss(t1_vecs, exec_dists, data_ranges):
+    """Weighted equivalence loss: push T1 distances toward zero for
+    pairs with small exec distance, weighted by output range.
+
+    Pairs of high-range instructions that agree are strong evidence of
+    equivalence. Pairs of low-range instructions that agree are weak
+    evidence (they had little room to disagree).
+
+    weight[i,j] = max(range_i, range_j) / (1 + exec_dist[i,j])
+    """
+    t1_dists = torch.cdist(t1_vecs, t1_vecs)
+
+    B = t1_vecs.shape[0]
+    idx = torch.triu_indices(B, B, offset=1, device=t1_vecs.device)
+    t1_flat = t1_dists[idx[0], idx[1]]
+    exec_flat = exec_dists[idx[0], idx[1]]
+
+    # Per-pair range: max of the two instructions' output ranges.
+    pair_range = torch.maximum(data_ranges[idx[0]], data_ranges[idx[1]])
+
+    weight = pair_range / (1.0 + exec_flat)
+    weight = weight / weight.sum().clamp(min=1e-8)  # normalize to sum to 1
+
+    return (t1_flat * weight).sum()
+
+
 def combined_loss(t1_vecs, dt_logits, dr_logits,
-                  exec_dists, dt_targets, dr_targets):
-    """Correlation + destination classification loss."""
+                  exec_dists, dt_targets, dr_targets, data_ranges):
+    """Correlation + equivalence + destination classification loss."""
     corr = correlation_loss(t1_vecs, exec_dists)
+    eq = equiv_loss(t1_vecs, exec_dists, data_ranges)
     type_loss = F.cross_entropy(dt_logits, dt_targets)
 
     reg_mask = (dt_targets == 0)
@@ -62,7 +89,7 @@ def combined_loss(t1_vecs, dt_logits, dr_logits,
     else:
         reg_loss = torch.tensor(0.0, device=t1_vecs.device)
 
-    return corr + type_loss + reg_loss
+    return corr + eq + type_loss + reg_loss
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +99,7 @@ def combined_loss(t1_vecs, dt_logits, dr_logits,
 def exec_distance(data_vals, pc_vals, device):
     """Two-component pairwise distance on GPU.
 
-    Distance = mean_over_inputs(log(1 + |data_diff|) + log(1 + |pc_diff|)).
+    Distance = mean_over_inputs(|data_diff| + |pc_diff|).
     """
     dv = torch.tensor(data_vals, dtype=torch.float64, device=device)
     pv = torch.tensor(pc_vals, dtype=torch.float64, device=device)
@@ -82,7 +109,7 @@ def exec_distance(data_vals, pc_vals, device):
     for s in range(S):
         d_diff = (dv[:, s].unsqueeze(1) - dv[:, s].unsqueeze(0)).abs()
         p_diff = (pv[:, s].unsqueeze(1) - pv[:, s].unsqueeze(0)).abs()
-        dist += torch.log1p(d_diff) + torch.log1p(p_diff)
+        dist += d_diff + p_diff
     dist /= S
 
     return dist.float()
@@ -147,9 +174,14 @@ def train(
             dt_targets = torch.from_numpy(batch.dest_types).to(device)
             dr_targets = torch.from_numpy(batch.dest_regs).to(device)
 
+            # Per-instruction output range across input states.
+            dv_range = batch.data_vals.max(axis=1) - batch.data_vals.min(axis=1)
+            data_ranges = torch.tensor(dv_range, dtype=torch.float32, device=device)
+
             t1_vecs, dt_logits, dr_logits = model(token_ids, padding_mask)
             loss = combined_loss(t1_vecs, dt_logits, dr_logits,
-                                 exec_dists, dt_targets, dr_targets)
+                                 exec_dists, dt_targets, dr_targets,
+                                 data_ranges)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
