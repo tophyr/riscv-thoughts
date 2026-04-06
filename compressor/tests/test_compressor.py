@@ -108,21 +108,22 @@ class TestExecDistance:
 class TestTrainingSmoke:
     def _train_small_model(self, tmp_path):
         """Train a tiny model and save it. Returns the run directory."""
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         producer = InlineProducer(batch_size=8, n_inputs=4,
                                   n_batches=3, seed=42)
         model = T1Compressor(vocab_size=VOCAB_SIZE, d_model=32, n_heads=2,
-                             n_layers=1, d_out=8)
+                             n_layers=1, d_out=8).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
         losses = []
         for batch in producer:
-            ids = torch.from_numpy(batch.token_ids)
-            mask = torch.from_numpy(batch.padding_mask)
-            ed = exec_distance(batch.data_vals, batch.pc_vals, torch.device('cpu'))
-            dt = torch.from_numpy(batch.dest_types)
-            dr = torch.from_numpy(batch.dest_regs)
+            ids = torch.from_numpy(batch.token_ids).to(device)
+            mask = torch.from_numpy(batch.padding_mask).to(device)
+            ed = exec_distance(batch.data_vals, batch.pc_vals, device)
+            dt = torch.from_numpy(batch.dest_types).to(device)
+            dr = torch.from_numpy(batch.dest_regs).to(device)
             dv_range = batch.data_vals.max(axis=1) - batch.data_vals.min(axis=1)
-            data_ranges = torch.tensor(dv_range, dtype=torch.float32)
+            data_ranges = torch.tensor(dv_range, dtype=torch.float32, device=device)
 
             t1, dt_logits, dr_logits = model(ids, mask)
             loss = combined_loss(t1, dt_logits, dr_logits, ed, dt, dr, data_ranges)

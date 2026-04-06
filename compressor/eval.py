@@ -42,9 +42,14 @@ def load_model(run_dir):
     return model
 
 
+def _device_of(model):
+    return next(model.parameters()).device
+
+
 def get_t1(model, instructions):
     """Get T1 vectors for a list of instructions."""
-    ids, mask = tokenize_batch(instructions)
+    device = _device_of(model)
+    ids, mask = tokenize_batch(instructions, device=device)
     with torch.no_grad():
         t1, _, _ = model(ids, mask)
         return t1
@@ -221,12 +226,13 @@ def eval_correlation(model, n_inputs):
     batch = produce_batch(64, n_inputs, np.random.default_rng(99))
 
     t1_vecs = get_t1(model, batch.instructions)
-    t1_dists = torch.cdist(t1_vecs, t1_vecs).numpy()
+    t1_dists = torch.cdist(t1_vecs, t1_vecs).cpu().numpy()
 
-    ed = exec_distance(batch.data_vals, batch.pc_vals, torch.device('cpu'))
+    ed = exec_distance(batch.data_vals, batch.pc_vals, _device_of(model))
     idx = np.triu_indices(64, k=1)
-    r_pearson, _ = pearsonr(ed.numpy()[idx], t1_dists[idx])
-    r_spearman, _ = spearmanr(ed.numpy()[idx], t1_dists[idx])
+    ed_np = ed.cpu().float().numpy()
+    r_pearson, _ = pearsonr(ed_np[idx], t1_dists[idx])
+    r_spearman, _ = spearmanr(ed_np[idx], t1_dists[idx])
     print(f"  Pearson r:  {r_pearson:.4f}")
     print(f"  Spearman r: {r_spearman:.4f}")
 
@@ -257,7 +263,9 @@ def eval_loss_trajectory(run_dir):
 def evaluate(run_dir, n_inputs=256):
     """Run all evaluations on a trained model."""
     model = load_model(run_dir)
-    print(f"Loaded model from {run_dir}")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+    print(f"Loaded model from {run_dir} (on {device})")
     print()
     eval_loss_trajectory(run_dir)
     eval_equivalence(model)

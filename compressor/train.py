@@ -110,19 +110,15 @@ def exec_distance(data_vals, pc_vals, device):
     """Two-component pairwise distance on GPU.
 
     Distance = mean_over_inputs(|data_diff| + |pc_diff|).
+    Vectorized across input states — one kernel launch instead of 32.
     """
-    dv = torch.tensor(data_vals, dtype=torch.float64, device=device)
-    pv = torch.tensor(pc_vals, dtype=torch.float64, device=device)
-    B, S = dv.shape
+    dv = torch.tensor(data_vals, dtype=torch.bfloat16, device=device)
+    pv = torch.tensor(pc_vals, dtype=torch.bfloat16, device=device)
 
-    dist = torch.zeros(B, B, dtype=torch.float64, device=device)
-    for s in range(S):
-        d_diff = (dv[:, s].unsqueeze(1) - dv[:, s].unsqueeze(0)).abs()
-        p_diff = (pv[:, s].unsqueeze(1) - pv[:, s].unsqueeze(0)).abs()
-        dist += d_diff + p_diff
-    dist /= S
-
-    return dist.float()
+    # (B, 1, S) - (1, B, S) → (B, B, S) pairwise diffs across all inputs.
+    d_all = (dv.unsqueeze(1) - dv.unsqueeze(0)).abs()
+    p_all = (pv.unsqueeze(1) - pv.unsqueeze(0)).abs()
+    return (d_all + p_all).mean(dim=2)
 
 
 # ---------------------------------------------------------------------------
