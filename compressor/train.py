@@ -69,7 +69,10 @@ def equiv_loss(t1_vecs, exec_dists, data_ranges):
     exec_flat = exec_dists[idx[0], idx[1]]
 
     # Per-pair range: max of the two instructions' output ranges.
-    pair_range = torch.maximum(data_ranges[idx[0]], data_ranges[idx[1]])
+    # +1 ensures constant-output equivalences (range=0) still get
+    # collapse signal, while preserving ordering (range=0 gets half
+    # the weight of range=1).
+    pair_range = torch.maximum(data_ranges[idx[0]], data_ranges[idx[1]]) + 1.0
 
     weight = pair_range / (1.0 + exec_flat)
     weight = weight / weight.sum().clamp(min=1e-8)
