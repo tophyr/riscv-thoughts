@@ -7,7 +7,7 @@ from emulator import Instruction
 from tokenizer import VOCAB_SIZE
 from compressor import T1Compressor
 from compressor.train import (
-    tokenize_batch, correlation_loss, combined_loss, exec_distance,
+    tokenize_batch, _pearson, combined_loss, exec_distance,
 )
 from datagen import InlineProducer, random_instruction
 
@@ -52,17 +52,23 @@ class TestT1Compressor:
 # Loss / distance
 # ---------------------------------------------------------------------------
 
-class TestCorrelationLoss:
+class TestPearson:
     def test_perfect_correlation(self):
-        t1 = torch.tensor([[0.0], [1.0], [3.0]])
-        ed = torch.tensor([[0., 1., 3.], [1., 0., 2.], [3., 2., 0.]])
-        assert correlation_loss(t1, ed).item() < 0.01
+        t1_flat = torch.tensor([1.0, 3.0, 2.0])  # pairwise dists for 3 points
+        exec_flat = torch.tensor([1.0, 3.0, 2.0])
+        assert _pearson(t1_flat, exec_flat).item() < 0.01
 
     def test_gradient_flows(self):
-        t1 = torch.randn(8, 4, requires_grad=True)
-        ed = torch.rand(8, 8); ed = (ed + ed.T) / 2; ed.fill_diagonal_(0)
-        correlation_loss(t1, ed).backward()
-        assert t1.grad is not None
+        t1_flat = torch.randn(28, requires_grad=True)  # 8 choose 2 = 28 pairs
+        exec_flat = torch.rand(28)
+        _pearson(t1_flat, exec_flat).backward()
+        assert t1_flat.grad is not None
+
+    def test_weighted(self):
+        t1_flat = torch.tensor([1.0, 3.0, 2.0])
+        exec_flat = torch.tensor([1.0, 3.0, 2.0])
+        weight = torch.tensor([0.5, 0.3, 0.2])
+        assert _pearson(t1_flat, exec_flat, weight).item() < 0.01
 
 
 class TestCombinedLoss:

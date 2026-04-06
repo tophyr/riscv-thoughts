@@ -33,60 +33,48 @@ def tokenize_batch(instructions, device=torch.device('cpu')):
 # Loss
 # ---------------------------------------------------------------------------
 
-def correlation_loss(t1_vecs, exec_dist_matrix):
-    """1 - Pearson correlation between T1 and execution pairwise distances."""
-    t1_dists = torch.cdist(t1_vecs, t1_vecs)
+def _pearson(t1_flat, exec_flat, weight=None):
+    """Pearson correlation between T1 and exec pairwise distances.
 
-    B = t1_vecs.shape[0]
-    idx = torch.triu_indices(B, B, offset=1, device=t1_vecs.device)
-    t1_flat = t1_dists[idx[0], idx[1]]
-    exec_flat = exec_dist_matrix[idx[0], idx[1]]
-
-    t1_centered = t1_flat - t1_flat.mean()
-    exec_centered = exec_flat - exec_flat.mean()
-
-    num = (t1_centered * exec_centered).sum()
-    denom = (t1_centered.norm() * exec_centered.norm()).clamp(min=1e-8)
-    return 1.0 - num / denom
-
-
-def equiv_loss(t1_vecs, exec_dists, data_ranges):
-    """Weighted Pearson correlation over pairwise distances.
-
-    Same idea as correlation_loss but with per-pair weights that
-    emphasize high-range, low-exec-dist pairs — the region where
-    equivalence lives. Bounded [0, 2], scale-invariant, bidirectional.
-
-    Weight = (max(range_i, range_j) + 1) / (1 + exec_dist).
-    The +1 counts the output space size, not raw range.
+    If weight is provided, computes weighted Pearson correlation.
+    Returns 1 - r (loss in [0, 2]).
     """
-    t1_dists = torch.cdist(t1_vecs, t1_vecs)
-
-    B = t1_vecs.shape[0]
-    idx = torch.triu_indices(B, B, offset=1, device=t1_vecs.device)
-    t1_flat = t1_dists[idx[0], idx[1]]
-    exec_flat = exec_dists[idx[0], idx[1]]
-
-    pair_range = torch.maximum(data_ranges[idx[0]], data_ranges[idx[1]]) + 1.0
-    weight = pair_range / (1.0 + exec_flat)
-    weight = weight / weight.sum().clamp(min=1e-8)
-
-    t1_mean = (t1_flat * weight).sum()
-    ex_mean = (exec_flat * weight).sum()
-    t1_c = t1_flat - t1_mean
-    ex_c = exec_flat - ex_mean
-    num = (weight * t1_c * ex_c).sum()
-    denom = ((weight * t1_c.square()).sum().sqrt()
-             * (weight * ex_c.square()).sum().sqrt()).clamp(min=1e-8)
-
+    if weight is not None:
+        t1_mean = (t1_flat * weight).sum()
+        ex_mean = (exec_flat * weight).sum()
+        t1_c = t1_flat - t1_mean
+        ex_c = exec_flat - ex_mean
+        num = (weight * t1_c * ex_c).sum()
+        denom = ((weight * t1_c.square()).sum().sqrt()
+                 * (weight * ex_c.square()).sum().sqrt()).clamp(min=1e-8)
+    else:
+        t1_c = t1_flat - t1_flat.mean()
+        ex_c = exec_flat - exec_flat.mean()
+        num = (t1_c * ex_c).sum()
+        denom = (t1_c.norm() * ex_c.norm()).clamp(min=1e-8)
     return 1.0 - num / denom
 
 
 def combined_loss(t1_vecs, dt_logits, dr_logits,
                   exec_dists, dt_targets, dr_targets, data_ranges):
     """Correlation + equivalence + destination classification loss."""
-    corr = correlation_loss(t1_vecs, exec_dists)
-    eq = equiv_loss(t1_vecs, exec_dists, data_ranges)
+    # Compute pairwise T1 distances once.
+    t1_dists = torch.cdist(t1_vecs, t1_vecs)
+
+    # Extract upper triangle once.
+    B = t1_vecs.shape[0]
+    idx = torch.triu_indices(B, B, offset=1, device=t1_vecs.device)
+    t1_flat = t1_dists[idx[0], idx[1]]
+    exec_flat = exec_dists[idx[0], idx[1]]
+
+    # Unweighted correlation: global proportionality.
+    corr = _pearson(t1_flat, exec_flat)
+
+    # Weighted correlation: emphasize high-range near-equivalences.
+    pair_range = torch.maximum(data_ranges[idx[0]], data_ranges[idx[1]]) + 1.0
+    weight = pair_range / (1.0 + exec_flat)
+    weight = weight / weight.sum().clamp(min=1e-8)
+    eq = _pearson(t1_flat, exec_flat, weight)
     type_loss = F.cross_entropy(dt_logits, dt_targets)
 
     reg_mask = (dt_targets == 0)
