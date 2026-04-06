@@ -51,15 +51,14 @@ def correlation_loss(t1_vecs, exec_dist_matrix):
 
 
 def equiv_loss(t1_vecs, exec_dists, data_ranges):
-    """Weighted distance-matching loss: push T1 distances toward
-    being proportional to exec distances, weighted by output range.
+    """Weighted Pearson correlation over pairwise distances.
 
-    Pairs of high-range instructions that agree get strong signal.
-    Pairs of low-range instructions get weak signal.
+    Same idea as correlation_loss but with per-pair weights that
+    emphasize high-range, low-exec-dist pairs — the region where
+    equivalence lives. Bounded [0, 2], scale-invariant, bidirectional.
 
-    Both attractive (collapse equivalences) and repulsive (maintain
-    separation for non-equivalences). The weight emphasizes pairs
-    where agreement is most surprising given the output range.
+    Weight = (max(range_i, range_j) + 1) / (1 + exec_dist).
+    The +1 counts the output space size, not raw range.
     """
     t1_dists = torch.cdist(t1_vecs, t1_vecs)
 
@@ -68,22 +67,19 @@ def equiv_loss(t1_vecs, exec_dists, data_ranges):
     t1_flat = t1_dists[idx[0], idx[1]]
     exec_flat = exec_dists[idx[0], idx[1]]
 
-    # Per-pair range: max of the two instructions' output ranges.
-    # +1 ensures constant-output equivalences (range=0) still get
-    # collapse signal, while preserving ordering (range=0 gets half
-    # the weight of range=1).
     pair_range = torch.maximum(data_ranges[idx[0]], data_ranges[idx[1]]) + 1.0
-
     weight = pair_range / (1.0 + exec_flat)
     weight = weight / weight.sum().clamp(min=1e-8)
 
-    # Scale exec distances to match T1 distance scale.
-    # Use the weighted ratio of T1 to exec distances as the scale factor.
-    with torch.no_grad():
-        scale = (t1_flat * weight).sum() / (exec_flat * weight).sum().clamp(min=1e-8)
+    t1_mean = (t1_flat * weight).sum()
+    ex_mean = (exec_flat * weight).sum()
+    t1_c = t1_flat - t1_mean
+    ex_c = exec_flat - ex_mean
+    num = (weight * t1_c * ex_c).sum()
+    denom = ((weight * t1_c.square()).sum().sqrt()
+             * (weight * ex_c.square()).sum().sqrt()).clamp(min=1e-8)
 
-    target = exec_flat * scale
-    return (weight * (t1_flat - target).square()).sum()
+    return 1.0 - num / denom
 
 
 def combined_loss(t1_vecs, dt_logits, dr_logits,
