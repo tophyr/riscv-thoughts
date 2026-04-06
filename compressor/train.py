@@ -51,14 +51,15 @@ def correlation_loss(t1_vecs, exec_dist_matrix):
 
 
 def equiv_loss(t1_vecs, exec_dists, data_ranges):
-    """Weighted equivalence loss: push T1 distances toward zero for
-    pairs with small exec distance, weighted by output range.
+    """Weighted distance-matching loss: push T1 distances toward
+    being proportional to exec distances, weighted by output range.
 
-    Pairs of high-range instructions that agree are strong evidence of
-    equivalence. Pairs of low-range instructions that agree are weak
-    evidence (they had little room to disagree).
+    Pairs of high-range instructions that agree get strong signal.
+    Pairs of low-range instructions get weak signal.
 
-    weight[i,j] = max(range_i, range_j) / (1 + exec_dist[i,j])
+    Both attractive (collapse equivalences) and repulsive (maintain
+    separation for non-equivalences). The weight emphasizes pairs
+    where agreement is most surprising given the output range.
     """
     t1_dists = torch.cdist(t1_vecs, t1_vecs)
 
@@ -71,9 +72,15 @@ def equiv_loss(t1_vecs, exec_dists, data_ranges):
     pair_range = torch.maximum(data_ranges[idx[0]], data_ranges[idx[1]])
 
     weight = pair_range / (1.0 + exec_flat)
-    weight = weight / weight.sum().clamp(min=1e-8)  # normalize to sum to 1
+    weight = weight / weight.sum().clamp(min=1e-8)
 
-    return (t1_flat * weight).sum()
+    # Scale exec distances to match T1 distance scale.
+    # Use the weighted ratio of T1 to exec distances as the scale factor.
+    with torch.no_grad():
+        scale = (t1_flat * weight).sum() / (exec_flat * weight).sum().clamp(min=1e-8)
+
+    target = exec_flat * scale
+    return (weight * (t1_flat - target).square()).sum()
 
 
 def combined_loss(t1_vecs, dt_logits, dr_logits,

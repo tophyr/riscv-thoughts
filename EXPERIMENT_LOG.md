@@ -332,3 +332,49 @@ pairs. The model has no gradient incentive to collapse equivalences.
   (1 + exec_dist). High-range instructions that agree get massive
   weight; low-range instructions (SLT, BEQ) that trivially agree
   get negligible weight.
+
+### Experiment 8: Raw diff + attract-only equiv loss
+
+d_out=128, batch=4096, lr=3e-4, 100K steps. Log scaling removed.
+Added weighted equiv loss: weight = max(range_i, range_j) / (1 +
+exec_dist), loss = weighted mean of T1 distances (pushing toward 0).
+
+**Result: Equivalence collapse solved — but over-collapse.**
+
+| Equiv pair | Exp 7 | Exp 8 |
+|------------|-------|-------|
+| ADD x5,x3,x3 vs SLLI x5,x3,1 | 55.97 | **0.011** |
+| ADD x5,x3,x0 vs ADDI x5,x3,0 | 51.67 | **0.022** |
+| ADD commutative | 43.30 | **0.002** |
+| SLLI vs SRLI (shift by 0) | 28.84 | **0.002** |
+| BEQ vs BGE (always taken) | 4.94 | **0.064** |
+
+Near-perfect collapse for high-range equivalences. The weighted equiv
+loss worked exactly as designed.
+
+**But:** the model over-collapsed. All T1 distances shrank to a tiny
+range. ADD vs SUB: 5.1 (was 35.8). SRL/SRA/SLT/LW/BEQ/JAL all within
+0.1-0.6 of each other despite being computationally unrelated.
+
+Pearson r = 0.982, Spearman r = 0.944. Proportional structure maintained
+but at compressed scale — everything crammed into a small region.
+
+**Root cause:** the equiv loss only had attractive force (push T1
+distances toward zero). The correlation loss is scale-invariant
+(Pearson r doesn't care about absolute magnitude). Nothing pushed
+distances APART. The only repulsive force was the classification heads,
+which separate by destination but not by computation. Two instructions
+writing to the same register with different operations (ADD x5 vs
+SLT x5) had no separation signal.
+
+**One outlier:** SUB x5,x3,x3 vs XOR x5,x3,x3 = 4.00. Both always
+output 0 → range = 0 → equiv weight = 0. Constant-output equivalences
+get no collapse signal from the range-weighted loss.
+
+**Fix applied for next run:** make equiv loss bidirectional. Instead
+of pushing T1 distances toward zero, push them toward a scaled version
+of exec distances: loss = weight * (T1_dist - scale * exec_dist)².
+For equivalent pairs (exec_dist=0), target is 0 (attractive). For
+non-equivalent pairs, target is positive (repulsive). Scale factor
+computed per-batch from the current weighted T1/exec ratio, detached
+from gradients.
