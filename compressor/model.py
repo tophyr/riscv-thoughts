@@ -7,6 +7,7 @@ frozen encoder, no pre-training.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class T1Compressor(nn.Module):
@@ -83,5 +84,5 @@ class T1Compressor(nn.Module):
         else:
             x = x.mean(dim=1)
 
-        t1 = self.output_proj(x)
+        t1 = F.normalize(self.output_proj(x), dim=-1)
         return t1, self.dest_type_head(t1), self.dest_reg_head(t1)

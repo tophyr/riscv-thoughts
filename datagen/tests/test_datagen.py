@@ -1,11 +1,15 @@
 """Tests for the training data producer."""
 
+import io
 import numpy as np
+import pytest
 from emulator import Instruction, SparseMemory
 from datagen import (
-    Batch, InlineProducer, ParallelProducer,
+    Batch,
     random_instruction, produce_batch,
     dest_type, dest_reg, extract_data_val,
+    write_batch, read_batch,
+    write_stream_header, read_stream_header,
 )
 from emulator import R_TYPE, I_TYPE, B_TYPE, LOAD_TYPE, STORE_TYPE
 
@@ -86,30 +90,61 @@ class TestProduceBatch:
         assert np.array_equal(b1.pc_vals, b2.pc_vals)
 
 
-class TestInlineProducer:
-    def test_yields_correct_count(self):
-        batches = list(InlineProducer(batch_size=8, n_inputs=4,
-                                      n_batches=5, seed=42))
-        assert len(batches) == 5
+class TestBatchIO:
+    def test_roundtrip(self):
+        batch = produce_batch(16, 4, np.random.default_rng(42))
+        buf = io.BytesIO()
+        write_stream_header(buf)
+        write_batch(buf, batch)
+        buf.seek(0)
+        read_stream_header(buf)
+        batch2 = read_batch(buf)
+        assert np.array_equal(batch.token_ids, batch2.token_ids)
+        assert np.array_equal(batch.padding_mask, batch2.padding_mask)
+        assert np.array_equal(batch.data_vals, batch2.data_vals)
+        assert np.array_equal(batch.pc_vals, batch2.pc_vals)
+        assert np.array_equal(batch.dest_types, batch2.dest_types)
+        assert np.array_equal(batch.dest_regs, batch2.dest_regs)
+        assert batch2.instructions is None
 
-    def test_batches_are_valid(self):
-        for batch in InlineProducer(batch_size=8, n_inputs=4,
-                                    n_batches=3, seed=42):
-            assert isinstance(batch, Batch)
-            assert batch.token_ids.shape[0] == 8
+    def test_multiple_batches(self):
+        rng = np.random.default_rng(42)
+        buf = io.BytesIO()
+        write_stream_header(buf)
+        for _ in range(3):
+            write_batch(buf, produce_batch(8, 4, rng))
+        buf.seek(0)
+        read_stream_header(buf)
+        batches = []
+        while True:
+            b = read_batch(buf)
+            if b is None:
+                break
+            batches.append(b)
+        assert len(batches) == 3
 
+    def test_eof(self):
+        assert read_batch(io.BytesIO()) is None
 
-class TestParallelProducer:
-    def test_yields_correct_count(self):
-        with ParallelProducer(batch_size=8, n_inputs=4, n_batches=5,
-                              seed=42, n_workers=2, prefetch=3) as p:
-            assert len(list(p)) == 5
+    def test_bad_magic(self):
+        buf = io.BytesIO(b'XXXX\x01' + b'\x00' * 6)
+        with pytest.raises(ValueError, match='Bad magic'):
+            read_stream_header(buf)
 
-    def test_batches_are_valid(self):
-        with ParallelProducer(batch_size=8, n_inputs=4, n_batches=3,
-                              seed=42, n_workers=2, prefetch=3) as p:
-            for batch in p:
-                assert isinstance(batch, Batch)
-                assert batch.token_ids.shape[0] == 8
+    def test_truncated_batch(self):
+        buf = io.BytesIO()
+        write_stream_header(buf)
+        buf.write(b'\x02\x00\x00\x00')  # partial header
+        buf.seek(len(buf.getvalue()) - 4)  # seek to after stream header
+        # Actually, seek to right after stream header to read the partial batch header
+        buf.seek(0)
+        read_stream_header(buf)
+        with pytest.raises(EOFError):
+            read_batch(buf)
 
-
+    def test_empty_after_header(self):
+        buf = io.BytesIO()
+        write_stream_header(buf)
+        buf.seek(0)
+        read_stream_header(buf)
+        assert read_batch(buf) is None

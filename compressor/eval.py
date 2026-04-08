@@ -10,7 +10,6 @@ from scipy.stats import pearsonr, spearmanr
 from .model import T1Compressor
 from .train import tokenize_batch, exec_distance
 from emulator import Instruction
-from datagen import produce_batch
 
 
 def load_model(run_dir):
@@ -217,51 +216,74 @@ def eval_type_clustering(model):
         print(f"  {desc}: {t1_dist(model, a, b):.4f}")
 
 
-def eval_correlation(model, n_inputs):
-    """Test correlation on held-out random instructions (all types)."""
+def eval_correlation(model, batches):
+    """Test correlation on held-out batches."""
     print()
     print("=" * 60)
-    print(f"Correlation on held-out data ({n_inputs} input states)")
+    print(f"Correlation on held-out data ({len(batches)} batches)")
     print("=" * 60)
-    batch = produce_batch(64, n_inputs, np.random.default_rng(99))
-
-    t1_vecs = get_t1(model, batch.instructions)
-    t1_dists = torch.cdist(t1_vecs, t1_vecs).cpu().numpy()
-
-    ed = exec_distance(batch.data_vals, batch.pc_vals, _device_of(model))
-    idx = np.triu_indices(64, k=1)
-    ed_np = ed.cpu().float().numpy()
-    r_pearson, _ = pearsonr(ed_np[idx], t1_dists[idx])
-    r_spearman, _ = spearmanr(ed_np[idx], t1_dists[idx])
-    print(f"  Pearson r:  {r_pearson:.4f}")
-    print(f"  Spearman r: {r_spearman:.4f}")
+    device = _device_of(model)
+    all_pearson = []
+    all_spearman = []
+    for batch in batches:
+        ids = torch.from_numpy(batch.token_ids).to(device)
+        mask = torch.from_numpy(batch.padding_mask).to(device)
+        with torch.no_grad():
+            t1, _, _ = model(ids, mask)
+        t1_dists = torch.cdist(t1, t1).cpu().numpy()
+        ed = exec_distance(batch.data_vals, batch.pc_vals, device,
+                           compiled=False)
+        B = t1.shape[0]
+        idx = np.triu_indices(B, k=1)
+        ed_np = ed.cpu().float().numpy()
+        r_p, _ = pearsonr(ed_np[idx], t1_dists[idx])
+        r_s, _ = spearmanr(ed_np[idx], t1_dists[idx])
+        all_pearson.append(r_p)
+        all_spearman.append(r_s)
+    print(f"  Pearson r:  {np.mean(all_pearson):.4f}")
+    print(f"  Spearman r: {np.mean(all_spearman):.4f}")
 
 
 def eval_loss_trajectory(run_dir):
     """Print loss trajectory summary."""
-    losses_path = Path(run_dir) / 'losses.json'
+    run_dir = Path(run_dir)
+    losses_path = run_dir / 'losses.json'
     if not losses_path.exists():
         return
     with open(losses_path) as f:
         losses = json.load(f)
 
+    hparams_path = run_dir / 'hparams.json'
+    log_every = 1
+    n_steps = len(losses)
+    if hparams_path.exists():
+        with open(hparams_path) as f:
+            hp = json.load(f)
+        log_every = hp.get('log_every', 1)
+        n_steps = hp.get('steps_completed',
+                         hp.get('n_steps', len(losses) * log_every))
+
     print()
     print("=" * 60)
     print("Loss trajectory")
     print("=" * 60)
-    print(f"  Steps: {len(losses)}")
+    print(f"  Steps: {n_steps} ({len(losses)} logged)")
     print(f"  Best:  {min(losses):.5f}")
     print(f"  Final: {losses[-1]:.5f}")
-    print(f"  Mean last 1000: {np.mean(losses[-1000:]):.5f}")
 
     n = len(losses)
     sample_points = [0, n//10, n//4, n//2, 3*n//4, n-1]
     for i in sorted(set(sample_points)):
-        print(f"    step {i:7d}: {losses[i]:.5f}")
+        step = i * log_every
+        print(f"    step {step:7d}: {losses[i]:.5f}")
 
 
-def evaluate(run_dir, n_inputs=256):
-    """Run all evaluations on a trained model."""
+def evaluate(run_dir, batches=None):
+    """Run all evaluations on a trained model.
+
+    batches: list of Batch objects for correlation eval. If None,
+    correlation eval is skipped.
+    """
     model = load_model(run_dir)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
@@ -273,4 +295,5 @@ def evaluate(run_dir, n_inputs=256):
     eval_registers(model)
     eval_opcodes(model)
     eval_type_clustering(model)
-    eval_correlation(model, n_inputs)
+    if batches:
+        eval_correlation(model, batches)

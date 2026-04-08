@@ -8,7 +8,6 @@ from emulator import Instruction
 from tokenizer import encode_instruction, PAD, VOCAB_SIZE
 
 from .model import T1Compressor
-from datagen import ParallelProducer
 
 
 # ---------------------------------------------------------------------------
@@ -33,76 +32,54 @@ def tokenize_batch(instructions, device=torch.device('cpu')):
 # Loss
 # ---------------------------------------------------------------------------
 
-def _pearson(t1_flat, exec_flat, weight=None):
-    """Pearson correlation between T1 and exec pairwise distances.
-
-    If weight is provided, computes weighted Pearson correlation.
-    Returns 1 - r (loss in [0, 2]).
-    """
-    if weight is not None:
-        t1_mean = (t1_flat * weight).sum()
-        ex_mean = (exec_flat * weight).sum()
-        t1_c = t1_flat - t1_mean
-        ex_c = exec_flat - ex_mean
-        num = (weight * t1_c * ex_c).sum()
-        denom = ((weight * t1_c.square()).sum().sqrt()
-                 * (weight * ex_c.square()).sum().sqrt()).clamp(min=1e-8)
-    else:
-        t1_c = t1_flat - t1_flat.mean()
-        ex_c = exec_flat - exec_flat.mean()
-        num = (t1_c * ex_c).sum()
-        denom = (t1_c.norm() * ex_c.norm()).clamp(min=1e-8)
-    return 1.0 - num / denom
+_EXEC_DIST_SCALE = 2.0 / 22.0  # map log-scaled exec dist [0, ~22] → [0, ~2]
 
 
+@torch.compile
 def combined_loss(t1_vecs, dt_logits, dr_logits,
-                  exec_dists, dt_targets, dr_targets, data_ranges):
-    """Correlation + equivalence + destination classification loss."""
-    # Compute pairwise T1 distances once.
+                  exec_dists, dt_targets, dr_targets):
+    """MSE distance matching + destination classification loss."""
     t1_dists = torch.cdist(t1_vecs, t1_vecs)
 
-    # Extract upper triangle once.
     B = t1_vecs.shape[0]
     idx = torch.triu_indices(B, B, offset=1, device=t1_vecs.device)
     t1_flat = t1_dists[idx[0], idx[1]]
     exec_flat = exec_dists[idx[0], idx[1]]
 
-    # Unweighted correlation: global proportionality.
-    corr = _pearson(t1_flat, exec_flat)
+    # MSE: T1 distances should match scaled exec distances.
+    target = exec_flat * _EXEC_DIST_SCALE
+    dist_loss = (t1_flat - target).square().mean()
 
-    # Weighted correlation: emphasize high-range near-equivalences.
-    pair_range = torch.maximum(data_ranges[idx[0]], data_ranges[idx[1]]) + 1.0
-    weight = pair_range / (1.0 + exec_flat)
-    weight = weight / weight.sum().clamp(min=1e-8)
-    eq = _pearson(t1_flat, exec_flat, weight)
     type_loss = F.cross_entropy(dt_logits, dt_targets)
 
     reg_mask = (dt_targets == 0)
-    if reg_mask.any():
-        reg_loss = F.cross_entropy(dr_logits[reg_mask], dr_targets[reg_mask])
-    else:
-        reg_loss = torch.tensor(0.0, device=t1_vecs.device)
+    reg_loss = F.cross_entropy(dr_logits[reg_mask], dr_targets[reg_mask])
 
-    return corr + eq + type_loss + reg_loss
+    return dist_loss + type_loss + reg_loss
 
 
 # ---------------------------------------------------------------------------
 # GPU distance computation
 # ---------------------------------------------------------------------------
 
-def exec_distance(data_vals, pc_vals, device):
-    """Two-component pairwise distance on GPU.
+def _exec_distance_impl(dv, pv):
+    B, S = dv.shape
+    acc = torch.zeros(B, B, dtype=torch.float32, device=dv.device)
+    for s in range(S):
+        d = (dv[:, s].unsqueeze(1) - dv[:, s].unsqueeze(0)).abs()
+        p = (pv[:, s].unsqueeze(1) - pv[:, s].unsqueeze(0)).abs()
+        acc += torch.log1p(d + p)
+    return acc / S
 
-    Distance = mean_over_inputs(|data_diff| + |pc_diff|).
-    Vectorized across input states — one kernel launch instead of 32.
-    """
+_exec_distance_compiled = torch.compile(_exec_distance_impl)
+
+
+def exec_distance(data_vals, pc_vals, device, compiled=True):
+    """Pairwise execution distance: mean log1p(|data_diff| + |pc_diff|)."""
     dv = torch.tensor(data_vals, dtype=torch.bfloat16, device=device)
     pv = torch.tensor(pc_vals, dtype=torch.bfloat16, device=device)
-
-    # (B, 1, S) - (1, B, S) → (B, B, S) pairwise diffs across all inputs.
-    d_all = (dv.unsqueeze(1) - dv.unsqueeze(0)).abs()
-    p_all = (pv.unsqueeze(1) - pv.unsqueeze(0)).abs()
-    return (d_all + p_all).mean(dim=2)
+    fn = _exec_distance_compiled if compiled else _exec_distance_impl
+    return fn(dv, pv)
 
 
 # ---------------------------------------------------------------------------
@@ -110,88 +87,83 @@ def exec_distance(data_vals, pc_vals, device):
 # ---------------------------------------------------------------------------
 
 def train(
-    batch_size: int,
-    n_steps: int,
-    n_inputs: int,
-    n_producers: int,
-    prefetch: int,
     torch_threads: int,
     lr: float,
-    lr_min: float,
     d_model: int,
     n_heads: int,
     n_layers: int,
     d_out: int,
     device: str,
     log_every: int,
-    seed: int,
+    batch_iter,
+    n_steps: int | None = None,
+    lr_schedule: int | None = None,
+    lr_min: float = 1e-6,
 ):
-    """Train the T0→T1 compressor on all RV32I instruction types."""
-    rng = np.random.default_rng(seed)
+    """Train the T0→T1 compressor on all RV32I instruction types.
 
-    # Fork producers BEFORE initializing CUDA or torch threads.
-    with ParallelProducer(
-        batch_size=batch_size, n_inputs=n_inputs,
-        n_batches=n_steps, seed=int(rng.integers(0, 2**63)),
-        n_workers=n_producers, prefetch=prefetch,
-    ) as producer:
+    batch_iter: any iterable yielding Batch objects.
+    n_steps: expected batch count. Used for ETA display only.
+    lr_schedule: if set, number of steps for cosine LR decay to lr_min.
+        If None, LR is constant. Implies n_steps for ETA.
+    """
+    import time
 
-        torch.set_num_threads(torch_threads)
+    torch.set_num_threads(torch_threads)
+    torch.set_float32_matmul_precision('high')
 
-        if device == 'auto':
-            device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        device = torch.device(device)
+    if device == 'auto':
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = torch.device(device)
 
-        model = T1Compressor(
-            vocab_size=VOCAB_SIZE,
-            d_model=d_model,
-            n_heads=n_heads,
-            n_layers=n_layers,
-            d_out=d_out,
-        ).to(device)
+    model = T1Compressor(
+        vocab_size=VOCAB_SIZE,
+        d_model=d_model,
+        n_heads=n_heads,
+        n_layers=n_layers,
+        d_out=d_out,
+    ).to(device)
+    model = torch.compile(model)
 
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = None
+    if lr_schedule is not None:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=n_steps, eta_min=lr_min)
-        import time
-        losses = []
-        t_start = time.monotonic()
+            optimizer, T_max=lr_schedule, eta_min=lr_min)
+    expected = lr_schedule or n_steps
+    losses = []
+    t_start = time.monotonic()
 
-        for step, batch in enumerate(producer):
-            token_ids = torch.from_numpy(batch.token_ids).to(device)
-            padding_mask = torch.from_numpy(batch.padding_mask).to(device)
-            exec_dists = exec_distance(batch.data_vals, batch.pc_vals, device)
-            dt_targets = torch.from_numpy(batch.dest_types).to(device)
-            dr_targets = torch.from_numpy(batch.dest_regs).to(device)
+    for step, batch in enumerate(batch_iter):
+        token_ids = torch.from_numpy(batch.token_ids).to(device)
+        padding_mask = torch.from_numpy(batch.padding_mask).to(device)
+        exec_dists = exec_distance(batch.data_vals, batch.pc_vals, device)
+        dt_targets = torch.from_numpy(batch.dest_types).to(device)
+        dr_targets = torch.from_numpy(batch.dest_regs).to(device)
 
-            # Per-instruction output range across input states.
-            dv_range = batch.data_vals.max(axis=1) - batch.data_vals.min(axis=1)
-            data_ranges = torch.tensor(dv_range, dtype=torch.float32, device=device)
-
-            t1_vecs, dt_logits, dr_logits = model(token_ids, padding_mask)
-            loss = combined_loss(t1_vecs, dt_logits, dr_logits,
-                                 exec_dists, dt_targets, dr_targets,
-                                 data_ranges)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+        t1_vecs, dt_logits, dr_logits = model(token_ids, padding_mask)
+        loss = combined_loss(t1_vecs, dt_logits, dr_logits,
+                             exec_dists, dt_targets, dr_targets)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        if scheduler is not None:
             scheduler.step()
 
+        if step % log_every == 0:
             loss_val = loss.item()
             losses.append(loss_val)
-
-            if step % log_every == 0:
-                elapsed = time.monotonic() - t_start
-                current_lr = optimizer.param_groups[0]['lr']
-                if step > 0:
-                    remaining = elapsed / step * (n_steps - step)
-                    m, s = divmod(int(remaining), 60)
-                    h, m = divmod(m, 60)
-                    eta = f'{h}h{m:02d}m' if h else f'{m}m{s:02d}s'
-                else:
-                    eta = '...'
-                print(f'step {step:5d}  loss={loss_val:.4f}  '
-                      f'lr={current_lr:.2e}  eta={eta}')
+            current_lr = optimizer.param_groups[0]['lr']
+            elapsed = time.monotonic() - t_start
+            ms_per_step = elapsed / step * 1000 if step > 0 else 0
+            eta = ''
+            if expected is not None and step > 0:
+                remaining = elapsed / step * (expected - step)
+                m, s = divmod(int(remaining), 60)
+                h, m = divmod(m, 60)
+                eta = f'  eta={h}h{m:02d}m' if h else f'  eta={m}m{s:02d}s'
+            print(f'step {step:5d}  loss={loss_val:.4f}  '
+                  f'lr={current_lr:.2e}  {ms_per_step:.0f}ms/step{eta}')
 
     return model, losses
 
@@ -209,7 +181,10 @@ def save_run(model, losses, hparams=None, out_dir='runs'):
     run_dir = out / stamp
     run_dir.mkdir()
 
-    torch.save(model.state_dict(), run_dir / 'model.pt')
+    # torch.compile wraps the model, prefixing state_dict keys with
+    # _orig_mod. Save the underlying model so checkpoints are portable.
+    raw_model = getattr(model, '_orig_mod', model)
+    torch.save(raw_model.state_dict(), run_dir / 'model.pt')
     with open(run_dir / 'losses.json', 'w') as f:
         json.dump(losses, f)
     if hparams is not None:

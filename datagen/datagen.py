@@ -1,19 +1,19 @@
-"""Training data producers for the T0→T1 compressor.
+"""Training data generation and batch I/O for the T0→T1 compressor.
 
-Two implementations of the same iterator interface:
-- InlineProducer: synchronous, single-threaded. For tests and debugging.
-- ParallelProducer: fans out across processes. For real training.
+Core function is produce_batch() which generates one batch synchronously.
+Parallelism is handled externally via gen_batches.py + mux_batches.py.
 
-Both yield Batch objects.
+Binary format: write_batch/read_batch serialize Batch objects for piping.
+BatchReader wraps a binary stream as an iterator for the training loop.
 """
 
+import struct
 from dataclasses import dataclass
-from collections import deque
 
 import numpy as np
 
 from emulator import (
-    Instruction, run as run_instruction, random_regs,
+    Instruction, run as run_instruction, make_ctx, random_regs,
     R_TYPE, I_TYPE, B_TYPE, LOAD_TYPE, STORE_TYPE, MEM_WIDTH,
 )
 from tokenizer import encode_instruction, PAD
@@ -139,13 +139,14 @@ def produce_batch(batch_size: int, n_inputs: int,
 
     data_vals = np.zeros((B, n_inputs), dtype=np.int64)
     pc_vals = np.zeros((B, n_inputs), dtype=np.int64)
+    ctx = make_ctx()
 
     for s in range(n_inputs):
         regs = random_regs(rng)
         pc = int(rng.integers(0, 1024)) * 4
         for i, instr in enumerate(instructions):
             state, final_pc, final_mem = run_instruction(
-                [instr], regs=regs, pc=pc, rng=rng)
+                [instr], regs=regs, pc=pc, rng=rng, _ctx=ctx)
             data_vals[i, s] = extract_data_val(instr, state.regs, final_mem)
             pc_vals[i, s] = final_pc
 
@@ -160,81 +161,138 @@ def produce_batch(batch_size: int, n_inputs: int,
     return Batch(instructions, token_ids, padding_mask, data_vals, pc_vals, dt, dr)
 
 
-def _produce_batch_from_seed(args):
-    """Entry point for ProcessPoolExecutor. Unpacks args and calls produce_batch."""
-    seed, batch_size, n_inputs = args
-    return produce_batch(batch_size, n_inputs, np.random.default_rng(seed))
-
-
 # ---------------------------------------------------------------------------
-# Producer implementations
+# Binary batch I/O
+#
+# Stream format:
+#   Stream header (once):  4-byte magic "RVB\x00" + 1-byte version (1)
+#                          + 6 dtype chars (token_ids, padding_mask,
+#                          data_vals, pc_vals, dest_types, dest_regs)
+#   Per batch:             12-byte header (B, max_len, n_inputs as uint32)
+#                          + raw array data in field order
 # ---------------------------------------------------------------------------
 
-class InlineProducer:
-    """Synchronous batch producer. Yields Batch objects one at a time.
+_MAGIC = b'RVB\x00'
+_VERSION = 1
+_STREAM_HEADER = struct.Struct('<4sB6s')  # magic, version, 6 dtype chars
+_BATCH_HEADER = struct.Struct('<III')     # B, max_len, n_inputs
 
-    No threading, no multiprocessing. Suitable for tests and debugging.
+# Dtype chars for each field, in order.
+_FIELD_DTYPES = (
+    np.dtype(np.int64),   # token_ids
+    np.dtype(np.bool_),   # padding_mask
+    np.dtype(np.int64),   # data_vals
+    np.dtype(np.int64),   # pc_vals
+    np.dtype(np.int64),   # dest_types
+    np.dtype(np.int64),   # dest_regs
+)
+_DTYPE_CHARS = b''.join(dt.char.encode() for dt in _FIELD_DTYPES)
+
+
+def _batch_body_size(B, max_len, n_inputs):
+    """Compute the byte size of a batch body given its header values."""
+    return (
+        B * max_len * _FIELD_DTYPES[0].itemsize +  # token_ids
+        B * max_len * _FIELD_DTYPES[1].itemsize +   # padding_mask
+        B * n_inputs * _FIELD_DTYPES[2].itemsize +   # data_vals
+        B * n_inputs * _FIELD_DTYPES[3].itemsize +   # pc_vals
+        B * _FIELD_DTYPES[4].itemsize +               # dest_types
+        B * _FIELD_DTYPES[5].itemsize                 # dest_regs
+    )
+
+
+def write_stream_header(f):
+    """Write the stream header. Call once before writing batches."""
+    f.write(_STREAM_HEADER.pack(_MAGIC, _VERSION, _DTYPE_CHARS))
+
+
+def read_stream_header(f):
+    """Read and validate the stream header. Call once before reading batches."""
+    buf = f.read(_STREAM_HEADER.size)
+    if len(buf) < _STREAM_HEADER.size:
+        raise ValueError('Missing stream header')
+    magic, version, dtype_chars = _STREAM_HEADER.unpack(buf)
+    if magic != _MAGIC:
+        raise ValueError(f'Bad magic: {magic!r} (expected {_MAGIC!r})')
+    if version != _VERSION:
+        raise ValueError(f'Unsupported version: {version} (expected {_VERSION})')
+    if dtype_chars != _DTYPE_CHARS:
+        raise ValueError(f'Dtype mismatch: {dtype_chars!r} (expected {_DTYPE_CHARS!r})')
+
+
+def write_batch(f, batch):
+    """Write a Batch to a binary stream (after stream header)."""
+    B, max_len = batch.token_ids.shape
+    n_inputs = batch.data_vals.shape[1]
+    f.write(_BATCH_HEADER.pack(B, max_len, n_inputs))
+    f.write(batch.token_ids.tobytes())
+    f.write(batch.padding_mask.tobytes())
+    f.write(batch.data_vals.tobytes())
+    f.write(batch.pc_vals.tobytes())
+    f.write(batch.dest_types.tobytes())
+    f.write(batch.dest_regs.tobytes())
+
+
+def read_batch(f):
+    """Read a Batch from a binary stream. Returns None at clean EOF."""
+    header = f.read(_BATCH_HEADER.size)
+    if len(header) == 0:
+        return None
+    if len(header) < _BATCH_HEADER.size:
+        raise EOFError(f'Truncated batch header ({len(header)} bytes)')
+    B, max_len, n_inputs = _BATCH_HEADER.unpack(header)
+
+    def _read_array(dtype, shape):
+        nbytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
+        buf = f.read(nbytes)
+        if len(buf) < nbytes:
+            raise EOFError(f'Truncated batch data (got {len(buf)}, expected {nbytes})')
+        return np.frombuffer(buf, dtype=dtype).reshape(shape).copy()
+
+    return Batch(
+        instructions=None,
+        token_ids=_read_array(_FIELD_DTYPES[0], (B, max_len)),
+        padding_mask=_read_array(_FIELD_DTYPES[1], (B, max_len)),
+        data_vals=_read_array(_FIELD_DTYPES[2], (B, n_inputs)),
+        pc_vals=_read_array(_FIELD_DTYPES[3], (B, n_inputs)),
+        dest_types=_read_array(_FIELD_DTYPES[4], (B,)),
+        dest_regs=_read_array(_FIELD_DTYPES[5], (B,)),
+    )
+
+
+def read_batch_bytes(f):
+    """Read one complete batch as raw bytes. Returns None at clean EOF.
+
+    For pass-through use (e.g. muxing) where parsing is unnecessary.
+    """
+    header = f.read(_BATCH_HEADER.size)
+    if len(header) == 0:
+        return None
+    if len(header) < _BATCH_HEADER.size:
+        raise EOFError(f'Truncated batch header ({len(header)} bytes)')
+    B, max_len, n_inputs = _BATCH_HEADER.unpack(header)
+    body_size = _batch_body_size(B, max_len, n_inputs)
+    body = f.read(body_size)
+    if len(body) < body_size:
+        raise EOFError(f'Truncated batch data (got {len(body)}, expected {body_size})')
+    return header + body
+
+
+class BatchReader:
+    """Reads pre-generated batches from a binary stream.
+
+    Validates the stream header, then yields Batch objects until EOF.
     """
 
-    def __init__(self, batch_size: int, n_inputs: int,
-                 n_batches: int, seed: int):
-        self._batch_size = batch_size
-        self._n_inputs = n_inputs
-        self._n_batches = n_batches
-        self._rng = np.random.default_rng(seed)
-
-    def __iter__(self):
-        for _ in range(self._n_batches):
-            yield produce_batch(self._batch_size, self._n_inputs, self._rng)
-
-
-class ParallelProducer:
-    """Asynchronous batch producer backed by a ProcessPoolExecutor.
-
-    Maintains a prefetch queue of futures so the training loop never
-    waits for data. Must be closed after use.
-
-    Fork the pool BEFORE initializing CUDA or torch threads.
-    """
-
-    def __init__(self, batch_size: int, n_inputs: int,
-                 n_batches: int, seed: int,
-                 n_workers: int, prefetch: int):
-        from concurrent.futures import ProcessPoolExecutor
-
-        self._batch_size = batch_size
-        self._n_inputs = n_inputs
-        self._rng = np.random.default_rng(seed)
-        self._remaining = n_batches
-        self._pool = ProcessPoolExecutor(max_workers=n_workers)
-        self._pending = deque()
-
-        for _ in range(min(prefetch, n_batches)):
-            self._submit()
-
-    def _submit(self):
-        seed = int(self._rng.integers(0, 2**63))
-        self._pending.append(
-            self._pool.submit(_produce_batch_from_seed,
-                              (seed, self._batch_size, self._n_inputs)))
-        self._remaining -= 1
+    def __init__(self, f):
+        self._f = f
+        read_stream_header(f)
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        if not self._pending:
+        batch = read_batch(self._f)
+        if batch is None:
             raise StopIteration
-        batch = self._pending.popleft().result()
-        if self._remaining > 0:
-            self._submit()
         return batch
-
-    def close(self):
-        self._pool.shutdown()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.close()
