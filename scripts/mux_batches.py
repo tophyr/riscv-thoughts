@@ -46,6 +46,8 @@ def main():
     p.add_argument('--batch-size', type=int, default=4096)
     p.add_argument('--n-inputs', type=int, default=32)
     p.add_argument('--seed', type=int, default=42)
+    p.add_argument('-v', '--verbose', action='count', default=0,
+                   help='-v for mux status, -vv for worker status too')
     args = p.parse_args()
 
     out = os.fdopen(os.dup(sys.stdout.fileno()), 'wb')
@@ -58,18 +60,21 @@ def main():
     script = str(Path(__file__).resolve().parent / 'gen_batches.py')
     q = queue.Queue(maxsize=args.n_workers * 2)
 
+    worker_args = [sys.executable, script,
+                   '--batch-size', str(args.batch_size),
+                   '--n-inputs', str(args.n_inputs)]
+    if args.verbose >= 2:
+        worker_args.append('-v')
+
     workers = []
     for i, count in enumerate(counts):
         if count == 0:
             continue
         proc = subprocess.Popen(
-            [sys.executable, script,
-             '--n-batches', str(count),
-             '--batch-size', str(args.batch_size),
-             '--n-inputs', str(args.n_inputs),
-             '--seed', str(args.seed + i)],
+            worker_args + ['--n-batches', str(count),
+                           '--seed', str(args.seed + i)],
             stdout=subprocess.PIPE,
-            stderr=sys.stderr,
+            stderr=sys.stderr if args.verbose >= 2 else subprocess.DEVNULL,
         )
         t = threading.Thread(target=_reader, args=(proc.stdout, q), daemon=True)
         t.start()
@@ -90,7 +95,7 @@ def main():
             continue
         out.write(data)
         written += 1
-        if written % 100 == 0:
+        if args.verbose >= 1 and written % 100 == 0:
             print(f'{written}/{args.n_batches} batches')
 
     out.close()
@@ -101,8 +106,9 @@ def main():
             failed.append(i)
     if failed:
         print(f'WARNING: workers {failed} exited with errors', file=sys.stderr)
-    print(f'Done: {written} batches, '
-          f'{written * args.batch_size} instructions')
+    if args.verbose >= 1:
+        print(f'Done: {written} batches, '
+              f'{written * args.batch_size} instructions')
 
 
 if __name__ == '__main__':

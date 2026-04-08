@@ -27,6 +27,7 @@ def main():
     p.add_argument('--n-inputs', type=int, default=32)
     p.add_argument('--n-batches', type=int, required=True)
     p.add_argument('--seed', type=int, default=42)
+    p.add_argument('-v', '--verbose', action='store_true')
     args = p.parse_args()
 
     # Write binary to a dup'd fd so stray prints don't corrupt the stream.
@@ -39,12 +40,13 @@ def main():
     for i in range(args.n_batches):
         batch = produce_batch(args.batch_size, args.n_inputs, rng)
         write_batch(out, batch)
-        if (i + 1) % 100 == 0:
+        if args.verbose and (i + 1) % 100 == 0:
             print(f'{i + 1}/{args.n_batches} batches')
 
     out.close()
-    print(f'Done: {args.n_batches} batches, '
-          f'{args.n_batches * args.batch_size} instructions')
+    if args.verbose:
+        print(f'Done: {args.n_batches} batches, '
+              f'{args.n_batches * args.batch_size} instructions')
 
 
 if __name__ == '__main__':
