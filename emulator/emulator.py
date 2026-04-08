@@ -229,6 +229,17 @@ def _build_dispatch(m):
     return dispatch
 
 
+def make_ctx():
+    """Create a reusable (machine, dispatch) context for run().
+
+    The machine object is stateful (registers, PC, memory), but run()
+    resets it before each execution. Reusing the context avoids
+    recreating the machine and dispatch table on every call.
+    """
+    m = machine(64)
+    return (m, _build_dispatch(m))
+
+
 def run(
     instructions: list[Instruction],
     regs: np.ndarray | None = None,
@@ -236,6 +247,7 @@ def run(
     mem=None,
     rng: np.random.Generator | None = None,
     max_steps: int | None = None,
+    _ctx=None,
 ) -> tuple[RV32IState, int, object]:
     """Execute instructions and return final state.
 
@@ -249,12 +261,16 @@ def run(
         rng: Random generator for SparseMemory fill when mem is None.
         max_steps: Maximum instructions to execute. Defaults to
             10x the instruction count.
+        _ctx: Reusable (machine, dispatch) from make_ctx(). Created
+            fresh if None.
 
     Returns:
         (RV32IState, final_pc, final_mem) tuple.
     """
-    m = machine(64)
-    dispatch = _build_dispatch(m)
+    if _ctx is not None:
+        m, dispatch = _ctx
+    else:
+        m, dispatch = make_ctx()
 
     # Registers.
     if regs is not None:
