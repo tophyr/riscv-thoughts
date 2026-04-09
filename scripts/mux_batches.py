@@ -5,19 +5,26 @@ Inputs can be files, pipes, process substitution, or spawned
 gen_batches.py workers. All go through the same muxing plumbing.
 
 Muxing modes:
-  fifo:        output whichever batch is ready first (default)
-  round-robin: cycle through inputs in order
-  shuffle:     pick a random input each time
+  fifo:        output whichever batch is ready first (default when
+               no weights given). Ignores weights.
+  round-robin: cycle through inputs in order. Ignores weights.
+  weighted:    pick proportional to weight from available inputs
+               (default when any input has a weight prefix).
+               Weights affect interleaving, not throughput.
+
+Inputs can have weights via prefix syntax: "128:/dev/fd/63" or
+"0.5:corpus.bin". Default weight is 1.0. Spawned workers each
+get --gen-weight (default 1.0).
 
 Usage:
     # Spawn 16 generators, 1000 batches each:
     mux_batches.py --gen 16 --n-batches 1000 > corpus.bin
 
-    # Mix spawned generators with a network stream:
-    mux_batches.py --gen 8 --n-batches 500 <(nc threadripper 9000) > corpus.bin
+    # Mix local generators with weighted network stream:
+    mux_batches.py --gen 16 128:<(nc threadripper 9000 -d | unlz4) > corpus.bin
 
-    # File inputs only:
-    mux_batches.py input1.bin input2.bin > combined.bin
+    # File inputs with weights:
+    mux_batches.py 1:local.bin 8:remote.bin > combined.bin
 
     # Round-robin mode:
     mux_batches.py --mode round-robin --gen 4 --n-batches 100 > corpus.bin
@@ -53,6 +60,23 @@ def _reader(f, q, idx):
     q.put((idx, None))  # sentinel
 
 
+def _reader_per_q(f, per_q, ready, idx):
+    """Read batches from a stream into a per-input queue."""
+    try:
+        read_stream_header(f)
+        while True:
+            data = read_batch_bytes(f)
+            if data is None:
+                break
+            per_q.put(data)
+            ready.release()
+    except (EOFError, ValueError) as e:
+        per_q.put(e)
+        ready.release()
+    per_q.put(None)  # sentinel
+    ready.release()
+
+
 def _mux_write(out, written_ref, data, verbose):
     """Write one batch and update counter. Returns False on BrokenPipe."""
     try:
@@ -65,8 +89,11 @@ def _mux_write(out, written_ref, data, verbose):
     return True
 
 
-def mux_fifo(files, out, verbose=False):
-    """Output whichever batch is ready first."""
+def mux_fifo(files, weights, out, verbose=False):
+    """Output whichever batch is ready first.
+
+    Weights are ignored — all inputs compete equally for queue space.
+    """
     q = queue.Queue(maxsize=len(files) * 2)
 
     for i, f in enumerate(files):
@@ -90,9 +117,12 @@ def mux_fifo(files, out, verbose=False):
     return written[0]
 
 
-def mux_round_robin(files, out, verbose=False):
-    """Cycle through inputs in order, one batch per input per cycle."""
-    # One queue per input so we can pull from a specific input.
+def mux_round_robin(files, weights, out, verbose=False):
+    """Cycle through inputs in order, one batch per input per cycle.
+
+    Weights are ignored — each input gets one batch per cycle regardless
+    of weight. Blocks on the slowest input each cycle.
+    """
     queues = []
     for i, f in enumerate(files):
         q = queue.Queue(maxsize=2)
@@ -120,29 +150,39 @@ def mux_round_robin(files, out, verbose=False):
     return written[0]
 
 
-def mux_shuffle(files, out, verbose=False, seed=42):
-    """Pick a random input each time."""
-    # One queue per input so we can pull from a specific input.
+def mux_weighted(files, weights, out, verbose=False, seed=42):
+    """Pick from available inputs proportional to weight."""
+    ready = threading.Semaphore(0)
     queues = []
     for i, f in enumerate(files):
-        q = queue.Queue(maxsize=2)
-        t = threading.Thread(target=_reader, args=(f, q, i), daemon=True)
+        per_q = queue.Queue(maxsize=2)
+        t = threading.Thread(target=_reader_per_q,
+                             args=(f, per_q, ready, i), daemon=True)
         t.start()
-        queues.append(q)
+        queues.append(per_q)
 
     written = [0]
-    active = list(range(len(files)))
+    active = set(range(len(files)))
     rng = random.Random(seed)
 
     while active:
-        pick = rng.choice(active)
-        idx, data = queues[pick].get()
+        ready.acquire()
+
+        # Find non-empty queues among active inputs.
+        available = [i for i in active if not queues[i].empty()]
+        if not available:
+            continue
+
+        w = [weights[i] for i in available]
+        pick = rng.choices(available, weights=w, k=1)[0]
+        data = queues[pick].get_nowait()
+
         if data is None:
-            active.remove(pick)
+            active.discard(pick)
             continue
         if isinstance(data, Exception):
             print(f'Input {pick} error: {data}', file=sys.stderr)
-            active.remove(pick)
+            active.discard(pick)
             continue
         if not _mux_write(out, written, data, verbose):
             break
@@ -150,19 +190,38 @@ def mux_shuffle(files, out, verbose=False, seed=42):
     return written[0]
 
 
+def _parse_weighted_input(s):
+    """Parse 'weight:path' or plain 'path'. Returns (path, weight)."""
+    if ':' in s:
+        parts = s.split(':', 1)
+        try:
+            weight = float(parts[0])
+            return parts[1], weight
+        except ValueError:
+            pass
+    return s, 1.0
+
+
 def main():
     p = argparse.ArgumentParser(description='Mux binary batch streams.')
-    p.add_argument('inputs', nargs='*', help='Input files/pipes to mux')
-    p.add_argument('--mode', choices=['fifo', 'round-robin', 'shuffle'],
-                   default='fifo')
+    p.add_argument('inputs', nargs='*',
+                   help='Input files/pipes, optionally weight-prefixed '
+                        '(e.g. "128:file.bin")')
+    p.add_argument('--mode', choices=['fifo', 'round-robin', 'weighted'],
+                   default=None,
+                   help='Muxing mode (default: weighted if any input has '
+                        'a weight prefix, fifo otherwise). fifo and '
+                        'round-robin ignore weights.')
     p.add_argument('--shuffle-seed', type=int, default=42,
-                   help='Random seed for shuffle mode (default: 42)')
+                   help='Random seed for weighted mode (default: 42)')
     p.add_argument('-v', '--verbose', action='count', default=0,
                    help='-v for mux status, -vv for worker status too')
 
     g = p.add_argument_group('generator spawning')
     g.add_argument('--gen', type=int, default=0, metavar='N',
                    help='Spawn N gen_batches.py workers')
+    g.add_argument('--gen-weight', type=float, default=1.0,
+                   help='Weight per spawned worker (default: 1.0)')
     g.add_argument('--n-batches', type=int, default=1000,
                    help='Batches per spawned worker (default: 1000)')
     g.add_argument('--batch-size', type=int, default=4096)
@@ -177,13 +236,19 @@ def main():
     out = binary_stdout()
 
     files = []
+    weights = []
     procs = []
     file_handles = []
 
-    # Open file/pipe inputs.
-    for path in args.inputs:
+    # Open file/pipe inputs with optional weights.
+    has_explicit_weight = False
+    for raw in args.inputs:
+        path, weight = _parse_weighted_input(raw)
+        if weight != 1.0:
+            has_explicit_weight = True
         f = open(path, 'rb')
         files.append(f)
+        weights.append(weight)
         file_handles.append(f)
 
     # Spawn generator workers.
@@ -204,39 +269,45 @@ def main():
                 else subprocess.DEVNULL)
             procs.append(proc)
             files.append(proc.stdout)
+            weights.append(args.gen_weight)
+
+    # Auto-select mode if not specified.
+    mode = args.mode
+    if mode is None:
+        mode = 'weighted' if has_explicit_weight else 'fifo'
 
     if args.verbose >= 1:
         n_file = len(file_handles)
         n_gen = len(procs)
         parts = []
         if n_file:
-            parts.append(f'{n_file} file inputs')
+            w_strs = [f'{w:.3g}' for w in weights[:n_file]]
+            parts.append(f'{n_file} file inputs (weights: {", ".join(w_strs)})')
         if n_gen:
-            parts.append(f'{n_gen} spawned workers')
-        print(f'Muxing {" + ".join(parts)}, mode={args.mode}',
+            parts.append(f'{n_gen} spawned workers (weight: {args.gen_weight})')
+        print(f'Muxing {" + ".join(parts)}, mode={mode}',
               file=sys.stderr)
 
     write_stream_header(out)
 
-    if args.mode == 'shuffle':
-        written = mux_shuffle(files, out, verbose=(args.verbose >= 1),
-                              seed=args.shuffle_seed)
+    if mode == 'weighted':
+        written = mux_weighted(files, weights, out,
+                               verbose=(args.verbose >= 1),
+                               seed=args.shuffle_seed)
     else:
-        mux_fn = {'fifo': mux_fifo, 'round-robin': mux_round_robin}[args.mode]
-        written = mux_fn(files, out, verbose=(args.verbose >= 1))
+        mux_fn = {'fifo': mux_fifo,
+                   'round-robin': mux_round_robin}[mode]
+        written = mux_fn(files, weights, out,
+                         verbose=(args.verbose >= 1))
 
     out.close()
     for f in file_handles:
         f.close()
 
-    failed = []
-    for i, proc in enumerate(procs):
-        rc = proc.wait()
-        if rc != 0:
-            failed.append(i)
-    if failed:
-        print(f'WARNING: workers {failed} exited with errors',
-              file=sys.stderr)
+    for proc in procs:
+        proc.terminate()
+    for proc in procs:
+        proc.wait()
     if args.verbose >= 1:
         print(f'Done: {written} batches', file=sys.stderr)
 
