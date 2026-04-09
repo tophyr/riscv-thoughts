@@ -10,7 +10,6 @@ Usage:
 """
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
@@ -19,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import numpy as np
 
 from datagen import produce_batch, write_batch, write_stream_header
+from scripts._batch_util import binary_stdout
 
 
 def main():
@@ -30,18 +30,19 @@ def main():
     p.add_argument('-v', '--verbose', action='store_true')
     args = p.parse_args()
 
-    # Write binary to a dup'd fd so stray prints don't corrupt the stream.
-    out = os.fdopen(os.dup(sys.stdout.fileno()), 'wb')
-    sys.stdout = sys.stderr
+    out = binary_stdout()
 
     rng = np.random.default_rng(args.seed)
     write_stream_header(out)
 
-    for i in range(args.n_batches):
-        batch = produce_batch(args.batch_size, args.n_inputs, rng)
-        write_batch(out, batch)
-        if args.verbose and (i + 1) % 100 == 0:
-            print(f'{i + 1}/{args.n_batches} batches')
+    try:
+        for i in range(args.n_batches):
+            batch = produce_batch(args.batch_size, args.n_inputs, rng)
+            write_batch(out, batch)
+            if args.verbose and (i + 1) % 100 == 0:
+                print(f'{i + 1}/{args.n_batches} batches')
+    except BrokenPipeError:
+        pass
 
     out.close()
     if args.verbose:
