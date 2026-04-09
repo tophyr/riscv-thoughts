@@ -349,22 +349,6 @@ class TestRandomRegs:
         assert regs.shape == (32,)
         assert regs.dtype == np.int32
 
-    def test_structured_equal_groups(self):
-        rng = np.random.default_rng(0)
-        n = 10000
-        count = 0
-        for _ in range(n):
-            regs = random_regs(rng)
-            # Count how many non-x0 registers share a value with
-            # at least one other non-x0 register.
-            from collections import Counter
-            vals = Counter(int(regs[k]) for k in range(1, 32))
-            grouped = sum(c for c in vals.values() if c > 1)
-            if grouped >= 8:
-                count += 1
-        rate = count / n
-        assert 0.10 < rate < 0.25, f'grouped-equal rate {rate:.3f} outside [0.10, 0.25]'
-
     def test_structured_small_values(self):
         rng = np.random.default_rng(0)
         n = 10000

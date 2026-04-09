@@ -161,6 +161,74 @@ def produce_batch(batch_size: int, n_inputs: int,
     return Batch(instructions, token_ids, padding_mask, data_vals, pc_vals, dt, dr)
 
 
+def produce_focused_batch(batch_size: int, n_inputs: int,
+                          rng: np.random.Generator) -> Batch:
+    """Generate a batch focused on branch behavior.
+
+    Half branch instructions, half non-branches. Register states have
+    many equal pairs so branches actually trigger. Gives the model
+    clear signal that branching instructions behave differently from
+    comparison/ALU instructions.
+    """
+    half = batch_size // 2
+    instructions = []
+
+    # Half branches.
+    for _ in range(half):
+        op = rng.choice(_BRANCH_OPS)
+        instructions.append(Instruction(
+            op, int(rng.choice(_SRC_REGS)),
+            int(rng.choice(_SRC_REGS)),
+            int(rng.integers(-2048, 2048)) * 2))
+
+    # Half non-branches (comparison + ALU mix for contrast).
+    for _ in range(batch_size - half):
+        roll = rng.random()
+        if roll < 0.3:
+            # SLT/SLTU — the instructions we want to separate from branches.
+            op = rng.choice(['SLT', 'SLTU'])
+            instructions.append(Instruction(
+                op, int(rng.choice(_DEST_REGS)),
+                int(rng.choice(_SRC_REGS)),
+                int(rng.choice(_SRC_REGS))))
+        else:
+            instructions.append(random_instruction(rng))
+
+    B = len(instructions)
+    dt = np.array([dest_type(instr) for instr in instructions], dtype=np.int64)
+    dr = np.array([dest_reg(instr) for instr in instructions], dtype=np.int64)
+
+    data_vals = np.zeros((B, n_inputs), dtype=np.int64)
+    pc_vals = np.zeros((B, n_inputs), dtype=np.int64)
+    ctx = make_ctx()
+
+    for s in range(n_inputs):
+        regs = random_regs(rng)
+        # Force many registers to share a value so branches trigger.
+        n_equal = int(rng.integers(15, 26))
+        idxs = rng.choice(range(1, 32), size=n_equal, replace=False)
+        val = regs[idxs[0]]
+        for k in idxs:
+            regs[k] = val
+
+        pc = int(rng.integers(0, 1024)) * 4
+        for i, instr in enumerate(instructions):
+            state, final_pc, final_mem = run_instruction(
+                [instr], regs=regs, pc=pc, rng=rng, _ctx=ctx)
+            data_vals[i, s] = extract_data_val(instr, state.regs, final_mem)
+            pc_vals[i, s] = final_pc
+
+    encoded = [encode_instruction(instr) for instr in instructions]
+    max_len = max(len(e) for e in encoded)
+    token_ids = np.full((B, max_len), PAD, dtype=np.int64)
+    padding_mask = np.ones((B, max_len), dtype=np.bool_)
+    for i, enc in enumerate(encoded):
+        token_ids[i, :len(enc)] = enc
+        padding_mask[i, :len(enc)] = False
+
+    return Batch(instructions, token_ids, padding_mask, data_vals, pc_vals, dt, dr)
+
+
 # ---------------------------------------------------------------------------
 # Binary batch I/O
 #

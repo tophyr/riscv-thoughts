@@ -328,17 +328,6 @@ def random_regs(rng: np.random.Generator | None = None) -> np.ndarray:
     )
     regs[0] = 0
 
-    # ~15%: grouped equal registers. Pick a random value and assign
-    # it to 8-15 registers. Gives BEQ/BNE a ~25-50% chance of
-    # comparing two equal registers, making branches actually taken.
-    # Also realistic — real programs frequently reuse values.
-    if rng.random() < 0.15:
-        n = int(rng.integers(8, 16))
-        idxs = rng.choice(range(1, 32), size=n, replace=False)
-        val = regs[idxs[0]]
-        for k in idxs:
-            regs[k] = val
-
     # ~10%: small values (meaningful shift amounts, small comparisons)
     if rng.random() < 0.10:
         n = int(rng.integers(2, 6))
