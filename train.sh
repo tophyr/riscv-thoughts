@@ -20,6 +20,6 @@ trap "kill $SSH_PID 2>/dev/null; ssh ${REMOTE} 'pkill -f \"mux_batches.*6464\"; 
 sleep 5
 kill -0 $SSH_PID 2>/dev/null || { echo "ERROR: remote process died" >&2; exit 1; }
 
-${MUX_BATCHES} --gen 16 <(nc odin 6464 -d | unlz4) /mnt/d/batch_data/70k_4k.dat |
+${MUX_BATCHES} --gen 16 <(nc odin 6464 -d | unlz4) |
   ${PYTHON} scripts/batch_slice.py --count ${NUM_BATCHES} |
   ${PYTHON} scripts/train_compressor.py --lr-schedule ${NUM_BATCHES}
