@@ -235,28 +235,31 @@ rather than too large — overcomplete spaces enable shortcut solutions
 
 ### Loss terms
 
-**Primary: execution equivalence.** For equivalent pairs (S, S'),
-T(S) ≈ T(S'). Measured by MSE or cosine distance. The compressor
-should map all semantic-preserving transformations to the same point.
+**Evolved through experimentation** (see EXPERIMENT_LOG.md for the
+full progression). The current best approach:
 
-**Primary: execution distance preservation.** For near-equivalent
-pairs (S, S'_d) with known state distance d, the compressed distance
-||T(S) - T(S'_d)|| should be monotonically related to d. This
-directly trains smoothness — the compressed distance should track the
-semantic distance.
+**MSE distance matching on the unit sphere.** Normalize compressed
+vectors to the unit hypersphere (S^(d-1)). MSE between pairwise T1
+distances and scaled execution distances. The sphere prevents collapse
+(fixed norms), MSE provides scale (explicit nonzero distance targets),
+and the combination handles both equivalence (target=0 for equivalent
+pairs) and separation (target>0 for different pairs) in one loss.
 
-This is the signal that was impossible in natural language. In natural
-language, semantic distance between passages is a judgment call. Here,
-it's a computation. The loss can directly penalize violations of
-distance ordering: if d(S, S'_a) < d(S, S'_b) in execution space,
-then ||T(S) - T(S'_a)|| < ||T(S) - T(S'_b)|| in compressed space.
+Execution distance: log1p(|data_diff| + |pc_diff|) averaged over
+random input states. Log scaling compresses the enormous dynamic range
+(0 to 2^32) into a tractable range (~0 to 22).
 
-**Secondary: InfoNCE for batch discrimination.** Standard contrastive
-learning within each batch. Prevents collapse.
+**Destination classification heads.** CrossEntropy on dest_type
+(register vs memory) and dest_reg (which register). Provides
+structural gradient signal. These may become unnecessary in the
+streaming architecture where cross-level feedback provides structure.
 
-**Optional: noise injection.** Add Gaussian noise to compressed points,
-require equivalence discrimination to still work. Enforces local
-smoothness.
+**What didn't work:** Pearson correlation (scale-invariant, allows
+nonzero intercept — equivalences don't collapse), weighted Pearson
+(degenerate near-zero-variance statistics in the equivalence region),
+attract-only losses without sphere (global collapse), ranking loss
+(collapsed to zero immediately). See EXPERIMENT_LOG.md experiments
+1-11 for details.
 
 ### Training data volume
 
