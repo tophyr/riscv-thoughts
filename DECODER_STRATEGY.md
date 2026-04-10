@@ -75,6 +75,30 @@ distance landscape is smooth enough to navigate by gradient. If it
 fails, the geometry is the problem, not the search method, and no
 learned decoder will do better.
 
+### Preliminary Results (Experiment 18)
+
+Implemented and tested on the Exp 16 T0→T1 model (S^127, MSE loss,
+Spearman 0.730). Key findings:
+
+- **Search works where the geometry is good.** ADD x5,x3,x7 decoded
+  to its commutative equivalent ADD x5,x7,x3 -- the decoder
+  discovered execution equivalence by navigating the T1 space.
+  SLLI x5,x3,1 recovered exactly.
+
+- **Search fails where the geometry is bad.** SUB-self (always zero)
+  decoded to a branch instruction (false cluster). BEQ couldn't be
+  decoded at all. The T1 space's known problems (SLT/BEQ cluster,
+  rough branch geometry) directly cause decoder failures.
+
+- **Discrete snapping adds distance.** Successful decodes land at
+  distance 0.4-0.8 from the target even when the continuous optimum
+  is very close. The discrete token vocabulary is sparse on S^127.
+
+These results validate the proposer+verifier framework: the
+compressor IS usable as a scoring function for search, and search
+DOES find execution-equivalent instructions in the regions where
+the compressor learned smooth geometry.
+
 ---
 
 ## Phase 2: Learned Decoder
