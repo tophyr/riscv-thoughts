@@ -612,3 +612,63 @@ learn fine. This problem is unrelated to input states.
 
 The fixes are independent: structured inputs for problem 1,
 equivalence pair injection for problem 2.
+
+### Experiment 17: Focused branch batches, 100K steps
+
+Introduced produce_focused_batch(): batches of 256 instructions
+(half branches, half non-branches) with equality-rich register
+states (15-25 of 31 registers sharing a value in every state).
+Mixed into the training stream via a second muxer at weight 0.5
+(~10% of branch instructions from focused context).
+
+Also changed weighted mux mode to enforce ratio strictly — blocks
+when the chosen input is empty instead of falling back.
+
+**Result: BEQ branch offset scaling learned for the first time.**
+
+| BEQ offset | Before (all runs) | With focused |
+|------------|-------------------|-------------|
+| off=10 | 0.001-0.005 | 0.024 |
+| off=32 | 0.001-0.008 | 0.048 |
+| off=128 | 0.001-0.012 | 0.094 |
+| off=1024 | 0.003-0.015 | 0.182 |
+
+Clean monotonic progression — the model learned that different
+branch offsets produce different PC values. This was flat noise in
+every previous run.
+
+SLT/BEQ cluster slightly improved (0.2 vs 0.1 in previous runs).
+SLT/SLTU unchanged at 0.0. Correlation slightly lower (Pearson
+0.934 vs 0.956) — the focused batches may add noise to the global
+distance metric due to different batch size and instruction
+distribution.
+
+Loss trajectory showed oscillation: best 0.026 at 50K, final
+0.107. Focused batches have different loss characteristics from
+normal batches, causing the loss to spike when a focused batch
+is processed.
+
+### Phase 4 Summary
+
+Structured random inputs improved correlation quality (Spearman
+0.659 → 0.730) and focused batches enabled branch offset learning.
+However, the two core problems remain partially unsolved:
+
+1. SLT/BEQ cluster: improved slightly but not broken. Would need
+   even more aggressive focused rates or a different approach.
+2. Cross-syntax equivalences: unchanged. Requires instruction
+   pairing, not input state changes.
+
+Both problems are fundamentally **context-free ambiguities** that
+dissolve with sequential context. A streaming compressor (T1→T2)
+would see BEQ preceded by a loop counter increment and know it's
+a loop terminator. The single-instruction T1 compressor cannot
+resolve these without increasingly complex data engineering that
+may not justify the effort.
+
+**Decision: move to multilevel streaming architecture.** The T0→T1
+single-instruction compressor provides a good-enough representation
+(correct opcode clustering, register sensitivity, immediate scaling,
+branch offset learning) that can serve as initialization or
+reference for the streaming encoder. The remaining T0→T1 problems
+are best solved at T1→T2 where context is available.
