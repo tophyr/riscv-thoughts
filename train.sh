@@ -5,17 +5,13 @@
 # along with pregenerated data on disk, to ensure that the GPU is always fed to maximum capacity.
 
 PYTHON=.venv/bin/python
-
 BATCH_SIZE=4096
 NUM_BATCHES=$1
 
-MUX_BATCHES="${PYTHON} scripts/mux_batches.py"
-FOCUSED_BATCHES="${PYTHON} scripts/gen_batches --focused --batch-size 256 --n-batches ${NUM_BATCHES}"
-MUX_15_F="${MUX_BATCHES}  --batch-size ${BATCH_SIZE} --n-batches ${NUM_BATCHES} --gen 15 <(${FOCUSED_BATCHES})"
-MUX_4_MUX_15_F="${MUX_BATCHES} <(${MUX_15_F}) <(${MUX_15_F}) <(${MUX_15_F}) <(${MUX_15_F})"
-
 REMOTE=chrissarbora@odin
-ssh ${REMOTE} "cd Projects/riscv-thoughts && ${MUX_BATCHES} <(${MUX_4_MUX_15_F}) <(${MUX_4_MUX_15_F}) | lz4 | nc -l -q 0 6464" &
+ssh ${REMOTE} "cd Projects/riscv-thoughts && \
+  ${PYTHON} scripts/mux_batches.py --batch-size ${BATCH_SIZE} --n-batches ${NUM_BATCHES} --gen 128 \
+  | lz4 | nc -l -q 0 6464" &
 SSH_PID=$!
 trap "kill $SSH_PID 2>/dev/null; ssh ${REMOTE} 'pkill -f \"mux_batches.*6464\"; pkill -f \"nc -l.*6464\"' 2>/dev/null; wait $SSH_PID 2>/dev/null" EXIT
 
@@ -23,6 +19,12 @@ trap "kill $SSH_PID 2>/dev/null; ssh ${REMOTE} 'pkill -f \"mux_batches.*6464\"; 
 sleep 5
 kill -0 $SSH_PID 2>/dev/null || { echo "ERROR: remote process died" >&2; exit 1; }
 
-${MUX_15_F} <(nc odin 6464 -d | unlz4) |
-  ${PYTHON} scripts/batch_slice.py --count ${NUM_BATCHES} |
+# First mux: normal batches from local generators + remote stream.
+# Second mux: mix in focused branch batches at weight 0.5 (~10% of
+# branch instructions come from focused context).
+${PYTHON} scripts/mux_batches.py --batch-size ${BATCH_SIZE} --n-batches ${NUM_BATCHES} --gen 16 \
+    <(nc odin 6464 -d | unlz4) | \
+  ${PYTHON} scripts/mux_batches.py /dev/stdin \
+    0.5:<(${PYTHON} scripts/gen_batches.py --focused --batch-size 256 --n-batches ${NUM_BATCHES} --seed 8888) | \
+  ${PYTHON} scripts/batch_slice.py --count ${NUM_BATCHES} | \
   ${PYTHON} scripts/train_compressor.py --lr-schedule ${NUM_BATCHES}

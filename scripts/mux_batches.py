@@ -60,7 +60,7 @@ def _reader(f, q, idx):
     q.put((idx, None))  # sentinel
 
 
-def _reader_per_q(f, per_q, ready, idx):
+def _reader_per_q(f, per_q, idx):
     """Read batches from a stream into a per-input queue."""
     try:
         read_stream_header(f)
@@ -69,12 +69,9 @@ def _reader_per_q(f, per_q, ready, idx):
             if data is None:
                 break
             per_q.put(data)
-            ready.release()
     except (EOFError, ValueError) as e:
         per_q.put(e)
-        ready.release()
     per_q.put(None)  # sentinel
-    ready.release()
 
 
 def _mux_write(out, written_ref, data, verbose):
@@ -151,38 +148,37 @@ def mux_round_robin(files, weights, out, verbose=False):
 
 
 def mux_weighted(files, weights, out, verbose=False, seed=42):
-    """Pick from available inputs proportional to weight."""
-    ready = threading.Semaphore(0)
+    """Pick inputs proportional to weight, blocking if necessary.
+
+    The output ratio matches the weight ratio exactly (in expectation),
+    even if it means waiting for a slow input. This can reduce
+    throughput when a high-weight input is slower than the consumer.
+    """
     queues = []
     for i, f in enumerate(files):
         per_q = queue.Queue(maxsize=2)
         t = threading.Thread(target=_reader_per_q,
-                             args=(f, per_q, ready, i), daemon=True)
+                             args=(f, per_q, i), daemon=True)
         t.start()
         queues.append(per_q)
 
     written = [0]
-    active = set(range(len(files)))
+    active = list(range(len(files)))
     rng = random.Random(seed)
 
     while active:
-        ready.acquire()
+        w = [weights[i] for i in active]
+        pick = rng.choices(active, weights=w, k=1)[0]
 
-        # Find non-empty queues among active inputs.
-        available = [i for i in active if not queues[i].empty()]
-        if not available:
-            continue
-
-        w = [weights[i] for i in available]
-        pick = rng.choices(available, weights=w, k=1)[0]
-        data = queues[pick].get_nowait()
+        # Block until the chosen input has data.
+        data = queues[pick].get()
 
         if data is None:
-            active.discard(pick)
+            active.remove(pick)
             continue
         if isinstance(data, Exception):
             print(f'Input {pick} error: {data}', file=sys.stderr)
-            active.discard(pick)
+            active.remove(pick)
             continue
         if not _mux_write(out, written, data, verbose):
             break
