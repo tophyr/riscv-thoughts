@@ -195,6 +195,29 @@ class StreamingCompressor(nn.Module):
                 torch.tensor(emit_counts, device=device),
                 gate_logits)
 
+    def encode_soft(self, soft_emb, padding_mask=None):
+        """Encode from soft embeddings (for round-trip loss).
+
+        Shares weights with the main encoder. Takes pre-computed
+        embeddings instead of token IDs.
+
+        Args:
+            soft_emb: (N, T, d_model) — differentiable token embeddings
+            padding_mask: (N, T) bool — True = padding
+        Returns:
+            (N, d_out) L2-normalized vectors
+        """
+        B, T, _ = soft_emb.shape
+        pos = torch.arange(T, device=soft_emb.device)
+        x = soft_emb + self.pos_emb(pos)
+        x = self.encoder(x, src_key_padding_mask=padding_mask)
+        if padding_mask is not None:
+            mask = (~padding_mask).float().unsqueeze(-1)
+            x = (x * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+        else:
+            x = x.mean(dim=1)
+        return F.normalize(self.proj(x), dim=-1)
+
 
 class Decoder(nn.Module):
     """Autoregressive decoder conditioned on an emission vector.
