@@ -20,9 +20,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from datagen import read_batch_bytes, read_stream_header, write_stream_header
-from datagen.datagen import _BATCH_HEADER, _batch_body_size
-from scripts._batch_util import binary_stdout, validate_batch_header
+from datagen import read_stream_header, read_batch_bytes, write_stream_header
+from scripts._batch_util import binary_stdout, validate_batch_header, \
+    BATCH_HEADER, batch_body_size
 
 
 def _build_index(f):
@@ -30,14 +30,14 @@ def _build_index(f):
     index = []
     while True:
         offset = f.tell()
-        header = f.read(_BATCH_HEADER.size)
+        header = f.read(BATCH_HEADER.size)
         if len(header) == 0:
             break
-        if len(header) < _BATCH_HEADER.size:
+        if len(header) < BATCH_HEADER.size:
             raise EOFError(f'Truncated header at offset {offset}')
-        B, max_len, n_inputs = validate_batch_header(header)
-        body_size = _batch_body_size(B, max_len, n_inputs)
-        total_size = _BATCH_HEADER.size + body_size
+        vals = validate_batch_header(header)
+        body = batch_body_size(*vals)
+        total_size = BATCH_HEADER.size + body
         index.append((offset, total_size))
         f.seek(offset + total_size)
     return index
@@ -45,7 +45,6 @@ def _build_index(f):
 
 def shuffle_seekable(f, out, seed, verbose=False):
     """Shuffle using seek-based random access. O(n_batches) memory."""
-    read_stream_header(f)
     index = _build_index(f)
 
     if verbose:
@@ -74,7 +73,6 @@ def shuffle_seekable(f, out, seed, verbose=False):
 
 def shuffle_buffered(f, out, seed, verbose=False):
     """Shuffle by buffering all batches in memory. For stdin."""
-    read_stream_header(f)
     batches = []
     while True:
         data = read_batch_bytes(f)
@@ -111,8 +109,10 @@ def main():
 
     if args.file:
         with open(args.file, 'rb') as f:
+            read_stream_header(f)
             shuffle_seekable(f, out, args.seed, verbose=args.verbose)
     else:
+        read_stream_header(sys.stdin.buffer)
         shuffle_buffered(sys.stdin.buffer, out, args.seed,
                          verbose=args.verbose)
 

@@ -15,9 +15,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from datagen import read_batch_bytes, read_stream_header, write_stream_header
-from datagen.datagen import _BATCH_HEADER, _batch_body_size
-from scripts._batch_util import binary_stdout, validate_batch_header
+from datagen import read_stream_header, read_batch_bytes, write_stream_header
+from scripts._batch_util import binary_stdout, validate_batch_header, \
+    BATCH_HEADER, batch_body_size
 
 
 def _count_batches(f):
@@ -25,14 +25,14 @@ def _count_batches(f):
     count = 0
     while True:
         offset = f.tell()
-        header = f.read(_BATCH_HEADER.size)
+        header = f.read(BATCH_HEADER.size)
         if len(header) == 0:
             break
-        if len(header) < _BATCH_HEADER.size:
+        if len(header) < BATCH_HEADER.size:
             break
-        B, max_len, n_inputs = validate_batch_header(header)
-        body_size = _batch_body_size(B, max_len, n_inputs)
-        f.seek(offset + _BATCH_HEADER.size + body_size)
+        vals = validate_batch_header(header)
+        body = batch_body_size(*vals)
+        f.seek(offset + BATCH_HEADER.size + body)
         count += 1
     return count
 

@@ -4,12 +4,12 @@ import io
 import numpy as np
 import pytest
 
-from emulator import Instruction, R_TYPE, I_TYPE, B_TYPE, LOAD_TYPE, STORE_TYPE, run, make_ctx
+from emulator import Instruction, R_TYPE, I_TYPE, B_TYPE, LOAD_TYPE, STORE_TYPE, run, make_ctx, random_regs
 from datagen import (
-    SequenceBatch,
-    random_basic_block, execute_sequence, produce_seq_batch,
-    write_seq_batch, read_seq_batch,
-    write_seq_stream_header, read_seq_stream_header,
+    Batch,
+    random_basic_block, execute_sequence, produce_batch,
+    write_batch, read_batch,
+    write_stream_header, read_stream_header,
 )
 
 
@@ -138,13 +138,66 @@ class TestExecuteSequence:
         assert regs_snap[3, 5] == 30
         assert regs_snap[3, 6] == 20
 
+    def test_store_load_persistence(self):
+        """Stores within a sequence should be visible to subsequent loads."""
+        rng = np.random.default_rng(0)
+        # SW x3, 0(x0)  → store regs[3]=42 at address 0
+        # LW x5, 0(x0)  → load from address 0 into x5
+        # BEQ x5, x3, 8 → terminator
+        instructions = [Instruction('SW', 3, 0, 0),
+                        Instruction('LW', 5, 0, 0),
+                        Instruction('BEQ', 5, 3, 8)]
+        regs = np.zeros(32, dtype=np.int32)
+        regs[3] = 42
+        ctx = make_ctx()
+
+        regs_snap, _ = execute_sequence(
+            instructions, regs, pc=0, rng=rng, ctx=ctx)
+
+        # After SW: registers unchanged
+        assert regs_snap[1, 3] == 42
+        assert regs_snap[1, 5] == 0
+        # After LW: x5 should be 42 (loaded from stored value)
+        assert regs_snap[2, 5] == 42
+
+    def test_final_state_matches_emulator(self):
+        """The final register state from execute_sequence should match
+        emulator.run() on ALU-only blocks (no loads/stores, since
+        execute_sequence uses zero-initialized memory while
+        emulator.run() uses random-filled memory)."""
+        rng = np.random.default_rng(7)
+        ctx = make_ctx()
+
+        for _ in range(50):
+            block = random_basic_block(rng, max_length=6)
+            # Filter to ALU+branch only (no loads/stores) so memory
+            # independence doesn't affect the comparison.
+            alu_block = [i for i in block
+                         if i.opcode not in ('LB', 'LBU', 'LH', 'LHU',
+                                             'LW', 'SB', 'SH', 'SW')]
+            if len(alu_block) < 2:
+                continue
+
+            regs = random_regs(rng)
+            pc = int(rng.integers(0, 256)) * 4
+
+            regs_snap, _ = execute_sequence(
+                alu_block, regs, pc=pc, rng=rng, ctx=ctx)
+
+            state, _, _ = run(alu_block, regs=regs, pc=pc,
+                              rng=rng, _ctx=ctx, max_steps=len(alu_block))
+
+            np.testing.assert_array_equal(
+                regs_snap[-1], state.regs,
+                err_msg='execute_sequence final state != emulator.run')
+
 
 class TestProduceSeqBatch:
     def test_shapes(self):
         rng = np.random.default_rng(0)
-        batch = produce_seq_batch(batch_size=8, n_inputs=4,
+        batch = produce_batch(batch_size=8, n_inputs=4,
                                   max_block_len=5, rng=rng)
-        assert isinstance(batch, SequenceBatch)
+        assert isinstance(batch, Batch)
         B = 8
         assert batch.token_ids.shape[0] == B
         assert batch.padding_mask.shape == batch.token_ids.shape
@@ -159,7 +212,7 @@ class TestProduceSeqBatch:
 
     def test_n_instructions_consistent(self):
         rng = np.random.default_rng(0)
-        batch = produce_seq_batch(batch_size=16, n_inputs=2,
+        batch = produce_batch(batch_size=16, n_inputs=2,
                                   max_block_len=5, rng=rng)
         # max_instrs from batch should be max of n_instructions
         max_instrs = batch.per_instr_regs.shape[1] - 1
@@ -167,7 +220,7 @@ class TestProduceSeqBatch:
 
     def test_token_instr_idx_validity(self):
         rng = np.random.default_rng(0)
-        batch = produce_seq_batch(batch_size=8, n_inputs=2,
+        batch = produce_batch(batch_size=8, n_inputs=2,
                                   max_block_len=5, rng=rng)
         for b in range(8):
             n = int(batch.n_instructions[b])
@@ -182,15 +235,15 @@ class TestProduceSeqBatch:
 
     def test_x0_always_zero(self):
         rng = np.random.default_rng(0)
-        batch = produce_seq_batch(batch_size=8, n_inputs=4,
+        batch = produce_batch(batch_size=8, n_inputs=4,
                                   max_block_len=5, rng=rng)
         # x0 (register 0) should always be 0 in any snapshot
         assert (batch.per_instr_regs[..., 0] == 0).all()
 
     def test_deterministic(self):
-        b1 = produce_seq_batch(batch_size=4, n_inputs=2,
+        b1 = produce_batch(batch_size=4, n_inputs=2,
                                max_block_len=5, rng=np.random.default_rng(42))
-        b2 = produce_seq_batch(batch_size=4, n_inputs=2,
+        b2 = produce_batch(batch_size=4, n_inputs=2,
                                max_block_len=5, rng=np.random.default_rng(42))
         assert np.array_equal(b1.token_ids, b2.token_ids)
         assert np.array_equal(b1.per_instr_regs, b2.per_instr_regs)
@@ -199,16 +252,16 @@ class TestProduceSeqBatch:
 class TestSeqBatchIO:
     def test_roundtrip(self):
         rng = np.random.default_rng(42)
-        batch = produce_seq_batch(batch_size=4, n_inputs=2,
+        batch = produce_batch(batch_size=4, n_inputs=2,
                                   max_block_len=5, rng=rng)
 
         buf = io.BytesIO()
-        write_seq_stream_header(buf)
-        write_seq_batch(buf, batch)
+        write_stream_header(buf)
+        write_batch(buf, batch)
 
         buf.seek(0)
-        read_seq_stream_header(buf)
-        batch2 = read_seq_batch(buf)
+        read_stream_header(buf)
+        batch2 = read_batch(buf)
 
         assert np.array_equal(batch.token_ids, batch2.token_ids)
         assert np.array_equal(batch.padding_mask, batch2.padding_mask)
@@ -220,25 +273,25 @@ class TestSeqBatchIO:
     def test_multiple_batches(self):
         rng = np.random.default_rng(42)
         buf = io.BytesIO()
-        write_seq_stream_header(buf)
+        write_stream_header(buf)
         for _ in range(3):
-            write_seq_batch(buf, produce_seq_batch(
+            write_batch(buf, produce_batch(
                 batch_size=4, n_inputs=2, max_block_len=5, rng=rng))
 
         buf.seek(0)
-        read_seq_stream_header(buf)
+        read_stream_header(buf)
         batches = []
         while True:
-            b = read_seq_batch(buf)
+            b = read_batch(buf)
             if b is None:
                 break
             batches.append(b)
         assert len(batches) == 3
 
     def test_eof(self):
-        assert read_seq_batch(io.BytesIO()) is None
+        assert read_batch(io.BytesIO()) is None
 
     def test_bad_magic(self):
         buf = io.BytesIO(b'XXXX\x01' + b'\x00' * 6)
         with pytest.raises(ValueError, match='Bad magic'):
-            read_seq_stream_header(buf)
+            read_stream_header(buf)

@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 
-from datagen import produce_seq_batch, write_seq_batch, write_seq_stream_header
+from datagen import produce_batch, write_batch, write_stream_header
 from scripts._batch_util import binary_stdout
 
 
@@ -34,14 +34,14 @@ def main():
     out = binary_stdout()
 
     rng = np.random.default_rng(args.seed)
-    write_seq_stream_header(out)
+    write_stream_header(out)
 
     try:
         for i in range(args.n_batches):
-            batch = produce_seq_batch(
+            batch = produce_batch(
                 args.batch_size, args.n_inputs,
                 args.max_block_len, rng)
-            write_seq_batch(out, batch)
+            write_batch(out, batch)
             if args.verbose and (i + 1) % 100 == 0:
                 print(f'{i + 1}/{args.n_batches} batches',
                       file=sys.stderr)
