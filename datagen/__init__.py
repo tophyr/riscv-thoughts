@@ -5,3 +5,9 @@ from .datagen import (
     write_batch, read_batch, read_batch_bytes,
     write_stream_header, read_stream_header,
 )
+from .seqgen import (
+    SequenceBatch, SeqBatchReader,
+    random_basic_block, execute_sequence, produce_seq_batch,
+    write_seq_batch, read_seq_batch, read_seq_batch_bytes,
+    write_seq_stream_header, read_seq_stream_header,
+)
