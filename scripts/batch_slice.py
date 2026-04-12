@@ -5,20 +5,10 @@ Like dd but for batches. Reads a batch stream from a file or stdin,
 writes a batch stream to stdout.
 
 Usage:
-    # First 100 batches:
     batch_slice.py --count 100 < corpus.bin > first100.bin
-
-    # Skip 50, take 100:
     batch_slice.py --skip 50 --count 100 < corpus.bin > middle.bin
-
-    # Last 10 batches:
     batch_slice.py --tail 10 corpus.bin > last10.bin
-
-    # Count and validate (no output):
     batch_slice.py --info corpus.bin
-
-    # Salvage a truncated file:
-    batch_slice.py --lenient corpus.bin > clean.bin
 """
 
 import argparse
@@ -35,8 +25,7 @@ def _read_one_batch(f, lenient=False):
     """Read one batch as raw bytes with validation.
 
     Returns (bytes, None) on success, (None, None) on clean EOF,
-    (None, error_str) on error. In lenient mode, truncation returns
-    clean EOF instead of error.
+    (None, error_str) on error.
     """
     try:
         data = read_batch_bytes(f)
@@ -57,16 +46,9 @@ def _read_one_batch(f, lenient=False):
 
 def do_info(f, lenient=False):
     """Count and validate batches. Print summary to stderr."""
-    try:
-        read_stream_header(f)
-    except ValueError as e:
-        print(f'ERROR: {e}', file=sys.stderr)
-        return 1
-
     count = 0
-    total_instructions = 0
+    total_items = 0
     last_B = None
-    last_n_inputs = None
 
     while True:
         data, err = _read_one_batch(f, lenient=lenient)
@@ -77,28 +59,20 @@ def do_info(f, lenient=False):
             if not lenient:
                 return 1
             break
-        B, _, n_inputs = validate_batch_header(data)
+        B, _, _, _ = validate_batch_header(data)
         count += 1
-        total_instructions += B
+        total_items += B
         last_B = B
-        last_n_inputs = n_inputs
 
     print(f'Batches:      {count}', file=sys.stderr)
-    print(f'Instructions: {total_instructions}', file=sys.stderr)
+    print(f'Items:        {total_items}', file=sys.stderr)
     if last_B is not None:
         print(f'Batch size:   {last_B}', file=sys.stderr)
-        print(f'Input states: {last_n_inputs}', file=sys.stderr)
     return 0
 
 
 def do_slice(f, out, skip=0, count=None, lenient=False):
     """Copy a range of batches from f to out."""
-    try:
-        read_stream_header(f)
-    except ValueError as e:
-        print(f'ERROR: {e}', file=sys.stderr)
-        return 1
-
     write_stream_header(out)
 
     idx = 0
@@ -133,12 +107,6 @@ def do_slice(f, out, skip=0, count=None, lenient=False):
 def do_tail(f, out, n, lenient=False):
     """Copy the last n batches from f to out."""
     from collections import deque
-
-    try:
-        read_stream_header(f)
-    except ValueError as e:
-        print(f'ERROR: {e}', file=sys.stderr)
-        return 1
 
     ring = deque(maxlen=n)
     total = 0
@@ -188,6 +156,12 @@ def main():
         f = open(args.file, 'rb')
     else:
         f = sys.stdin.buffer
+
+    try:
+        read_stream_header(f)
+    except ValueError as e:
+        print(f'ERROR: {e}', file=sys.stderr)
+        sys.exit(1)
 
     if args.info:
         rc = do_info(f, lenient=args.lenient)

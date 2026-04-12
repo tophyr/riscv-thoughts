@@ -3,23 +3,30 @@
 import os
 import sys
 
-from datagen.datagen import _BATCH_HEADER
+from datagen.seqgen import _BATCH_HEADER, _batch_body_size
+
+# Re-export for scripts that need to scan batch headers.
+BATCH_HEADER = _BATCH_HEADER
+batch_body_size = _batch_body_size
 
 # Sanity bounds for batch header validation.
-MAX_B = 1_000_000
-MAX_LEN = 1000
-MAX_INPUTS = 10000
+_MAX_B = 1_000_000
+_MAX_TOKENS = 10_000
+_MAX_INSTRS = 1_000
+_MAX_INPUTS = 10_000
 
 
 def validate_batch_header(data):
-    """Validate a raw batch's header values. Returns (B, max_len, n_inputs)
-    or raises ValueError."""
-    B, max_len, n_inputs = _BATCH_HEADER.unpack(data[:_BATCH_HEADER.size])
-    if not (0 < B <= MAX_B and 0 < max_len <= MAX_LEN
-            and 0 < n_inputs <= MAX_INPUTS):
+    """Validate a batch header. Returns (B, max_tokens, max_instrs, n_inputs)."""
+    vals = BATCH_HEADER.unpack(data[:BATCH_HEADER.size])
+    B, max_tokens, max_instrs, n_inputs = vals
+    if not (0 < B <= _MAX_B and 0 < max_tokens <= _MAX_TOKENS
+            and 0 < max_instrs <= _MAX_INSTRS
+            and 0 < n_inputs <= _MAX_INPUTS):
         raise ValueError(
-            f'Invalid header: B={B}, max_len={max_len}, n_inputs={n_inputs}')
-    return B, max_len, n_inputs
+            f'Invalid header: B={B}, max_tokens={max_tokens}, '
+            f'max_instrs={max_instrs}, n_inputs={n_inputs}')
+    return vals
 
 
 def binary_stdout():

@@ -6,7 +6,6 @@ stream header followed by all batches from all files in order.
 
 Usage:
     batch_cat.py part1.bin part2.bin part3.bin > combined.bin
-    batch_cat.py day*.bin | train_compressor.py
 """
 
 import argparse
@@ -15,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from datagen import read_batch_bytes, read_stream_header, write_stream_header
+from datagen import read_stream_header, read_batch_bytes, write_stream_header
 from scripts._batch_util import binary_stdout
 
 

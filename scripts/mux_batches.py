@@ -2,7 +2,7 @@
 """Multiplex multiple binary batch streams into one.
 
 Inputs can be files, pipes, process substitution, or spawned
-gen_batches.py workers. All go through the same muxing plumbing.
+gen_seq_batches.py workers. All go through the same muxing plumbing.
 
 Muxing modes:
   fifo:        output whichever batch is ready first (default when
@@ -215,13 +215,14 @@ def main():
 
     g = p.add_argument_group('generator spawning')
     g.add_argument('--gen', type=int, default=0, metavar='N',
-                   help='Spawn N gen_batches.py workers')
+                   help='Spawn N gen_seq_batches.py workers')
     g.add_argument('--gen-weight', type=float, default=1.0,
                    help='Weight per spawned worker (default: 1.0)')
     g.add_argument('--n-batches', type=int, default=1000,
                    help='Batches per spawned worker (default: 1000)')
-    g.add_argument('--batch-size', type=int, default=4096)
-    g.add_argument('--n-inputs', type=int, default=32)
+    g.add_argument('--batch-size', type=int, default=256)
+    g.add_argument('--n-inputs', type=int, default=4)
+    g.add_argument('--max-block-len', type=int, default=5)
     g.add_argument('--seed', type=int, default=42)
 
     args = p.parse_args()
@@ -249,10 +250,11 @@ def main():
 
     # Spawn generator workers.
     if args.gen > 0:
-        script = str(Path(__file__).resolve().parent / 'gen_batches.py')
+        script = str(Path(__file__).resolve().parent / 'gen_seq_batches.py')
         base_cmd = [sys.executable, script,
                     '--batch-size', str(args.batch_size),
-                    '--n-inputs', str(args.n_inputs)]
+                    '--n-inputs', str(args.n_inputs),
+                    '--max-block-len', str(args.max_block_len)]
         if args.verbose >= 2:
             base_cmd.append('-v')
 
