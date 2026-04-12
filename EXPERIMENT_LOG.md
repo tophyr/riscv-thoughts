@@ -915,3 +915,113 @@ Next steps: longer training run to find the reconstruction accuracy
 ceiling, then switch to round-trip loss (decode → re-encode through
 frozen encoder, compare vectors) to accommodate execution equivalence
 without changing the architecture.
+
+### Experiment 21: 10K steps with round-trip loss
+
+Same architecture as Exp 20, plus:
+- **Decoder**: 2-layer transformer decoder (d_model=128, 4 heads),
+  cross-attention to emission vector, autoregressive teacher-forcing.
+- **Round-trip loss**: decoder output → Gumbel-softmax → soft
+  embeddings → re-encode through encoder → cosine distance to
+  original emission. All three losses (reconstruction, pairwise MSE,
+  round-trip) weighted equally at 1.0.
+
+5000 batches × 256 sequences, repeated. 10K steps, cosine LR decay.
+
+**Results:**
+
+| Step  | Recon | Pair  | RT    | Acc    | emit/instr |
+|-------|-------|-------|-------|--------|------------|
+| 200   | 2.18  | 0.28  | 0.07  | 36%    | 3.4/3.4    |
+| 1000  | 0.37  | 0.19  | 0.03  | 90%    | 3.5/3.5    |
+| 2000  | 0.15  | 0.17  | 0.03  | 95%    | 3.5/3.5    |
+| 5000  | 0.024 | 0.19  | 0.014 | 99.2%  | 3.4/3.4    |
+| 8000  | 0.013 | 0.18  | 0.009 | 99.7%  | 3.6/3.6    |
+| 10000 | 0.017 | 0.21  | 0.008 | 99.6%  | 3.5/3.5    |
+
+All three losses converge without interference. 99.6% token
+reconstruction accuracy. Round-trip cosine distance 0.008 (cosine
+similarity 0.992).
+
+**Equivalence analysis** on the trained model:
+
+| Pair                        | Cosine | Equivalent? |
+|-----------------------------|--------|-------------|
+| ADD(5,3,7) / ADD(5,7,3)    | 0.956  | yes (commutative) |
+| XOR(10,3,7) / XOR(10,7,3)  | 0.965  | yes (commutative) |
+| SUB(5,3,3) / XOR(5,3,3)    | 0.929  | yes (both zero) |
+| ADD(5,3,3) / SLLI(5,3,1)   | 0.687  | yes (both 2×x3) |
+| ADDI(5,3,0) / OR(5,3,0)    | 0.563  | yes (both identity) |
+| ADD(5,3,7) / SUB(5,3,7)    | 0.845  | **no** |
+| ADD(5,3,7) / AND(5,3,7)    | 0.865  | **no** |
+
+Key findings:
+
+1. **Same-syntax equivalences collapse well.** Commutative pairs
+   (cosine ~0.96) and same-opcode zero-producers (0.93) are nearby.
+   The pairwise MSE loss handles these.
+
+2. **Cross-syntax equivalences do NOT collapse.** ADD-double vs
+   SLLI (0.687) and ADDI-identity vs OR-zero (0.563) remain far
+   apart. Worse: non-equivalent same-syntax pairs (ADD vs SUB:
+   0.845) are CLOSER than equivalent cross-syntax pairs. The
+   syntactic bias from reconstruction overpowers the execution
+   distance signal.
+
+3. **The decoder memorizes, not canonicalizes.** Each vector decodes
+   back to its original instruction exactly. No equivalence
+   discovery — the decoder is a faithful recorder of what it saw,
+   not a discoverer of alternatives.
+
+4. **Round-trip loss doesn't help equivalence.** RT loss of 0.008
+   just confirms the decoder is consistent with the encoder — both
+   are consistently wrong about cross-syntax equivalence. The RT
+   loss can't fix this because it optimizes consistency (round-trip
+   fidelity), not correctness (execution equivalence).
+
+**Assessment:** The architecture is sound — encoder, gate, decoder,
+and all three losses train stably to high accuracy. But the training
+signal doesn't drive equivalence collapse for cross-syntax pairs.
+The cross-entropy reconstruction loss actively prevents it by
+rewarding exact token reproduction.
+
+To fix this, the decoder needs to be evaluated against execution
+equivalence rather than token identity. Options:
+- Drop cross-entropy, train with round-trip loss only (requires
+  the encoder's pairwise MSE to provide enough structure for the
+  round-trip to bootstrap from)
+- Add an execution verification step: decode → execute → compare
+  register deltas to original (REINFORCE or similar, since
+  execution is not differentiable)
+- Use the round-trip loss with a frozen encoder that already has
+  good equivalence geometry (chicken-and-egg: need the equivalence
+  to train the equivalence)
+
+**Decoder equivalence validation.** To confirm the architecture is
+compatible with future equivalence training, tested decoding from
+interpolated points between equivalent instruction vectors:
+
+| Pair (cosine)               | Midpoint decodes to    | Equiv? |
+|-----------------------------|------------------------|--------|
+| ADD(5,3,7) / ADD(5,7,3) (0.96) | ADD X5 X3 X7       | yes    |
+| XOR(10,3,7) / XOR(10,7,3) (0.97) | XOR X10 X3 X7   | yes    |
+| SUB(5,3,3) / XOR(5,3,3) (0.93) | XOR X5 X3 X3       | yes    |
+| ADD(5,3,3) / SLLI(5,3,1) (0.69) | SLLI X5 X3 1      | yes    |
+| ADDI(5,3,0) / OR(5,3,0) (0.56) | SLLI X5 X3 11      | **no** |
+
+For pairs with cosine > ~0.7, the decoder produces a valid
+execution-equivalent instruction from every point along the
+interpolation path (tested at α = 0.25, 0.50, 0.75). The decoder
+smoothly transitions between equivalent forms — e.g., commutative
+ADD flips operand order between α=0.50 and α=0.75, SUB-self
+transitions to XOR-self at α=0.50.
+
+Breaks down at cosine < ~0.6 (ADDI-identity / OR-zero): the
+interpolation path passes through invalid territory.
+
+**Conclusion:** the decoder architecture is fundamentally compatible
+with equivalence. If the encoder collapses equivalents to nearby
+points, the decoder correctly picks one valid representative. The
+equivalence problem is purely in the encoder's training signal,
+not in the decoder's architecture. No architectural changes needed
+when equivalence training is added later.

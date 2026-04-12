@@ -202,7 +202,8 @@ def streaming_train(batch_iter, d_model=128, n_heads=4, n_layers=2,
                     dec_n_layers=2, lr=3e-4, device='auto',
                     n_steps=None, log_every=100, lr_schedule=None,
                     lr_min=1e-6, gate_tau=1.0, recon_weight=1.0,
-                    pairwise_weight=1.0):
+                    pairwise_weight=1.0, roundtrip_weight=0.0,
+                    gumbel_tau=1.0):
     """Train streaming compressor + decoder jointly.
 
     Losses:
@@ -280,9 +281,38 @@ def streaming_train(batch_iter, d_model=128, n_heads=4, n_layers=2,
             model_dists[tri[0], tri[1]],
             exec_dists[tri[0], tri[1]])
 
+        # --- Round-trip loss ---
+        rt_loss_val = 0.0
+        if roundtrip_weight > 0:
+            # Gumbel-softmax on decoder output for differentiable tokens.
+            soft = F.gumbel_softmax(logits, tau=gumbel_tau,
+                                    hard=True, dim=-1)  # (N, T, V)
+
+            # Soft embeddings using encoder's token embedding matrix.
+            soft_emb = soft @ encoder.tok_emb.weight  # (N, T, d_model)
+
+            # Prepend BOS embedding.
+            bos_emb = encoder.tok_emb(
+                torch.full((N, 1), BOS, dtype=torch.long, device=device))
+            full_emb = torch.cat([bos_emb, soft_emb], dim=1)  # (N, T+1, d_model)
+            full_pad = torch.cat([
+                torch.zeros(N, 1, dtype=torch.bool, device=device),
+                dec_padding,
+            ], dim=1)
+
+            # Re-encode through the encoder.
+            reencoded = encoder.encode_soft(full_emb, full_pad)
+
+            # Cosine distance (vectors are L2-normalized).
+            rt_loss = (1 - (emissions * reencoded).sum(dim=-1)).mean()
+            rt_loss_val = rt_loss.item()
+        else:
+            rt_loss = 0.0
+
         # --- Combined loss ---
         loss = (recon_weight * recon_loss
-                + pairwise_weight * pairwise_loss)
+                + pairwise_weight * pairwise_loss
+                + roundtrip_weight * rt_loss)
 
         opt.zero_grad()
         loss.backward()
@@ -297,6 +327,7 @@ def streaming_train(batch_iter, d_model=128, n_heads=4, n_layers=2,
             'total': loss_val,
             'recon': recon_val,
             'pairwise': pair_val,
+            'roundtrip': rt_loss_val,
         })
 
         # Gate statistics.
@@ -329,9 +360,10 @@ def streaming_train(batch_iter, d_model=128, n_heads=4, n_layers=2,
             elapsed = time.time() - t0
             ms_per = elapsed / step * 1000
             current_lr = scheduler.get_last_lr()[0] if scheduler else lr
+            rt_str = f' rt {rt_loss_val:.4f}' if roundtrip_weight > 0 else ''
             print(f'step {step:>6d}  '
                   f'loss {loss_val:.4f} '
-                  f'(recon {recon_val:.3f} pair {pair_val:.4f})  '
+                  f'(recon {recon_val:.3f} pair {pair_val:.4f}{rt_str})  '
                   f'acc {recon_acc:.1%}  '
                   f'lr {current_lr:.1e}  {ms_per:.0f}ms/step  '
                   f'emit {gs["emits_per_seq"]:.1f}/'

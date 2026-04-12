@@ -64,6 +64,10 @@ def main():
                    help='Weight for reconstruction loss')
     p.add_argument('--pairwise-weight', type=float, default=1.0,
                    help='Weight for pairwise MSE loss')
+    p.add_argument('--roundtrip-weight', type=float, default=0.0,
+                   help='Weight for round-trip loss (0 = disabled)')
+    p.add_argument('--gumbel-tau', type=float, default=1.0,
+                   help='Gumbel-softmax temperature for decoder output')
 
     args = p.parse_args()
 
@@ -104,6 +108,8 @@ def main():
             gate_tau=args.gate_tau,
             recon_weight=args.recon_weight,
             pairwise_weight=args.pairwise_weight,
+            roundtrip_weight=args.roundtrip_weight,
+            gumbel_tau=args.gumbel_tau,
         )
         last = losses[-1]
         print(f'\nDone: {len(losses)} steps, '
