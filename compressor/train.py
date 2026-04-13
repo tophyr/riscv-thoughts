@@ -252,17 +252,29 @@ def streaming_train(batch_iter, d_model=128, n_heads=4, n_layers=2,
         if N < 2:
             continue
 
-        # --- Reconstruction loss ---
+        # --- Reconstruction loss (weighted by window size) ---
         dec_input, dec_target, dec_padding = _prepare_decoder_targets(
             emission_info, device)
 
         logits = decoder(emissions, dec_input, dec_padding)
 
-        # Cross-entropy ignoring PAD positions.
-        recon_loss = F.cross_entropy(
+        # Per-emission cross-entropy, weighted by window size.
+        # Larger windows = higher cost, pushing the gate to emit earlier.
+        window_sizes = torch.tensor(
+            [info['window_size'] for info in emission_info],
+            dtype=torch.float32, device=device)
+
+        per_token_loss = F.cross_entropy(
             logits.reshape(-1, VOCAB_SIZE),
             dec_target.reshape(-1),
-            ignore_index=PAD)
+            ignore_index=PAD, reduction='none')
+        # Reshape back to (N, T) and compute per-emission mean.
+        per_token_loss = per_token_loss.reshape(N, -1)
+        non_pad_counts = (~dec_padding).sum(dim=1).clamp(min=1).float()
+        per_emission_loss = per_token_loss.sum(dim=1) / non_pad_counts
+
+        # Weight by window size and average.
+        recon_loss = (per_emission_loss * window_sizes).sum() / window_sizes.sum()
 
         # --- Pairwise MSE loss ---
         emission_deltas = _compute_emission_deltas(
@@ -310,6 +322,8 @@ def streaming_train(batch_iter, d_model=128, n_heads=4, n_layers=2,
             rt_loss = 0.0
 
         # --- Combined loss ---
+        # Reconstruction loss is already weighted by window size:
+        # larger windows cost more, pushing the gate to emit early.
         loss = (recon_weight * recon_loss
                 + pairwise_weight * pairwise_loss
                 + roundtrip_weight * rt_loss)
@@ -323,11 +337,13 @@ def streaming_train(batch_iter, d_model=128, n_heads=4, n_layers=2,
         loss_val = loss.item()
         recon_val = recon_loss.item()
         pair_val = pairwise_loss.item()
+        mean_window = window_sizes.mean().item()
         losses.append({
             'total': loss_val,
             'recon': recon_val,
             'pairwise': pair_val,
             'roundtrip': rt_loss_val,
+            'mean_window': mean_window,
         })
 
         # Gate statistics.
@@ -363,11 +379,13 @@ def streaming_train(batch_iter, d_model=128, n_heads=4, n_layers=2,
             rt_str = f' rt {rt_loss_val:.4f}' if roundtrip_weight > 0 else ''
             print(f'step {step:>6d}  '
                   f'loss {loss_val:.4f} '
-                  f'(recon {recon_val:.3f} pair {pair_val:.4f}{rt_str})  '
+                  f'(recon {recon_val:.3f} pair {pair_val:.4f}'
+                  f'{rt_str})  '
                   f'acc {recon_acc:.1%}  '
                   f'lr {current_lr:.1e}  {ms_per:.0f}ms/step  '
                   f'emit {gs["emits_per_seq"]:.1f}/'
-                  f'{gs["instrs_per_seq"]:.1f}')
+                  f'{gs["instrs_per_seq"]:.1f}  '
+                  f'win {mean_window:.1f}')
 
         if n_steps and step >= n_steps:
             break
