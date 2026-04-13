@@ -172,6 +172,7 @@ class StreamingCompressor(nn.Module):
                         'instr_start': i_start,
                         'instr_end': i_end,
                         'target_tokens': target_toks,
+                        'window_size': t - window_start + 1,
                     })
                     n_emits += 1
 
@@ -229,7 +230,7 @@ class Decoder(nn.Module):
     """
 
     def __init__(self, vocab_size, d_model, n_heads, n_layers, d_emb,
-                 max_seq_len=24, dropout=0.0):
+                 max_seq_len=64, dropout=0.0):
         super().__init__()
         self.d_model = d_model
         self.vocab_size = vocab_size
