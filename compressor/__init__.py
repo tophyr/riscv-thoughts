@@ -1,1 +1,1 @@
-from .model import Compressor, StreamingCompressor, Decoder
+from .model import Compressor, ShiftReduceCompressor, Decoder

@@ -3,14 +3,14 @@
 
 Modes:
     fixed:     Fixed-window model for context experiments.
-    streaming: Streaming encoder + decoder with learnable emit gate.
+    streaming: Shift-reduce compressor with REINFORCE gate training.
 
 Usage:
-    # Context experiment (fixed window):
+    # Context experiment:
     gen_seq_batches.py --n-batches 5000 | \
         train_compressor.py --mode fixed --window-size 2
 
-    # Streaming compressor with decoder:
+    # Streaming compressor:
     gen_seq_batches.py --n-batches 5000 | \
         train_compressor.py --mode streaming --n-steps 10000
 """
@@ -47,27 +47,17 @@ def main():
     # Training.
     p.add_argument('--lr', type=float, default=3e-4)
     p.add_argument('--n-steps', type=int, default=None)
-    p.add_argument('--lr-schedule', type=int, default=None,
-                   help='Cosine decay over this many steps')
+    p.add_argument('--lr-schedule', type=int, default=None)
     p.add_argument('--device', default='auto')
     p.add_argument('--log-every', type=int, default=100)
     p.add_argument('--save', type=str, default=None)
 
-    # Fixed-window mode.
-    p.add_argument('--window-size', type=int, default=1,
-                   help='Instructions per window (fixed mode only)')
+    # Fixed mode.
+    p.add_argument('--window-size', type=int, default=1)
 
     # Streaming mode.
-    p.add_argument('--gate-tau', type=float, default=1.0,
-                   help='Gumbel-sigmoid temperature')
-    p.add_argument('--recon-weight', type=float, default=1.0,
-                   help='Weight for reconstruction loss')
-    p.add_argument('--pairwise-weight', type=float, default=1.0,
-                   help='Weight for pairwise MSE loss')
-    p.add_argument('--roundtrip-weight', type=float, default=0.0,
-                   help='Weight for round-trip loss (0 = disabled)')
-    p.add_argument('--gumbel-tau', type=float, default=1.0,
-                   help='Gumbel-softmax temperature for decoder output')
+    p.add_argument('--pairwise-weight', type=float, default=1.0)
+    p.add_argument('--reinforce-lr', type=float, default=1e-3)
 
     args = p.parse_args()
 
@@ -105,11 +95,8 @@ def main():
             n_steps=args.n_steps,
             log_every=args.log_every,
             lr_schedule=args.lr_schedule,
-            gate_tau=args.gate_tau,
-            recon_weight=args.recon_weight,
             pairwise_weight=args.pairwise_weight,
-            roundtrip_weight=args.roundtrip_weight,
-            gumbel_tau=args.gumbel_tau,
+            reinforce_lr=args.reinforce_lr,
         )
         last = losses[-1]
         print(f'\nDone: {len(losses)} steps, '
