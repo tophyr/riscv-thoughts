@@ -17,9 +17,9 @@ import numpy as np
 import torch
 from scipy import stats
 
-from datagen import BatchReader
-from compressor.model import Compressor
-from compressor.train import extract_windows, exec_distance
+from datagen import SequenceBatchReader
+from compressor.model import T1Compressor
+from compressor.train import extract_windows, exec_distance_deltas as exec_distance
 from tokenizer import VOCAB_SIZE, VOCAB
 
 
@@ -42,7 +42,7 @@ def evaluate(model, batch_iter, window_size, device, max_batches=100):
             pad = torch.from_numpy(padding_mask).to(device)
             delta_t = torch.from_numpy(deltas)
 
-            vecs = model(tok, pad)
+            vecs = model.encode(tok, pad)
             md = torch.cdist(vecs.unsqueeze(0), vecs.unsqueeze(0),
                              p=2).squeeze(0)
             ed = exec_distance(delta_t, device)
@@ -82,13 +82,13 @@ def main():
     else:
         device = args.device
 
-    model = Compressor(VOCAB_SIZE, args.d_model, args.n_heads,
+    model = T1Compressor(VOCAB_SIZE, args.d_model, args.n_heads,
                        args.n_layers, args.d_out)
     model.load_state_dict(torch.load(args.model, map_location=device,
                                      weights_only=True))
     model = model.to(device)
 
-    reader = BatchReader(sys.stdin.buffer)
+    reader = SequenceBatchReader(sys.stdin.buffer)
     evaluate(model, reader, args.window_size, device,
              max_batches=args.max_batches)
 

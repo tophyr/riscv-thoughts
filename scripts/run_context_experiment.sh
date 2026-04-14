@@ -13,7 +13,6 @@ echo "=== Training window_size=1 (baseline, no context) ==="
 python scripts/batch_repeat.py --forever /tmp/context_exp_corpus.bin | \
     python scripts/train_compressor.py \
         --window-size 1 --n-steps 5000 --log-every 500 \
-        --lr-schedule 5000 \
         --save /tmp/context_exp_w1
 
 echo ""
@@ -21,7 +20,6 @@ echo "=== Training window_size=2 (one instruction of context) ==="
 python scripts/batch_repeat.py --forever /tmp/context_exp_corpus.bin | \
     python scripts/train_compressor.py \
         --window-size 2 --n-steps 5000 --log-every 500 \
-        --lr-schedule 5000 \
         --save /tmp/context_exp_w2
 
 echo ""

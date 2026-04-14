@@ -6,11 +6,45 @@ import pytest
 
 from emulator import Instruction, R_TYPE, I_TYPE, B_TYPE, LOAD_TYPE, STORE_TYPE, run, make_ctx, random_regs
 from datagen import (
-    Batch,
-    random_basic_block, execute_sequence, produce_batch,
-    write_batch, read_batch,
-    write_stream_header, read_stream_header,
+    SequenceBatch, random_basic_block, execute_sequence, produce_sequence_batch,
 )
+from datagen.seqgen import (
+    write_stream_header, read_stream_header,
+    write_batch, read_batch,
+)
+from datagen.instrgen import (
+    _OPCODE_DISTRIBUTION, DEFAULT_DISTRIBUTION,
+    validate_distribution,
+)
+
+
+class TestOpcodeDistribution:
+    def test_default_weights_sum_to_one(self):
+        """The default distribution is validated at import time.
+        This test verifies the built table also sums correctly."""
+        total = sum(weight for weight, _ in _OPCODE_DISTRIBUTION)
+        assert abs(total - 1.0) < 1e-9, \
+            f'opcode distribution weights sum to {total}, not 1.0'
+
+    def test_validate_rejects_bad_sum(self):
+        bad = dict(DEFAULT_DISTRIBUTION)
+        bad['R_ALU'] = 0.99  # now sums to > 1
+        with pytest.raises(ValueError, match='sum to'):
+            validate_distribution(bad)
+
+    def test_validate_rejects_unknown_category(self):
+        bad = {'R_ALU': 0.5, 'NONEXISTENT': 0.5}
+        with pytest.raises(ValueError, match='Unknown'):
+            validate_distribution(bad)
+
+    def test_produce_with_bad_distribution_fails(self):
+        """Passing a bad distribution to produce_instruction_batch
+        should fail at validation time, not silently produce garbage."""
+        from datagen import produce_instruction_batch
+        rng = np.random.default_rng(0)
+        bad = {'R_ALU': 0.5, 'I_ALU': 0.3}  # sums to 0.8
+        with pytest.raises(ValueError, match='sum to'):
+            produce_instruction_batch(8, 2, rng, dist=bad)
 
 
 class TestRandomBasicBlock:
@@ -195,9 +229,9 @@ class TestExecuteSequence:
 class TestProduceSeqBatch:
     def test_shapes(self):
         rng = np.random.default_rng(0)
-        batch = produce_batch(batch_size=8, n_inputs=4,
-                                  max_block_len=5, rng=rng)
-        assert isinstance(batch, Batch)
+        batch = produce_sequence_batch(batch_size=8, n_inputs=4,
+                                          max_block_len=5, rng=rng)
+        assert isinstance(batch, SequenceBatch)
         B = 8
         assert batch.token_ids.shape[0] == B
         assert batch.padding_mask.shape == batch.token_ids.shape
@@ -212,16 +246,16 @@ class TestProduceSeqBatch:
 
     def test_n_instructions_consistent(self):
         rng = np.random.default_rng(0)
-        batch = produce_batch(batch_size=16, n_inputs=2,
-                                  max_block_len=5, rng=rng)
+        batch = produce_sequence_batch(batch_size=16, n_inputs=2,
+                                          max_block_len=5, rng=rng)
         # max_instrs from batch should be max of n_instructions
         max_instrs = batch.per_instr_regs.shape[1] - 1
         assert max_instrs == int(batch.n_instructions.max())
 
     def test_token_instr_idx_validity(self):
         rng = np.random.default_rng(0)
-        batch = produce_batch(batch_size=8, n_inputs=2,
-                                  max_block_len=5, rng=rng)
+        batch = produce_sequence_batch(batch_size=8, n_inputs=2,
+                                          max_block_len=5, rng=rng)
         for b in range(8):
             n = int(batch.n_instructions[b])
             indices = batch.token_instr_idx[b]
@@ -235,16 +269,16 @@ class TestProduceSeqBatch:
 
     def test_x0_always_zero(self):
         rng = np.random.default_rng(0)
-        batch = produce_batch(batch_size=8, n_inputs=4,
-                                  max_block_len=5, rng=rng)
+        batch = produce_sequence_batch(batch_size=8, n_inputs=4,
+                                          max_block_len=5, rng=rng)
         # x0 (register 0) should always be 0 in any snapshot
         assert (batch.per_instr_regs[..., 0] == 0).all()
 
     def test_deterministic(self):
-        b1 = produce_batch(batch_size=4, n_inputs=2,
-                               max_block_len=5, rng=np.random.default_rng(42))
-        b2 = produce_batch(batch_size=4, n_inputs=2,
-                               max_block_len=5, rng=np.random.default_rng(42))
+        b1 = produce_sequence_batch(batch_size=4, n_inputs=2,
+                                       max_block_len=5, rng=np.random.default_rng(42))
+        b2 = produce_sequence_batch(batch_size=4, n_inputs=2,
+                                       max_block_len=5, rng=np.random.default_rng(42))
         assert np.array_equal(b1.token_ids, b2.token_ids)
         assert np.array_equal(b1.per_instr_regs, b2.per_instr_regs)
 
@@ -252,8 +286,8 @@ class TestProduceSeqBatch:
 class TestSeqBatchIO:
     def test_roundtrip(self):
         rng = np.random.default_rng(42)
-        batch = produce_batch(batch_size=4, n_inputs=2,
-                                  max_block_len=5, rng=rng)
+        batch = produce_sequence_batch(batch_size=4, n_inputs=2,
+                                          max_block_len=5, rng=rng)
 
         buf = io.BytesIO()
         write_stream_header(buf)
@@ -275,7 +309,7 @@ class TestSeqBatchIO:
         buf = io.BytesIO()
         write_stream_header(buf)
         for _ in range(3):
-            write_batch(buf, produce_batch(
+            write_batch(buf, produce_sequence_batch(
                 batch_size=4, n_inputs=2, max_block_len=5, rng=rng))
 
         buf.seek(0)

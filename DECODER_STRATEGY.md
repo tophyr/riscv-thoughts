@@ -101,10 +101,14 @@ the compressor learned smooth geometry.
 
 ---
 
-## Phase 2: Learned Decoder
+## Phase 2: Learned Decoder (Implemented — Exp 20-21)
 
 Replace gradient search with a neural network that jumps to the
-answer in one forward pass.
+answer in one forward pass. **Status:** implemented as a 2-layer
+transformer decoder with cross-attention to the emission vector.
+Reaches 99.6% token reconstruction accuracy (Exp 21). Equivalence
+validation confirms correct behavior at vector midpoints when
+cosine similarity > 0.7.
 
 ### Architecture
 
@@ -163,7 +167,7 @@ controls quality.
 
 ---
 
-## Phase 3: Continuous Learning
+## Phase 3: Continuous Learning (Future)
 
 Every real decoding attempt is a free training example.
 

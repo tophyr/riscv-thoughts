@@ -13,45 +13,15 @@ import numpy as np
 
 from emulator import (
     Instruction, run as run_instruction, make_ctx, random_regs,
-    SparseMemory,
-    R_TYPE, I_TYPE, B_TYPE, LOAD_TYPE, STORE_TYPE,
+    SparseMemory, B_TYPE, STORE_TYPE,
 )
 from tokenizer import encode_instruction, BOS, EOS, PAD
 
-
-# ---------------------------------------------------------------------------
-# Opcode, register, and immediate helpers
-# ---------------------------------------------------------------------------
-
-_DEST_REGS = list(range(1, 32))
-_SRC_REGS = list(range(0, 32))
-
-_ALU_R_OPS = ['ADD', 'SUB', 'XOR', 'OR', 'AND', 'SLL', 'SRL', 'SRA', 'SLT', 'SLTU']
-_ALU_I_OPS = ['ADDI', 'XORI', 'ORI', 'ANDI', 'SLLI', 'SRLI', 'SRAI', 'SLTI', 'SLTIU']
-_SHIFT_I_OPS = {'SLLI', 'SRLI', 'SRAI'}
-_LOAD_OPS = ['LB', 'LBU', 'LH', 'LHU', 'LW']
-_STORE_OPS = ['SB', 'SH', 'SW']
-_BRANCH_OPS = ['BEQ', 'BNE', 'BLT', 'BGE', 'BLTU', 'BGEU']
-
-
-def _random_imm12(rng: np.random.Generator) -> int:
-    """Random 12-bit signed immediate [-2048, 2048)."""
-    return int(rng.integers(-2048, 2048))
-
-
-def _i_type_imm(rng: np.random.Generator, op: str) -> int:
-    """Random I-type immediate: 5-bit shift amount or 12-bit signed."""
-    return int(rng.integers(0, 32)) if op in _SHIFT_I_OPS else _random_imm12(rng)
-
-
-def _random_branch_offset(rng: np.random.Generator) -> int:
-    """Random branch offset (13-bit signed, 2-byte aligned)."""
-    return int(rng.integers(-2048, 2048)) * 2
-
-
-def _random_upper_imm(rng: np.random.Generator) -> int:
-    """Random upper immediate (20-bit unsigned)."""
-    return int(rng.integers(0, 0x100000))
+from .instrgen import (
+    random_instruction, _make_instruction,
+    _ALU_R_OPS, _ALU_I_OPS, _LOAD_OPS, _STORE_OPS, _BRANCH_OPS,
+    _DEST_REGS, _SRC_REGS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +29,7 @@ def _random_upper_imm(rng: np.random.Generator) -> int:
 # ---------------------------------------------------------------------------
 
 @dataclass
-class Batch:
+class SequenceBatch:
     """A batch of instruction sequences with execution snapshots.
 
     Token layout: each sequence is a flat token stream with optional
@@ -89,6 +59,10 @@ def _data_flow_instruction(rng: np.random.Generator,
     the live register set (creating a data dependency).
 
     If force_branch is True, generate a branch instruction.
+
+    NOTE: the type distribution here (40/35/10/10/5) is hardcoded.
+    When sequence generation needs configurable distributions, this
+    should accept an opcode table like random_instruction does.
     """
     live_list = sorted(live_regs)  # deterministic ordering for rng.choice
 
@@ -102,7 +76,7 @@ def _data_flow_instruction(rng: np.random.Generator,
         else:
             rs1 = int(rng.choice(_SRC_REGS))
             rs2 = int(rng.choice(_SRC_REGS))
-        return Instruction(op, int(rs1), int(rs2), _random_branch_offset(rng))
+        return _make_instruction(rng, op, rs1=int(rs1), rs2=int(rs2))
 
     use_live = len(live_list) > 0 and rng.random() < 0.6
 
@@ -111,34 +85,19 @@ def _data_flow_instruction(rng: np.random.Generator,
 
     roll = rng.random()
     if roll < 0.4:
-        # R-type ALU
         op = str(rng.choice(_ALU_R_OPS))
-        rd = int(rng.choice(_DEST_REGS))
-        rs1 = _pick_src()
-        rs2 = int(rng.choice(_SRC_REGS))
-        return Instruction(op, rd, rs1, rs2)
+        return _make_instruction(rng, op, rs1=_pick_src())
     elif roll < 0.75:
-        # I-type ALU
         op = str(rng.choice(_ALU_I_OPS))
-        rd = int(rng.choice(_DEST_REGS))
-        rs1 = _pick_src()
-        return Instruction(op, rd, rs1, _i_type_imm(rng, op))
+        return _make_instruction(rng, op, rs1=_pick_src())
     elif roll < 0.85:
-        # Load
         op = str(rng.choice(_LOAD_OPS))
-        rd = int(rng.choice(_DEST_REGS))
-        rs1 = _pick_src()
-        return Instruction(op, rd, _random_imm12(rng), rs1)
+        return _make_instruction(rng, op, rs1=_pick_src())
     elif roll < 0.95:
-        # Store
         op = str(rng.choice(_STORE_OPS))
-        rs2 = _pick_src()
-        rs1 = int(rng.choice(_SRC_REGS))
-        return Instruction(op, rs2, _random_imm12(rng), rs1)
+        return _make_instruction(rng, op, rs2=_pick_src())
     else:
-        # LUI
-        rd = int(rng.choice(_DEST_REGS))
-        return Instruction('LUI', rd, _random_upper_imm(rng))
+        return _make_instruction(rng, 'LUI')
 
 
 def _instr_dest_reg(instr: Instruction) -> int | None:
@@ -251,8 +210,8 @@ def _encode_with_instr_idx(instructions: list[Instruction]
 # Batch production
 # ---------------------------------------------------------------------------
 
-def produce_batch(batch_size: int, n_inputs: int, max_block_len: int,
-                  rng: np.random.Generator) -> Batch:
+def produce_sequence_batch(batch_size: int, n_inputs: int, max_block_len: int,
+                           rng: np.random.Generator) -> SequenceBatch:
     """Generate one batch of instruction sequences with executions."""
     sequences: list[list[Instruction]] = []
     encoded: list[tuple[list[int], list[int]]] = []
@@ -291,7 +250,7 @@ def produce_batch(batch_size: int, n_inputs: int, max_block_len: int,
             per_instr_regs[b, :n + 1, s, :] = regs_snap
             per_instr_pcs[b, :n + 1, s] = pc_snap
 
-    return Batch(
+    return SequenceBatch(
         token_ids=token_ids,
         padding_mask=padding_mask,
         token_instr_idx=token_instr_idx,
@@ -361,8 +320,8 @@ def read_stream_header(f):
         raise ValueError(f'Dtype mismatch: {dtype_chars!r}')
 
 
-def write_batch(f, batch: Batch):
-    """Write a Batch to a binary stream."""
+def write_batch(f, batch: SequenceBatch):
+    """Write a SequenceBatch to a binary stream."""
     B, max_tokens = batch.token_ids.shape
     max_instrs = batch.per_instr_regs.shape[1] - 1
     n_inputs = batch.per_instr_regs.shape[2]
@@ -375,8 +334,8 @@ def write_batch(f, batch: Batch):
     f.write(batch.per_instr_pcs.tobytes())
 
 
-def read_batch(f) -> Batch | None:
-    """Read a Batch from a binary stream. Returns None at clean EOF."""
+def read_batch(f) -> SequenceBatch | None:
+    """Read a SequenceBatch from a binary stream. Returns None at clean EOF."""
     header = f.read(_BATCH_HEADER.size)
     if len(header) == 0:
         return None
@@ -391,7 +350,7 @@ def read_batch(f) -> Batch | None:
             raise EOFError(f'Truncated batch data (got {len(buf)}, expected {nbytes})')
         return np.frombuffer(buf, dtype=dtype).reshape(shape).copy()
 
-    return Batch(
+    return SequenceBatch(
         token_ids=_read_array(_FIELD_DTYPES[0], (B, max_tokens)),
         padding_mask=_read_array(_FIELD_DTYPES[1], (B, max_tokens)),
         token_instr_idx=_read_array(_FIELD_DTYPES[2], (B, max_tokens)),
@@ -418,8 +377,8 @@ def read_batch_bytes(f) -> bytes | None:
     return header + body
 
 
-class BatchReader:
-    """Reads pre-generated batches from a binary stream."""
+class SequenceBatchReader:
+    """Reads pre-generated sequence batches from a binary stream."""
 
     def __init__(self, f):
         self._f = f
