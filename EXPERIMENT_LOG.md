@@ -1025,3 +1025,153 @@ points, the decoder correctly picks one valid representative. The
 equivalence problem is purely in the encoder's training signal,
 not in the decoder's architecture. No architectural changes needed
 when equivalence training is added later.
+
+---
+
+## Phase 8: Shift-Reduce Architecture (Gate Training)
+
+Goal: replace the parallel bidirectional encoder with a genuine
+streaming shift-reduce parser where gates control information flow
+causally. The accept gate admits tokens one at a time, the emit
+gate decides when to output a T1 vector, and the evict gate removes
+stale tokens from the window.
+
+### Architecture
+
+**Window encoder:** bidirectional transformer over current window
+contents. Produces a T1 candidate on S^127 from the window state.
+Runs at every iteration (not just at emit points).
+
+**Gate controller:** GRU processes T1 candidates sequentially,
+maintaining hidden state across iterations. Three independent gate
+heads (2-layer MLPs):
+- Accept: sees (next token embedding, T1 candidate, GRU hidden)
+- Emit: sees (T1 candidate, GRU hidden)
+- Evict: sees (T1 candidate, GRU hidden)
+
+**Decoder:** autoregressive transformer decoder conditioned on T1
+vector. Evaluates T1 candidate against current window tokens at
+every iteration (not just at emit points), providing per-iteration
+reconstruction quality signal.
+
+**Key design decisions:**
+- Gates read from the T1 candidate (the compression output), not
+  the raw token stream. The emit gate asks "is this vector good
+  enough to output?" by judging the compressed representation.
+- Tokens arrive strictly in order; the window is always contiguous.
+  Accept cannot skip tokens. Evict removes the oldest token (FIFO).
+- The GRU provides temporal context ("how has the T1 candidate
+  been evolving?") without requiring future information.
+
+### Experiment 22: Gumbel-sigmoid gates (2000 steps)
+
+First attempt: gates use Gumbel-sigmoid with straight-through
+estimation. The gate decisions control Python if-statements in
+the shift-reduce loop.
+
+**Result: Gates learned nothing.** Accept 17-18%, emit 75-76%,
+evict 12% — identical from step 100 to step 2000. The decoder
+improved (loss 3.2 → 2.1, accuracy 23% → 34%) by learning to
+reconstruct from random windows.
+
+**Root cause:** Converting Gumbel-sigmoid output to Python booleans
+(`.item() > 0.5`) and using them in `if` statements breaks the
+computation graph. The gate logits receive zero gradient. The
+straight-through trick requires the hard decision to multiply a
+continuous value, not control program flow.
+
+### Experiment 23: REINFORCE gates with per-iteration decoder (500 steps)
+
+Replaced Gumbel-sigmoid with Bernoulli sampling + REINFORCE.
+The decoder evaluates the T1 candidate at every iteration (not
+just emit points), providing per-iteration reconstruction quality
+as the reward signal.
+
+**Gate training signal:**
+- High recon quality + emit=no → penalize (should have emitted)
+- Low recon quality + emit=yes → penalize (emitted garbage)
+- High recon quality + emit=yes → reward (good emission)
+- Low recon quality + emit=no → reward (correctly waited)
+
+Per-iteration advantage = reconstruction loss - moving average
+baseline. Separate optimizer for gate parameters (REINFORCE LR)
+vs encoder+decoder parameters (normal backprop LR).
+
+**Result: Gates respond but don't learn boundaries.**
+
+| Metric     | Step 25 | Step 250 | Step 500 |
+|------------|---------|----------|----------|
+| Recon loss | 51.6    | 35.9     | 37.8     |
+| Accuracy   | 20.9%   | 28.5%    | 28.7%    |
+| Accept     | 87%     | 89%      | 88%      |
+| Emit       | 10%     | 11%      | 6%       |
+| Evict      | 12%     | 14%      | 14%      |
+| Emissions  | 100/3.5 | 95/3.4   | 98/3.7   |
+
+REINFORCE successfully moves the gates (accept jumped to 88%,
+emit dropped to 6-10%). But the emit gate learns "fire rarely"
+uniformly — not "fire at instruction boundaries." The decoder
+reaches only ~29% accuracy, not enough to provide contrast
+between "good emit point" (complete instruction, low loss) and
+"bad emit point" (partial instruction, high loss).
+
+**Fundamental problem: chicken-and-egg.** The gates need a
+competent decoder to know where to emit. The decoder needs
+good windows to learn reconstruction. The gates need good
+windows to provide good training data. Joint training from
+scratch can't bootstrap all three simultaneously.
+
+### Conclusions: Piecemeal Assembly for T1
+
+The joint training experiments (Exp 20-23) conclusively show
+that training all components together from scratch doesn't work
+for T1. The gate training problem is not that the architecture
+is wrong — the shift-reduce parser with REINFORCE is correct —
+but that each component needs the others to already work before
+it can learn.
+
+However, training components separately IS tractable:
+- Encoder on fixed windows → 99.6% decodable (Exp 21)
+- Decoder conditioned on those vectors → 99.6% accuracy (Exp 21)
+- Gates supervised on instruction boundaries → straightforward
+
+**Decision: assemble T1 from separately-trained components.**
+
+1. **Encoder:** train on fixed windows (already done, Exp 21)
+2. **Decoder:** train conditioned on encoder vectors (already done)
+3. **Gates:** supervised training on instruction boundaries
+4. **Assembly:** combine into the shift-reduce architecture
+5. **Fine-tune:** joint training with T2 feedback when T2 exists
+
+This is not a retreat from the streaming architecture. The
+shift-reduce parser IS the final architecture. The gates ARE
+learned. The only change is training order: components are
+pre-trained separately and assembled, then fine-tuned jointly
+when cross-level feedback (T2) provides signal that requires
+joint optimization.
+
+The philosophy — "gates should discover boundaries themselves"
+— is worth pursuing at T2 and above, where thought boundaries
+are NOT syntactically obvious and must be inferred from semantic
+content. At T1, instruction boundaries are syntactically marked
+(opcode tokens), so supervising them is pragmatic, not a
+compromise. The architecture supports either approach.
+
+**What the joint training DID accomplish:** the unified experiments
+were not wasted. They forced us to design the correct streaming
+architecture — the shift-reduce parser with causal gate controller,
+bidirectional window encoder, per-iteration decoder evaluation,
+and REINFORCE gate training. These architectural decisions would
+not have been reached by training components in isolation. The
+architecture is correct; only the training order needs to change.
+Specifically:
+- Gumbel-sigmoid in Python control flow gives zero gradient
+  (Exp 22). REINFORCE is the right gate training signal.
+- The decoder must evaluate at every iteration, not just emit
+  points, so the emit gate gets signal for missed opportunities.
+- The gate controller must be causal (GRU), reading from the T1
+  candidate (the compression output) rather than raw tokens.
+- Gates fire independently per iteration; evict removes one
+  token (FIFO) per firing.
+- Window-size-weighted reconstruction provides the right cost
+  signal for all three gates without explicit density targets.

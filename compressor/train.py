@@ -1,7 +1,7 @@
 """Training loops for the compressor.
 
 - train(): fixed-window training for context experiments
-- streaming_train(): streaming compressor with emit gate + decoder
+- streaming_train(): shift-reduce compressor with REINFORCE gate training
 """
 
 import time
@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from tokenizer import BOS, EOS, PAD, VOCAB_SIZE
-from .model import Compressor, StreamingCompressor, Decoder
+from .model import Compressor, ShiftReduceCompressor, Decoder
 
 
 # ---------------------------------------------------------------------------
@@ -19,11 +19,7 @@ from .model import Compressor, StreamingCompressor, Decoder
 # ---------------------------------------------------------------------------
 
 def exec_distance(deltas, device):
-    """Pairwise execution distance from per-register deltas.
-
-    deltas: (N, n_inputs, 32) tensor
-    Returns: (N, N) float32 distance matrix
-    """
+    """Pairwise execution distance from per-register deltas."""
     d = deltas.to(device=device, dtype=torch.float32)
     diff = (d.unsqueeze(1) - d.unsqueeze(0)).abs()
     return diff.log1p_().mean(dim=(-1, -2))
@@ -36,7 +32,6 @@ def exec_distance(deltas, device):
 def extract_windows(batch, window_size=1):
     """Extract per-instruction training examples from a sequence batch."""
     B = batch.token_ids.shape[0]
-
     all_tokens = []
     all_deltas = []
 
@@ -51,7 +46,6 @@ def extract_windows(batch, window_size=1):
             sel = mask & (idx >= start_instr) & (idx <= i)
             instr_tokens = tok[sel].tolist()
             all_tokens.append([BOS] + instr_tokens + [EOS])
-
             delta = (batch.per_instr_regs[b, i + 1, :, :]
                      - batch.per_instr_regs[b, i, :, :])
             all_deltas.append(delta)
@@ -138,32 +132,20 @@ def train(batch_iter, window_size=1, d_model=128, n_heads=4, n_layers=2,
 
 
 # ---------------------------------------------------------------------------
-# Streaming compressor training with decoder
+# Decoder target preparation
 # ---------------------------------------------------------------------------
 
-def _prepare_decoder_targets(emission_info, device):
-    """Build decoder input/target tensors from emission info.
+def _prepare_decoder_targets(token_lists, device):
+    """Build decoder input/target tensors from lists of token IDs.
 
-    For each emission, the target sequence is:
-        [BOS] + instruction_tokens + [EOS]
-
-    Decoder input (teacher forcing): target[:-1]
-    Decoder target labels: target[1:]
-
-    Returns:
-        dec_input: (N, T) int64 — decoder input tokens
-        dec_target: (N, T) int64 — target labels (PAD = ignore)
-        dec_padding: (N, T) bool — True = padding
+    Each token list gets wrapped: [BOS] + tokens + [EOS].
+    Returns dec_input (shifted right), dec_target, dec_padding.
+    Returns None tuple if token_lists is empty.
     """
-    seqs = []
-    for info in emission_info:
-        seq = [BOS] + info['target_tokens'] + [EOS]
-        seqs.append(seq)
-
-    if not seqs:
+    if not token_lists:
         return None, None, None
 
-    # Input is seq[:-1], target is seq[1:].
+    seqs = [[BOS] + toks + [EOS] for toks in token_lists]
     max_len = max(len(s) - 1 for s in seqs)
     N = len(seqs)
     dec_input = np.full((N, max_len), PAD, dtype=np.int64)
@@ -171,7 +153,7 @@ def _prepare_decoder_targets(emission_info, device):
     dec_padding = np.ones((N, max_len), dtype=np.bool_)
 
     for j, seq in enumerate(seqs):
-        L = len(seq) - 1  # input/target length
+        L = len(seq) - 1
         dec_input[j, :L] = seq[:-1]
         dec_target[j, :L] = seq[1:]
         dec_padding[j, :L] = False
@@ -182,7 +164,7 @@ def _prepare_decoder_targets(emission_info, device):
 
 
 def _compute_emission_deltas(batch, emission_info, device):
-    """Compute cumulative register deltas for each emission."""
+    """Compute cumulative register deltas for complete emissions."""
     deltas = []
     for info in emission_info:
         b = info['batch_idx']
@@ -197,41 +179,63 @@ def _compute_emission_deltas(batch, emission_info, device):
     return torch.stack(deltas).to(device)
 
 
+# ---------------------------------------------------------------------------
+# Streaming compressor training with REINFORCE gate training
+# ---------------------------------------------------------------------------
+
 def streaming_train(batch_iter, d_model=128, n_heads=4, n_layers=2,
                     d_out=128, dec_d_model=128, dec_n_heads=4,
                     dec_n_layers=2, lr=3e-4, device='auto',
                     n_steps=None, log_every=100, lr_schedule=None,
-                    lr_min=1e-6, gate_tau=1.0, recon_weight=1.0,
-                    pairwise_weight=1.0, roundtrip_weight=0.0,
-                    gumbel_tau=1.0):
-    """Train streaming compressor + decoder jointly.
+                    lr_min=1e-6, pairwise_weight=1.0,
+                    reinforce_lr=1e-3, baseline_decay=0.99):
+    """Train shift-reduce compressor + decoder.
 
-    Losses:
-        - Reconstruction: cross-entropy on decoder output vs original tokens.
-          Trains encoder, gate, and decoder.
-        - Pairwise MSE: distance matching on emission vectors.
-          Trains encoder and gate (not decoder).
+    The encoder (window encoder + GRU + projector) and decoder are
+    trained via normal backprop through reconstruction loss.
+
+    The gates are trained via REINFORCE: at every iteration, the
+    decoder evaluates the T1 candidate against the current window
+    contents. The per-iteration reconstruction loss serves as the
+    reward signal (negated: lower loss = higher reward).
 
     Returns (encoder, decoder, losses, gate_stats).
     """
     if device == 'auto':
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    encoder = StreamingCompressor(
-        VOCAB_SIZE, d_model, n_heads, n_layers, d_out,
-        gate_tau=gate_tau)
+    encoder = ShiftReduceCompressor(
+        VOCAB_SIZE, d_model, n_heads, n_layers, d_out)
     encoder = encoder.to(device)
 
     decoder = Decoder(
         VOCAB_SIZE, dec_d_model, dec_n_heads, dec_n_layers, d_emb=d_out)
     decoder = decoder.to(device)
 
-    all_params = list(encoder.parameters()) + list(decoder.parameters())
-    opt = torch.optim.Adam(all_params, lr=lr)
+    # Separate optimizers: normal backprop for encoder+decoder,
+    # REINFORCE for gates.
+    encoder_params = (
+        list(encoder.tok_emb.parameters())
+        + list(encoder.win_pos_emb.parameters())
+        + list(encoder.win_encoder.parameters())
+        + list(encoder.proj.parameters())
+        + list(encoder.gru.parameters()))
+    gate_params = (
+        list(encoder.accept_head.parameters())
+        + list(encoder.emit_head.parameters())
+        + list(encoder.evict_head.parameters()))
+
+    opt_main = torch.optim.Adam(
+        encoder_params + list(decoder.parameters()), lr=lr)
+    opt_gates = torch.optim.Adam(gate_params, lr=reinforce_lr)
+
     scheduler = None
     if lr_schedule and n_steps:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt, T_max=n_steps, eta_min=lr_min)
+            opt_main, T_max=n_steps, eta_min=lr_min)
+
+    # REINFORCE baseline (moving average of per-iteration loss).
+    baseline = 0.0
 
     losses = []
     gate_stats = []
@@ -244,129 +248,209 @@ def streaming_train(batch_iter, d_model=128, n_heads=4, n_layers=2,
         idx = torch.from_numpy(batch.token_instr_idx).to(device)
         n_instr = torch.from_numpy(batch.n_instructions).to(device)
 
-        # Encoder forward.
-        emissions, emission_info, emit_counts, gate_logits = encoder(
-            tok, pad, idx, n_instr)
+        B = tok.shape[0]
 
-        N = emissions.shape[0]
-        if N < 2:
+        # --- Forward pass (shift-reduce loop) ---
+        (iter_t1s, iter_window_tokens,
+         iter_gate_log_probs, iter_gate_decisions,
+         emission_info, emit_counts) = encoder(tok, pad, idx, n_instr)
+
+        n_iters = len(iter_t1s)
+        if n_iters == 0:
             continue
 
-        # --- Reconstruction loss (weighted by window size) ---
-        dec_input, dec_target, dec_padding = _prepare_decoder_targets(
-            emission_info, device)
+        # --- Per-iteration decoder evaluation ---
+        # For each iteration, run the decoder on the T1 candidate
+        # against the current window tokens. This gives a per-iteration
+        # reconstruction loss used as REINFORCE reward.
+        iter_recon_losses = []  # per-iteration, shape (B,) each
 
-        logits = decoder(emissions, dec_input, dec_padding)
+        for it in range(n_iters):
+            t1 = iter_t1s[it]  # (B, d_out)
+            win_toks = iter_window_tokens[it]  # list of B token lists
 
-        # Per-emission cross-entropy, weighted by window size.
-        # Larger windows = higher cost, pushing the gate to emit earlier.
-        window_sizes = torch.tensor(
-            [info['window_size'] for info in emission_info],
-            dtype=torch.float32, device=device)
+            # Find sequences with non-empty windows.
+            nonempty = [b for b in range(B) if win_toks[b]]
+            if not nonempty:
+                iter_recon_losses.append(
+                    torch.zeros(B, device=device))
+                continue
 
-        per_token_loss = F.cross_entropy(
-            logits.reshape(-1, VOCAB_SIZE),
-            dec_target.reshape(-1),
-            ignore_index=PAD, reduction='none')
-        # Reshape back to (N, T) and compute per-emission mean.
-        per_token_loss = per_token_loss.reshape(N, -1)
-        non_pad_counts = (~dec_padding).sum(dim=1).clamp(min=1).float()
-        per_emission_loss = per_token_loss.sum(dim=1) / non_pad_counts
+            # Prepare decoder targets for non-empty windows.
+            nonempty_toks = [win_toks[b] for b in nonempty]
+            dec_in, dec_tgt, dec_pad = _prepare_decoder_targets(
+                nonempty_toks, device)
 
-        # Weight by window size and average.
-        recon_loss = (per_emission_loss * window_sizes).sum() / window_sizes.sum()
+            # Decoder forward.
+            ne_t1 = t1[nonempty]
+            logits = decoder(ne_t1, dec_in, dec_pad)
 
-        # --- Pairwise MSE loss ---
-        emission_deltas = _compute_emission_deltas(
-            batch, emission_info, device)
+            # Per-sequence reconstruction loss.
+            per_tok = F.cross_entropy(
+                logits.reshape(-1, VOCAB_SIZE),
+                dec_tgt.reshape(-1),
+                ignore_index=PAD, reduction='none')
+            per_tok = per_tok.reshape(len(nonempty), -1)
+            non_pad_counts = (~dec_pad).sum(dim=1).clamp(min=1).float()
+            per_seq_loss = per_tok.sum(dim=1) / non_pad_counts
 
-        model_dists = torch.cdist(
-            emissions.unsqueeze(0), emissions.unsqueeze(0),
-            p=2).squeeze(0)
-        exec_dists = exec_distance(emission_deltas, device)
+            # Window-size weighting.
+            win_sizes = torch.tensor(
+                [len(win_toks[b]) for b in nonempty],
+                dtype=torch.float32, device=device)
+            per_seq_loss = per_seq_loss * win_sizes
 
-        scale = 2.0 / max(exec_dists.max().item(), 1e-6)
-        exec_dists = exec_dists * min(scale, 4.0)
+            # Scatter back to full batch.
+            full_loss = torch.zeros(B, device=device)
+            for j, b in enumerate(nonempty):
+                full_loss[b] = per_seq_loss[j]
 
-        tri = torch.triu_indices(N, N, offset=1, device=device)
-        pairwise_loss = F.mse_loss(
-            model_dists[tri[0], tri[1]],
-            exec_dists[tri[0], tri[1]])
+            iter_recon_losses.append(full_loss)
 
-        # --- Round-trip loss ---
-        rt_loss_val = 0.0
-        if roundtrip_weight > 0:
-            # Gumbel-softmax on decoder output for differentiable tokens.
-            soft = F.gumbel_softmax(logits, tau=gumbel_tau,
-                                    hard=True, dim=-1)  # (N, T, V)
-
-            # Soft embeddings using encoder's token embedding matrix.
-            soft_emb = soft @ encoder.tok_emb.weight  # (N, T, d_model)
-
-            # Prepend BOS embedding.
-            bos_emb = encoder.tok_emb(
-                torch.full((N, 1), BOS, dtype=torch.long, device=device))
-            full_emb = torch.cat([bos_emb, soft_emb], dim=1)  # (N, T+1, d_model)
-            full_pad = torch.cat([
-                torch.zeros(N, 1, dtype=torch.bool, device=device),
-                dec_padding,
-            ], dim=1)
-
-            # Re-encode through the encoder.
-            reencoded = encoder.encode_soft(full_emb, full_pad)
-
-            # Cosine distance (vectors are L2-normalized).
-            rt_loss = (1 - (emissions * reencoded).sum(dim=-1)).mean()
-            rt_loss_val = rt_loss.item()
+        # --- Reconstruction loss for encoder+decoder (normal backprop) ---
+        # Average across all iterations and sequences.
+        all_recon = torch.stack(iter_recon_losses)  # (n_iters, B)
+        # Mask out done sequences (zero loss).
+        recon_mask = all_recon > 0
+        if recon_mask.any():
+            recon_loss = all_recon[recon_mask].mean()
         else:
-            rt_loss = 0.0
+            recon_loss = torch.tensor(0.0, device=device)
 
-        # --- Combined loss ---
-        # Reconstruction loss is already weighted by window size:
-        # larger windows cost more, pushing the gate to emit early.
-        loss = (recon_weight * recon_loss
-                + pairwise_weight * pairwise_loss
-                + roundtrip_weight * rt_loss)
+        # --- Pairwise MSE loss (on actual emissions with complete instrs) ---
+        complete_info = [info for info in emission_info
+                         if info['has_complete']]
 
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
+        if len(complete_info) >= 2:
+            # Gather emission T1 vectors.
+            emission_vecs = []
+            for info in complete_info:
+                it = info['iteration']
+                b = info['batch_idx']
+                emission_vecs.append(iter_t1s[it][b])
+            emission_vecs = torch.stack(emission_vecs)
+
+            emission_deltas = _compute_emission_deltas(
+                batch, complete_info, device)
+            Nc = emission_vecs.shape[0]
+            model_dists = torch.cdist(
+                emission_vecs.unsqueeze(0),
+                emission_vecs.unsqueeze(0),
+                p=2).squeeze(0)
+            exec_dists = exec_distance(emission_deltas, device)
+            scale = 2.0 / max(exec_dists.max().item(), 1e-6)
+            exec_dists = exec_dists * min(scale, 4.0)
+            tri = torch.triu_indices(Nc, Nc, offset=1, device=device)
+            pairwise_loss = F.mse_loss(
+                model_dists[tri[0], tri[1]],
+                exec_dists[tri[0], tri[1]])
+        else:
+            pairwise_loss = torch.tensor(0.0, device=device)
+
+        # --- REINFORCE for gates ---
+        # Compute REINFORCE loss BEFORE main backward (shares graph).
+        with torch.no_grad():
+            iter_rewards = torch.stack(iter_recon_losses)
+            mean_reward = iter_rewards[iter_rewards > 0].mean().item() \
+                if (iter_rewards > 0).any() else 0.0
+            baseline = baseline_decay * baseline + (1 - baseline_decay) * mean_reward
+
+        reinforce_loss = torch.tensor(0.0, device=device)
+        n_terms = 0
+        for it in range(n_iters):
+            log_probs = iter_gate_log_probs[it]  # (B, 3)
+            rewards = iter_recon_losses[it].detach()  # (B,)
+            advantages = rewards - baseline
+
+            total_lp = log_probs.sum(dim=1)
+            active = rewards > 0
+            if active.any():
+                reinforce_loss = reinforce_loss + \
+                    (total_lp[active] * advantages[active]).mean()
+                n_terms += 1
+
+        if n_terms > 0:
+            reinforce_loss = reinforce_loss / n_terms
+
+        # --- Combined backward ---
+        main_loss = recon_loss + pairwise_weight * pairwise_loss
+        total_loss = main_loss + reinforce_loss
+        opt_main.zero_grad()
+        opt_gates.zero_grad()
+        total_loss.backward()
+        opt_main.step()
+        opt_gates.step()
         if scheduler:
             scheduler.step()
 
-        loss_val = loss.item()
+        # --- Logging ---
         recon_val = recon_loss.item()
         pair_val = pairwise_loss.item()
-        mean_window = window_sizes.mean().item()
+        loss_val = main_loss.item()
+        reinforce_val = reinforce_loss.item() if n_terms > 0 else 0.0
+
+        with torch.no_grad():
+            # Gate decision rates.
+            total_a = total_e = total_v = total_steps = 0
+            total_window = 0
+            for it in range(n_iters):
+                decs = iter_gate_decisions[it]  # (B, 3)
+                for b in range(B):
+                    wt = iter_window_tokens[it][b]
+                    if wt or (it == 0):  # active sequence
+                        total_a += decs[b, 0].item() > 0.5
+                        total_e += decs[b, 1].item() > 0.5
+                        total_v += decs[b, 2].item() > 0.5
+                        total_steps += 1
+                        total_window += len(wt)
+
+            accept_rate = total_a / max(total_steps, 1)
+            emit_rate = total_e / max(total_steps, 1)
+            evict_rate = total_v / max(total_steps, 1)
+            mean_emits = emit_counts.float().mean().item()
+            mean_instrs = n_instr.float().mean().item()
+            mean_window = total_window / max(total_steps, 1)
+            complete_frac = len(complete_info) / max(len(emission_info), 1)
+
+            # Reconstruction accuracy on actual emissions.
+            if emission_info:
+                all_tgt_toks = [info['target_tokens'] for info in emission_info]
+                dec_in, dec_tgt, dec_pad = _prepare_decoder_targets(
+                    all_tgt_toks, device)
+                if dec_in is not None:
+                    # Find emission T1 vectors.
+                    em_vecs = []
+                    for info in emission_info:
+                        em_vecs.append(
+                            iter_t1s[info['iteration']][info['batch_idx']])
+                    em_vecs = torch.stack(em_vecs)
+                    em_logits = decoder(em_vecs, dec_in, dec_pad)
+                    pred = em_logits.argmax(dim=-1)
+                    non_pad_dec = ~dec_pad
+                    correct = (pred == dec_tgt) & non_pad_dec
+                    recon_acc = correct.sum().item() / non_pad_dec.sum().item()
+                else:
+                    recon_acc = 0.0
+            else:
+                recon_acc = 0.0
+
         losses.append({
             'total': loss_val,
             'recon': recon_val,
             'pairwise': pair_val,
-            'roundtrip': rt_loss_val,
+            'reinforce': reinforce_val,
             'mean_window': mean_window,
         })
-
-        # Gate statistics.
-        with torch.no_grad():
-            non_pad = ~pad
-            gate_probs = torch.sigmoid(gate_logits)
-            mean_prob = gate_probs[non_pad].mean().item()
-            mean_emits = emit_counts.float().mean().item()
-            mean_instrs = n_instr.float().mean().item()
-
-            # Reconstruction accuracy: fraction of non-PAD tokens
-            # where argmax(logits) == target.
-            pred = logits.argmax(dim=-1)
-            non_pad_dec = ~dec_padding
-            correct = (pred == dec_target) & non_pad_dec
-            recon_acc = correct.sum().item() / non_pad_dec.sum().item()
-
         gs = {
-            'emit_prob': mean_prob,
+            'accept_rate': accept_rate,
+            'emit_rate': emit_rate,
+            'evict_rate': evict_rate,
             'emits_per_seq': mean_emits,
             'instrs_per_seq': mean_instrs,
-            'n_emissions': N,
+            'n_emissions': len(emission_info),
+            'complete_frac': complete_frac,
             'recon_acc': recon_acc,
+            'iters_per_seq': n_iters,
         }
         gate_stats.append(gs)
 
@@ -376,16 +460,19 @@ def streaming_train(batch_iter, d_model=128, n_heads=4, n_layers=2,
             elapsed = time.time() - t0
             ms_per = elapsed / step * 1000
             current_lr = scheduler.get_last_lr()[0] if scheduler else lr
-            rt_str = f' rt {rt_loss_val:.4f}' if roundtrip_weight > 0 else ''
             print(f'step {step:>6d}  '
                   f'loss {loss_val:.4f} '
-                  f'(recon {recon_val:.3f} pair {pair_val:.4f}'
-                  f'{rt_str})  '
+                  f'(recon {recon_val:.3f} pair {pair_val:.4f} '
+                  f'rl {reinforce_val:.3f})  '
                   f'acc {recon_acc:.1%}  '
                   f'lr {current_lr:.1e}  {ms_per:.0f}ms/step  '
-                  f'emit {gs["emits_per_seq"]:.1f}/'
+                  f'a/e/v={accept_rate:.0%}/{emit_rate:.0%}/'
+                  f'{evict_rate:.0%}  '
+                  f'{gs["emits_per_seq"]:.1f}/'
                   f'{gs["instrs_per_seq"]:.1f}  '
-                  f'win {mean_window:.1f}')
+                  f'win {mean_window:.1f}  '
+                  f'ok {complete_frac:.0%}  '
+                  f'iters {n_iters}')
 
         if n_steps and step >= n_steps:
             break
