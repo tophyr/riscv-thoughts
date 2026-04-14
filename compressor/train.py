@@ -1,28 +1,170 @@
 """Training loops for the compressor.
 
-- train(): fixed-window training for context experiments
+- train_batches(): N×N pairwise MSE on single-instruction batches (step 1)
+- train_sequences(): fixed-window training on sequence batches (context experiments)
 - streaming_train(): shift-reduce compressor with REINFORCE gate training
 """
 
 import time
+from datetime import timedelta
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from tokenizer import BOS, EOS, PAD, VOCAB_SIZE
-from .model import Compressor, ShiftReduceCompressor, Decoder
+from .model import T1Compressor, Decoder
 
 
 # ---------------------------------------------------------------------------
-# Shared: execution distance from per-register deltas
+# Execution distance metrics
 # ---------------------------------------------------------------------------
 
-def exec_distance(deltas, device):
-    """Pairwise execution distance from per-register deltas."""
+def exec_distance_deltas(deltas, device):
+    """Pairwise execution distance from per-register deltas.
+    Used by sequence-based training (RVS).
+    """
     d = deltas.to(device=device, dtype=torch.float32)
     diff = (d.unsqueeze(1) - d.unsqueeze(0)).abs()
     return diff.log1p_().mean(dim=(-1, -2))
+
+
+def _exec_distance_scalar_impl(dv, pv):
+    """Pairwise distance from scalar data_vals and pc_vals.
+
+    mean_s(log1p(|data_diff_s| + |pc_diff_s|))
+
+    This is the proven metric from Exp 3+. It compares the single
+    computed output value per instruction, not all 32 registers.
+    """
+    B, S = dv.shape
+    acc = torch.zeros(B, B, dtype=torch.float32, device=dv.device)
+    for s in range(S):
+        d = (dv[:, s].unsqueeze(1) - dv[:, s].unsqueeze(0)).abs()
+        p = (pv[:, s].unsqueeze(1) - pv[:, s].unsqueeze(0)).abs()
+        acc += torch.log1p(d + p)
+    return acc / S
+
+
+_exec_distance_scalar_compiled = torch.compile(_exec_distance_scalar_impl)
+
+
+def exec_distance_scalar(data_vals, pc_vals, device):
+    """Pairwise execution distance from computed output values.
+    Used by single-instruction batch training (RVB).
+
+    data_vals: (B, n_inputs) int64 numpy array
+    pc_vals: (B, n_inputs) int64 numpy array
+    Returns: (B, B) float32 tensor
+    """
+    dv = torch.tensor(data_vals, dtype=torch.bfloat16, device=device)
+    pv = torch.tensor(pc_vals, dtype=torch.bfloat16, device=device)
+    return _exec_distance_scalar_compiled(dv, pv)
+
+
+# ---------------------------------------------------------------------------
+# Execution distance scaling
+# ---------------------------------------------------------------------------
+
+_EXEC_DIST_SCALE = 2.0 / 22.0  # map log-scaled [0, ~22] → [0, ~2]
+
+
+# ---------------------------------------------------------------------------
+# N×N pairwise MSE training on single-instruction batches (step 1)
+# ---------------------------------------------------------------------------
+
+def train_batches(batch_iter, d_model=128, n_heads=4, n_layers=2,
+                  d_out=128, lr=3e-4, device='auto', n_steps=None,
+                  log_every=100, lr_min=1e-6):
+    """Train the T1 encoder on single-instruction batches (RVB).
+
+    N×N pairwise MSE between T1 vector distances and execution
+    distances computed from scalar data_vals and pc_vals.
+
+    Returns (model, losses).
+    """
+    if device == 'auto':
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    torch.set_float32_matmul_precision('high')
+
+    model = T1Compressor(VOCAB_SIZE, d_model, n_heads, n_layers, d_out)
+    model = model.to(device)
+
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = None
+    if n_steps:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=n_steps, eta_min=lr_min)
+
+    losses = []
+    step = 0
+    t0 = time.time()
+
+    for batch in batch_iter:
+        tok = torch.from_numpy(batch.token_ids).to(device)
+        pad = torch.from_numpy(batch.padding_mask).to(device)
+        dt_targets = torch.from_numpy(batch.dest_types).to(device)
+        dr_targets = torch.from_numpy(batch.dest_regs).to(device)
+
+        vecs = model.compiled_encode(tok, pad)  # (B, d_out)
+        dt_logits = model.dest_type_head(vecs)
+        dr_logits = model.dest_reg_head(vecs)
+
+        # N×N pairwise distances.
+        model_dists = torch.cdist(vecs.unsqueeze(0), vecs.unsqueeze(0),
+                                  p=2).squeeze(0)
+        exec_dists = exec_distance_scalar(
+            batch.data_vals, batch.pc_vals, device)
+
+        # MSE on upper triangle with fixed scaling.
+        N = vecs.shape[0]
+        tri = torch.triu_indices(N, N, offset=1, device=device)
+        target = exec_dists[tri[0], tri[1]] * _EXEC_DIST_SCALE
+        mse_loss = (model_dists[tri[0], tri[1]] - target).square().mean()
+
+        # Destination classification: dest_type for all instructions,
+        # dest_reg only for register-writing instructions (dt=0).
+        dt_loss = F.cross_entropy(dt_logits, dt_targets)
+        reg_mask = (dt_targets == 0)
+        if reg_mask.any():
+            dr_loss = F.cross_entropy(
+                dr_logits[reg_mask], dr_targets[reg_mask])
+        else:
+            dr_loss = torch.tensor(0.0, device=device)
+
+        loss = mse_loss + dt_loss + dr_loss
+
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        if scheduler:
+            scheduler.step()
+
+        loss_val = loss.item()
+        losses.append(loss_val)
+        step += 1
+
+        if step % log_every == 0:
+            elapsed = time.time() - t0
+            ms_per = elapsed / step * 1000
+            current_lr = scheduler.get_last_lr()[0] if scheduler else lr
+            eta_str = ''
+            if n_steps:
+                eta_sec = int(max(0, n_steps - step) * ms_per / 1000)
+                eta_str = f'  eta {timedelta(seconds=eta_sec)}'
+            print(f'step {step:>6d}  '
+                  f'loss {loss_val:.4f} '
+                  f'(mse {mse_loss.item():.4f} '
+                  f'dt {dt_loss.item():.3f} '
+                  f'dr {dr_loss.item():.3f})  '
+                  f'lr {current_lr:.1e}  {ms_per:.0f}ms/step  '
+                  f'N={N}{eta_str}')
+
+        if n_steps and step >= n_steps:
+            break
+
+    return model, losses
 
 
 # ---------------------------------------------------------------------------
@@ -65,70 +207,16 @@ def extract_windows(batch, window_size=1):
     return token_ids, padding_mask, deltas
 
 
-def train(batch_iter, window_size=1, d_model=128, n_heads=4, n_layers=2,
-          d_out=128, lr=3e-4, device='auto', n_steps=None, log_every=100,
-          lr_schedule=None, lr_min=1e-6):
-    """Train a fixed-window compressor. Returns (model, losses)."""
-    if device == 'auto':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+def train_sequences(batch_iter, **kwargs):
+    """Placeholder for sequence-based training.
 
-    model = Compressor(VOCAB_SIZE, d_model, n_heads, n_layers, d_out)
-    model = model.to(device)
-    compiled = torch.compile(model)
-
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = None
-    if lr_schedule and n_steps:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt, T_max=n_steps, eta_min=lr_min)
-
-    losses = []
-    step = 0
-    t0 = time.time()
-
-    for batch in batch_iter:
-        token_ids, padding_mask, deltas = extract_windows(batch, window_size)
-        if token_ids is None:
-            continue
-
-        tok = torch.from_numpy(token_ids).to(device)
-        pad = torch.from_numpy(padding_mask).to(device)
-        delta_t = torch.from_numpy(deltas)
-
-        vecs = compiled(tok, pad)
-        model_dists = torch.cdist(vecs.unsqueeze(0), vecs.unsqueeze(0),
-                                  p=2).squeeze(0)
-        exec_dists = exec_distance(delta_t, device)
-        scale = 2.0 / max(exec_dists.max().item(), 1e-6)
-        exec_dists = exec_dists * min(scale, 4.0)
-
-        N = vecs.shape[0]
-        tri = torch.triu_indices(N, N, offset=1, device=device)
-        loss = F.mse_loss(model_dists[tri[0], tri[1]],
-                          exec_dists[tri[0], tri[1]])
-
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
-        if scheduler:
-            scheduler.step()
-
-        losses.append(loss.item())
-        step += 1
-
-        if step % log_every == 0:
-            elapsed = time.time() - t0
-            ms_per = elapsed / step * 1000
-            current_lr = scheduler.get_last_lr()[0] if scheduler else lr
-            print(f'step {step:>6d}  loss {losses[-1]:.4f}  '
-                  f'lr {current_lr:.1e}  {ms_per:.0f}ms/step  '
-                  f'N={N}')
-
-        if n_steps and step >= n_steps:
-            break
-
-    raw = getattr(compiled, '_orig_mod', compiled)
-    return raw, losses
+    The original implementation (context experiments, Exp 19) used
+    fixed windows with per-register delta execution distance. It will
+    be replaced with streaming_train when T2 fine-tuning is built.
+    """
+    raise NotImplementedError(
+        'train_sequences is not implemented. Use train_batches for '
+        'encoder training (step 1) or streaming_train for gate training.')
 
 
 # ---------------------------------------------------------------------------
@@ -186,9 +274,9 @@ def _compute_emission_deltas(batch, emission_info, device):
 def streaming_train(batch_iter, d_model=128, n_heads=4, n_layers=2,
                     d_out=128, dec_d_model=128, dec_n_heads=4,
                     dec_n_layers=2, lr=3e-4, device='auto',
-                    n_steps=None, log_every=100, lr_schedule=None,
-                    lr_min=1e-6, pairwise_weight=1.0,
-                    reinforce_lr=1e-3, baseline_decay=0.99):
+                    n_steps=None, log_every=100, lr_min=1e-6,
+                    pairwise_weight=1.0, reinforce_lr=1e-3,
+                    baseline_decay=0.99):
     """Train shift-reduce compressor + decoder.
 
     The encoder (window encoder + GRU + projector) and decoder are
@@ -204,7 +292,7 @@ def streaming_train(batch_iter, d_model=128, n_heads=4, n_layers=2,
     if device == 'auto':
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    encoder = ShiftReduceCompressor(
+    encoder = T1Compressor(
         VOCAB_SIZE, d_model, n_heads, n_layers, d_out)
     encoder = encoder.to(device)
 
@@ -230,7 +318,7 @@ def streaming_train(batch_iter, d_model=128, n_heads=4, n_layers=2,
     opt_gates = torch.optim.Adam(gate_params, lr=reinforce_lr)
 
     scheduler = None
-    if lr_schedule and n_steps:
+    if n_steps:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             opt_main, T_max=n_steps, eta_min=lr_min)
 
@@ -337,7 +425,7 @@ def streaming_train(batch_iter, d_model=128, n_heads=4, n_layers=2,
                 emission_vecs.unsqueeze(0),
                 emission_vecs.unsqueeze(0),
                 p=2).squeeze(0)
-            exec_dists = exec_distance(emission_deltas, device)
+            exec_dists = exec_distance_deltas(emission_deltas, device)
             scale = 2.0 / max(exec_dists.max().item(), 1e-6)
             exec_dists = exec_dists * min(scale, 4.0)
             tri = torch.triu_indices(Nc, Nc, offset=1, device=device)
@@ -460,6 +548,10 @@ def streaming_train(batch_iter, d_model=128, n_heads=4, n_layers=2,
             elapsed = time.time() - t0
             ms_per = elapsed / step * 1000
             current_lr = scheduler.get_last_lr()[0] if scheduler else lr
+            eta_str = ''
+            if n_steps:
+                eta_sec = int(max(0, n_steps - step) * ms_per / 1000)
+                eta_str = f'  eta {timedelta(seconds=eta_sec)}'
             print(f'step {step:>6d}  '
                   f'loss {loss_val:.4f} '
                   f'(recon {recon_val:.3f} pair {pair_val:.4f} '
@@ -472,7 +564,7 @@ def streaming_train(batch_iter, d_model=128, n_heads=4, n_layers=2,
                   f'{gs["instrs_per_seq"]:.1f}  '
                   f'win {mean_window:.1f}  '
                   f'ok {complete_frac:.0%}  '
-                  f'iters {n_iters}')
+                  f'iters {n_iters}{eta_str}')
 
         if n_steps and step >= n_steps:
             break

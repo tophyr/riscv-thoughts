@@ -1,8 +1,8 @@
-"""Compressor models.
+"""T1 Compressor and Decoder.
 
-Compressor: fixed-window model for context experiments.
-ShiftReduceCompressor: neural shift-reduce parser with per-iteration
-    gate decisions and bidirectional window encoder.
+T1Compressor: neural shift-reduce parser with per-iteration gate
+    decisions and bidirectional window encoder. Can also operate in
+    fixed-window mode (no gates) for encoder-only training.
 Decoder: autoregressive decoder conditioned on emission vectors.
 """
 
@@ -11,63 +11,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class Compressor(nn.Module):
-    """Fixed-window compressor for context experiments."""
-
-    def __init__(self, vocab_size, d_model, n_heads, n_layers, d_out,
-                 max_seq_len=24, dropout=0.0):
-        super().__init__()
-        self.tok_emb = nn.Embedding(vocab_size, d_model)
-        self.pos_emb = nn.Embedding(max_seq_len, d_model)
-        layer = nn.TransformerEncoderLayer(
-            d_model, n_heads, dim_feedforward=d_model * 4,
-            dropout=dropout, batch_first=True)
-        self.encoder = nn.TransformerEncoder(layer, n_layers)
-        self.proj = nn.Linear(d_model, d_out)
-
-    def forward(self, token_ids, padding_mask=None):
-        B, L = token_ids.shape
-        pos = torch.arange(L, device=token_ids.device)
-        x = self.tok_emb(token_ids) + self.pos_emb(pos)
-        x = self.encoder(x, src_key_padding_mask=padding_mask)
-        if padding_mask is not None:
-            mask = (~padding_mask).float().unsqueeze(-1)
-            x = (x * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-        else:
-            x = x.mean(dim=1)
-        return F.normalize(self.proj(x), dim=-1)
-
-
-def gumbel_sigmoid(logits, tau=1.0, hard=True):
-    """Differentiable binary gate via Gumbel-sigmoid."""
-    if not logits.requires_grad:
-        return (logits > 0).float()
-    gumbels = -torch.log(-torch.log(torch.rand_like(logits) + 1e-20) + 1e-20)
-    y_soft = torch.sigmoid((logits + gumbels) / tau)
-    if hard:
-        y_hard = (y_soft > 0.5).float()
-        return y_hard - y_soft.detach() + y_soft
-    return y_soft
-
-
-class ShiftReduceCompressor(nn.Module):
+class T1Compressor(nn.Module):
     """Neural shift-reduce parser for thought compression.
 
-    Per iteration (batched across all active sequences):
-    1. Window encoder runs on each sequence's window → T1 candidates
-    2. GRU processes T1 candidates → updates hidden states
-    3. All three gates sample decisions (Bernoulli from learned logits)
-    4. Execute gate decisions, update window states
-    5. Record T1 candidate + window tokens (for decoder evaluation)
+    Operates in two modes:
 
-    Gate training: gates are trained via REINFORCE using per-iteration
-    reconstruction quality (decoder evaluates T1 candidate against
-    current window tokens at every iteration).
+    **Streaming mode** (forward): runs the full shift-reduce loop
+    with gates, GRU, and per-iteration state tracking. Used for
+    gate training and inference.
+
+    **Fixed-window mode** (encode): encodes a batch of token
+    sequences directly through the window encoder. No gates, no
+    GRU. Used for encoder-only training (step 1) and evaluation.
+
+    Both modes share the same window encoder and projection, so
+    weights trained in fixed-window mode transfer to streaming mode.
     """
 
     def __init__(self, vocab_size, d_model, n_heads, n_layers, d_out,
                  max_window=64, dropout=0.0,
-                 max_iterations_per_token=4):
+                 max_iterations_per_token=4,
+                 n_dest_types=2, n_regs=32):
         super().__init__()
         self.d_model = d_model
         self.d_out = d_out
@@ -81,16 +45,25 @@ class ShiftReduceCompressor(nn.Module):
         self.win_encoder = nn.TransformerEncoder(win_layer, n_layers)
         self.proj = nn.Linear(d_model, d_out)
 
+        # Destination classification heads. Read from the normalized
+        # T1 vector to force the encoder to carry destination info
+        # that the scalar exec_distance metric is blind to.
+        self.dest_type_head = nn.Linear(d_out, n_dest_types)
+        self.dest_reg_head = nn.Linear(d_out, n_regs)
+
         self.gru = nn.GRUCell(d_out, d_model)
 
+        # Accept: next_token_emb + t1 + gru_hidden
         self.accept_head = nn.Sequential(
             nn.Linear(d_model + d_out + d_model, d_model),
             nn.ReLU(),
             nn.Linear(d_model, 1))
+        # Emit: t1 + gru_hidden
         self.emit_head = nn.Sequential(
             nn.Linear(d_out + d_model, d_model),
             nn.ReLU(),
             nn.Linear(d_model, 1))
+        # Evict: t1 + gru_hidden
         self.evict_head = nn.Sequential(
             nn.Linear(d_out + d_model, d_model),
             nn.ReLU(),
@@ -100,9 +73,53 @@ class ShiftReduceCompressor(nn.Module):
         nn.init.constant_(self.emit_head[-1].bias, -2.0)
         nn.init.constant_(self.evict_head[-1].bias, -2.0)
 
+        # Compiled encode: a standalone function capturing only the
+        # encoder submodules, so torch.compile doesn't trace through
+        # the gate/GRU submodules unused during encoding.
+        tok_emb = self.tok_emb
+        pos_emb = self.win_pos_emb
+        win_encoder = self.win_encoder
+        proj = self.proj
+
+        def _encode_fn(token_ids, padding_mask):
+            B, L = token_ids.shape
+            x = tok_emb(token_ids) + pos_emb(
+                torch.arange(L, device=token_ids.device))
+            x = win_encoder(x, src_key_padding_mask=padding_mask)
+            if padding_mask is not None:
+                lengths = (~padding_mask).sum(dim=1)
+                last_idx = (lengths - 1).clamp(min=0)
+                last_repr = x[torch.arange(B, device=token_ids.device),
+                              last_idx]
+            else:
+                last_repr = x[:, -1]
+            return F.normalize(proj(last_repr), dim=-1)
+
+        self.encode = _encode_fn
+        self.compiled_encode = torch.compile(_encode_fn)
+
+    def encode_soft(self, soft_emb, padding_mask=None):
+        """Encode from soft embeddings (for round-trip loss).
+
+        Same as encode() but takes pre-computed embeddings instead
+        of token IDs. Shares all weights.
+        """
+        B, T, _ = soft_emb.shape
+        pos = torch.arange(T, device=soft_emb.device)
+        x = soft_emb + self.win_pos_emb(pos)
+        x = self.win_encoder(x, src_key_padding_mask=padding_mask)
+        if padding_mask is not None:
+            lengths = (~padding_mask).sum(dim=1)
+            last_idx = (lengths - 1).clamp(min=0)
+            last_repr = x[torch.arange(B, device=soft_emb.device), last_idx]
+        else:
+            last_repr = x[:, -1]
+        return F.normalize(self.proj(last_repr), dim=-1)
+
     def _encode_windows_batched(self, all_window_tokens, device):
         """Encode multiple windows in one batched pass.
 
+        all_window_tokens: list of lists of token IDs, one per sequence
         Returns: (B, d_out) T1 candidates. Zero vector for empty windows.
         """
         B = len(all_window_tokens)
@@ -128,14 +145,7 @@ class ShiftReduceCompressor(nn.Module):
                                           device=device)
             win_pad[j, :L] = False
 
-        pos = torch.arange(max_len, device=device)
-        x = self.tok_emb(win_ids) + self.win_pos_emb(pos)
-        x = self.win_encoder(x, src_key_padding_mask=win_pad)
-
-        lengths = (~win_pad).sum(dim=1)
-        last_idx = (lengths - 1).clamp(min=0)
-        last_repr = x[torch.arange(N, device=device), last_idx]
-        vecs = F.normalize(self.proj(last_repr), dim=-1)
+        vecs = self.encode(win_ids, win_pad)
 
         for j, idx in enumerate(indices):
             result[idx] = vecs[j]
@@ -144,19 +154,14 @@ class ShiftReduceCompressor(nn.Module):
 
     def forward(self, token_ids, padding_mask, token_instr_idx,
                 n_instructions):
-        """Run batched shift-reduce loop.
+        """Run batched shift-reduce loop (streaming mode).
 
         Returns:
-            iter_t1s: list of (B, d_out) T1 candidates, one per iteration
-            iter_window_tokens: list of [list of token IDs per seq],
-                one per iteration
-            iter_gate_log_probs: list of (B, 3) log-probabilities of
-                the sampled gate decisions [accept, emit, evict]
-            iter_gate_decisions: list of (B, 3) bool decisions
+            iter_t1s: list of (B, d_out) T1 candidates per iteration
+            iter_window_tokens: list of window token lists per iteration
+            iter_gate_log_probs: list of (B, 3) gate log-probs
+            iter_gate_decisions: list of (B, 3) gate decisions
             emission_info: list of dicts for actual emissions
-                (with 'batch_idx', 'instr_start', 'instr_end',
-                 'target_tokens', 'window_size', 'has_complete',
-                 'iteration', 't1_index')
             emit_counts: (B,) emissions per sequence
         """
         B, L = token_ids.shape
@@ -166,16 +171,14 @@ class ShiftReduceCompressor(nn.Module):
         pad_np = padding_mask.cpu().numpy()
         n_instr_np = n_instructions.cpu().numpy()
 
-        all_tok_embs = self.tok_emb(token_ids)  # (B, L, d_model)
+        all_tok_embs = self.tok_emb(token_ids)
 
-        # Per-sequence state.
         seq_lens = [int((~pad_np[b]).sum()) for b in range(B)]
         windows = [[] for _ in range(B)]
         input_pos = [0] * B
         gru_h = torch.zeros(B, self.d_model, device=device)
         done = [False] * B
 
-        # Precompute instruction boundaries.
         instr_first = [{} for _ in range(B)]
         instr_last = [{} for _ in range(B)]
         token_to_instr = [{} for _ in range(B)]
@@ -188,13 +191,10 @@ class ShiftReduceCompressor(nn.Module):
                     instr_last[b][ii] = t
                 token_to_instr[b][t] = ii
 
-        # Per-iteration outputs.
         iter_t1s = []
         iter_window_tokens = []
         iter_gate_log_probs = []
         iter_gate_decisions = []
-
-        # Emission tracking.
         emission_info = []
         emit_counts = [0] * B
 
@@ -202,20 +202,17 @@ class ShiftReduceCompressor(nn.Module):
         iteration = 0
 
         while not all(done) and iteration < max_total_iters:
-            # 1. Batch-encode windows.
             win_tok_lists = [[wt[0] for wt in windows[b]]
                              if not done[b] else []
                              for b in range(B)]
             t1 = self._encode_windows_batched(win_tok_lists, device)
 
-            # 2. GRU update.
             active = torch.tensor([not d for d in done],
                                   dtype=torch.bool, device=device)
             if active.any():
                 new_h = self.gru(t1, gru_h)
                 gru_h = torch.where(active.unsqueeze(1), new_h, gru_h)
 
-            # 3. Gate logits (batched).
             next_embs = torch.zeros(B, self.d_model, device=device)
             has_input = [False] * B
             for b in range(B):
@@ -230,7 +227,6 @@ class ShiftReduceCompressor(nn.Module):
             evict_logits = self.evict_head(
                 torch.cat([t1, gru_h], dim=1)).squeeze(-1)
 
-            # Sample gate decisions (Bernoulli) and compute log-probs.
             accept_probs = torch.sigmoid(accept_logits)
             emit_probs = torch.sigmoid(emit_logits)
             evict_probs = torch.sigmoid(evict_logits)
@@ -239,9 +235,6 @@ class ShiftReduceCompressor(nn.Module):
             emit_sample = torch.bernoulli(emit_probs)
             evict_sample = torch.bernoulli(evict_probs)
 
-            # Log-probabilities of the sampled decisions.
-            # Recompute from logits (not from probs used for sampling)
-            # to get a fresh computation graph for REINFORCE backward.
             accept_lp = F.logsigmoid(
                 torch.where(accept_sample > 0.5,
                             accept_logits, -accept_logits))
@@ -252,17 +245,15 @@ class ShiftReduceCompressor(nn.Module):
                 torch.where(evict_sample > 0.5,
                             evict_logits, -evict_logits))
 
-            # Record per-iteration data.
             iter_t1s.append(t1)
             iter_window_tokens.append(
-                [list(wt) for wt in win_tok_lists])  # deep copy
+                [list(wt) for wt in win_tok_lists])
             iter_gate_log_probs.append(
                 torch.stack([accept_lp, emit_lp, evict_lp], dim=1))
             iter_gate_decisions.append(
                 torch.stack([accept_sample, emit_sample, evict_sample],
                             dim=1))
 
-            # 4. Execute decisions.
             for b in range(B):
                 if done[b]:
                     continue
@@ -312,24 +303,13 @@ class ShiftReduceCompressor(nn.Module):
 
             iteration += 1
 
+        if not iter_t1s:
+            iter_t1s = [torch.zeros(B, self.d_out, device=device)]
+
         return (iter_t1s, iter_window_tokens,
                 iter_gate_log_probs, iter_gate_decisions,
                 emission_info,
                 torch.tensor(emit_counts, device=device))
-
-    def encode_soft(self, soft_emb, padding_mask=None):
-        """Encode from soft embeddings (for round-trip loss)."""
-        B, T, _ = soft_emb.shape
-        pos = torch.arange(T, device=soft_emb.device)
-        x = soft_emb + self.win_pos_emb(pos)
-        x = self.win_encoder(x, src_key_padding_mask=padding_mask)
-        if padding_mask is not None:
-            lengths = (~padding_mask).sum(dim=1)
-            last_idx = (lengths - 1).clamp(min=0)
-            last_repr = x[torch.arange(B, device=soft_emb.device), last_idx]
-        else:
-            last_repr = x[:, -1]
-        return F.normalize(self.proj(last_repr), dim=-1)
 
 
 class Decoder(nn.Module):

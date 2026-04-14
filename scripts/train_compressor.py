@@ -2,15 +2,15 @@
 """Train a compressor model.
 
 Modes:
-    fixed:     Fixed-window model for context experiments.
+    instr:     N×N pairwise MSE on single-instruction batches (step 1).
     streaming: Shift-reduce compressor with REINFORCE gate training.
 
 Usage:
-    # Context experiment:
-    gen_seq_batches.py --n-batches 5000 | \
-        train_compressor.py --mode fixed --window-size 2
+    # Encoder training on RVB batches (step 1):
+    gen_instr_batches.py --n-batches 10000 | \
+        train_compressor.py --mode instr --n-steps 100000
 
-    # Streaming compressor:
+    # Streaming compressor on RVS batches:
     gen_seq_batches.py --n-batches 5000 | \
         train_compressor.py --mode streaming --n-steps 10000
 """
@@ -18,20 +18,25 @@ Usage:
 import argparse
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 
-from datagen import BatchReader
-from compressor.train import train, streaming_train
+from compressor.train import train_batches, streaming_train
+
+
+def _default_save_dir():
+    stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    return f'runs/{stamp}'
 
 
 def main():
     p = argparse.ArgumentParser(description='Train compressor.')
-    p.add_argument('--mode', choices=['fixed', 'streaming'],
-                   default='streaming')
+    p.add_argument('--mode', choices=['instr', 'streaming'],
+                   default='instr')
 
     # Encoder architecture.
     p.add_argument('--d-model', type=int, default=128)
@@ -47,13 +52,12 @@ def main():
     # Training.
     p.add_argument('--lr', type=float, default=3e-4)
     p.add_argument('--n-steps', type=int, default=None)
-    p.add_argument('--lr-schedule', type=int, default=None)
     p.add_argument('--device', default='auto')
     p.add_argument('--log-every', type=int, default=100)
-    p.add_argument('--save', type=str, default=None)
-
-    # Fixed mode.
-    p.add_argument('--window-size', type=int, default=1)
+    p.add_argument('--save', type=str, default=None,
+                   help='Save directory (default: runs/<timestamp>)')
+    p.add_argument('--no-save', action='store_true',
+                   help='Disable auto-save')
 
     # Streaming mode.
     p.add_argument('--pairwise-weight', type=float, default=1.0)
@@ -61,12 +65,15 @@ def main():
 
     args = p.parse_args()
 
-    reader = BatchReader(sys.stdin.buffer)
+    save_dir = None
+    if not args.no_save:
+        save_dir = Path(args.save or _default_save_dir())
 
-    if args.mode == 'fixed':
-        model, losses = train(
+    if args.mode == 'instr':
+        from datagen import InstructionBatchReader
+        reader = InstructionBatchReader(sys.stdin.buffer)
+        model, losses = train_batches(
             batch_iter=reader,
-            window_size=args.window_size,
             d_model=args.d_model,
             n_heads=args.n_heads,
             n_layers=args.n_layers,
@@ -75,12 +82,14 @@ def main():
             device=args.device,
             n_steps=args.n_steps,
             log_every=args.log_every,
-            lr_schedule=args.lr_schedule,
         )
         print(f'\nDone: {len(losses)} steps, '
               f'final loss {losses[-1]:.4f}')
         extra = {}
-    else:
+
+    else:  # streaming
+        from datagen import SequenceBatchReader
+        reader = SequenceBatchReader(sys.stdin.buffer)
         encoder, decoder, losses, gate_stats = streaming_train(
             batch_iter=reader,
             d_model=args.d_model,
@@ -94,7 +103,6 @@ def main():
             device=args.device,
             n_steps=args.n_steps,
             log_every=args.log_every,
-            lr_schedule=args.lr_schedule,
             pairwise_weight=args.pairwise_weight,
             reinforce_lr=args.reinforce_lr,
         )
@@ -105,8 +113,7 @@ def main():
         model = encoder
         extra = {'gate_stats': gate_stats}
 
-    if args.save:
-        save_dir = Path(args.save)
+    if save_dir:
         save_dir.mkdir(parents=True, exist_ok=True)
         torch.save(model.state_dict(), save_dir / 'encoder.pt')
         if args.mode == 'streaming':

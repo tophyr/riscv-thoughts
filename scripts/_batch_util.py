@@ -1,40 +1,123 @@
-"""Shared utilities for batch pipeline scripts."""
+"""Shared utilities for batch pipeline scripts.
+
+Supports RVS (sequence) and RVB (single-instruction) stream formats
+via auto-detection from the 4-byte magic.
+"""
 
 import os
+import struct
 import sys
 
-from datagen.seqgen import _BATCH_HEADER, _batch_body_size
+from datagen.seqgen import (
+    _BATCH_HEADER as _RVS_BATCH_HEADER,
+    _batch_body_size as _rvs_body_size,
+    _DTYPE_CHARS as _RVS_DTYPE_CHARS,
+    read_stream_header as _rvs_read_header,
+    write_stream_header as _rvs_write_header,
+    read_batch_bytes as _rvs_read_bytes,
+)
+from datagen.batchgen import (
+    _BATCH_HEADER as _RVB_BATCH_HEADER,
+    _batch_body_size as _rvb_body_size,
+    _DTYPE_CHARS as _RVB_DTYPE_CHARS,
+    read_stream_header as _rvb_read_header,
+    write_stream_header as _rvb_write_header,
+    read_batch_bytes as _rvb_read_bytes,
+)
 
-# Re-export for scripts that need to scan batch headers.
-BATCH_HEADER = _BATCH_HEADER
-batch_body_size = _batch_body_size
+_STREAM_HEADER = struct.Struct('<4sB6s')
 
-# Sanity bounds for batch header validation.
 _MAX_B = 1_000_000
 _MAX_TOKENS = 10_000
-_MAX_INSTRS = 1_000
 _MAX_INPUTS = 10_000
 
 
-def validate_batch_header(data):
-    """Validate a batch header. Returns (B, max_tokens, max_instrs, n_inputs)."""
-    vals = BATCH_HEADER.unpack(data[:BATCH_HEADER.size])
+class StreamFmt:
+    """Format descriptor for batch stream I/O."""
+    def __init__(self, name, dtype_chars, read_header, write_header,
+                 read_bytes, batch_header, body_size, validate):
+        self.name = name
+        self.dtype_chars = dtype_chars
+        self.read_header = read_header
+        self.write_header = write_header
+        self.read_bytes = read_bytes
+        self.batch_header = batch_header
+        self.body_size = body_size
+        self.validate = validate
+
+
+def _validate_rvs(data):
+    vals = _RVS_BATCH_HEADER.unpack(data[:_RVS_BATCH_HEADER.size])
     B, max_tokens, max_instrs, n_inputs = vals
     if not (0 < B <= _MAX_B and 0 < max_tokens <= _MAX_TOKENS
-            and 0 < max_instrs <= _MAX_INSTRS
             and 0 < n_inputs <= _MAX_INPUTS):
-        raise ValueError(
-            f'Invalid header: B={B}, max_tokens={max_tokens}, '
-            f'max_instrs={max_instrs}, n_inputs={n_inputs}')
+        raise ValueError(f'Invalid RVS header: {vals}')
     return vals
 
 
-def binary_stdout():
-    """Return a binary fd for stdout, redirecting Python stdout to stderr.
+def _validate_rvb(data):
+    vals = _RVB_BATCH_HEADER.unpack(data[:_RVB_BATCH_HEADER.size])
+    B, max_len, n_inputs = vals
+    if not (0 < B <= _MAX_B and 0 < max_len <= _MAX_TOKENS
+            and 0 < n_inputs <= _MAX_INPUTS):
+        raise ValueError(f'Invalid RVB header: {vals}')
+    return vals
 
-    Prevents stray prints from corrupting binary output. Call once
-    at script startup before any output.
+
+RVS = StreamFmt('rvs', _RVS_DTYPE_CHARS,
+                _rvs_read_header, _rvs_write_header,
+                _rvs_read_bytes, _RVS_BATCH_HEADER, _rvs_body_size,
+                _validate_rvs)
+
+RVB = StreamFmt('rvb', _RVB_DTYPE_CHARS,
+                _rvb_read_header, _rvb_write_header,
+                _rvb_read_bytes, _RVB_BATCH_HEADER, _rvb_body_size,
+                _validate_rvb)
+
+_FORMATS = {b'RVS\x00': RVS, b'RVB\x00': RVB}
+
+
+def detect_format(f):
+    """Read stream header, auto-detect format, validate.
+
+    Returns the StreamFmt. Consumes the header bytes.
     """
+    buf = f.read(_STREAM_HEADER.size)
+    if len(buf) < _STREAM_HEADER.size:
+        raise ValueError('Missing or truncated stream header')
+    magic, version, dtype_chars = _STREAM_HEADER.unpack(buf)
+
+    fmt = _FORMATS.get(magic)
+    if fmt is None:
+        raise ValueError(f'Unknown format: {magic!r}')
+    if version != 1:
+        raise ValueError(f'Unsupported version: {version}')
+    if dtype_chars != fmt.dtype_chars:
+        raise ValueError(f'Dtype mismatch for {fmt.name}: {dtype_chars!r}')
+    return fmt
+
+
+def peek_format(f):
+    """Peek at magic bytes without consuming the header.
+
+    Uses BufferedReader.peek so it works on non-seekable streams
+    (pipes, FIFOs from process substitution).
+    """
+    buf = b''
+    while len(buf) < 4:
+        prev = len(buf)
+        buf = f.peek(4)
+        if len(buf) <= prev:
+            raise ValueError(f'Truncated stream: {len(buf)} bytes before magic')
+    magic = bytes(buf[:4])
+    fmt = _FORMATS.get(magic)
+    if fmt is None:
+        raise ValueError(f'Unknown format: {magic!r}')
+    return fmt
+
+
+def binary_stdout():
+    """Return a binary fd for stdout, redirecting Python stdout to stderr."""
     out = os.fdopen(os.dup(sys.stdout.fileno()), 'wb')
     sys.stdout = sys.stderr
     return out

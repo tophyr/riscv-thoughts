@@ -17,7 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 
-from datagen import produce_batch, write_batch, write_stream_header
+from datagen import produce_sequence_batch
+from datagen.seqgen import write_stream_header, write_batch
 from scripts._batch_util import binary_stdout
 
 
@@ -38,7 +39,7 @@ def main():
 
     try:
         for i in range(args.n_batches):
-            batch = produce_batch(
+            batch = produce_sequence_batch(
                 args.batch_size, args.n_inputs,
                 args.max_block_len, rng)
             write_batch(out, batch)

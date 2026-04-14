@@ -23,7 +23,7 @@ import torch
 
 from emulator import Instruction, make_ctx, random_regs, run as run_instruction, SparseMemory
 from tokenizer import encode_instruction, BOS, EOS, PAD, VOCAB_SIZE
-from compressor.model import Compressor
+from compressor.model import T1Compressor
 
 
 def make_examples(target_instr, predecessors, n_inputs=4, seed=42):
@@ -175,7 +175,7 @@ def analyze(model, target_instr, predecessors, device, n_inputs=8):
 
     model.eval()
     with torch.no_grad():
-        vecs = model(tok, pad).cpu().numpy()  # (N, d_out)
+        vecs = model.encode(tok, pad).cpu().numpy()  # (N, d_out)
 
     # Pairwise cosine similarity.
     # Vectors are L2-normalized, so dot product = cosine similarity.
@@ -258,7 +258,7 @@ def main():
     else:
         device = args.device
 
-    model = Compressor(VOCAB_SIZE, args.d_model, args.n_heads,
+    model = T1Compressor(VOCAB_SIZE, args.d_model, args.n_heads,
                        args.n_layers, args.d_out)
     model.load_state_dict(torch.load(args.model, map_location=device,
                                      weights_only=True))

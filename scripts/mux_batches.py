@@ -1,33 +1,18 @@
 #!/usr/bin/env python3
-"""Multiplex multiple binary batch streams into one.
+"""Multiplex multiple binary batch streams into one (RVS or RVB).
 
-Inputs can be files, pipes, process substitution, or spawned
-gen_seq_batches.py workers. All go through the same muxing plumbing.
-
-Muxing modes:
-  fifo:        output whichever batch is ready first (default when
-               no weights given). Ignores weights.
-  round-robin: cycle through inputs in order. Ignores weights.
-  weighted:    pick proportional to weight from available inputs
-               (default when any input has a weight prefix).
-               Weights affect interleaving, not throughput.
-
-Inputs can have weights via prefix syntax: "128:/dev/fd/63" or
-"0.5:corpus.bin". Default weight is 1.0. Spawned workers each
-get --gen-weight (default 1.0).
+Spawns generator workers or reads from files/pipes. All inputs
+must be the same format.
 
 Usage:
-    # Spawn 16 generators, 1000 batches each:
-    mux_batches.py --gen 16 --n-batches 1000 > corpus.bin
+    # Single-instruction batches:
+    mux_batches.py --gen instr --gen-count 16 --n-batches 1000 > corpus.bin
 
-    # Mix local generators with weighted network stream:
-    mux_batches.py --gen 16 128:<(nc threadripper 9000 -d | unlz4) > corpus.bin
+    # Sequence batches:
+    mux_batches.py --gen seq --gen-count 16 --n-batches 1000 > seqs.bin
 
-    # File inputs with weights:
+    # File inputs (auto-detected):
     mux_batches.py 1:local.bin 8:remote.bin > combined.bin
-
-    # Round-robin mode:
-    mux_batches.py --mode round-robin --gen 4 --n-batches 100 > corpus.bin
 """
 
 import argparse
@@ -40,42 +25,36 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from datagen import (
-    read_batch_bytes, read_stream_header, write_stream_header,
-)
-from scripts._batch_util import binary_stdout
+from scripts._batch_util import binary_stdout, detect_format, peek_format, RVS, RVB
 
 
-def _reader(f, q, idx):
-    """Read batches from a stream and put (idx, bytes) on the queue."""
+def _reader(f, q, idx, fmt):
     try:
-        read_stream_header(f)
+        fmt.read_header(f)
         while True:
-            data = read_batch_bytes(f)
+            data = fmt.read_bytes(f)
             if data is None:
                 break
             q.put((idx, data))
     except (EOFError, ValueError) as e:
         q.put((idx, e))
-    q.put((idx, None))  # sentinel
+    q.put((idx, None))
 
 
-def _reader_per_q(f, per_q, idx):
-    """Read batches from a stream into a per-input queue."""
+def _reader_per_q(f, per_q, idx, fmt):
     try:
-        read_stream_header(f)
+        fmt.read_header(f)
         while True:
-            data = read_batch_bytes(f)
+            data = fmt.read_bytes(f)
             if data is None:
                 break
             per_q.put(data)
     except (EOFError, ValueError) as e:
         per_q.put(e)
-    per_q.put(None)  # sentinel
+    per_q.put(None)
 
 
 def _mux_write(out, written_ref, data, verbose):
-    """Write one batch and update counter. Returns False on BrokenPipe."""
     try:
         out.write(data)
     except BrokenPipeError:
@@ -86,17 +65,12 @@ def _mux_write(out, written_ref, data, verbose):
     return True
 
 
-def mux_fifo(files, weights, out, verbose=False):
-    """Output whichever batch is ready first.
-
-    Weights are ignored — all inputs compete equally for queue space.
-    """
+def mux_fifo(files, weights, out, fmt, verbose=False):
     q = queue.Queue(maxsize=len(files) * 2)
-
     for i, f in enumerate(files):
-        t = threading.Thread(target=_reader, args=(f, q, i), daemon=True)
+        t = threading.Thread(target=_reader, args=(f, q, i, fmt),
+                             daemon=True)
         t.start()
-
     written = [0]
     done = 0
     while done < len(files):
@@ -110,26 +84,19 @@ def mux_fifo(files, weights, out, verbose=False):
             continue
         if not _mux_write(out, written, data, verbose):
             break
-
     return written[0]
 
 
-def mux_round_robin(files, weights, out, verbose=False):
-    """Cycle through inputs in order, one batch per input per cycle.
-
-    Weights are ignored — each input gets one batch per cycle regardless
-    of weight. Blocks on the slowest input each cycle.
-    """
+def mux_round_robin(files, weights, out, fmt, verbose=False):
     queues = []
     for i, f in enumerate(files):
         q = queue.Queue(maxsize=2)
-        t = threading.Thread(target=_reader, args=(f, q, i), daemon=True)
+        t = threading.Thread(target=_reader, args=(f, q, i, fmt),
+                             daemon=True)
         t.start()
         queues.append(q)
-
     written = [0]
     active = list(range(len(files)))
-
     while active:
         next_active = []
         for i in active:
@@ -143,36 +110,24 @@ def mux_round_robin(files, weights, out, verbose=False):
                 return written[0]
             next_active.append(i)
         active = next_active
-
     return written[0]
 
 
-def mux_weighted(files, weights, out, verbose=False, seed=42):
-    """Pick inputs proportional to weight, blocking if necessary.
-
-    The output ratio matches the weight ratio exactly (in expectation),
-    even if it means waiting for a slow input. This can reduce
-    throughput when a high-weight input is slower than the consumer.
-    """
+def mux_weighted(files, weights, out, fmt, verbose=False, seed=42):
     queues = []
     for i, f in enumerate(files):
         per_q = queue.Queue(maxsize=2)
         t = threading.Thread(target=_reader_per_q,
-                             args=(f, per_q, i), daemon=True)
+                             args=(f, per_q, i, fmt), daemon=True)
         t.start()
         queues.append(per_q)
-
     written = [0]
     active = list(range(len(files)))
     rng = random.Random(seed)
-
     while active:
         w = [weights[i] for i in active]
         pick = rng.choices(active, weights=w, k=1)[0]
-
-        # Block until the chosen input has data.
         data = queues[pick].get()
-
         if data is None:
             active.remove(pick)
             continue
@@ -182,12 +137,10 @@ def mux_weighted(files, weights, out, verbose=False, seed=42):
             continue
         if not _mux_write(out, written, data, verbose):
             break
-
     return written[0]
 
 
 def _parse_weighted_input(s):
-    """Parse 'weight:path' or plain 'path'. Returns (path, weight)."""
     if ':' in s:
         parts = s.split(':', 1)
         try:
@@ -201,64 +154,87 @@ def _parse_weighted_input(s):
 def main():
     p = argparse.ArgumentParser(description='Mux binary batch streams.')
     p.add_argument('inputs', nargs='*',
-                   help='Input files/pipes, optionally weight-prefixed '
-                        '(e.g. "128:file.bin")')
+                   help='Input files, optionally weight-prefixed')
     p.add_argument('--mode', choices=['fifo', 'round-robin', 'weighted'],
-                   default=None,
-                   help='Muxing mode (default: weighted if any input has '
-                        'a weight prefix, fifo otherwise). fifo and '
-                        'round-robin ignore weights.')
-    p.add_argument('--shuffle-seed', type=int, default=42,
-                   help='Random seed for weighted mode (default: 42)')
-    p.add_argument('-v', '--verbose', action='count', default=0,
-                   help='-v for mux status, -vv for worker status too')
+                   default=None)
+    p.add_argument('--shuffle-seed', type=int, default=42)
+    p.add_argument('-v', '--verbose', action='count', default=0)
 
     g = p.add_argument_group('generator spawning')
-    g.add_argument('--gen', type=int, default=0, metavar='N',
-                   help='Spawn N gen_seq_batches.py workers')
-    g.add_argument('--gen-weight', type=float, default=1.0,
-                   help='Weight per spawned worker (default: 1.0)')
-    g.add_argument('--n-batches', type=int, default=1000,
-                   help='Batches per spawned worker (default: 1000)')
-    g.add_argument('--batch-size', type=int, default=256)
-    g.add_argument('--n-inputs', type=int, default=4)
-    g.add_argument('--max-block-len', type=int, default=5)
+    g.add_argument('--gen', choices=['instr', 'seq'], default=None,
+                   help='Type of generator to spawn')
+    g.add_argument('--gen-count', type=int, default=0, metavar='N',
+                   help='Spawn N generator workers')
+    g.add_argument('--gen-weight', type=float, default=1.0)
+    g.add_argument('--n-batches', type=int, default=1000)
+    g.add_argument('--batch-size', type=int, default=None)
+    g.add_argument('--n-inputs', type=int, default=None)
+    g.add_argument('--max-block-len', type=int, default=5,
+                   help='For seq generator')
+    g.add_argument('--config', type=str, default=None,
+                   help='JSON config file for instr generator distribution')
     g.add_argument('--seed', type=int, default=42)
 
     args = p.parse_args()
 
-    if not args.inputs and args.gen == 0:
-        p.error('Provide input files and/or --gen N')
+    if not args.inputs and not args.gen:
+        p.error('Provide input files and/or --gen TYPE --gen-count N')
+
+    # Determine format and defaults.
+    if args.gen == 'instr':
+        fmt = RVB
+        batch_size = args.batch_size or 4096
+        n_inputs = args.n_inputs or 32
+    elif args.gen == 'seq':
+        fmt = RVS
+        batch_size = args.batch_size or 256
+        n_inputs = args.n_inputs or 4
+    else:
+        fmt = None
+        batch_size = args.batch_size or 4096
+        n_inputs = args.n_inputs or 32
 
     out = binary_stdout()
-
     files = []
     weights = []
     procs = []
     file_handles = []
 
-    # Open file/pipe inputs with optional weights.
     has_explicit_weight = False
     for raw in args.inputs:
         path, weight = _parse_weighted_input(raw)
         if weight != 1.0:
             has_explicit_weight = True
         f = open(path, 'rb')
+        file_fmt = peek_format(f)
+        if fmt is None:
+            fmt = file_fmt
+        elif file_fmt.name != fmt.name:
+            print(f'ERROR: {path}: format {file_fmt.name} != {fmt.name}',
+                  file=sys.stderr)
+            sys.exit(1)
         files.append(f)
         weights.append(weight)
         file_handles.append(f)
 
-    # Spawn generator workers.
-    if args.gen > 0:
-        script = str(Path(__file__).resolve().parent / 'gen_seq_batches.py')
-        base_cmd = [sys.executable, script,
-                    '--batch-size', str(args.batch_size),
-                    '--n-inputs', str(args.n_inputs),
-                    '--max-block-len', str(args.max_block_len)]
+    if args.gen and args.gen_count > 0:
+        if args.gen == 'instr':
+            script = str(Path(__file__).resolve().parent / 'gen_instr_batches.py')
+            base_cmd = [sys.executable, script,
+                        '--batch-size', str(batch_size),
+                        '--n-inputs', str(n_inputs)]
+            if args.config:
+                base_cmd += ['--config', args.config]
+        else:
+            script = str(Path(__file__).resolve().parent / 'gen_seq_batches.py')
+            base_cmd = [sys.executable, script,
+                        '--batch-size', str(batch_size),
+                        '--n-inputs', str(n_inputs),
+                        '--max-block-len', str(args.max_block_len)]
         if args.verbose >= 2:
             base_cmd.append('-v')
 
-        for i in range(args.gen):
+        for i in range(args.gen_count):
             cmd = base_cmd + ['--n-batches', str(args.n_batches),
                               '--seed', str(args.seed + i)]
             proc = subprocess.Popen(
@@ -269,7 +245,10 @@ def main():
             files.append(proc.stdout)
             weights.append(args.gen_weight)
 
-    # Auto-select mode if not specified.
+    if fmt is None:
+        print('ERROR: cannot determine format', file=sys.stderr)
+        sys.exit(1)
+
     mode = args.mode
     if mode is None:
         mode = 'weighted' if has_explicit_weight else 'fifo'
@@ -279,29 +258,26 @@ def main():
         n_gen = len(procs)
         parts = []
         if n_file:
-            w_strs = [f'{w:.3g}' for w in weights[:n_file]]
-            parts.append(f'{n_file} file inputs (weights: {", ".join(w_strs)})')
+            parts.append(f'{n_file} file inputs')
         if n_gen:
-            parts.append(f'{n_gen} spawned workers (weight: {args.gen_weight})')
-        print(f'Muxing {" + ".join(parts)}, mode={mode}',
-              file=sys.stderr)
+            parts.append(f'{n_gen} spawned {args.gen} workers')
+        print(f'Muxing {" + ".join(parts)}, mode={mode}, '
+              f'format={fmt.name}', file=sys.stderr)
 
-    write_stream_header(out)
+    fmt.write_header(out)
 
     if mode == 'weighted':
-        written = mux_weighted(files, weights, out,
+        written = mux_weighted(files, weights, out, fmt,
                                verbose=(args.verbose >= 1),
                                seed=args.shuffle_seed)
     else:
-        mux_fn = {'fifo': mux_fifo,
-                   'round-robin': mux_round_robin}[mode]
-        written = mux_fn(files, weights, out,
+        mux_fn = {'fifo': mux_fifo, 'round-robin': mux_round_robin}[mode]
+        written = mux_fn(files, weights, out, fmt,
                          verbose=(args.verbose >= 1))
 
     out.close()
     for f in file_handles:
         f.close()
-
     for proc in procs:
         proc.terminate()
     for proc in procs:
