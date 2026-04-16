@@ -12,8 +12,37 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from tokenizer import BOS, EOS, PAD, VOCAB_SIZE
+from tokenizer import BOS, EOS, PAD, VOCAB_SIZE, encode_instruction
+from emulator.emulator import Instruction
 from .model import T1Compressor, Decoder
+
+
+# Fixed probe instructions for watching geometry during training.
+# Distances reported in each log line:
+#   aa:    ADD x5,x7,x7 vs ADD x5,x1,x2    (different-operand ADDs)
+#   canon: ADD x5,x7,x7 vs SLLI x5,x7,1    (double_is_shl1 canonical)
+#   ss:    SLLI x5,x7,1 vs SLLI x5,x3,2    (SLLI neighbor)
+#   comm:  ADD x5,x1,x2 vs ADD x5,x2,x1    (commutative swap — should collapse)
+_PROBE_INSTRS = [
+    Instruction('ADD',  5, 7, 7),   # 0: ADD rs,rs (double canonical)
+    Instruction('SLLI', 5, 7, 1),   # 1: SLLI rs,1 (shl1 canonical)
+    Instruction('ADD',  5, 1, 2),   # 2: random ADD
+    Instruction('SLLI', 5, 3, 2),   # 3: SLLI neighbor
+    Instruction('ADD',  5, 2, 1),   # 4: commutative swap of #2
+]
+
+
+def _probe_tensor(device):
+    """Tokenize + pad the fixed probe instructions for periodic eval."""
+    encoded = [encode_instruction(i) for i in _PROBE_INSTRS]
+    max_len = max(len(e) for e in encoded)
+    tok = np.full((len(encoded), max_len), PAD, dtype=np.int64)
+    pad = np.ones((len(encoded), max_len), dtype=np.bool_)
+    for i, e in enumerate(encoded):
+        tok[i, :len(e)] = e
+        pad[i, :len(e)] = False
+    return (torch.from_numpy(tok).to(device),
+            torch.from_numpy(pad).to(device))
 
 
 # ---------------------------------------------------------------------------
@@ -32,17 +61,20 @@ def exec_distance_deltas(deltas, device):
 def _exec_distance_scalar_impl(dv, pv):
     """Pairwise distance from scalar data_vals and pc_vals.
 
-    mean_s(log1p(|data_diff_s| + |pc_diff_s|))
+    mean_s(log1p(log1p(|data_diff_s| + |pc_diff_s|)))
 
-    This is the proven metric from Exp 3+. It compares the single
-    computed output value per instruction, not all 32 registers.
+    Nested log: first log1p compresses the int32 range (0..4e9) to
+    (0..22); second log1p compresses that to (0..3.14). The second
+    compression spreads the low end more uniformly, so near-equivalence
+    pairs (e.g., ADDI imm=0 vs imm=1, raw diff=1) get meaningfully
+    larger targets and thus more gradient pressure during training.
     """
     B, S = dv.shape
     acc = torch.zeros(B, B, dtype=torch.float32, device=dv.device)
     for s in range(S):
         d = (dv[:, s].unsqueeze(1) - dv[:, s].unsqueeze(0)).abs()
         p = (pv[:, s].unsqueeze(1) - pv[:, s].unsqueeze(0)).abs()
-        acc += torch.log1p(d + p)
+        acc += torch.log1p(torch.log1p(d + p))
     return acc / S
 
 
@@ -66,7 +98,7 @@ def exec_distance_scalar(data_vals, pc_vals, device):
 # Execution distance scaling
 # ---------------------------------------------------------------------------
 
-_EXEC_DIST_SCALE = 2.0 / 22.0  # map log-scaled [0, ~22] → [0, ~2]
+_EXEC_DIST_SCALE = 2.0 / 3.14  # nested-log range [0, ~3.14] → [0, ~2]
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +132,7 @@ def train_batches(batch_iter, d_model=128, n_heads=4, n_layers=2,
     losses = []
     step = 0
     t0 = time.time()
+    probe_tok, probe_pad = _probe_tensor(device)
 
     for batch in batch_iter:
         tok = torch.from_numpy(batch.token_ids).to(device)
@@ -153,13 +186,23 @@ def train_batches(batch_iter, d_model=128, n_heads=4, n_layers=2,
             if n_steps:
                 eta_sec = int(max(0, n_steps - step) * ms_per / 1000)
                 eta_str = f'  eta {timedelta(seconds=eta_sec)}'
+            with torch.no_grad():
+                pv = model.encode(probe_tok, probe_pad)
+            d_add_add = (pv[0] - pv[2]).norm().item()
+            d_canon = (pv[0] - pv[1]).norm().item()
+            d_sll_sll = (pv[1] - pv[3]).norm().item()
+            d_comm = (pv[2] - pv[4]).norm().item()
             print(f'step {step:>6d}  '
                   f'loss {loss_val:.4f} '
                   f'(mse {mse_loss.item():.4f} '
                   f'dt {dt_loss.item():.3f} '
                   f'dr {dr_loss.item():.3f})  '
                   f'lr {current_lr:.1e}  {ms_per:.0f}ms/step  '
-                  f'N={N}{eta_str}')
+                  f'N={N}{eta_str}  '
+                  f'probe[aa={d_add_add:.3f} '
+                  f'canon={d_canon:.3f} '
+                  f'ss={d_sll_sll:.3f} '
+                  f'comm={d_comm:.3f}]')
 
         if n_steps and step >= n_steps:
             break

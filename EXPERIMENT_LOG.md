@@ -1175,3 +1175,127 @@ Specifically:
   token (FIFO) per firing.
 - Window-size-weighted reconstruction provides the right cost
   signal for all three gates without explicit density targets.
+
+### Experiment 24: Equivalence manifest, injection, and targeted boost
+
+Built the T1 Foundations Pass: a template-based equivalence
+manifest, per-class eval harness, and tuple-injection mechanism
+in the batch pipeline. Ran six progressive training configurations
+to understand what drives equivalence collapse and what blocks it.
+
+**Architecture additions:**
+
+- `datagen/equivalences.py` — manifest of 16 classes covering six
+  structural axes: operand-order commutativity, self-operand
+  identity, zero-register alias, zero/identity immediate,
+  cross-opcode aliasing, and condition-forcing (for branches).
+  Each class is a *rule* with free variables (rd, rs, rs1,
+  rs2, imm, shamt) and optional constraints. The sampler
+  instantiates concrete instructions per binding.
+- `scripts/eval_equivalences.py` — per-class intra-cohesion vs
+  inter-separation on a trained encoder. Reports ratio = intra /
+  inter with PASS (<0.3), WEAK (<0.7), FAIL thresholds.
+- `datagen/batchgen.py` — `produce_instruction_batch` injects
+  canonical tuples at a configurable rate via an `equivalences`
+  sub-dict in the distribution config. Three-pass: guaranteed
+  `min_per_class` tuples, per-class `boost` counts, random fill.
+- `datagen/instrgen.py` — `_DEST_REGS` now includes x0.
+  Write-to-x0 NOPs are a real semantic class; the old exclusion
+  was carried forward from sequence training where x0-writes
+  "wasted" sequence slots, an inapplicable rationale for
+  single-instruction batches.
+- `compressor/train.py` — nested-log metric
+  `log1p(log1p(|data_diff|+|pc_diff|))` replaces single `log1p`.
+  Sharpens low-end distance differentiation so near-equivalence
+  contrasts (e.g., ADDI imm=0 vs imm=1, raw diff=1) get more
+  gradient.
+- Probe instrumentation in `train_batches`: every log step reports
+  ADD-ADD, canonical (ADD rs,rs vs SLLI rs,1), SLLI-SLLI, and
+  commutative ADD swap distances to watch geometry evolve across
+  training.
+
+**Baseline (previous 250K run, no injection, no dest heads,
+constant LR bug):** 3 PASS / 3 WEAK / 7 FAIL.
+
+**Progressive configurations:**
+
+| config                                  | steps | PASS | WEAK | FAIL |
+|-----------------------------------------|-------|------|------|------|
+| 1% injection                            | 10K   | 4    | 2    | 7    |
+| 10% + min_per_class=4                   | 10K   | 5    | 4    | 4    |
+| + boost shl1=60                         | 10K   | 6    | 1    | 6    |
+| + nested log                            | 10K   | 6    | 3    | 4    |
+| 250K no boost                           | 250K  | 5    | 4    | 4    |
+| 250K + 20% + boost commutatives + shl1  | 250K  | **8**| **2**| **3**|
+
+**Final 250K + boost per-class results:**
+
+```
+commutative_add           WEAK (0.38)
+commutative_and           PASS (0.22)
+commutative_or            PASS (0.27)
+commutative_xor           FAIL (0.74)
+self_op_zero              PASS (0.004)
+self_op_identity          PASS (0.05)
+mv_via_zero_reg           FAIL (0.77)
+double_is_shl1            PASS (0.12)
+write_zero_to_rd          PASS (0.04)
+x0_write_nop              PASS (0.002)
+branch_always_taken       WEAK (0.35)
+branch_never_taken        PASS (0.004)
+sign_test                 FAIL (1.60)
+```
+
+**Key findings:**
+
+1. **Injection works, but density matters.** 1% (~10 canonical
+   tuples/batch) is too thin to overcome random-operand gradient.
+   10% + guaranteed 4 tuples/class is adequate for most classes.
+   Cross-opcode and high-specificity contrasts need 20% + per-class
+   boost (30 tuples/batch for commutatives and double_is_shl1).
+
+2. **Loss plateau vs geometry evolution.** Total loss plateaued
+   at 0.156 by step 50K and stayed flat for 200K more steps. But
+   geometric probes kept improving dramatically: canon (ADD rs,rs
+   vs SLLI rs,1) went from 0.67 at step 50K to 0.13 at step 250K.
+   The optimizer wanders the equal-loss manifold, biased by
+   persistent injection gradients, producing geometric deformation
+   that total loss doesn't measure. **Loss-based convergence is
+   uninformative for the actual objective.**
+
+3. **Opcode clustering dissolves with training.** Early training
+   (~step 10K) shows tight opcode clusters (ADD-ADD = 0.03). By
+   step 50K clusters are gone (ADD-ADD = 1.0). Good for
+   cross-opcode equivalences (the ADD-SLLI bridge can form), but
+   bad for commutativity: operand order starts mattering to the
+   encoder, so swapped pairs no longer collapse for free.
+   Commutative boost is required to re-collapse them at long
+   training. The short-training "commutative PASS" was a cluster
+   illusion, not real commutativity learning.
+
+4. **Cross-opcode aliases collapse with long training.**
+   `double_is_shl1` (ADD rs,rs ≡ SLLI rs,1) went from FAIL (1.87
+   at 10K) to PASS (0.12 at 250K + boost). The opcode-similarity
+   prior is a *learned bias*, not a hard constraint — it dissolves
+   under sustained injection pressure at sufficient training
+   length. The earlier claim that opcode clustering was
+   structurally unbridgeable was wrong.
+
+5. **Persistent failures are metric-bound.** `sign_test`,
+   `mv_via_zero_reg`, `commutative_xor` all have contrasts that
+   differ only at rare register-value conditions (rs=0) or have
+   tiny raw-diff gaps that nested log compresses further. Boost
+   doesn't help; either state-preconditions or a different metric
+   is needed. Deferred to the smooth-distance experiment.
+
+**Implication for next step:**
+
+The loss-plateau phenomenon argues for moving from implicit
+injection-via-batch-MSE to an **explicit equivalence loss term**.
+The main MSE has no direct gradient on equivalence collapse — it
+only provides gradient through batch-level pair inclusion. A
+dedicated equivalence loss (encode canonical tuples per class per
+step, target pairwise distance = 0) would provide strong, direct
+gradient and should greatly shorten required training. This is
+Option B of the earlier injection-vs-loss decision, now supported
+by the plateau evidence.

@@ -103,20 +103,45 @@ def produce_instruction_batch(batch_size: int, n_inputs: int,
                               dist=None) -> InstructionBatch:
     """Generate one batch of single instructions with execution results.
 
-    dist: optional distribution dict (from load_distribution or
-          DEFAULT_DISTRIBUTION). Controls instruction type mix.
+    dist: optional config dict (from load_distribution or
+          DEFAULT_DISTRIBUTION). Controls instruction type mix and
+          optionally the equivalence-tuple injection rate via an
+          'equivalences' sub-dict (keys: 'rate', 'max_per_class').
     """
     if dist is not None:
         validate_distribution(dist)
         opcode_table = _build_opcode_table(dist)
+        eq_config = dist.get('equivalences', {})
     else:
         opcode_table = None
+        eq_config = {}
 
+    inject_rate = eq_config.get('rate', 0.0)
+    max_per_class = eq_config.get('max_per_class', 8)
+    min_per_class = eq_config.get('min_per_class', 0)
+    boost = eq_config.get('boost', None)
+
+    target_inject = int(round(batch_size * inject_rate))
+    if target_inject > 0:
+        from datagen.equivalences import sample_injection_tuples
+        injected = sample_injection_tuples(
+            target_inject, max_per_class, rng,
+            min_per_class=min_per_class, boost=boost)
+        # Cap to leave room for at least one random instruction.
+        if len(injected) >= batch_size:
+            injected = injected[:batch_size - 1]
+    else:
+        injected = []
+
+    n_random = batch_size - len(injected)
     instructions: list[Instruction] = []
     encoded: list[list[int]] = []
 
-    for _ in range(batch_size):
+    for _ in range(n_random):
         instr = random_instruction(rng, opcode_table=opcode_table)
+        instructions.append(instr)
+        encoded.append(encode_instruction(instr))
+    for instr in injected:
         instructions.append(instr)
         encoded.append(encode_instruction(instr))
 
