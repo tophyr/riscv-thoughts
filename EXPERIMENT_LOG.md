@@ -1299,3 +1299,120 @@ step, target pairwise distance = 0) would provide strong, direct
 gradient and should greatly shorten required training. This is
 Option B of the earlier injection-vs-loss decision, now supported
 by the plateau evidence.
+
+### Experiment 25: Explicit equivalence loss
+
+Adds a dedicated loss term that encodes each class's canonical
+templates (under a fresh binding per step) and minimizes their
+pairwise squared distances directly (target = 0). This is Option
+B, picked up after the Exp 24 plateau analysis showed the main
+MSE's per-equivalence-pair gradient is ~0.012% of total gradient
+share — effectively invisible, even at high injection rates.
+
+**Mechanism:**
+- `compressor/train.equivalence_loss`: for every manifest class
+  with >=2 canonical templates, sample a binding, materialize,
+  batch all classes' templates into one padded tensor, encode
+  once (shared forward), then slice per-class and compute
+  `mean((d_ij)² for i<j)` per class. Average over classes.
+- Added `--equiv-weight` CLI arg to train_compressor.
+- Batched-across-classes encode matters for speed: the first
+  implementation had 14 separate forward passes per step and
+  doubled step time (49ms → 106ms). Batching brought it back to
+  51ms.
+
+**Why it's structurally different from heavy injection:**
+Injected pairs have to share the batch's ~8.4M-pair gradient
+budget with random pairs. Even at extreme injection rates, the
+fraction of *true within-tuple equivalence* pairs in the batch
+caps out at ~0.1% of pairs. The explicit loss operates on a
+separate set of ~75 encoded instructions with its own gradient
+budget, so per-equivalence-pair gradient is ~150,000× stronger
+for the same weight.
+
+**Progressive runs:**
+
+| config                              | steps | PASS | WEAK | FAIL |
+|-------------------------------------|-------|------|------|------|
+| equiv only, w=0.5 (unbatched)       |  (partial, killed — over-collapse) |
+| equiv only, w=0.05 (batched)        | 10K   | 5    | 5    | 3    |
+| equiv + 5% injection, w=0.05        | 10K   | 7    | 1    | 5    |
+| equiv + 5% injection, w=0.05 (100K) | 100K  | **12** | **0** | **1** |
+
+**Final 100K combined per-class:**
+
+```
+commutative_add           PASS (0.018)
+commutative_and           PASS (0.022)
+commutative_or            PASS (0.023)
+commutative_xor           PASS (0.018)
+self_op_zero              PASS (0.012)
+self_op_identity          PASS (0.016)
+mv_via_zero_reg           PASS (0.029)
+double_is_shl1            PASS (0.016)
+write_zero_to_rd          PASS (0.083)
+x0_write_nop              PASS (0.003)
+branch_always_taken       PASS (0.018)
+branch_never_taken        PASS (0.005)
+sign_test                 FAIL (0.940)
+```
+
+12/13 testable classes PASS in 70 minutes — significantly better
+than the 250K + boost run's 8/2/3 in 2.5 hours.
+
+**"Teaching to the test" sanity checks on the final checkpoint:**
+
+- Pearson on *out-of-manifest* random pairs: 0.9129 (vs 0.9268 for
+  the 250K + boost reference). The equiv loss cost ~0.014 of
+  global correlation — noticeable but small, and still well above
+  the 0.85 target. The global geometry was not warped.
+- Spearman 0.6436 (vs 0.6604). Similar slight drop; fine-grained
+  rank ordering noise is comparable to the previous best run.
+- PCA dimensionality: 94 dims for 90% variance, participation
+  ratio 84.8 (vs 100 / 90.75 for the reference). Both runs use
+  ~70% of the 128-d space actively. No excessive collapse.
+- Top 10 singular values are essentially identical between the
+  two runs (55.5/56.5, 21.9/21.9, 15.8/15.7, …). This is strong
+  evidence both runs converged to geometrically comparable
+  attractors — not different local minima.
+
+**Findings:**
+
+1. **Injection and explicit loss are complementary, not
+   substitutes.** Explicit loss alone (no injection) gave 5/5/3
+   — it learned the abstract rules but regressed on classes that
+   benefited from natural random batch co-occurrence (self_op_zero,
+   write_zero_to_rd). Adding 5% injection back restored the "many
+   varied specific instances" signal those classes need. Combined
+   is dramatically better than either alone.
+
+2. **Gradient concentration beats gradient volume.** The 100K
+   combined run reached tighter PASS ratios than 250K + boost
+   (e.g., commutative_add: 0.018 vs 0.38, commutative_xor: 0.018
+   vs 0.74) in less than half the wall time. The explicit loss's
+   ~150,000× gradient concentration per equivalence pair is the
+   mechanism.
+
+3. **Only sign_test still fails, and the ratio is now 0.94** (vs
+   1.60 in the 250K + boost run). This class's contrast —
+   SLTI rd,rs,0 vs SLTI rd,rs,1 — only diverges when rs=0, which
+   is rare under random-state sampling. Even ~150,000× gradient
+   concentration can't overcome the fact that canonical and
+   contrast produce identical outputs for nearly all inputs.
+   Needs state-preconditions (boost the rare distinguishing
+   register values) or a different metric, not more training.
+
+**Cost comparison (wall-clock to 100K-step result quality):**
+- Injection-only (20% + boosts), 250K: 150 minutes → 8/2/3
+- Combined (5% + equiv w=0.05), 100K: 70 minutes → 12/0/1
+
+**Implication for next step:**
+
+The manifest now collapses reliably with the combined approach.
+Remaining question: is the geometry consistent across seeds, or
+are we finding comparable-but-not-identical attractors on each
+run? The out-of-manifest Pearson and singular-value agreement
+between runs suggest consistency, but a true seed-robustness
+study would require 3+ runs with varied `--seed`. Deferred in
+favor of moving on to the `d_out` compression sweep, which is
+the actual purpose of this foundations pass.

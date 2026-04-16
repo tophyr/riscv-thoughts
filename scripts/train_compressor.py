@@ -63,6 +63,11 @@ def main():
     p.add_argument('--pairwise-weight', type=float, default=1.0)
     p.add_argument('--reinforce-lr', type=float, default=1e-3)
 
+    # Explicit equivalence loss (instr mode).
+    p.add_argument('--equiv-weight', type=float, default=0.0,
+                   help='Weight for explicit equivalence collapse loss. '
+                        '0 disables.')
+
     args = p.parse_args()
 
     save_dir = None
@@ -82,6 +87,7 @@ def main():
             device=args.device,
             n_steps=args.n_steps,
             log_every=args.log_every,
+            equiv_weight=args.equiv_weight,
         )
         print(f'\nDone: {len(losses)} steps, '
               f'final loss {losses[-1]:.4f}')

@@ -2,78 +2,68 @@
 
 ## Current: T1 Foundations
 
-Correct foundational choices before building the T1 pipeline
-end-to-end. Coverage of the equivalence classes we care about
-and the right encoder dimensionality shape every training run;
-fixing them up front is cheaper than fixing them after assembly.
-
 ### Step 1: Equivalence manifest and coverage
 
-The N×N pairwise MSE only exerts collapse pressure on pairs that
-co-occur in a batch. Random sampling under-represents rare
-equivalences, and many classes require specific register-state
-preconditions to be observable. Fix both.
-
-- [ ] Enumerate equivalence classes in a manifest file
-      (commutative operand swap; self-op identities XOR/SUB y,y=0
-      and AND/OR y,y=y; zero-reg aliases ADD x,x0,y ≡ MV, SUB x,x0,y
-      ≡ NEG, XORI x,y,-1 ≡ NOT; write-to-x0 NOPs across all ops;
-      shift-by-0 identities; ADD y,y ≡ SLLI y,1; branch-taken-with-
-      equal-operands ≡ JAL x0; signed/unsigned comparison coincidence;
-      load-immediate-zero via multiple routes)
-- [ ] Per-class manifest: canonical tuples, register-state
-      preconditions that make the equivalence observable, contrast
-      tuples that must stay separate
-- [ ] Eval harness: per-class intra-class cohesion and inter-class
-      separation metrics on a trained encoder
-- [ ] Baseline: measure current d_out=128 encoder per-class; identify
-      which classes already collapse vs which need help
-- [ ] Design injection mechanism (per-batch tuple injection vs
-      auxiliary equivalence loss vs state-precondition generator
-      configs vs hybrid)
-- [ ] Retrain with injection; verify per-class cohesion improves
-      and contrast pairs stay apart
-- [ ] (Deferred) Smooth-distance / ordering tests: some relationships
-      don't fit the binary equivalence/contrast frame (e.g., ADDI
-      imm=0 vs imm=1 vs imm=1000 should produce roughly monotonic
-      distances, not just "not-equivalent"). Handle as a separate
-      sensitivity harness once the equivalence manifest works.
+- [x] Enumerate equivalence classes in a manifest file
+      (16 classes across 6 structural axes in
+      datagen/equivalences.py)
+- [x] Per-class manifest: canonical tuples with free variables
+      and constraints, contrast tuples
+- [x] Eval harness (scripts/eval_equivalences.py): per-class
+      intra-cohesion vs inter-separation with PASS/WEAK/FAIL
+- [x] Baseline measurement on pre-foundations encoder (3/3/7)
+- [x] Injection mechanism: per-batch canonical-tuple injection
+      with configurable rate, min_per_class guarantees, and
+      per-class boost
+- [x] Explicit equivalence loss: dedicated loss term encoding
+      all classes' canonicals each step, ~150,000× gradient
+      concentration vs batch-MSE. Combined with 5% injection
+      reaches 12/0/1 in 100K steps (Exp 25).
+- [ ] (Deferred) Smooth-distance / ordering tests: some
+      relationships don't fit the binary equivalence/contrast
+      frame (e.g., ADDI imm=0 vs imm=1 vs imm=1000 should
+      produce roughly monotonic distances). Handle as a
+      separate sensitivity harness. sign_test (the only
+      remaining FAIL at ratio 0.94) is this category.
+- [ ] (Deferred) State-precondition injection for sign_test:
+      SLTI imm=0 vs imm=1 only diverges when rs=0, which
+      is rare under random sampling. Needs boosted zero-value
+      register states, not more training.
 
 ### Step 2: Encoder dimensionality
 
-d_out=128 was chosen early and never revisited. The core thesis is
-compression, so d_out should be sized deliberately as a compression
-ratio, not left oversized by inertia.
+d_out=128 was chosen early and never revisited. The core thesis
+is compression, so d_out should be sized deliberately.
 
-- [ ] PCA/SVD on trained d_out=128 outputs — measure the
-      actually-used subspace dimensionality
-- [ ] MDS on pairwise exec-distance matrix — measure intrinsic
-      dimension from the target geometry side
-- [ ] d_out sweep {4, 8, 16, 32, 64, 128} on a consistent training
-      setup with step 1's injected signal
-- [ ] Measure per-class cohesion and contrast separation at each
-      d_out; plot the collapse order of equivalence classes as
-      d_out shrinks (the compression-ratio experiment)
-- [ ] Commit to final d_out as the smallest value that preserves
-      manifest-defined equivalences and contrasts
+- [x] PCA/SVD on trained d_out=128 outputs: 94 dims for 90%
+      variance, participation ratio 84.8. ~70% of the 128-d
+      space is actively used.
+- [ ] MDS on pairwise exec-distance matrix (may not be needed
+      given PCA results and the d_out sweep below)
+- [ ] d_out sweep {4, 8, 16, 32, 64, 128} with equiv loss +
+      injection. d_out=64 run in progress.
+- [ ] Measure per-class cohesion and contrast separation at
+      each d_out; find where classes start breaking
+- [ ] Commit to final d_out
 
 ## Next: T1 Piecemeal Assembly
 
 With the manifest and a chosen d_out in hand, assemble T1's
 components one at a time.
 
-### Step 3: Encoder (N×N pairwise MSE training)
+### Step 3: Encoder (final training)
 - [x] RVB single-instruction batch format and pipeline tools
 - [x] Format auto-detection (RVB/RVS) in all pipeline tools
-- [x] N×N pairwise training loop using computed-value execution
-      distance (the metric from Exp 3+ that actually works)
-- [ ] Train encoder on RVB batches with muxed generation
-- [ ] Verify: Pearson > 0.85 on held-out data
-- [ ] Verify: immediate sensitivity (ADDI imm=0 vs imm=1 > imm=1000)
-- [ ] Verify: non-equivalent same-opcode separation
+- [x] N×N pairwise training loop with nested-log metric,
+      dest-type/dest-reg CE heads, and explicit equiv loss
+- [x] Pearson > 0.85 on held-out data (achieved 0.91)
+- [x] Non-equivalent same-opcode separation (12/13 manifest
+      classes PASS via eval harness)
+- [ ] Final production training run at chosen d_out
 
 ### Step 4: Decoder (reconstruction from frozen encoder)
-- [ ] Freeze encoder, train decoder with teacher-forced cross-entropy
+- [ ] Freeze encoder, train decoder with teacher-forced
+      cross-entropy
 - [ ] Verify: reconstruction accuracy > 95%
 - [ ] Verify: equivalence interpolation still works (midpoint
       decoding test from Exp 21)
