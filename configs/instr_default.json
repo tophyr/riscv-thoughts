@@ -6,5 +6,17 @@
     "BRANCH": 0.15,
     "UPPER": 0.0825,
     "JAL": 0.04,
-    "JALR": 0.0275
+    "JALR": 0.0275,
+    "equivalences": {
+        "rate": 0.20,
+        "max_per_class": 8,
+        "min_per_class": 4,
+        "boost": {
+            "commutative_add": 30,
+            "commutative_and": 30,
+            "commutative_or": 30,
+            "commutative_xor": 30,
+            "double_is_shl1": 30
+        }
+    }
 }

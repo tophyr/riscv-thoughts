@@ -17,7 +17,7 @@ from emulator import (
 # Opcode and register sets
 # ---------------------------------------------------------------------------
 
-_DEST_REGS = list(range(1, 32))
+_DEST_REGS = list(range(0, 32))  # x0 included: write-to-x0 NOPs are a real semantic class
 _SRC_REGS = list(range(0, 32))
 
 _ALU_R_OPS = ['ADD', 'SUB', 'XOR', 'OR', 'AND', 'SLL', 'SRL', 'SRA', 'SLT', 'SLTU']
@@ -138,20 +138,47 @@ _CATEGORY_OPS = {
 }
 
 
+_CONFIG_EXTRA_KEYS = {'equivalences'}
+_EQUIVALENCES_KEYS = {'rate', 'max_per_class', 'min_per_class', 'boost'}
+
+
 def validate_distribution(dist):
-    """Validate an opcode distribution dict. Raises ValueError if
-    keys are unrecognized or weights don't sum to 1.0."""
-    unknown = set(dist.keys()) - set(_CATEGORY_OPS.keys())
+    """Validate a config dict.
+
+    Required: opcode-category keys with weights summing to 1.0.
+    Optional: 'equivalences' sub-dict with 'rate' (float in [0,1])
+    and 'max_per_class' (positive int).
+    """
+    keys = set(dist.keys())
+    unknown = keys - set(_CATEGORY_OPS.keys()) - _CONFIG_EXTRA_KEYS
     if unknown:
-        raise ValueError(f'Unknown instruction categories: {unknown}')
-    total = sum(dist.values())
+        raise ValueError(f'Unknown config keys: {unknown}')
+    weights = {k: v for k, v in dist.items() if k in _CATEGORY_OPS}
+    total = sum(weights.values())
     if abs(total - 1.0) > 1e-6:
         raise ValueError(
             f'Distribution weights sum to {total}, not 1.0')
+    if 'equivalences' in dist:
+        eq = dist['equivalences']
+        if not isinstance(eq, dict):
+            raise ValueError("'equivalences' must be a dict")
+        eq_unknown = set(eq.keys()) - _EQUIVALENCES_KEYS
+        if eq_unknown:
+            raise ValueError(f'Unknown equivalences keys: {eq_unknown}')
+        if 'rate' in eq and not (0 <= eq['rate'] <= 1):
+            raise ValueError(
+                f"equivalences.rate must be in [0,1], got {eq['rate']}")
+        if 'max_per_class' in eq and eq['max_per_class'] < 1:
+            raise ValueError(
+                "equivalences.max_per_class must be >= 1, got "
+                f"{eq['max_per_class']}")
+        if 'boost' in eq and not isinstance(eq['boost'], dict):
+            raise ValueError("equivalences.boost must be a dict")
 
 
 def load_distribution(path):
-    """Load an opcode distribution from a JSON file."""
+    """Load a batch config from a JSON file. May include opcode
+    weights and an optional 'equivalences' section."""
     with open(path) as f:
         dist = json.load(f)
     validate_distribution(dist)
@@ -159,8 +186,10 @@ def load_distribution(path):
 
 
 def _build_opcode_table(dist):
-    """Convert a distribution dict to the internal (weight, ops) list."""
-    return [(dist[cat], _CATEGORY_OPS[cat]) for cat in dist]
+    """Convert the opcode-distribution portion of a config dict to
+    the internal (weight, ops) list. Ignores non-opcode keys."""
+    return [(dist[cat], _CATEGORY_OPS[cat])
+            for cat in dist if cat in _CATEGORY_OPS]
 
 
 # Validate and build default table at import time.
