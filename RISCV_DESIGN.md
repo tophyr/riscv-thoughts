@@ -245,14 +245,24 @@ distances and scaled execution distances. The sphere prevents collapse
 and the combination handles both equivalence (target=0 for equivalent
 pairs) and separation (target>0 for different pairs) in one loss.
 
-Execution distance: log1p(|data_diff| + |pc_diff|) averaged over
-random input states. Log scaling compresses the enormous dynamic range
-(0 to 2^32) into a tractable range (~0 to 22).
+Execution distance: log1p(log1p(|data_diff| + |pc_diff|)) averaged
+over random input states. Nested log compresses the dynamic range
+(0 to 2^32) into ~0 to 3.14 while spreading the low end more
+uniformly than single log1p, so near-equivalence contrasts (e.g.,
+ADDI imm=0 vs imm=1) get meaningful gradient.
 
 **Destination classification heads.** CrossEntropy on dest_type
 (register vs memory) and dest_reg (which register). Provides
-structural gradient signal. These may become unnecessary in the
-streaming architecture where cross-level feedback provides structure.
+structural gradient signal that the scalar exec_distance metric
+is blind to (exec_distance doesn't distinguish which register
+was written, only the computed value).
+
+**Explicit equivalence loss.** Per-step, encodes canonical tuples
+from the equivalence manifest (datagen/equivalences.py) and
+minimizes within-class pairwise squared distances (target=0).
+Combined with low-rate injection of manifest tuples into the
+main batch, this reaches 12/13 manifest classes PASS in 100K
+steps.
 
 **What didn't work:** Pearson correlation (scale-invariant, allows
 nonzero intercept — equivalences don't collapse), weighted Pearson

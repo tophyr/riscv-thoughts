@@ -282,7 +282,16 @@ full experimental results.
 
 **Losses:**
 - **Pairwise MSE:** N×N MSE between T1 vector distances and
-  computed-value execution distances. Trains encoder geometry.
+  nested-log execution distances. Trains encoder geometry.
+- **Destination CE:** dest_type (register/memory) and dest_reg
+  (which register) cross-entropy heads read from the T1 vector.
+  Compensates for the scalar exec_distance metric's blindness
+  to destination register identity.
+- **Equivalence:** explicit per-step loss encoding canonical
+  tuples from the equivalence manifest (datagen/equivalences.py)
+  and minimizing within-class pairwise squared distance (target=0).
+  Combined with low-rate tuple injection into the main batch for
+  varied specific instances. See Exp 24-25.
 - **Reconstruction:** teacher-forced cross-entropy from emission
   vector to instruction tokens. Trains decoder; window-size
   weighting incentivizes early emission.
@@ -345,13 +354,17 @@ match found." That criterion must be learned.
    average baseline). Gumbel-sigmoid doesn't work (zero gradient
    through Python control flow).
 
-### Open
+6. **Equivalence collapse.** Resolved: explicit equivalence loss
+   (per-step encoding of canonical tuples from the manifest,
+   target pairwise distance = 0) combined with low-rate injection
+   of manifest tuples into the main batch. Reaches 12/13 manifest
+   classes PASS in 100K steps (Exp 25). The remaining failure
+   (sign_test) is a state-distribution problem, not a training
+   mechanism problem. Single-mechanism approaches (injection
+   alone or equiv loss alone) were insufficient; the combination
+   is needed because they address different failure modes.
 
-6. **Equivalence collapse.** Cross-syntax equivalences (ADD-double
-   ≈ SLLI) don't collapse from pairwise MSE or reconstruction loss.
-   Longer training with N×N repulsion may help (Exp 4 showed
-   equivalence improving past loss plateau). If not: round-trip
-   loss with execution verification, or equivalence pair injection.
+### Open
 
 7. **Feedback loop stability.** T2 feedback into T1 creates
    recurrence. Untested. The structural argument (eviction ensures
@@ -361,8 +374,10 @@ match found." That criterion must be learned.
    planned approach. Alternatives (additive conditioning, gating
    modulation) exist. Empirical when T2 is built.
 
-9. **Output space per level.** S^127 works for T1. Whether each
-   level needs its own dimensionality is empirical.
+9. **Output space per level.** d_out=128 (S^127) works for T1 but
+   is oversized — PCA shows ~94 of 128 dims carry 90% of variance.
+   d_out sweep in progress (Exp 25). Whether each level needs its
+   own dimensionality is empirical.
 
 10. **Memory in state delta.** Per-register deltas work for the
     current instruction set. Memory effects (load/store) are

@@ -6,10 +6,5 @@
     "BRANCH": 0.15,
     "UPPER": 0.0825,
     "JAL": 0.04,
-    "JALR": 0.0275,
-    "equivalences": {
-        "rate": 0.05,
-        "max_per_class": 8,
-        "min_per_class": 2
-    }
+    "JALR": 0.0275
 }

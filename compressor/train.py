@@ -14,6 +14,7 @@ import torch.nn.functional as F
 
 from tokenizer import BOS, EOS, PAD, VOCAB_SIZE, encode_instruction
 from emulator.emulator import Instruction
+from datagen.equivalences import MANIFEST, sample_binding, materialize
 from .model import T1Compressor, Decoder
 
 
@@ -43,6 +44,57 @@ def _probe_tensor(device):
         pad[i, :len(e)] = False
     return (torch.from_numpy(tok).to(device),
             torch.from_numpy(pad).to(device))
+
+
+def _encode_instrs(model, instrs, device):
+    """Tokenize + pad a list of Instructions and encode them."""
+    encoded = [encode_instruction(i) for i in instrs]
+    max_len = max(len(e) for e in encoded)
+    tok = np.full((len(encoded), max_len), PAD, dtype=np.int64)
+    pad = np.ones((len(encoded), max_len), dtype=np.bool_)
+    for i, e in enumerate(encoded):
+        tok[i, :len(e)] = e
+        pad[i, :len(e)] = False
+    tok_t = torch.from_numpy(tok).to(device)
+    pad_t = torch.from_numpy(pad).to(device)
+    return model.encode(tok_t, pad_t)
+
+
+def equivalence_loss(model, device, rng):
+    """Per-class MSE on canonical pairwise distances, target=0.
+
+    Each call: for every manifest class with >=2 canonical templates,
+    sample a fresh binding, materialize, collect all instructions
+    across classes into a single padded batch, encode once, then
+    slice per-class to compute mean squared within-class distance.
+    Returns the mean across classes.
+    """
+    all_instrs = []
+    class_ranges = []  # list of (start, end) slices into the batch
+    start = 0
+    for klass in MANIFEST:
+        if len(klass.canonical) < 2:
+            continue
+        binding = sample_binding(klass, rng)
+        instrs = [materialize(t, binding) for t in klass.canonical]
+        all_instrs.extend(instrs)
+        class_ranges.append((start, start + len(instrs)))
+        start += len(instrs)
+
+    if not class_ranges:
+        return torch.tensor(0.0, device=device)
+
+    vecs = _encode_instrs(model, all_instrs, device)  # (N_total, d_out)
+
+    losses = []
+    for s, e in class_ranges:
+        class_vecs = vecs[s:e]
+        N = class_vecs.shape[0]
+        idx = torch.triu_indices(N, N, offset=1, device=device)
+        dists = torch.cdist(class_vecs.unsqueeze(0),
+                            class_vecs.unsqueeze(0)).squeeze(0)
+        losses.append(dists[idx[0], idx[1]].square().mean())
+    return torch.stack(losses).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +159,8 @@ _EXEC_DIST_SCALE = 2.0 / 3.14  # nested-log range [0, ~3.14] → [0, ~2]
 
 def train_batches(batch_iter, d_model=128, n_heads=4, n_layers=2,
                   d_out=128, lr=3e-4, device='auto', n_steps=None,
-                  log_every=100, lr_min=1e-6):
+                  log_every=100, lr_min=1e-6, equiv_weight=0.0,
+                  equiv_seed=0):
     """Train the T1 encoder on single-instruction batches (RVB).
 
     N×N pairwise MSE between T1 vector distances and execution
@@ -133,6 +186,7 @@ def train_batches(batch_iter, d_model=128, n_heads=4, n_layers=2,
     step = 0
     t0 = time.time()
     probe_tok, probe_pad = _probe_tensor(device)
+    equiv_rng = np.random.default_rng(equiv_seed)
 
     for batch in batch_iter:
         tok = torch.from_numpy(batch.token_ids).to(device)
@@ -166,7 +220,12 @@ def train_batches(batch_iter, d_model=128, n_heads=4, n_layers=2,
         else:
             dr_loss = torch.tensor(0.0, device=device)
 
-        loss = mse_loss + dt_loss + dr_loss
+        if equiv_weight > 0:
+            eq_loss = equivalence_loss(model, device, equiv_rng)
+        else:
+            eq_loss = torch.tensor(0.0, device=device)
+
+        loss = mse_loss + dt_loss + dr_loss + equiv_weight * eq_loss
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -196,7 +255,8 @@ def train_batches(batch_iter, d_model=128, n_heads=4, n_layers=2,
                   f'loss {loss_val:.4f} '
                   f'(mse {mse_loss.item():.4f} '
                   f'dt {dt_loss.item():.3f} '
-                  f'dr {dr_loss.item():.3f})  '
+                  f'dr {dr_loss.item():.3f} '
+                  f'eq {eq_loss.item():.4f})  '
                   f'lr {current_lr:.1e}  {ms_per:.0f}ms/step  '
                   f'N={N}{eta_str}  '
                   f'probe[aa={d_add_add:.3f} '
