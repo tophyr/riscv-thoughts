@@ -40,33 +40,41 @@ is compression, so d_out should be sized deliberately.
       space is actively used.
 - [ ] MDS on pairwise exec-distance matrix (may not be needed
       given PCA results and the d_out sweep below)
-- [ ] d_out sweep {4, 8, 16, 32, 64, 128} with equiv loss +
-      injection. d_out=64 run in progress.
-- [ ] Measure per-class cohesion and contrast separation at
-      each d_out; find where classes start breaking
-- [ ] Commit to final d_out
+- [x] d_out sweep {16, 32, 64, 128} × {2, 4, 8} layers with
+      equiv loss + injection. d_out=64 × 2 layers is the sweet
+      spot (13/13 PASS, Pearson 0.906). Depth doesn't break
+      capacity ceilings. See Exp 26.
+- [x] Per-class cohesion and contrast separation measured at
+      each d_out. Pearson ceiling is d_out-dependent (~0.91
+      at 64, ~0.89 at 32, ~0.86 at 16), not depth-dependent.
+- [x] Decoder eval across all checkpoints (Exp 27): frozen
+      encoder + trained decoder peaks at 65% token accuracy.
+      Gradient-based inversion peaks at 31%. The encoder
+      preserves distances but not identity — reconstruction
+      loss is needed during encoder training.
+- [ ] Commit to final d_out (d_out=64 is the candidate, pending
+      decoder-joint-training validation)
 
 ## Next: T1 Piecemeal Assembly
 
-With the manifest and a chosen d_out in hand, assemble T1's
-components one at a time.
-
-### Step 3: Encoder (final training)
+### Step 3: Encoder + Decoder (joint training)
 - [x] RVB single-instruction batch format and pipeline tools
 - [x] Format auto-detection (RVB/RVS) in all pipeline tools
 - [x] N×N pairwise training loop with nested-log metric,
       dest-type/dest-reg CE heads, and explicit equiv loss
-- [x] Pearson > 0.85 on held-out data (achieved 0.91)
-- [x] Non-equivalent same-opcode separation (12/13 manifest
-      classes PASS via eval harness)
-- [ ] Final production training run at chosen d_out
-
-### Step 4: Decoder (reconstruction from frozen encoder)
-- [ ] Freeze encoder, train decoder with teacher-forced
-      cross-entropy
+- [x] Pearson > 0.85 on held-out data (achieved 0.91 at d_out=64)
+- [x] Non-equivalent same-opcode separation (13/13 manifest
+      classes PASS at d_out=64)
+- [ ] Add reconstruction CE to encoder training loss (joint
+      encoder+decoder from cold start, recon_weight ~0.1).
+      Not the same as frozen-encoder-then-decoder (Exp 27
+      showed that fails at 65% accuracy). The encoder needs
+      reconstruction gradient to learn information-preserving
+      geometry alongside distance-preserving geometry.
+- [ ] Final production training run at d_out=64
 - [ ] Verify: reconstruction accuracy > 95%
-- [ ] Verify: equivalence interpolation still works (midpoint
-      decoding test from Exp 21)
+- [ ] Verify: equivalence classes still PASS with reconstruction
+      loss in the mix
 
 ### Step 5: Gates (supervised + REINFORCE)
 - [ ] Freeze encoder + decoder
