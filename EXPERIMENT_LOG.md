@@ -1416,3 +1416,136 @@ between runs suggest consistency, but a true seed-robustness
 study would require 3+ runs with varied `--seed`. Deferred in
 favor of moving on to the `d_out` compression sweep, which is
 the actual purpose of this foundations pass.
+
+### Experiment 26: d_out compression sweep + depth
+
+Sweep d_out ∈ {128, 64, 32, 16} × n_layers ∈ {2, 4, 8}, all at
+100K steps with combined training (5% injection + equiv w=0.05).
+Goal: find the smallest d_out that preserves equivalence collapse
+and global geometry.
+
+**Results — equivalence eval + Pearson (out-of-manifest random):**
+
+| d_out | layers | PASS | sign_test | Pearson |
+|-------|--------|------|-----------|---------|
+| 128   | 2      | 12/13 | FAIL (0.94) | 0.913 |
+| **64**| **2**  | **13/13** | **PASS (0.29)** | **0.906** |
+| 32    | 2      | 12/13 | WEAK (0.55) | 0.893 |
+| 32    | 4      | 12/13 | FAIL (0.71) | 0.895 |
+| 32    | 8      | 12/13 | FAIL (1.65) | 0.895 |
+| 16    | 2      | 12/13 | FAIL (0.82) | 0.862 |
+| 16    | 4      | 12/13 | FAIL (0.92) | 0.862 |
+| 16    | 8      | 12/13 | FAIL (0.89) | 0.863 |
+
+**Key findings:**
+
+1. **d_out=64 is the sweet spot.** Only configuration where all
+   13 testable classes PASS. Pearson barely dips (0.906 vs 0.913
+   at d_out=128). PCA shows 52 of 64 dims carry 90% variance
+   (81% space efficiency, up from 73% at d_out=128).
+
+2. **sign_test has a non-monotonic compression response.** FAIL
+   at d_out=128 (too much slack → encoder is sloppy), PASS at 64
+   (forced compression helps), WEAK at 32, FAIL at 16. The sweet
+   spot is d_out=64 where compression forces distinctions the
+   encoder wouldn't make at higher dimensionality.
+
+3. **Pearson ceiling is d_out-dependent, not depth-dependent.**
+   At d_out=32: Pearson ≈ 0.894 regardless of 2/4/8 layers.
+   At d_out=16: Pearson ≈ 0.862 regardless of 2/4/8 layers.
+   More depth cannot break through a capacity ceiling. The
+   limitation is how many independent distance relationships
+   can be represented in d_out dimensions on the unit sphere.
+
+4. **Depth tightens equivalences but doesn't expand capacity.**
+   More layers → tighter PASS ratios (commutative_add goes
+   from 0.009 to 0.003 at d_out=32 with 2→8 layers). The
+   encoder organizes its limited space more efficiently. But
+   Pearson stays flat.
+
+5. **PCA space efficiency increases with compression.** d_out=128
+   uses 73%, d_out=64 uses 81%, d_out=32 uses 84%, d_out=16
+   uses 88%. Smaller spaces are used more efficiently — less
+   wasted dimensionality.
+
+**Conclusion:** d_out=64 with 2 layers is the optimal
+configuration. RV32I instruction semantics live on a
+~50-60 dimensional manifold. d_out=128 is wasteful; d_out=32
+works but loses sign_test; d_out=16 hits a real capacity wall
+(Pearson drops to 0.86).
+
+### Experiment 27: Decoder evaluation (reconstruction from frozen encoder)
+
+Tested whether the pairwise-MSE-trained T1 vectors are
+information-preserving enough for reconstruction. Two methods
+across all 8 encoder checkpoints.
+
+**Method 1: Trained decoder (5K steps, teacher-forced CE).**
+Freeze encoder, train a fresh decoder (d_model=128, 2 layers)
+to reconstruct token sequences from T1 vectors. Same corpus
+across all checkpoints for fair comparison.
+
+| d_out | layers | tok_acc | instr_acc |
+|-------|--------|---------|-----------|
+| 128   | 2      | 64.9%   | 2.3%      |
+| 64    | 2      | 63.9%   | 0.0%      |
+| 32    | 2      | 60.0%   | 0.0%      |
+| 32    | 4      | 57.1%   | 0.8%      |
+| 32    | 8      | 55.5%   | 0.4%      |
+| 16    | 2      | 54.9%   | 0.4%      |
+| 16    | 4      | 55.4%   | 0.8%      |
+| 16    | 8      | 51.7%   | 0.0%      |
+
+All converged (loss plateaued by step 3K). No configuration
+exceeded 65% token accuracy or 3% instruction accuracy.
+
+**Method 2: Gradient-based encoder inversion.** Optimize soft
+embeddings through encode_soft to match target T1 vector, snap
+to nearest token embeddings. Tested on d_out=128 at multiple
+learning rates and iteration counts.
+
+| n_iters | lr    | final_loss | tok_acc |
+|---------|-------|------------|---------|
+| 500     | 0.1   | 0.003      | 31.2%   |
+| 2000    | 0.01  | 0.0003     | 23.5%   |
+| 2000    | 0.001 | 0.023      | 15.6%   |
+
+Tighter convergence (lower loss) produced WORSE token accuracy.
+The optimizer finds preimages that encode correctly but don't
+correspond to real token embeddings.
+
+**Diagnosis: distance-preserving ≠ information-preserving.**
+
+The encoder was trained for three objectives: pairwise MSE,
+equivalence collapse, and destination classification. None
+require the T1 vector to preserve enough information for full
+instruction reconstruction. The geometry encodes "how this
+instruction relates to others" but not "which instruction this
+is."
+
+The ~65% token accuracy is consistent with recovering what IS
+in the vector: opcode (well-encoded via equiv loss and MSE)
+and dest_reg (explicit CE head) ≈ 2 correct tokens out of 4-7.
+Source registers and immediates are poorly encoded (commutativity
+collapses operand order, immediate insensitivity persists).
+
+The gradient decode method performs worse (31%) because the
+encoder mapping is many-to-one: the equivalence loss explicitly
+collapses distinct instructions to the same T1 region. Gradient
+optimization finds A preimage but not THE original.
+
+**Implication:**
+
+The encoder needs reconstruction CE as a training loss alongside
+MSE + equiv + dest CE. The decoder provides gradient that says
+"also be information-preserving." This avoids the Exp 22-23
+blind-leading-blind problem because three of four encoder loss
+terms (MSE, equiv, dest CE) work independently of the decoder.
+The decoder's initial random gradient adds noise but no
+systematic error; as the encoder's geometry stabilizes (by
+~step 1K from MSE alone), the decoder quickly converges and
+its feedback becomes clean signal.
+
+Recommended setup: cold-start joint encoder+decoder training
+with recon_weight ≈ 0.1 to prevent the decoder's large initial
+loss (~4.5 vs MSE ~0.3) from dominating early gradient.
