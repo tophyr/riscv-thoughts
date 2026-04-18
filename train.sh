@@ -55,4 +55,4 @@ kill -0 $SSH_PID 2>/dev/null || { echo "ERROR: remote process died" >&2; exit 1;
 ${PYTHON} scripts/mux_batches.py --gen instr --gen-count 16 --batch-size ${BATCH_SIZE} --n-batches ${NUM_BATCHES} --config configs/instr_default.json \
     <(nc odin 6464 -d | unlz4) | \
   ${PYTHON} scripts/batch_slice.py --count ${NUM_BATCHES} | \
-  ${PYTHON} scripts/train_compressor.py --mode instr --n-steps ${NUM_BATCHES} --equiv-weight 0.05 --d-out ${D_OUT} --n-layers ${N_LAYERS}
+  ${PYTHON} scripts/train_compressor.py --mode instr --n-steps ${NUM_BATCHES} --equiv-weight 0.05 --recon-weight 0.01 --d-out ${D_OUT} --n-layers ${N_LAYERS}

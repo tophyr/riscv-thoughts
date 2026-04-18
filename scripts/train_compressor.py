@@ -68,6 +68,11 @@ def main():
                    help='Weight for explicit equivalence collapse loss. '
                         '0 disables.')
 
+    # Reconstruction loss (instr mode, joint encoder+decoder).
+    p.add_argument('--recon-weight', type=float, default=0.0,
+                   help='Weight for reconstruction CE loss. '
+                        '0 disables (no decoder trained).')
+
     args = p.parse_args()
 
     save_dir = None
@@ -77,7 +82,7 @@ def main():
     if args.mode == 'instr':
         from datagen import InstructionBatchReader
         reader = InstructionBatchReader(sys.stdin.buffer)
-        model, losses = train_batches(
+        model, decoder, losses = train_batches(
             batch_iter=reader,
             d_model=args.d_model,
             n_heads=args.n_heads,
@@ -88,6 +93,10 @@ def main():
             n_steps=args.n_steps,
             log_every=args.log_every,
             equiv_weight=args.equiv_weight,
+            recon_weight=args.recon_weight,
+            dec_d_model=args.dec_d_model,
+            dec_n_heads=args.dec_n_heads,
+            dec_n_layers=args.dec_n_layers,
         )
         print(f'\nDone: {len(losses)} steps, '
               f'final loss {losses[-1]:.4f}')
@@ -122,7 +131,7 @@ def main():
     if save_dir:
         save_dir.mkdir(parents=True, exist_ok=True)
         torch.save(model.state_dict(), save_dir / 'encoder.pt')
-        if args.mode == 'streaming':
+        if decoder is not None:
             torch.save(decoder.state_dict(), save_dir / 'decoder.pt')
         with open(save_dir / 'losses.json', 'w') as f:
             json.dump(losses, f)

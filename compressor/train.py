@@ -160,7 +160,8 @@ _EXEC_DIST_SCALE = 2.0 / 3.14  # nested-log range [0, ~3.14] → [0, ~2]
 def train_batches(batch_iter, d_model=128, n_heads=4, n_layers=2,
                   d_out=128, lr=3e-4, device='auto', n_steps=None,
                   log_every=100, lr_min=1e-6, equiv_weight=0.0,
-                  equiv_seed=0):
+                  equiv_seed=0, recon_weight=0.0,
+                  dec_d_model=128, dec_n_heads=4, dec_n_layers=2):
     """Train the T1 encoder on single-instruction batches (RVB).
 
     N×N pairwise MSE between T1 vector distances and execution
@@ -176,7 +177,16 @@ def train_batches(batch_iter, d_model=128, n_heads=4, n_layers=2,
     model = T1Compressor(VOCAB_SIZE, d_model, n_heads, n_layers, d_out)
     model = model.to(device)
 
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    decoder = None
+    if recon_weight > 0:
+        decoder = Decoder(VOCAB_SIZE, dec_d_model, dec_n_heads,
+                          dec_n_layers, d_emb=d_out)
+        decoder = decoder.to(device)
+        all_params = list(model.parameters()) + list(decoder.parameters())
+    else:
+        all_params = list(model.parameters())
+
+    opt = torch.optim.Adam(all_params, lr=lr)
     scheduler = None
     if n_steps:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -225,7 +235,32 @@ def train_batches(batch_iter, d_model=128, n_heads=4, n_layers=2,
         else:
             eq_loss = torch.tensor(0.0, device=device)
 
-        loss = mse_loss + dt_loss + dr_loss + equiv_weight * eq_loss
+        if recon_weight > 0 and decoder is not None:
+            B = tok.shape[0]
+            token_lists = []
+            for b in range(B):
+                mask = ~batch.padding_mask[b]
+                token_lists.append(batch.token_ids[b][mask].tolist())
+            dec_in, dec_tgt, dec_pad = _prepare_decoder_targets(
+                token_lists, device)
+            dec_logits = decoder(vecs, dec_in, dec_pad)
+            recon_loss = F.cross_entropy(
+                dec_logits.reshape(-1, VOCAB_SIZE),
+                dec_tgt.reshape(-1), ignore_index=PAD)
+
+            with torch.no_grad():
+                pred = dec_logits.argmax(dim=-1)
+                non_pad = ~dec_pad
+                tok_correct = ((pred == dec_tgt) & non_pad).sum().item()
+                tok_total = non_pad.sum().item()
+                recon_acc = tok_correct / tok_total if tok_total else 0
+        else:
+            recon_loss = torch.tensor(0.0, device=device)
+            dec_logits = None
+            recon_acc = 0.0
+
+        loss = mse_loss + dt_loss + dr_loss + equiv_weight * eq_loss \
+            + recon_weight * recon_loss
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -251,12 +286,17 @@ def train_batches(batch_iter, d_model=128, n_heads=4, n_layers=2,
             d_canon = (pv[0] - pv[1]).norm().item()
             d_sll_sll = (pv[1] - pv[3]).norm().item()
             d_comm = (pv[2] - pv[4]).norm().item()
+            recon_str = ''
+            if dec_logits is not None:
+                recon_str = (f' recon {recon_loss.item():.3f}'
+                             f'/{recon_acc:.0%}')
             print(f'step {step:>6d}  '
                   f'loss {loss_val:.4f} '
                   f'(mse {mse_loss.item():.4f} '
                   f'dt {dt_loss.item():.3f} '
                   f'dr {dr_loss.item():.3f} '
-                  f'eq {eq_loss.item():.4f})  '
+                  f'eq {eq_loss.item():.4f}'
+                  f'{recon_str})  '
                   f'lr {current_lr:.1e}  {ms_per:.0f}ms/step  '
                   f'N={N}{eta_str}  '
                   f'probe[aa={d_add_add:.3f} '
@@ -267,7 +307,7 @@ def train_batches(batch_iter, d_model=128, n_heads=4, n_layers=2,
         if n_steps and step >= n_steps:
             break
 
-    return model, losses
+    return model, decoder, losses
 
 
 # ---------------------------------------------------------------------------

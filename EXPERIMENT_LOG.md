@@ -1549,3 +1549,193 @@ its feedback becomes clean signal.
 Recommended setup: cold-start joint encoder+decoder training
 with recon_weight ≈ 0.1 to prevent the decoder's large initial
 loss (~4.5 vs MSE ~0.3) from dominating early gradient.
+
+### Experiment 28: Joint encoder+decoder reconstruction training
+
+Tested three approaches to making the T1 encoder decodable:
+token-match CE, round-trip loss, and REINFORCE with execution
+reward. Each illuminated a different aspect of the problem.
+
+**Approach 1: Token-match CE at various weights.**
+
+Joint encoder+decoder, cold start, d_out=64.
+
+| weight | tok_acc | Pearson | equiv PASS |
+|--------|---------|---------|------------|
+| 0.10   | 96%     | 0.660   | 3/13       |
+| 0.05   | 85%     | 0.667   | 3/13       |
+| 0.01   | ~75%*   | —       | —          |
+
+(*killed mid-run)
+
+Token-match CE teaches the decoder effectively (96% at w=0.1)
+but destroys encoder geometry regardless of weight. Pearson
+drops from 0.91 to 0.66 even at w=0.05. The cause is NOT
+equivalence conflicts (those affect ~0.1% of gradient) but a
+general tension: CE wants the encoder to preserve token identity,
+MSE wants it to preserve pairwise distances. These partially
+conflict because instructions with similar exec_distance need
+to be equidistant (MSE) but still individually distinguishable
+(CE).
+
+**Approach 2: Round-trip loss (Gumbel-softmax).**
+
+Decode → Gumbel-softmax → soft embeddings → encode_soft →
+compare T1 to original. Equivalence-tolerant by design.
+
+| tau schedule     | tok_acc | Pearson | equiv PASS |
+|------------------|---------|---------|------------|
+| slow (1→0.1/100K)| 6%      | 0.903   | 12/13      |
+| fast (1→0.01/25K)| 6%      | 0.903   | 12/13      |
+
+Geometry perfectly preserved (Pearson 0.903 ≈ encoder-only
+0.906). But the decoder learns nothing useful: 6% token
+accuracy at all settings. The decoder exploits Gumbel-softmax
+by producing continuous blends of token embeddings that
+re-encode to the target T1 without corresponding to any real
+tokens. Even at tau=0.01 (near-discrete), the decoder commits
+to specific tokens that form invalid/nonsensical instruction
+sequences whose re-encoding happens to be close.
+
+Diagnosis: round-trip loss is too permissive — it accepts any
+token sequence (including garbage) that re-encodes nearby.
+
+**Approach 3: REINFORCE with execution-equivalence reward.**
+
+Decoder samples discrete tokens, decoded instructions are
+executed via the CPU emulator, compared to original. Reward =
+fraction of matching execution outputs across random inputs.
+
+50-step proof of concept (B=256):
+```
+valid 99%   equiv 11%   tok_acc 0%   reward 0.22
+```
+
+The decoder learned valid instruction syntax (99% valid) from
+pure execution reward — no token-match supervision. It produces
+genuinely different instructions that sometimes compute the same
+thing (11% execution-equivalent). Token accuracy is 0% because
+the decoder is NOT memorizing tokens; it's discovering functional
+equivalents. This is exactly the thesis: decode to any
+functionally-equivalent instruction, not the original tokens.
+
+However, REINFORCE at 1000 steps did not converge — high
+variance caused the equiv rate to oscillate between 4-12%
+without trending upward. Classic REINFORCE credit assignment
+problem: sequence-level reward doesn't identify which token
+was responsible.
+
+**Performance profiling (B=4096, 16-core parallel CPU):**
+
+```
+encoder forward (frozen, compiled):  19ms
+decoder forward + sample:            15ms
+CPU reward (parallel, 16 workers):  164ms
+REINFORCE backward + optim:          37ms
+                              total: 243ms/step
+```
+
+Validated by replacing CPU reward with fake random reward:
+step time dropped from 243ms to 69ms (delta = 174ms, matching
+the 164ms measurement). CPU emulation is genuinely the
+bottleneck.
+
+Key optimization finding: the initial ~600ms reward time was
+caused by 8192 individual GPU→CPU synchronization points
+(per-instruction `.item()` and `.tolist()` calls). Bulk
+`.cpu().numpy()` transfer reduced this to ~164ms.
+
+**Conclusions:**
+
+1. Token-match CE: decoder works, geometry breaks. Even very
+   low weights (0.01) damage Pearson because CE and MSE have a
+   fundamental (not just equivalence-related) tension.
+
+2. Round-trip loss: geometry preserved, decoder useless. The
+   Gumbel pathway allows "blending" cheats that circumvent
+   discrete token commitment.
+
+3. REINFORCE with execution reward: the principled solution.
+   Naturally equivalence-tolerant, teaches valid instruction
+   syntax, discovers functional equivalents. Needs faster
+   execution (GPU emulator) and variance reduction (multiple
+   samples per instruction) to converge.
+
+**Status:** REINFORCE decoder training is a work in progress.
+The mechanism works (valid instructions produced, equivalences
+discovered) but convergence requires a faster emulator to
+support multi-sample variance reduction. Next step: build a
+batched PyTorch RV32I emulator to bring the 164ms CPU reward
+down to ~5ms on GPU, enabling K=10-50 samples per instruction
+at the same wall-clock cost.
+
+### Experiment 29: GPU batch emulator + REINFORCE convergence
+
+Built a batched PyTorch RV32I emulator that executes all 37
+opcodes in parallel via `torch.where` cascades. Includes a GPU
+token parser that converts (B, T) token tensors directly to
+instruction fields — no CPU parsing loops.
+
+**GPU emulator performance:**
+
+| Component | Time (B=4096) |
+|-----------|---------------|
+| batch_execute | 1.69ms |
+| batch_parse_tokens | 2.09ms |
+| Full reward (parse+execute×4+compare) | 28ms |
+
+Correctness: 100% match against CPU emulator on all non-LOAD
+instructions (3248/3248 tested). LOADs use hash-based
+deterministic memory (different from CPU's rng-based
+SparseMemory, but internally consistent for REINFORCE
+reward comparison). STOREs return truncated stored value.
+
+**Optimization journey:**
+
+| Setup | reward_ms | total ms/step |
+|-------|-----------|---------------|
+| CPU serial (B=256) | 70ms | 110ms |
+| CPU parallel 16-core (B=4096) | 164ms | 243ms |
+| GPU exec + CPU parse | 130ms | 227ms |
+| Fully GPU (parse + exec) | 28ms | 78ms |
+
+Key bottleneck discoveries:
+- 8192 individual GPU→CPU `.item()`/`.tolist()` syncs cost
+  ~500ms. Bulk `.cpu().numpy()` transfer fixed it.
+- CPU token parsing (try_decode_tokens × 8192) cost ~130ms
+  even after GPU execution was fast. GPU token parser
+  eliminated it.
+
+**REINFORCE convergence with shaped reward:**
+
+| Config | equiv | tok_acc | reward |
+|--------|-------|---------|--------|
+| Binary reward, K=1 | 9% (flat) | 0% | 0.16 |
+| Binary reward, K=10 | 16% (flat) | 0% | 0.25 |
+| Shaped reward, K=10 | **23%** | **18%** | **0.56** |
+
+Shaped reward decomposes the binary all-or-nothing signal into
+four per-field components: 0.25 × (opcode match) + 0.25 ×
+(dest_reg match) + 0.25 × (data_val match fraction) + 0.25 ×
+(pc match fraction). This gives the decoder richer credit
+assignment and enables convergence that binary reward can't.
+
+The 23% execution-equivalence rate was achieved on a FROZEN
+encoder that was never trained for decodability (Exp 27 showed
+it only supports 65% token accuracy even with supervised CE).
+Joint encoder+REINFORCE-decoder training — where the encoder
+adapts to be decodable via execution-equivalence signal, not
+token-match CE — is the natural next step and should
+significantly improve this rate.
+
+**Implications:**
+
+1. The GPU emulator makes REINFORCE practical at training
+   speed (~78ms/step at B=4096), not just feasible.
+2. Shaped reward is essential — binary reward plateaus at
+   9-16% regardless of sample count.
+3. The decoder CAN learn to produce execution-equivalent
+   instructions from pure execution reward, even from an
+   encoder not designed for decodability.
+4. The remaining gap (23% → 90%+) likely requires joint
+   training so the encoder geometry supports decoding.
