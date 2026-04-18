@@ -65,16 +65,29 @@ is compression, so d_out should be sized deliberately.
 - [x] Pearson > 0.85 on held-out data (achieved 0.91 at d_out=64)
 - [x] Non-equivalent same-opcode separation (13/13 manifest
       classes PASS at d_out=64)
-- [ ] Add reconstruction CE to encoder training loss (joint
-      encoder+decoder from cold start, recon_weight ~0.1).
-      Not the same as frozen-encoder-then-decoder (Exp 27
-      showed that fails at 65% accuracy). The encoder needs
-      reconstruction gradient to learn information-preserving
-      geometry alongside distance-preserving geometry.
+- [x] Token-match CE joint training tested at w=0.1/0.05/0.01:
+      teaches decoder (96% tok_acc) but destroys geometry
+      (Pearson 0.66). CE and MSE have fundamental tension
+      beyond equivalence conflicts. (Exp 28)
+- [x] Round-trip loss (Gumbel-softmax) tested: geometry
+      preserved (Pearson 0.90) but decoder produces garbage
+      that re-encodes nearby. Too permissive. (Exp 28)
+- [x] REINFORCE with execution reward: proof of concept works
+      (99% valid instructions, 11% execution-equivalent). The
+      principled approach but needs faster emulation for
+      multi-sample variance reduction. (Exp 28)
+- [x] Batched PyTorch RV32I emulator: all 37 opcodes on GPU
+      via torch.where, 1.69ms for B=4096. GPU token parser
+      for fully-GPU reward pipeline (28ms total). (Exp 29)
+- [x] REINFORCE decoder with K=10 + shaped reward reaches
+      23% execution-equivalence on frozen encoder. Convergence
+      confirmed but rate limited by frozen encoder geometry.
+- [ ] Joint encoder + REINFORCE-decoder training (the encoder
+      adapts geometry for decodability via execution-equivalence
+      reward — no CE, no equivalence conflict)
 - [ ] Final production training run at d_out=64
-- [ ] Verify: reconstruction accuracy > 95%
-- [ ] Verify: equivalence classes still PASS with reconstruction
-      loss in the mix
+- [ ] Verify: execution-equivalent decoding rate > 90%
+- [ ] Verify: equivalence classes still PASS
 
 ### Step 5: Gates (supervised + REINFORCE)
 - [ ] Freeze encoder + decoder
