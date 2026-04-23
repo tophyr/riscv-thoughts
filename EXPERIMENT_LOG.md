@@ -1739,3 +1739,113 @@ significantly improve this rate.
    encoder not designed for decodability.
 4. The remaining gap (23% → 90%+) likely requires joint
    training so the encoder geometry supports decoding.
+
+### Experiment 30: Decoder capacity sweep and generalization
+
+The 85.5% plateau of the 8L/d128/64m decoder (Exp 27-28) was
+confirmed as a capacity limit, not an encoder information
+limit: 300K additional steps at constant LR=3e-4 oscillated
+between 84.7-85.5% without breaking through. Zhang et al.
+(2017) predicts a memorization floor of params ≥ data points;
+at 2.68M params vs 4.5M token predictions (819K instructions ×
+~5.5 positions), the ratio was 0.60× — undersized.
+
+**Scaling attempt 1: 16L/d512/64m (69.5M params, 5.1× target).**
+Total optimization failure. After 1.6M steps at B=512 (equiv
+to 200K steps at B=4096), tok_acc remained stuck at ~17% while
+loss dropped from 2.72 to 2.29. Post-mortem diagnostics on the
+trained model:
+
+| Test | Baseline | Shuffled vecs | Zero vecs | Random vecs |
+|------|----------|---------------|-----------|-------------|
+| tok_acc | 16.9% | 3.3% | 14.0% | 4.8% |
+
+The model WAS using emission vectors (shuffling destroyed
+accuracy) but the cross-attention pattern was broken: layer 0
+had 99.5%-of-max attention entropy (completely uniform), layer
+15 had 16.7% (sharp attention). Only the last ~1-2 layers had
+learned meaningful selection, and they were working with
+intermediate representations from 14 emission-blind layers.
+
+Mechanism: 16 layers without warmup made the gradient path too
+long for early-layer cross-attention to bootstrap. Self-attention
+and FFN paths (which don't need cross-attention to reduce loss)
+learned a position-dependent unigram model first; by the time
+late-layer cross-attention could have contributed, the trap was
+set. Loss dropped (model learned token frequency) without
+accuracy improvement (top-1 never shifted off the marginal mode).
+
+**Scaling attempt 2: 8L/d256/64m (9.55M params, 2.1× target).**
+Clean success. At 200K steps at B=512 peaked at 86.7% —
+breaking the d128 ceiling for the first time. Full run at 800K
+steps at B=1024 (equiv to 200K at B=4096) reached **95.5% peak
+tok_acc, 70.4% instr_acc**. No warmup needed at 8 layers —
+cross-attention bootstrapped from step 0.
+
+Checkpoint was not saved (forgot `--save-decoder`) — trajectory
+recoverable but specific weights lost.
+
+**Scaling attempt 3: 8L/d512/64m (35.9M params, 8.4× target).**
+WSD schedule: 25K sine warmup → 625K stable at 3e-4 → 150K
+cosine decay. Added gradient clipping at max_norm=1.0 after a
+no-clipping attempt loss-exploded at step 30K (loss 0.93 →
+1.90 → 2.69, accuracy crashed to 17%). With clipping, survived
+one mid-training dip (92.6% → 82.9% at step 230K) and recovered
+cleanly. Peaked at 96.2% tok_acc, 78.4% instr_acc at step 700K
+during decay.
+
+**Generalization test (held-out instructions, seed=99999):**
+
+| Model | Train tok_acc | Held-out tok_acc | Delta |
+|-------|---------------|------------------|-------|
+| d256 @ 200K | 82.3% | 71.5% | -10.7% |
+| d512 @ 800K | 86.5% | 71.9% | -14.6% |
+
+Held-out accuracy is essentially identical across models
+despite 3.7× capacity and 4× data exposure. **The encoder's
+T1 geometry carries ~72% tok_acc worth of decodable
+instruction-identity signal.** Everything above 72% on
+training is pure memorization. More decoder capacity buys
+more memorization, not more generalization.
+
+**Equivalence tolerance (autoregressive, held-out, d512):**
+
+| Category | Count | % |
+|----------|-------|---|
+| Exact match | 1,436 | 7.0% |
+| Execution-equivalent (not exact) | 3,352 | **16.4%** |
+| Valid but not equivalent | 14,868 | 72.6% |
+| Invalid | 824 | 4.0% |
+| **Correct (exact + equiv)** | 4,788 | **23.4%** |
+
+The decoder emerges equivalence tolerance without explicit
+equivalence training. 16.4% of held-out autoregressive
+decodings are execution-equivalent-but-not-identical — the
+encoder's equivalence-collapsing geometry (Exp 24-26) is
+visible in the decoder's output distribution. Only 4.0%
+invalid means the decoder learned RV32I grammar cleanly.
+
+**Implications for the plan:**
+
+1. CE decoder training is validated. The technique reaches
+   95%+ train tok_acc given adequate capacity.
+2. Generalization is bounded by the encoder. The 72% held-out
+   ceiling is consistent across model sizes and training
+   budgets — pushing it requires encoder changes, not decoder
+   changes.
+3. Equivalence tolerance emerges from the encoder geometry
+   alone without REINFORCE or explicit equivalence loss on
+   the decoder.
+4. The decoder is "good enough" to provide reward signal for
+   gate training — the 23% execution-equivalent / 4% invalid
+   distribution gives clear contrast between "good T1
+   emission" and "garbage T1".
+
+**Training infrastructure improvements:**
+- Cached + autocast + fused Adam: 72ms/step at d512 B=1024
+- Warmup-Stable-Decay (WSD) schedule with configurable
+  transitions and phase-endpoint checkpoints
+- Gradient clipping: essential for d≥512 to prevent loss
+  explosions from occasional bad-batch gradients
+- Micro-batching: re-chunks cached batches post-cache for
+  VRAM control independent of pre-generated batch size

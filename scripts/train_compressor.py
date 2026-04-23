@@ -68,10 +68,14 @@ def main():
                    help='Weight for explicit equivalence collapse loss. '
                         '0 disables.')
 
-    # Reconstruction loss (instr mode, joint encoder+decoder).
+    # REINFORCE reconstruction (instr mode, joint encoder+decoder).
     p.add_argument('--recon-weight', type=float, default=0.0,
-                   help='Weight for reconstruction CE loss. '
-                        '0 disables (no decoder trained).')
+                   help='Weight for REINFORCE execution-equivalence '
+                        'loss. 0 disables (no decoder trained).')
+    p.add_argument('--k-samples', type=int, default=10,
+                   help='REINFORCE samples per instruction')
+    p.add_argument('--n-reward-inputs', type=int, default=4,
+                   help='Random register states per execution comparison')
 
     args = p.parse_args()
 
@@ -97,6 +101,8 @@ def main():
             dec_d_model=args.dec_d_model,
             dec_n_heads=args.dec_n_heads,
             dec_n_layers=args.dec_n_layers,
+            k_samples=args.k_samples,
+            n_reward_inputs=args.n_reward_inputs,
         )
         print(f'\nDone: {len(losses)} steps, '
               f'final loss {losses[-1]:.4f}')
