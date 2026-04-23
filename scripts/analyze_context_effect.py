@@ -24,6 +24,8 @@ import torch
 from emulator import Instruction, make_ctx, random_regs, run as run_instruction, SparseMemory
 from tokenizer import encode_instruction, BOS, EOS, PAD, VOCAB_SIZE
 from compressor.model import T1Compressor
+from compressor.train import load_checkpoint
+from scripts._common import resolve_device
 
 
 def make_examples(target_instr, predecessors, n_inputs=4, seed=42):
@@ -253,15 +255,11 @@ def main():
     p.add_argument('--n-preds', type=int, default=200)
     args = p.parse_args()
 
-    if args.device == 'auto':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    else:
-        device = args.device
+    device = resolve_device(args.device)
 
     model = T1Compressor(VOCAB_SIZE, args.d_model, args.n_heads,
                        args.n_layers, args.d_out)
-    model.load_state_dict(torch.load(args.model, map_location=device,
-                                     weights_only=True))
+    model.load_state_dict(load_checkpoint(args.model, device))
     model = model.to(device)
 
     # Test several target instructions.

@@ -22,7 +22,9 @@ import torch
 
 from datagen.equivalences import MANIFEST, sample_binding, materialize
 from compressor.model import T1Compressor
+from compressor.train import load_checkpoint
 from tokenizer import VOCAB_SIZE, encode_instruction, PAD
+from scripts._common import resolve_device
 
 
 def encode_instructions(model, instrs, device):
@@ -103,16 +105,13 @@ def main():
     p.add_argument('--seed', type=int, default=42)
     args = p.parse_args()
 
-    if args.device == 'auto':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    else:
-        device = args.device
+    device = resolve_device(args.device)
 
     model = T1Compressor(VOCAB_SIZE, args.d_model, args.n_heads,
                          args.n_layers, args.d_out).to(device)
     # strict=False so pre-dest-heads checkpoints still load.
-    state = torch.load(args.model, map_location=device, weights_only=True)
-    missing, unexpected = model.load_state_dict(state, strict=False)
+    missing, unexpected = model.load_state_dict(
+        load_checkpoint(args.model, device), strict=False)
     if missing:
         print(f'# note: missing keys (random-init): {missing}',
               file=sys.stderr)

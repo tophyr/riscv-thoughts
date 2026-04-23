@@ -1,6 +1,42 @@
 # What Is a Thought?
 
-## A Theory of Compression, Search, and Meaning
+### A Theory of Compression, Thinking, and Expression
+
+Ask any capable LLM to produce a 2000-word summary of a 50-page
+document and you get something genuinely useful: the key claims,
+most of the nuance, the structure of the argument. Ask the same
+model to reduce that to 100 words and it will do it — but most of
+the specific detail is gone, and only the headline-level points
+remain. At 10 words you have a title.
+
+This is not a limitation of any particular model. It is taken as
+a property of summarization itself: aggressive compression
+discards information, and you cannot meaningfully reconstruct a
+document from its one-sentence summary. Nobody claims you should
+be able to.
+
+Yet the same models also demonstrate something quite different
+elsewhere: the famous `king − man + woman ≈ queen` arithmetic of
+token embeddings. A high-dimensional vector that stands in for a
+single word carries enough structure to support meaningful
+geometric operations. Relationships compose. Analogies work. The
+vector isn't a summary of the word — it's a representation of the
+word that you can manipulate.
+
+What if the compression of an entire document worked that way?
+What if the full text of *Romeo and Juliet* compressed not to a
+summary you read, but to a vector you *manipulate* — a single
+point in a high-dimensional space that still carried the play in
+full, that composed with other such vectors, and that decompressed
+back into nearly, or exactly, the original text on demand? And what
+if `Romeo and Juliet − Renaissance Verona + 1950s New York` defined
+an actual work that could be written out... or pointed you at *West
+Side Story*?
+
+That is the thesis of this project. The rest of this document
+works out what a "thought" would have to be for such a system to
+exist, what operations it would support, and what geometric
+properties its space would need to have.
 
 ---
 
@@ -8,11 +44,21 @@
 
 A thought is a compressed representation — a point in a continuous
 vector space produced by a deterministic compression function over
-tokens. Expression is the act of searching for a token sequence that
-closely matches that compressed representation.
+tokens.
 
-The compression defines what the thought means. The search is how the
-thought becomes language.
+Thinking is the composition and transformation of thought-points
+within that space: analogy, inference, abstraction, planning. These
+are geometric operations on vectors, not token manipulations. The
+whole point of having a compressed thought space is to make such
+operations meaningful and efficient.
+
+Expression is the act of searching for a token sequence that
+compresses back to a given thought — "lowering" the thought into
+something a human or another system can consume. This is the
+decoder's job, separate from thinking.
+
+The compression defines what a thought means. Operations on thoughts
+are thinking. The search from a thought back to tokens is expression.
 
 ---
 
@@ -47,16 +93,22 @@ candidate token sequence can be scored against.
 
 ---
 
-## Thinking Is Search
+## Expression Is Search
 
-Given a thought (a compressed point), thinking is the process of finding
-a token sequence whose compression matches it.
+Given a thought (a compressed point), expression is the process of
+finding a token sequence whose compression matches it — lowering the
+thought into surface form.
 
 This requires two components: a proposer that generates candidate token
 sequences, and the compressor that scores each candidate by compressing
-it and measuring proximity to the target.
+it and measuring proximity to the target. The sections below work
+through the practical constraints on each piece.
 
 ### The Proposer Must Be Conditioned
+
+Could we just use any off-the-shelf language model as the proposer?
+No — and the reason is worth making explicit, because it drives
+everything else about the decoding architecture.
 
 An unconditioned language model generating fluent text has no idea what
 thought you're trying to express. Its first-token distribution is just
@@ -80,11 +132,18 @@ vocabulary.
 
 ### Search Need Not Be Left-to-Right
 
-Autoregressive left-to-right generation starts with the least
-informative tokens. "The Kingdom of Tethra..." — "The" carries zero
-bits about the thought. "Tethra" carries a lot. The early beam steps
-navigate a completely flat scoring landscape where nothing distinguishes
-any candidate.
+Modern language models generate autoregressively: emit token one, then
+token two conditioned on token one, then token three conditioned on
+the previous two, and so on. When this style of model is used as the
+proposer for expression search, the search inherits this left-to-right
+shape — and that turns out to be badly matched to what the search
+actually needs.
+
+The problem: left-to-right generation starts with the least informative
+tokens. "The Kingdom of Tethra..." — "The" carries zero bits about the
+thought. "Tethra" carries a lot. The early beam steps navigate a
+completely flat scoring landscape where nothing distinguishes any
+candidate.
 
 Content-first generation is more natural: produce the highest-
 information tokens first, then fill in gaps. This mirrors human language
@@ -127,11 +186,17 @@ controls fidelity. These concerns are fully separated.
 
 ### Decoder Independence (Qualified)
 
-The thought representation is independent of any specific decoder, but
-decoders are not commodity infrastructure. Each proposer needs a trained
-conditioning mechanism — an adapter that maps from compressed space to
-something the frozen LM can consume. This adapter is trained against the
-specific compressed space.
+A natural next question: if we can swap proposers to get different
+languages or styles, are the proposers themselves freely
+interchangeable? Can we just bolt any off-the-shelf language model
+onto a trained compressor?
+
+Partially yes, partially no. The thought representation itself is
+independent of any specific decoder, but decoders are not commodity
+infrastructure. Each proposer needs a trained conditioning mechanism —
+an adapter that maps from compressed space to something the frozen LM
+can consume. This adapter is trained against the specific compressed
+space.
 
 The independence is: train the compressor once, train cheap conditioned
 proposers per use case. The compressor verifies all of them identically.
@@ -142,15 +207,21 @@ LM) requires training a new adapter but not retraining the compressor.
 
 ## Verification Is Free
 
-This architecture dissolves the "thought-lowering determinism" problem.
-The original concern: how do you guarantee that going from thought back
-to tokens produces the right output?
+Expression is non-deterministic: the same thought can produce many
+different valid token sequences. That raises an obvious worry — if
+decoding is a search with multiple possible outputs, how do you know
+the output you got is actually faithful to the thought you meant to
+express?
 
-With a standard learned decoder, that's a training problem — you need
-the decoder to be faithful, and you can't fully verify it. With search-
-based thinking against a deterministic compressor, verification is
-trivially free. Compress the candidate. Check if it matches the target.
-The compressor is the oracle.
+With a standard learned decoder — one trained end-to-end to map from
+thought-vectors to tokens — that's a training problem. You need the
+decoder to be faithful in general, and you can't fully verify that it
+is. Every decoding is a roll of the dice with no referee.
+
+With search-based expression against a deterministic compressor,
+verification is trivially free. Compress the candidate. Check if it
+matches the target. The compressor is the referee, and it's the same
+function you used to define the thought in the first place.
 
 If the candidate compresses to the same point, it is semantically
 equivalent by definition — because the compressor IS the definition of
@@ -160,45 +231,57 @@ The system has a clean three-way separation:
 
 - **Compression is deterministic.** Same tokens → same point, always.
   This is the ground truth. This is what you train.
-- **Thinking is non-deterministic.** Same thought → many valid token
+- **Expression is non-deterministic.** Same thought → many valid token
   sequences. The proposer controls variation. This is the search.
 - **Verification is deterministic.** Compress the candidate, check the
   distance. Pass or fail.
 
 The compressor is simultaneously the representation, the training
 objective, and the verification oracle. The proposer is a practical
-necessity — it must be conditioned on the target and its adapter must
-be trained — but its errors are caught by the compressor. The proposer
-is allowed to be imperfect because the compressor backstops it.
+necessity for expression — it must be conditioned on the target and
+its adapter must be trained — but its errors are caught by the
+compressor. The proposer is allowed to be imperfect because the
+compressor backstops it.
 
 ---
 
 ## The Hierarchy Is Search Acceleration
 
-Multi-level compression (T0 → T1 → T2 → ... → Tn) is not a theory of
-abstraction. It is a multi-resolution scoring function that makes the
-search tractable.
+The naïve form of expression-as-search has a serious problem: for any
+non-trivial thought, the space of candidate token sequences is
+astronomical, and scoring a partial candidate against the final
+compressor target is mostly uninformative until the sequence is nearly
+complete. A search that can't prune candidates early has to explore
+exponentially many branches. Single-level compression makes expression
+theoretically sound but practically intractable.
 
-Each level compresses a set of points into a smaller set. T0 tokens
-compress to T1 concept-level representations. T1 representations
-compress to T2 proposition-level representations. The levels need not
-share a vector space — each can have its own dimensionality, sized to
-the complexity of relationships at that level.
+The fix is to stack compressors. T0 tokens compress to T1 concept-level
+representations. T1 representations compress to T2 proposition-level
+representations. And so on up through however many levels the problem
+demands. The levels need not share a vector space — each can have its
+own dimensionality, sized to the complexity of relationships at that
+level.
+
+Multi-level compression, viewed this way, is not a theory of
+abstraction. It is a multi-resolution scoring function that makes the
+expression search tractable by providing cheap coarse checks before
+the expensive fine checks.
 
 ### The Compressed Space Is Continuous; Valid Lowerings Are Discrete
 
-At every level, the compressed representation lives in a continuous
-vector space, but the valid token sequences that can be lowered to are
-discrete points in that space. You can nudge a compressed point by an
-epsilon in any direction, but there may be no valid token sequence that
-compresses to exactly that new point.
+Before getting to the coarse-to-fine mechanics, one subtlety about the
+levels themselves: at every level, the compressed representation lives
+in a continuous vector space, but the valid token sequences that can
+be lowered to are discrete points in that space. You can nudge a
+compressed point by an epsilon in any direction, but there may be no
+valid token sequence that compresses to exactly that new point.
 
-This is not a problem — it is the correct framing for decoding. The
-decoder's job is not to perfectly invert the compression. It is to find
-the **nearest valid point** in the discrete set of lowerable sequences.
-The compressor scores candidates; the decoder proposes them; validity
-constraints (grammar in natural language, instruction-set rules in
-machine code) filter the proposals.
+This mismatch is not a problem — it is the correct framing for
+decoding. The decoder's job is not to perfectly invert the compression.
+It is to find the **nearest valid point** in the discrete set of
+lowerable sequences. The compressor scores candidates; the decoder
+proposes them; validity constraints (grammar in natural language,
+instruction-set rules in machine code) filter the proposals.
 
 This is the same constraint at every level. Natural language tokens must
 form grammatical sentences. Instructions must have valid opcodes,
@@ -207,7 +290,7 @@ respect encoding constraints. The valid lowerings are always a discrete
 subset of the continuous space, and the decoder always searches for the
 nearest one.
 
-During thinking (the search), the hierarchy provides coarse-to-fine
+During expression (the search), the hierarchy provides coarse-to-fine
 guidance:
 
 - Early in the search: score against the highest (coarsest) compression
@@ -249,53 +332,62 @@ search has no discrimination.
 
 ---
 
-## What Makes Thinking Efficient: Geometric Properties
+## What Makes Thinking and Expression Possible: Geometric Properties
 
 The geometric properties of the compressed representation are not
-aesthetic preferences. They are computational properties of the scoring
-landscape that determine whether the search converges.
+aesthetic preferences. They are what make operations on thought-points
+meaningful (thinking) and what make the token search converge
+(expression).
 
 **Smoothness.** The compressor must be smooth — similar inputs produce
-similar outputs. If the scoring landscape has sharp discontinuities, the
-search cannot use gradients to navigate. A small change to the candidate
-token sequence must produce a small, directionally informative change in
-the compressed point. Without smoothness, the search degenerates to
-random sampling.
+similar outputs. For thinking: a small perturbation of a thought should
+produce a neighboring thought, not a semantically unrelated one. For
+expression: if the scoring landscape has sharp discontinuities, the
+search cannot use gradients to navigate. Without smoothness, the space
+supports neither meaningful vector operations nor convergent search.
 
 **Factored structure.** If independent aspects of meaning (entities,
 relations, quantities, temporal structure) are encoded on independent
-axes, the search can decompose into sub-problems. Getting the entity
-right shouldn't interfere with getting the quantity right. Factored
-structure means the search makes independent progress on independent
-aspects of meaning.
+axes, both thought operations and expression search decompose into
+sub-problems. Adjusting the quantity of a thought shouldn't scramble its
+entities. The expression search can make independent progress on
+independent aspects of meaning.
 
 **Interpolation coherence.** Points between two valid compressed
 representations should correspond to semantically intermediate content.
-This means the scoring landscape has no discontinuous jumps between
-valid regions — the search can move smoothly from one valid solution
-toward another. Without interpolation coherence, the space between valid
-points is a wasteland that traps the search.
+For thinking: analogies and interpolations work — (king − man + woman)
+lands near (queen). For expression: the scoring landscape has no
+discontinuous jumps between valid regions; the search can move smoothly
+from one valid solution toward another.
 
 These properties are not nice-to-haves for publication. They are
-necessary conditions for the search to converge in tractable time. A
-rough, entangled, discontinuous compression produces a search problem
-that requires exponential beam width. A smooth, factored, interpolable
-compression produces a search problem that beam search can solve.
+necessary conditions for both thought operations to be meaningful and
+for expression search to converge in tractable time. A rough, entangled,
+discontinuous compression produces a space where thinking is arbitrary
+and search requires exponential beam width. A smooth, factored,
+interpolable compression produces a space where thinking is coherent and
+expression is tractable.
 
-Training the compressor to have these properties is training it to be
+Training the compressor to have these properties is defining both what
+meaningful thought-operations look like AND training it to be
 efficiently invertible by search. The geometric quality of the
-compressed space IS the computational tractability of thinking.
+compressed space IS the computational viability of thinking and
+expression.
 
 ---
 
-## What Matters Now
+## What To Build First
 
-The compressor is the research contribution. Its geometric properties
-are the publishable claims. Everything about decoding — the proposer
-architecture, the search strategy, the adapter training — is a
-downstream engineering problem.
+The framework above divides cleanly into two layers: the compressor
+(which defines meaning and provides a verification oracle) and the
+decoding stack (proposers, adapters, search strategies). The split
+suggests a research priority.
 
-The compressor can be validated without generating a single token:
+The compressor is the novel claim and the load-bearing component. If
+the compressed space doesn't have the right geometry, no amount of
+decoder cleverness will rescue it. If it does, any competent decoder
+can exploit it. So the first thing to validate is the compressor
+itself — and that can be done without generating a single token:
 
 - **QA-contradiction discrimination**: does the compressed point
   distinguish facts?
@@ -315,14 +407,15 @@ compressor and its geometry are what need to happen now.
 
 ## Alignment With Human Cognition
 
-The search-based thinking pattern aligns with how humans experience
+The search-based expression pattern aligns with how humans experience
 language production and comprehension. This is a structural analogy, not
-a neuroscientific claim.
+a neuroscientific claim. Each example below is about expression —
+getting a thought out — not about thinking itself.
 
 **"How do I say this?"** — The defining question of language production.
 The thought exists. The search for a token sequence that faithfully
 compresses to it has not yet converged. Deliberate word choice IS the
-search. This IS thinking.
+search. This IS expression.
 
 **"It's on the tip of my tongue."** — The thought is located. Its
 relationships are felt — near this, relates to that. The proposer is
@@ -368,16 +461,23 @@ deterministic compressor over tokens. Its meaning is defined by
 the compressor: two token sequences mean the same thing if and only
 if they compress to the same point.
 
-Thinking is search: given a thought, find tokens that express it. A
-conditioned proposer generates candidates; the compressor verifies them.
-The search is non-deterministic; the verification is exact.
+Thinking is what happens to thoughts in the compressed space:
+composition, transformation, analogy, inference. These are geometric
+operations on vectors. Having a thought space with the right geometry
+is what makes thinking possible in the first place.
 
-The hierarchy accelerates thinking from intractable to feasible by
+Expression is search: given a thought, find tokens that lower it into
+surface form. A conditioned proposer generates candidates; the
+compressor verifies them. The search is non-deterministic; the
+verification is exact.
+
+The hierarchy accelerates expression from intractable to feasible by
 providing multi-resolution scoring. Geometric properties of the
 compressed space — smoothness, factored structure, interpolation
-coherence — are what make the search converge. They are computational
-properties of the problem, not aesthetic properties of the
-representation.
+coherence — are what enable both meaningful thought operations and
+convergent expression search. They are computational properties of the
+problem, not aesthetic properties of the representation.
 
-Training the compressor is defining what meaning is. Evaluating the
-search is testing whether thinking works. Verifying the output is free.
+Training the compressor is defining what meaning is. Operations on
+thought-points are thinking. Finding tokens that recompress to a thought
+is expression. Verification is free.
