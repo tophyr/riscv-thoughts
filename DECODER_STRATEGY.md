@@ -101,14 +101,21 @@ the compressor learned smooth geometry.
 
 ---
 
-## Phase 2: Learned Decoder (Implemented — Exp 20-21)
+## Phase 2: Learned Decoder (Implemented)
 
 Replace gradient search with a neural network that jumps to the
-answer in one forward pass. **Status:** implemented as a 2-layer
-transformer decoder with cross-attention to the emission vector.
-Reaches 99.6% token reconstruction accuracy (Exp 21). Equivalence
-validation confirms correct behavior at vector midpoints when
-cosine similarity > 0.7.
+answer in one forward pass. An autoregressive transformer decoder
+with cross-attention to the emission vector, trained with
+cross-entropy against the original tokens on a frozen encoder.
+
+The "compressor-as-loss" framing from Phase 1 turned out to be
+unnecessary in practice. Simple CE against the original tokens
+produces a decoder that generalizes to held-out instructions and
+emerges equivalence tolerance automatically — the encoder's
+equivalence-collapsing geometry shows through at decode time,
+without needing the compressor as a verifier.
+
+See EXPERIMENT_LOG.md for empirical results.
 
 ### Architecture
 
@@ -123,31 +130,37 @@ or concatenation to the input embeddings. The model provides the
 "language competence" (valid instruction syntax) while the target
 provides the "what to say."
 
-### Training Signal: The Compressor Is the Loss
+### Training Signal
 
-The compressor provides the training signal directly. No supervised
-(thought, token_sequence) pairs needed:
+Cross-entropy against the original tokens is the primary signal.
+Given a (tokens, T1) pair, train the decoder to reproduce the
+tokens autoregressively conditioned on T1. Standard supervised
+learning on automatically-generated pairs — no human labels needed.
 
-1. Sample a target thought vector.
-2. Decoder proposes a token sequence.
-3. Compress the proposal through the frozen compressor.
-4. Loss = distance(compressed_proposal, target).
-5. Backprop through the decoder.
+Alternative signals were investigated and rejected as primary
+training loss:
 
-The gradient chain from loss to decoder parameters requires
-differentiable token selection. Options:
+- **Compressor-as-loss (Gumbel-softmax / round-trip):** decoder
+  outputs re-compress near the target, but the decoder learns to
+  produce "valid-looking garbage" that happens to compress nearby
+  rather than the actual instruction. Adding an instruction-
+  validity guardrail would likely fix this, but validity is a
+  discrete predicate — enforcing it non-differentiably pushes
+  the method into REINFORCE territory, losing the "clean
+  differentiable chain" that motivated the approach in the first
+  place.
+- **REINFORCE with execution reward:** works (23% exec-equivalence
+  rate on a frozen encoder) but high variance and converges much
+  slower than CE. Useful as a fine-tune on top of CE, not as
+  primary training.
 
-- **Gumbel-softmax:** replace discrete token sampling with
-  differentiable soft samples. The full chain (target -> decoder ->
-  soft tokens -> compressor -> loss) is differentiable end-to-end.
-  Cleanest approach.
-
-- **REINFORCE:** treat the compressor's distance as a reward signal,
-  train the decoder with policy gradient. Works with discrete tokens
-  but has high variance.
-
-- **Straight-through estimator:** use argmax in forward pass, soft
-  gradients in backward pass. Simple but biased.
+CE was initially suspect because it appears to fight execution
+equivalence (penalizing valid alternatives). Empirically, the
+encoder's equivalence-collapsing geometry means the T1 vectors
+for equivalents are close, so CE-trained decoders still produce
+equivalent alternatives on held-out data — the equivalence
+tolerance is inherited from the encoder, not learned by the
+decoder.
 
 ### Temperature and Diversity
 
@@ -237,11 +250,14 @@ signal, faster convergence.
    (explore), low temperature late (commit). How to anneal without
    getting stuck.
 
-3. **Decoder architecture size.** The decoder needs to be expressive
-   enough to propose valid instructions but small enough that the
-   compressor forward pass (for verification) isn't the bottleneck.
-   The compressor is tiny (2-layer transformer), so the decoder
-   probably should be too.
+3. **Decoder architecture size.** Empirically resolved: the decoder
+   needs to be substantially larger than the compressor. Rough rule
+   from memorization theory (Zhang et al. 2017): decoder parameter
+   count should be at least the total number of token predictions
+   in the training set. A too-small decoder plateaus below full
+   reconstruction even given unlimited training. A too-large decoder
+   wastes compute and memorizes beyond what the encoder geometry
+   actually preserves as structure.
 
 4. **Multi-sequence decoding.** For T2 targets, the decoder needs to
    produce a sequence of instructions, not just one. Does it generate

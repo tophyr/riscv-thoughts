@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train a decoder on a frozen encoder and report reconstruction accuracy.
+"""Train a decoder on a frozen encoder with teacher-forced CE.
 
 Pre-generate a corpus for fair comparison across encoder checkpoints:
     gen_instr_batches.py --n-batches 5000 --batch-size 256 --seed 12345 \
@@ -7,10 +7,12 @@ Pre-generate a corpus for fair comparison across encoder checkpoints:
 
 Then pipe to each checkpoint:
     batch_repeat.py --forever /tmp/decoder_corpus.bin | \
-        eval_decoder.py --model runs/XXX/encoder.pt --d-out 64
+        train_decoder.py --model runs/XXX/encoder.pt --d-out 64
 
 Reports per-token accuracy (fraction of tokens correct) and
-per-instruction accuracy (fraction of fully-correct reconstructions).
+per-instruction accuracy (fraction of fully-correct reconstructions)
+at each log point. For REINFORCE-based decoder training (autoregressive
+sampling with execution-equivalence reward), see train_reinforce_decoder.py.
 """
 
 import argparse
@@ -21,17 +23,6 @@ from pathlib import Path
 
 warnings.filterwarnings('ignore', message='.*nested tensors.*prototype stage.*')
 
-
-def format_eta(secs):
-    secs = int(secs)
-    if secs < 60:
-        return f'{secs}s'
-    if secs < 3600:
-        return f'{secs // 60}m'
-    if secs < 86400:
-        return f'{secs // 3600}h{(secs % 3600) // 60}m'
-    return f'{secs // 86400}d{(secs % 86400) // 3600}h'
-
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
@@ -40,8 +31,9 @@ import torch.nn.functional as F
 
 from datagen import InstructionBatchReader
 from compressor.model import T1Compressor, Decoder
-from compressor.train import _prepare_decoder_targets
+from compressor.train import _prepare_decoder_targets, load_checkpoint
 from tokenizer import VOCAB_SIZE, PAD
+from scripts._common import resolve_device, format_eta
 
 
 def main():
@@ -87,17 +79,14 @@ def main():
                         '(reduces activation memory)')
     args = p.parse_args()
 
-    if args.device == 'auto':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    else:
-        device = args.device
+    device = resolve_device(args.device)
 
     # Load frozen encoder.
     encoder = T1Compressor(
         VOCAB_SIZE, args.d_model, args.n_heads, args.n_layers, args.d_out
     ).to(device)
-    state = torch.load(args.model, map_location=device, weights_only=True)
-    encoder.load_state_dict(state, strict=False)
+    encoder.load_state_dict(
+        load_checkpoint(args.model, device), strict=False)
     encoder.eval()
     for param in encoder.parameters():
         param.requires_grad = False
@@ -108,11 +97,7 @@ def main():
         n_memory_tokens=args.dec_n_memory,
     ).to(device)
     if args.load_decoder:
-        state = torch.load(args.load_decoder, map_location=device,
-                           weights_only=True)
-        # Strip _orig_mod. prefix from torch.compile'd checkpoints.
-        state = {k.removeprefix('_orig_mod.'): v for k, v in state.items()}
-        decoder.load_state_dict(state)
+        decoder.load_state_dict(load_checkpoint(args.load_decoder, device))
         print(f'Loaded decoder from {args.load_decoder}',
               file=sys.stderr)
 

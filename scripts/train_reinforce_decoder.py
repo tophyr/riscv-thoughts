@@ -24,113 +24,15 @@ import torch.nn.functional as F
 
 from datagen import InstructionBatchReader
 from compressor.model import T1Compressor, Decoder
-from compressor.train import _prepare_decoder_targets
-from tokenizer import VOCAB_SIZE, PAD, BOS
-from emulator.batch_emulator import (
-    batch_execute, batch_parse_tokens, random_regs_gpu,
+from compressor.train import (
+    _prepare_decoder_targets,
+    autoregressive_sample,
+    compute_log_probs,
+    gpu_reward,
+    load_checkpoint,
 )
-
-
-@torch.no_grad()
-def autoregressive_sample(decoder, vecs, max_len, orig_lengths, device):
-    """Sample token sequences autoregressively (no gradient).
-
-    The decoder sees its OWN previous tokens at each position.
-    Returns sampled tokens only — log_probs are computed separately
-    in a single parallel forward pass to save memory.
-    """
-    B = vecs.shape[0]
-    generated = torch.full((B, 1), BOS, dtype=torch.long, device=device)
-
-    for pos in range(max_len):
-        pad_mask = torch.zeros(
-            B, generated.shape[1], dtype=torch.bool, device=device)
-        logits = decoder(vecs, generated, pad_mask)
-        next_logits = logits[:, -1, :]
-        next_token = torch.distributions.Categorical(
-            logits=next_logits).sample()
-        generated = torch.cat(
-            [generated, next_token.unsqueeze(1)], dim=1)
-
-    return generated[:, 1:]  # strip BOS
-
-
-def compute_log_probs(decoder, vecs, sampled, orig_lengths, device):
-    """Compute log_probs for a sampled sequence in one parallel forward.
-
-    Uses the sampled tokens as decoder input (shifted right with BOS).
-    This is 'teacher-forcing on the decoder's own output' — the
-    log_probs are conditioned on the sampled prefix, not ground truth.
-    """
-    B, T = sampled.shape
-    bos_col = torch.full((B, 1), BOS, dtype=torch.long, device=device)
-    dec_input = torch.cat([bos_col, sampled[:, :-1]], dim=1)
-    pad_mask = torch.zeros(B, T, dtype=torch.bool, device=device)
-
-    logits = decoder(vecs, dec_input, pad_mask)
-    dist = torch.distributions.Categorical(logits=logits)
-    log_probs = dist.log_prob(sampled)
-
-    pos_mask = (torch.arange(T, device=device).unsqueeze(0)
-                < orig_lengths.unsqueeze(1))
-    return (log_probs * pos_mask.float()).sum(dim=1)
-
-
-def gpu_reward(orig_tokens, sampled_tokens, orig_lengths,
-               sampled_lengths, device, n_inputs=4):
-    """Fully-GPU shaped execution-equivalence reward.
-
-    Decomposes the reward into per-field signals so the decoder
-    gets credit for partially-correct decodings:
-      0.25 × opcode match
-      0.25 × dest_reg match
-      0.25 × data_val match (fraction across n_inputs)
-      0.25 × pc match (fraction across n_inputs)
-
-    Returns (rewards, valid_mask, equiv_mask) as (B,) tensors.
-    """
-    o_op, o_rd, o_rs1, o_rs2, o_imm, o_valid = batch_parse_tokens(
-        orig_tokens, orig_lengths, device)
-    d_op, d_rd, d_rs1, d_rs2, d_imm, d_valid = batch_parse_tokens(
-        sampled_tokens, sampled_lengths, device)
-
-    both_valid = o_valid & d_valid
-    B = orig_tokens.shape[0]
-
-    # Field-level rewards.
-    op_match = (o_op == d_op).float()
-    rd_match = (o_rd == d_rd).float()
-
-    dv_match_count = torch.zeros(B, dtype=torch.float32, device=device)
-    pc_match_count = torch.zeros(B, dtype=torch.float32, device=device)
-
-    for _ in range(n_inputs):
-        regs = random_regs_gpu(B, device=device)
-        pc = torch.randint(0, 256, (B,), dtype=torch.int32,
-                           device=device) * 4
-
-        o_dv, o_pc = batch_execute(o_op, o_rd, o_rs1, o_rs2, o_imm,
-                                   regs, pc)
-        d_dv, d_pc = batch_execute(d_op, d_rd, d_rs1, d_rs2, d_imm,
-                                   regs, pc)
-
-        dv_match_count += (o_dv == d_dv).float()
-        pc_match_count += (o_pc == d_pc).float()
-
-    dv_match = dv_match_count / n_inputs
-    pc_match = pc_match_count / n_inputs
-
-    shaped_reward = 0.25 * op_match + 0.25 * rd_match \
-                  + 0.25 * dv_match + 0.25 * pc_match
-
-    rewards = torch.where(both_valid, shaped_reward,
-                          torch.zeros(B, dtype=torch.float32,
-                                      device=device))
-
-    equiv_mask = both_valid & (dv_match_count == n_inputs) \
-                            & (pc_match_count == n_inputs)
-
-    return rewards, d_valid, equiv_mask
+from tokenizer import VOCAB_SIZE, PAD
+from scripts._common import resolve_device
 
 
 def main():
@@ -156,10 +58,7 @@ def main():
     p.add_argument('--device', default='auto')
     args = p.parse_args()
 
-    if args.device == 'auto':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    else:
-        device = args.device
+    device = resolve_device(args.device)
 
     torch.set_float32_matmul_precision('high')
 
@@ -167,8 +66,8 @@ def main():
     encoder = T1Compressor(
         VOCAB_SIZE, args.d_model, args.n_heads, args.n_layers, args.d_out
     ).to(device)
-    state = torch.load(args.model, map_location=device, weights_only=True)
-    encoder.load_state_dict(state, strict=False)
+    encoder.load_state_dict(
+        load_checkpoint(args.model, device), strict=False)
     encoder.eval()
     for param in encoder.parameters():
         param.requires_grad = False
@@ -178,9 +77,7 @@ def main():
         args.dec_n_layers, d_emb=args.d_out
     ).to(device)
     if args.load_decoder:
-        decoder.load_state_dict(
-            torch.load(args.load_decoder, map_location=device,
-                       weights_only=True))
+        decoder.load_state_dict(load_checkpoint(args.load_decoder, device))
         print(f'Loaded decoder from {args.load_decoder}',
               file=sys.stderr)
     opt = torch.optim.Adam(decoder.parameters(), lr=args.lr)
@@ -242,7 +139,7 @@ def main():
 
         for _ in range(K):
             sampled = autoregressive_sample(
-                decoder, vecs, max_len, orig_lengths, device)
+                decoder, vecs, max_len, device)
 
             rewards_k, valid_k, equiv_k = gpu_reward(
                 tok, sampled, orig_lengths, orig_lengths,

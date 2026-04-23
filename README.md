@@ -6,16 +6,27 @@ geometry — and whether search-based decoding can invert the compression.
 
 ## The Idea
 
-A "thought" is a compressed representation — a point in a continuous
-vector space produced by a deterministic compression function over tokens.
-Two token sequences mean the same thing if and only if they compress to
-the same point. Thinking becomes akin to transformations of thought points:
-composition, differencing, and recombination in the compressed space. 
+LLMs are excellent summarizers — to a point. At 2000 words they
+capture nuance; at 100, mostly the headlines; at 10, a title. The
+detail loss is taken as inherent to compression. Yet the same models
+demonstrate `king − man + woman ≈ queen`: a vector standing in for
+a word both preserves its meaning and supports geometric operations.
+What if whole-document compression worked that way — where
+`Romeo and Juliet − Renaissance Verona + 1950s New York` pointed
+you at *West Side Story*, and the result was a vector you could
+decompress back into actual text?
 
-Thought expression is search: given a thought, find the token sequence that
-compresses nearest to it. Expression verifiability falls out of this for
-free, because it is simply compressing the expression and differencing it 
-against the original thought.
+A "thought" is exactly such a compressed representation — a point in
+a continuous vector space produced by a deterministic compression
+function over tokens. Two token sequences mean the same thing if and
+only if they compress to the same point. Thinking becomes akin to
+transformations of thought points: composition, differencing, and
+recombination in the compressed space.
+
+Thought expression is search: given a thought, find the token sequence
+that compresses nearest to it. Expression verifiability falls out of
+this for free, because it is simply compressing the expression and
+differencing it against the original thought.
 
 See [WHAT_IS_A_THOUGHT.md](WHAT_IS_A_THOUGHT.md) for the full theoretical
 framework.
@@ -38,17 +49,34 @@ See [RISCV_DESIGN.md](RISCV_DESIGN.md) for the testbed design.
 
 ## Current Status
 
-Phase 1 (T0→T1 single-instruction compression) is complete for ALU
-instructions. A small transformer compressor trained with execution-
-distance correlation loss produces a T1 vector space with:
+**T1 encoder — validated.** Transformer compressor trained on all
+RV32I instructions (single-instruction T0→T1) with nested-log MSE
+loss against execution deltas, plus explicit equivalence-collapse
+loss and equivalence-injected batches.
 
-- Pearson r = 0.995 between T1 and execution distances
-- Clean opcode clustering (SLT/SLTU: 0.26 apart, SRL/SRA: 0.44)
-- Monotonic immediate scaling
-- Correct register sensitivity hierarchy
-- Partial execution equivalence collapse
+- Pearson r = 0.91 between T1 and execution distances at d_out=64
+- 13/13 equivalence manifest classes PASS (cross-opcode aliasing,
+  commutativity, self-op identity, zero-reg alias, etc.)
+- Optimal dimensionality: d_out=64 (validated vs 32/128/256)
 
-See [EXPERIMENT_LOG.md](EXPERIMENT_LOG.md) for detailed results.
+**T1 decoder — validated.** CE-trained transformer decoder on a
+frozen encoder reaches 95%+ training tok_acc at 8L/d_model=256 and
+larger. Generalization ceiling is ~72% held-out tok_acc, set by
+the encoder's geometry rather than decoder capacity. 23.4% of
+held-out autoregressive decodings are execution-equivalent to the
+original without explicit equivalence training on the decoder —
+equivalence tolerance emerges from the encoder's collapsing geometry.
+
+**T1 gates — next.** Shift-reduce architecture with GRU-controlled
+accept/emit/evict gates to learn instruction boundaries. REINFORCE
+training on decoder reconstruction quality as reward signal.
+
+**GPU batch emulator.** All 37 RV32I opcodes executable in parallel
+via `torch.where`, 1.69ms for B=4096. Enables fully-GPU REINFORCE
+reward pipelines.
+
+See [EXPERIMENT_LOG.md](EXPERIMENT_LOG.md) for detailed results and
+[TODO.md](TODO.md) for the piecemeal assembly roadmap.
 
 ## Ancestry
 
@@ -64,10 +92,12 @@ over.
 ## Structure
 
 ```
-emulator/       RV32I emulator wrapper (TinyFive backend)
+emulator/       RV32I emulator + GPU batch emulator (all 37 opcodes
+                via torch.where, used for REINFORCE reward signal)
 tokenizer/      Structural tokenizer (89-token vocabulary)
-datagen/        Training data generator (equivalence & mutation pairs)
-compressor/     T0→T1 compressor model and training loop
+datagen/        Training data: single instructions (RVB), sequences
+                (RVS), and equivalence manifest (16 classes)
+compressor/     T1 encoder + decoder models, training loops
 scripts/        Training and evaluation entry points
 ```
 
@@ -77,12 +107,24 @@ scripts/        Training and evaluation entry points
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# Train
-python scripts/train_compressor.py
-python scripts/train_compressor.py --batch-size 4096 --d-out 128
+# Train encoder (instr mode: single-instruction batches)
+./train.sh 100000          # multi-node helper (see train.sh)
+# or locally:
+python scripts/gen_instr_batches.py --n-batches 10000 --batch-size 4096 \
+  --config configs/instr_default.json \
+  | python scripts/train_compressor.py --mode instr --n-steps 10000 \
+    --d-out 64 --equiv-weight 0.05
 
-# Evaluate
-python scripts/eval_compressor.py runs/<timestamp>
+# Pre-generate a decoder evaluation corpus
+python scripts/gen_instr_batches.py --n-batches 200 --batch-size 4096 \
+  --seed 12345 > /tmp/unique_corpus.bin
+
+# Train a decoder on a frozen encoder
+python scripts/train_decoder.py --model runs/<timestamp>/encoder.pt \
+  --d-out 64 --n-layers 2 --dec-n-layers 8 --dec-d-model 256 \
+  --dec-n-memory 64 --n-steps 800000 --cache --micro-batch 1024 \
+  --warmup-steps 25000 --decay-steps 150000 \
+  --save-decoder /tmp/decoder.pt < /tmp/unique_corpus.bin
 
 # Test
 python -m pytest

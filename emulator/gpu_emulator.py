@@ -17,7 +17,7 @@ import torch
 import numpy as np
 
 from tokenizer.tokenizer import _OP_TO_TOKEN, _TOKEN_TO_ID
-from emulator.emulator import Instruction
+from emulator.cpu_emulator import Instruction
 
 # ---------------------------------------------------------------------------
 # Token ID constants

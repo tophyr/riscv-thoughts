@@ -27,7 +27,7 @@ from typing import Callable
 
 import numpy as np
 
-from emulator.emulator import Instruction
+from emulator import Instruction
 
 
 @dataclass

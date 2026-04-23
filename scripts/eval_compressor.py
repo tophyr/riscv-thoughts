@@ -19,8 +19,13 @@ from scipy import stats
 
 from datagen import SequenceBatchReader
 from compressor.model import T1Compressor
-from compressor.train import extract_windows, exec_distance_deltas as exec_distance
+from compressor.train import (
+    extract_windows,
+    exec_distance_deltas as exec_distance,
+    load_checkpoint,
+)
 from tokenizer import VOCAB_SIZE, VOCAB
+from scripts._common import resolve_device
 
 
 def evaluate(model, batch_iter, window_size, device, max_batches=100):
@@ -77,15 +82,11 @@ def main():
     p.add_argument('--max-batches', type=int, default=100)
     args = p.parse_args()
 
-    if args.device == 'auto':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    else:
-        device = args.device
+    device = resolve_device(args.device)
 
     model = T1Compressor(VOCAB_SIZE, args.d_model, args.n_heads,
                        args.n_layers, args.d_out)
-    model.load_state_dict(torch.load(args.model, map_location=device,
-                                     weights_only=True))
+    model.load_state_dict(load_checkpoint(args.model, device))
     model = model.to(device)
 
     reader = SequenceBatchReader(sys.stdin.buffer)

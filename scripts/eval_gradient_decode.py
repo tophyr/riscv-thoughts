@@ -27,7 +27,9 @@ import torch
 
 from datagen import produce_instruction_batch
 from compressor.model import T1Compressor
+from compressor.train import load_checkpoint
 from tokenizer import VOCAB_SIZE, PAD, encode_instruction
+from scripts._common import resolve_device
 
 
 def gradient_decode_batch(encoder, target_vecs, lengths, max_len,
@@ -89,16 +91,13 @@ def main():
     p.add_argument('--device', default='auto')
     args = p.parse_args()
 
-    if args.device == 'auto':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    else:
-        device = args.device
+    device = resolve_device(args.device)
 
     encoder = T1Compressor(
         VOCAB_SIZE, args.d_model, args.n_heads, args.n_layers, args.d_out
     ).to(device)
-    state = torch.load(args.model, map_location=device, weights_only=True)
-    encoder.load_state_dict(state, strict=False)
+    encoder.load_state_dict(
+        load_checkpoint(args.model, device), strict=False)
     encoder.eval()
     for param in encoder.parameters():
         param.requires_grad = False
