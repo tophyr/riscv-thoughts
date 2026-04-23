@@ -15,6 +15,9 @@ import torch.nn.functional as F
 from tokenizer import BOS, EOS, PAD, VOCAB_SIZE, encode_instruction
 from emulator.emulator import Instruction
 from datagen.equivalences import MANIFEST, sample_binding, materialize
+from emulator.batch_emulator import (
+    batch_execute, batch_parse_tokens, random_regs_gpu,
+)
 from .model import T1Compressor, Decoder
 
 
@@ -161,7 +164,8 @@ def train_batches(batch_iter, d_model=128, n_heads=4, n_layers=2,
                   d_out=128, lr=3e-4, device='auto', n_steps=None,
                   log_every=100, lr_min=1e-6, equiv_weight=0.0,
                   equiv_seed=0, recon_weight=0.0,
-                  dec_d_model=128, dec_n_heads=4, dec_n_layers=2):
+                  dec_d_model=128, dec_n_heads=4, dec_n_layers=2,
+                  k_samples=10, n_reward_inputs=4):
     """Train the T1 encoder on single-instruction batches (RVB).
 
     N×N pairwise MSE between T1 vector distances and execution
@@ -197,6 +201,7 @@ def train_batches(batch_iter, d_model=128, n_heads=4, n_layers=2,
     t0 = time.time()
     probe_tok, probe_pad = _probe_tensor(device)
     equiv_rng = np.random.default_rng(equiv_seed)
+    recon_baseline = 0.0
 
     for batch in batch_iter:
         tok = torch.from_numpy(batch.token_ids).to(device)
@@ -236,24 +241,78 @@ def train_batches(batch_iter, d_model=128, n_heads=4, n_layers=2,
             eq_loss = torch.tensor(0.0, device=device)
 
         if recon_weight > 0 and decoder is not None:
-            B = tok.shape[0]
+            B_dec = tok.shape[0]
             token_lists = []
-            for b in range(B):
+            for b in range(B_dec):
                 mask = ~batch.padding_mask[b]
                 token_lists.append(batch.token_ids[b][mask].tolist())
             dec_in, dec_tgt, dec_pad = _prepare_decoder_targets(
                 token_lists, device)
-            dec_logits = decoder(vecs, dec_in, dec_pad)
-            recon_loss = F.cross_entropy(
-                dec_logits.reshape(-1, VOCAB_SIZE),
-                dec_tgt.reshape(-1), ignore_index=PAD)
 
-            with torch.no_grad():
-                pred = dec_logits.argmax(dim=-1)
-                non_pad = ~dec_pad
-                tok_correct = ((pred == dec_tgt) & non_pad).sum().item()
-                tok_total = non_pad.sum().item()
-                recon_acc = tok_correct / tok_total if tok_total else 0
+            # Decoder forward — vecs NOT detached so REINFORCE
+            # gradient flows through decoder to encoder.
+            dec_logits = decoder(vecs, dec_in, dec_pad)
+            non_pad_dec = ~dec_pad
+            orig_lengths = non_pad_dec.sum(dim=1)
+
+            dist = torch.distributions.Categorical(logits=dec_logits)
+
+            # K-sample REINFORCE with shaped execution reward.
+            reinforce_sum = torch.tensor(0.0, device=device)
+            total_reward = 0.0
+            total_equiv = 0
+
+            for _ in range(k_samples):
+                sampled = dist.sample()
+                lp = (dist.log_prob(sampled)
+                      * non_pad_dec.float()).sum(dim=1)
+
+                with torch.no_grad():
+                    o_op, o_rd, o_rs1, o_rs2, o_imm, o_v = \
+                        batch_parse_tokens(tok, orig_lengths, device)
+                    d_op, d_rd, d_rs1, d_rs2, d_imm, d_v = \
+                        batch_parse_tokens(sampled, orig_lengths, device)
+                    both_v = o_v & d_v
+
+                    op_m = (o_op == d_op).float()
+                    rd_m = (o_rd == d_rd).float()
+                    dv_m = torch.zeros(B_dec, device=device)
+                    pc_m = torch.zeros(B_dec, device=device)
+
+                    for _ in range(n_reward_inputs):
+                        rgs = random_regs_gpu(B_dec, device=device)
+                        pcr = torch.randint(
+                            0, 256, (B_dec,),
+                            dtype=torch.int32, device=device) * 4
+                        o_dv, o_pc = batch_execute(
+                            o_op, o_rd, o_rs1, o_rs2, o_imm, rgs, pcr)
+                        d_dv, d_pc = batch_execute(
+                            d_op, d_rd, d_rs1, d_rs2, d_imm, rgs, pcr)
+                        dv_m += (o_dv == d_dv).float()
+                        pc_m += (o_pc == d_pc).float()
+
+                    rewards = torch.where(
+                        both_v,
+                        0.25 * op_m + 0.25 * rd_m
+                        + 0.25 * dv_m / n_reward_inputs
+                        + 0.25 * pc_m / n_reward_inputs,
+                        torch.zeros(B_dec, device=device))
+
+                    equiv = both_v & (dv_m == n_reward_inputs) \
+                                   & (pc_m == n_reward_inputs)
+
+                advantage = rewards - recon_baseline
+                adv_std = advantage.std() + 1e-8
+                advantage = (advantage - advantage.mean()) / adv_std
+                reinforce_sum = reinforce_sum \
+                    - (lp * advantage).mean()
+                total_reward += rewards.mean().item()
+                total_equiv += equiv.sum().item()
+
+            recon_loss = reinforce_sum / k_samples
+            recon_baseline = (0.99 * recon_baseline
+                              + 0.01 * total_reward / k_samples)
+            recon_acc = total_equiv / (B_dec * k_samples)
         else:
             recon_loss = torch.tensor(0.0, device=device)
             dec_logits = None
@@ -288,8 +347,8 @@ def train_batches(batch_iter, d_model=128, n_heads=4, n_layers=2,
             d_comm = (pv[2] - pv[4]).norm().item()
             recon_str = ''
             if dec_logits is not None:
-                recon_str = (f' recon {recon_loss.item():.3f}'
-                             f'/{recon_acc:.0%}')
+                recon_str = (f' rl {recon_loss.item():.3f}'
+                             f' eq {recon_acc:.0%}')
             print(f'step {step:>6d}  '
                   f'loss {loss_val:.4f} '
                   f'(mse {mse_loss.item():.4f} '

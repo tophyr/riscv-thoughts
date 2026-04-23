@@ -25,10 +25,55 @@ import torch.nn.functional as F
 from datagen import InstructionBatchReader
 from compressor.model import T1Compressor, Decoder
 from compressor.train import _prepare_decoder_targets
-from tokenizer import VOCAB_SIZE, PAD
+from tokenizer import VOCAB_SIZE, PAD, BOS
 from emulator.batch_emulator import (
     batch_execute, batch_parse_tokens, random_regs_gpu,
 )
+
+
+@torch.no_grad()
+def autoregressive_sample(decoder, vecs, max_len, orig_lengths, device):
+    """Sample token sequences autoregressively (no gradient).
+
+    The decoder sees its OWN previous tokens at each position.
+    Returns sampled tokens only — log_probs are computed separately
+    in a single parallel forward pass to save memory.
+    """
+    B = vecs.shape[0]
+    generated = torch.full((B, 1), BOS, dtype=torch.long, device=device)
+
+    for pos in range(max_len):
+        pad_mask = torch.zeros(
+            B, generated.shape[1], dtype=torch.bool, device=device)
+        logits = decoder(vecs, generated, pad_mask)
+        next_logits = logits[:, -1, :]
+        next_token = torch.distributions.Categorical(
+            logits=next_logits).sample()
+        generated = torch.cat(
+            [generated, next_token.unsqueeze(1)], dim=1)
+
+    return generated[:, 1:]  # strip BOS
+
+
+def compute_log_probs(decoder, vecs, sampled, orig_lengths, device):
+    """Compute log_probs for a sampled sequence in one parallel forward.
+
+    Uses the sampled tokens as decoder input (shifted right with BOS).
+    This is 'teacher-forcing on the decoder's own output' — the
+    log_probs are conditioned on the sampled prefix, not ground truth.
+    """
+    B, T = sampled.shape
+    bos_col = torch.full((B, 1), BOS, dtype=torch.long, device=device)
+    dec_input = torch.cat([bos_col, sampled[:, :-1]], dim=1)
+    pad_mask = torch.zeros(B, T, dtype=torch.bool, device=device)
+
+    logits = decoder(vecs, dec_input, pad_mask)
+    dist = torch.distributions.Categorical(logits=logits)
+    log_probs = dist.log_prob(sampled)
+
+    pos_mask = (torch.arange(T, device=device).unsqueeze(0)
+                < orig_lengths.unsqueeze(1))
+    return (log_probs * pos_mask.float()).sum(dim=1)
 
 
 def gpu_reward(orig_tokens, sampled_tokens, orig_lengths,
@@ -104,6 +149,10 @@ def main():
     p.add_argument('--n-reward-inputs', type=int, default=4)
     p.add_argument('--k-samples', type=int, default=1,
                    help='Samples per instruction for variance reduction')
+    p.add_argument('--load-decoder', type=str, default=None,
+                   help='Load pre-trained decoder weights (e.g., from CE phase)')
+    p.add_argument('--save-decoder', type=str, default=None,
+                   help='Save decoder weights to this path on completion')
     p.add_argument('--device', default='auto')
     args = p.parse_args()
 
@@ -128,6 +177,12 @@ def main():
         VOCAB_SIZE, args.dec_d_model, args.dec_n_heads,
         args.dec_n_layers, d_emb=args.d_out
     ).to(device)
+    if args.load_decoder:
+        decoder.load_state_dict(
+            torch.load(args.load_decoder, map_location=device,
+                       weights_only=True))
+        print(f'Loaded decoder from {args.load_decoder}',
+              file=sys.stderr)
     opt = torch.optim.Adam(decoder.parameters(), lr=args.lr)
 
     baseline = 0.0
@@ -164,43 +219,50 @@ def main():
             torch.cuda.synchronize()
         t_dec = time.time()
 
-        logits = decoder(vecs, dec_in, dec_pad)
         non_pad = ~dec_pad
         orig_lengths = non_pad.sum(dim=1)
+        max_len = int(orig_lengths.max().item())
 
         if device != 'cpu':
             torch.cuda.synchronize()
 
-        # K-sample REINFORCE: sample K times, evaluate each,
-        # use the best reward per instruction for lower variance.
+        # K-sample autoregressive REINFORCE (two-phase).
+        # Phase 1: sample K sequences autoregressively (no gradient),
+        #          evaluate with GPU emulator, keep the best.
+        # Phase 2: compute log_probs for the best sample WITH gradient
+        #          in one parallel forward pass.
         t_reward = time.time()
         K = args.k_samples
-        dist = torch.distributions.Categorical(logits=logits)
 
         best_rewards = torch.full((B,), -1.0, device=device)
-        best_log_probs = torch.zeros(B, device=device)
+        best_sampled = torch.zeros(B, max_len, dtype=torch.long,
+                                   device=device)
         best_valid = torch.zeros(B, dtype=torch.bool, device=device)
         best_equiv = torch.zeros(B, dtype=torch.bool, device=device)
 
         for _ in range(K):
-            sampled = dist.sample()
-            log_probs = (dist.log_prob(sampled) * non_pad.float()).sum(dim=1)
+            sampled = autoregressive_sample(
+                decoder, vecs, max_len, orig_lengths, device)
 
             rewards_k, valid_k, equiv_k = gpu_reward(
                 tok, sampled, orig_lengths, orig_lengths,
                 device, n_inputs=args.n_reward_inputs)
 
-            # Keep the sample with highest reward per instruction.
             better = rewards_k > best_rewards
             best_rewards = torch.where(better, rewards_k, best_rewards)
-            best_log_probs = torch.where(better, log_probs, best_log_probs)
+            best_sampled = torch.where(
+                better.unsqueeze(1).expand_as(sampled),
+                sampled, best_sampled)
             best_valid = torch.where(better, valid_k, best_valid)
             best_equiv = torch.where(better, equiv_k, best_equiv)
 
         rewards = best_rewards.clamp(min=0)
-        seq_log_prob = best_log_probs
         valid_mask = best_valid
         equiv_mask = best_equiv
+
+        # Phase 2: log_probs with gradient for the best sample.
+        seq_log_prob = compute_log_probs(
+            decoder, vecs, best_sampled, orig_lengths, device)
 
         if device != 'cpu':
             torch.cuda.synchronize()
@@ -234,12 +296,6 @@ def main():
             valid_frac = valid_mask.float().mean().item()
             equiv_frac = equiv_mask.float().mean().item()
 
-            with torch.no_grad():
-                pred = logits.argmax(dim=-1)
-                tok_correct = ((pred == dec_tgt) & non_pad).sum().item()
-                tok_total = non_pad.sum().item()
-                tok_acc = tok_correct / tok_total
-
             enc_ms = (t_dec - t_enc) * 1000
             dec_ms = (t_reward - t_dec) * 1000
             back_ms = (t_done - t_back) * 1000
@@ -247,15 +303,17 @@ def main():
                   f'reward {mean_reward:.3f}  '
                   f'valid {valid_frac:.0%}  '
                   f'equiv {equiv_frac:.0%}  '
-                  f'tok_acc {tok_acc:.0%}  '
-                  f'enc {enc_ms:.0f} dec {dec_ms:.0f} '
-                  f'rew {reward_ms:.0f} back {back_ms:.0f}  '
+                  f'enc {enc_ms:.0f} dec+rew {dec_ms + reward_ms:.0f} '
+                  f'back {back_ms:.0f}  '
                   f'{ms_per:.0f}ms/step')
 
         if step >= args.n_steps:
             break
 
     print(f'\nDone: {step} steps')
+    if args.save_decoder:
+        torch.save(decoder.state_dict(), args.save_decoder)
+        print(f'Saved decoder to {args.save_decoder}')
 
 
 if __name__ == '__main__':

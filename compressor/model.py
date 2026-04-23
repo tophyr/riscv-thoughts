@@ -316,11 +316,12 @@ class Decoder(nn.Module):
     """Autoregressive decoder conditioned on an emission vector."""
 
     def __init__(self, vocab_size, d_model, n_heads, n_layers, d_emb,
-                 max_seq_len=64, dropout=0.0):
+                 max_seq_len=64, dropout=0.0, n_memory_tokens=1):
         super().__init__()
         self.d_model = d_model
         self.vocab_size = vocab_size
-        self.emission_proj = nn.Linear(d_emb, d_model)
+        self.n_memory_tokens = n_memory_tokens
+        self.emission_proj = nn.Linear(d_emb, n_memory_tokens * d_model)
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(max_seq_len, d_model)
         decoder_layer = nn.TransformerDecoderLayer(
@@ -332,11 +333,12 @@ class Decoder(nn.Module):
     def forward(self, emission_vecs, target_tokens, target_padding_mask):
         N, T = target_tokens.shape
         device = target_tokens.device
-        memory = self.emission_proj(emission_vecs).unsqueeze(1)
+        memory = self.emission_proj(emission_vecs).view(
+            N, self.n_memory_tokens, self.d_model)
         pos = torch.arange(T, device=device)
         tgt = self.tok_emb(target_tokens) + self.pos_emb(pos)
-        causal_mask = nn.Transformer.generate_square_subsequent_mask(
-            T, device=device)
+        causal_mask = torch.ones(
+            T, T, dtype=torch.bool, device=device).triu(diagonal=1)
         out = self.decoder(
             tgt, memory,
             tgt_mask=causal_mask,
