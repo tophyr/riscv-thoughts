@@ -104,6 +104,6 @@ class TestInstructionBatchIO:
         assert read_batch(io.BytesIO()) is None
 
     def test_bad_magic(self):
-        buf = io.BytesIO(b'XXXX\x01' + b'\x00' * 6)
+        buf = io.BytesIO(b'XXXX\x02' + b'\x00' * 7)
         with pytest.raises(ValueError, match='Bad magic'):
             read_stream_header(buf)
