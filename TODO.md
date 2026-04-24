@@ -99,10 +99,41 @@ is compression, so d_out should be sized deliberately.
       thesis validation. Revisit if gate training needs higher
       decoder quality.
 
-### Step 5: Gates (supervised + REINFORCE) ← NEXT
-- [ ] Freeze encoder + decoder (8L/d256/64m or 8L/d512/64m)
-- [ ] Train GRU gate controller with REINFORCE
-- [ ] Decoder runs every iteration → per-iteration quality signal
+### Step 4b: Encoder retraining — magnitude as validity ← NEXT
+Triggered by Phase 9 / Exp 33: the frozen encoder from Step 3
+places all compressed windows on the unit sphere with no
+readable validity signal, so any gate architecture reading T1
+cannot linearly discriminate emit points. Fix: move T1 into
+the unit ball and train magnitude as validity.
+
+- [ ] Drop `F.normalize` in the encoder (both `encode`/`encode_soft`
+      paths); output a raw B^d vector
+- [ ] Extend `train_batches` with on-the-fly invalid-window
+      augmentation: partial (prefix of one instr), spanning
+      (instr + prefix of next), multi-instruction concatenated,
+      bogus (random token bag)
+- [ ] Add magnitude loss: MSE between `||T1||` and a binary target
+      (1 for complete single-instr, 0 otherwise)
+- [ ] Compute the existing pair MSE + destination CE only on valid
+      windows, using normalized direction `T1/||T1||` for the pair
+      distance metric
+- [ ] Log `||T1||.max()` per step and add soft magnitude
+      regularization only if it drifts above 1
+- [ ] Probe against held-out windows: linear probe on T1 → validity
+      should reach near-perfect accuracy before we trust the
+      encoder for gate training
+- [ ] Re-run equivalence eval on direction-only T1 to confirm
+      the Step 3 geometry (13/13 PASS) is preserved
+
+### Step 5: Gates (supervised + REINFORCE) — paused
+Phase 9 gate-training attempts (Exp 31) plateaued at ~70%
+emit accuracy because T1 didn't carry validity. Resumes after
+Step 4b.
+
+- [ ] Freeze retrained encoder + decoder
+- [ ] Supervised BCE on emit against `batch_is_complete_instruction`
+      (now NEG-aware as of the Exp 32 fix)
+- [ ] Train GRU gate controller; REINFORCE on accept/evict
 - [ ] Verify: >90% of emissions at instruction boundaries
 
 ### Step 6: Assembly + fine-tune

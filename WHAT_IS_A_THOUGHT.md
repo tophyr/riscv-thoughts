@@ -93,6 +93,64 @@ candidate token sequence can be scored against.
 
 ---
 
+## Not Every Point Is a Thought
+
+If thoughts live in a continuous vector space, and composition is
+geometric (adding, subtracting, interpolating), then the space
+contains many points that are not thoughts in any meaningful sense.
+`encode("king") − encode("king")` trivially lands at the origin.
+`encode("blue") + encode("justice")` lands somewhere that isn't
+"blue justice" — because there's no such compositional referent
+to be. Arithmetic produces points; not every point is a referent.
+
+This has to be acknowledged in the geometry. A thought space where
+every point is equally a thought is a space where compositional
+arithmetic cannot fail, which contradicts the intuition that some
+compositions *don't mean anything*. Something has to distinguish
+a valid-thought region from the rest of the space.
+
+The choice we've made for T1: valid thoughts live near the surface
+of the unit ball (`||T1|| ≈ 1`); invalid inputs — partial data,
+spanning-boundary data, corrupted data, degenerate compositions —
+collapse toward the origin (`||T1|| ≈ 0`). Magnitude is validity.
+Direction is semantics. The origin is the "not-a-thought" point:
+not a zero-meaning thought, but the absence of one.
+
+This is distinct from representing *the concept of nonsense*. A
+high-magnitude thought pointing in some direction might denote
+"this thing I'm considering is nonsensical" — that's still a
+thought, with referent and structure. The origin is different:
+it's the geometric home for inputs that did not produce a
+thought at all.
+
+The two-dimensional separation — direction for what the thought
+*means*, magnitude for whether there's a thought at all — gives
+the space a clean handle on the failure modes of composition
+without complicating the expressive structure. A composition
+that pulls magnitude toward zero is announcing "this arithmetic
+did not produce a coherent referent." A composition that
+preserves magnitude near one is announcing "the result is as
+much a thought as its inputs were." The decoder and any
+downstream consumer read magnitude alongside direction and
+act accordingly — decode confidently if magnitude is high,
+defer or ignore if magnitude is low.
+
+This also means that compositional arithmetic should NOT be
+renormalized. Forcing every composed result back onto the unit
+sphere would erase exactly the signal that tells us whether the
+composition worked. Magnitude carries coherence; throwing it
+away takes us back to a geometry where arithmetic is claimed to
+always succeed, which it doesn't.
+
+The philosophical payoff: we no longer need a separate
+"invalidity" machinery bolted onto the thought-space. The
+geometry itself distinguishes between thoughts and non-thoughts,
+continuously and differentiably. Validity is learned alongside
+meaning, from the same training data, and lives at the same
+address as the thought it pertains to.
+
+---
+
 ## Expression Is Search
 
 Given a thought (a compressed point), expression is the process of

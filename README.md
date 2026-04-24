@@ -67,9 +67,20 @@ held-out autoregressive decodings are execution-equivalent to the
 original without explicit equivalence training on the decoder —
 equivalence tolerance emerges from the encoder's collapsing geometry.
 
-**T1 gates — next.** Shift-reduce architecture with GRU-controlled
-accept/emit/evict gates to learn instruction boundaries. REINFORCE
-training on decoder reconstruction quality as reward signal.
+**T1 encoder retraining — in progress.** The trained encoder
+places valid instructions on the unit sphere but does not
+discriminate valid windows from partial / spanning / bogus ones
+(Exp 33 linear probe barely beats majority baseline). Retraining
+with invalid-window augmentation and magnitude-as-validity: T1
+now lives in the unit ball, with `||T1||` as a learned
+confidence scalar and direction as semantics.
+
+**T1 gates — paused pending encoder retraining.** Shift-reduce
+architecture with GRU-controlled accept/emit/evict gates. Earlier
+REINFORCE + supervised gate-training attempts (Phase 9) plateaued
+at ~70% emit accuracy — the emit head reads T1, and the
+pre-magnitude T1 didn't carry the validity signal it needed to
+read. Resumes once the encoder is retrained.
 
 **GPU batch emulator.** All 37 RV32I opcodes executable in parallel
 via `torch.where`, 1.69ms for B=4096. Enables fully-GPU REINFORCE
