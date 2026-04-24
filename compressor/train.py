@@ -64,13 +64,15 @@ def _encode_instrs(model, instrs, device):
 
 
 def equivalence_loss(model, device, rng):
-    """Per-class MSE on canonical pairwise distances, target=0.
+    """Per-class MSE on canonical *directional* pairwise distances, target=0.
 
     Each call: for every manifest class with >=2 canonical templates,
     sample a fresh binding, materialize, collect all instructions
-    across classes into a single padded batch, encode once, then
-    slice per-class to compute mean squared within-class distance.
-    Returns the mean across classes.
+    across classes into a single padded batch, encode once, normalize
+    the resulting vectors to unit direction (T1 magnitude is a
+    separate validity signal — irrelevant for equivalence geometry),
+    then slice per-class to compute mean squared within-class
+    distance. Returns the mean across classes.
     """
     all_instrs = []
     class_ranges = []  # list of (start, end) slices into the batch
@@ -88,6 +90,7 @@ def equivalence_loss(model, device, rng):
         return torch.tensor(0.0, device=device)
 
     vecs = _encode_instrs(model, all_instrs, device)  # (N_total, d_out)
+    vecs = F.normalize(vecs, dim=-1)
 
     losses = []
     for s, e in class_ranges:
@@ -163,15 +166,30 @@ _EXEC_DIST_SCALE = 2.0 / 3.14  # nested-log range [0, ~3.14] → [0, ~2]
 def train_batches(batch_iter, d_model=128, n_heads=4, n_layers=2,
                   d_out=128, lr=3e-4, device='auto', n_steps=None,
                   log_every=100, lr_min=1e-6, equiv_weight=0.0,
-                  equiv_seed=0, recon_weight=0.0,
+                  equiv_seed=0, recon_weight=0.0, mag_weight=1.0,
                   dec_d_model=128, dec_n_heads=4, dec_n_layers=2,
                   k_samples=10, n_reward_inputs=4):
-    """Train the T1 encoder on single-instruction batches (RVB).
+    """Train the T1 encoder on single-instruction batches (RVB v2).
 
-    N×N pairwise MSE between T1 vector distances and execution
-    distances computed from scalar data_vals and pc_vals.
+    T1 lives in the unit ball (encoder no longer unit-normalizes).
+    Direction encodes semantics, magnitude encodes validity.
 
-    Returns (model, losses).
+    Loss composition:
+      - mag_loss:   MSE of ||T1|| against valid_mask (1 for valid
+                    single instruction, 0 for invalid window). All
+                    rows participate.
+      - mse_loss:   N×N MSE between *directional* T1 pairwise
+                    distances (using T1 / ||T1||) and scaled
+                    execution distances. Computed only over pairs
+                    where both rows are valid.
+      - dt_loss, dr_loss: destination classification CE on valid
+                    rows only (invalid rows have meaningless
+                    destinations).
+      - eq_loss:    equivalence-manifold loss on canonical tuples
+                    (always valid).
+      - recon_loss: decoder REINFORCE on valid rows only.
+
+    Returns (model, decoder, losses).
     """
     if device == 'auto':
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -208,50 +226,77 @@ def train_batches(batch_iter, d_model=128, n_heads=4, n_layers=2,
         pad = torch.from_numpy(batch.padding_mask).to(device)
         dt_targets = torch.from_numpy(batch.dest_types).to(device)
         dr_targets = torch.from_numpy(batch.dest_regs).to(device)
+        valid_mask = torch.from_numpy(batch.valid_mask).to(device)
 
+        # Raw T1 in the unit ball; magnitude = validity, direction = semantics.
         vecs = model.compiled_encode(tok, pad)  # (B, d_out)
-        dt_logits = model.dest_type_head(vecs)
-        dr_logits = model.dest_reg_head(vecs)
+        vec_norms = vecs.norm(dim=-1)
+        vec_dirs = vecs / vec_norms.clamp(min=1e-8).unsqueeze(-1)
 
-        # N×N pairwise distances.
-        model_dists = torch.cdist(vecs.unsqueeze(0), vecs.unsqueeze(0),
-                                  p=2).squeeze(0)
-        exec_dists = exec_distance_scalar(
-            batch.data_vals, batch.pc_vals, device)
+        # Magnitude / validity loss: MSE of ||T1|| against a binary
+        # target. All rows participate.
+        mag_targets = valid_mask.float()
+        mag_loss = F.mse_loss(vec_norms, mag_targets)
 
-        # MSE on upper triangle with fixed scaling.
-        N = vecs.shape[0]
-        tri = torch.triu_indices(N, N, offset=1, device=device)
-        target = exec_dists[tri[0], tri[1]] * _EXEC_DIST_SCALE
-        mse_loss = (model_dists[tri[0], tri[1]] - target).square().mean()
-
-        # Destination classification: dest_type for all instructions,
-        # dest_reg only for register-writing instructions (dt=0).
-        dt_loss = F.cross_entropy(dt_logits, dt_targets)
-        reg_mask = (dt_targets == 0)
-        if reg_mask.any():
-            dr_loss = F.cross_entropy(
-                dr_logits[reg_mask], dr_targets[reg_mask])
+        # Destination classification — only meaningful on valid rows.
+        if valid_mask.any():
+            valid_idx = valid_mask.nonzero(as_tuple=True)[0]
+            dt_logits = model.dest_type_head(vecs[valid_idx])
+            dr_logits = model.dest_reg_head(vecs[valid_idx])
+            dt_loss = F.cross_entropy(dt_logits, dt_targets[valid_idx])
+            reg_mask = (dt_targets[valid_idx] == 0)
+            if reg_mask.any():
+                dr_loss = F.cross_entropy(
+                    dr_logits[reg_mask], dr_targets[valid_idx][reg_mask])
+            else:
+                dr_loss = torch.tensor(0.0, device=device)
         else:
+            dt_loss = torch.tensor(0.0, device=device)
             dr_loss = torch.tensor(0.0, device=device)
+
+        # Directional pair MSE: compute N×N over valid rows only.
+        # Using vec_dirs (unit-norm) so pair distances are purely
+        # angular — magnitude is already shaped by mag_loss.
+        if valid_mask.sum() >= 2:
+            valid_idx = valid_mask.nonzero(as_tuple=True)[0]
+            v_dirs = vec_dirs[valid_idx]
+            model_dists = torch.cdist(v_dirs.unsqueeze(0),
+                                      v_dirs.unsqueeze(0), p=2).squeeze(0)
+            # exec_distance_scalar operates on the full batch; slice down.
+            exec_dists = exec_distance_scalar(
+                batch.data_vals, batch.pc_vals, device)
+            exec_dists = exec_dists[valid_idx][:, valid_idx]
+
+            N = v_dirs.shape[0]
+            tri = torch.triu_indices(N, N, offset=1, device=device)
+            target = exec_dists[tri[0], tri[1]] * _EXEC_DIST_SCALE
+            mse_loss = (model_dists[tri[0], tri[1]] - target).square().mean()
+        else:
+            mse_loss = torch.tensor(0.0, device=device)
+            N = int(valid_mask.sum().item())
 
         if equiv_weight > 0:
             eq_loss = equivalence_loss(model, device, equiv_rng)
         else:
             eq_loss = torch.tensor(0.0, device=device)
 
-        if recon_weight > 0 and decoder is not None:
-            B_dec = tok.shape[0]
+        if recon_weight > 0 and decoder is not None and valid_mask.any():
+            # Filter to valid rows — invalid windows aren't reconstructible.
+            valid_idx = valid_mask.nonzero(as_tuple=True)[0]
+            valid_tok = tok[valid_idx]
+            valid_pad = pad[valid_idx]
+            B_dec = valid_tok.shape[0]
             token_lists = []
             for b in range(B_dec):
-                mask = ~batch.padding_mask[b]
-                token_lists.append(batch.token_ids[b][mask].tolist())
+                mask_np = ~batch.padding_mask[valid_idx[b].item()]
+                token_lists.append(
+                    batch.token_ids[valid_idx[b].item()][mask_np].tolist())
             dec_in, dec_tgt, dec_pad = _prepare_decoder_targets(
                 token_lists, device)
 
             # Decoder forward — vecs NOT detached so REINFORCE
             # gradient flows through decoder to encoder.
-            dec_logits = decoder(vecs, dec_in, dec_pad)
+            dec_logits = decoder(vecs[valid_idx], dec_in, dec_pad)
             non_pad_dec = ~dec_pad
             orig_lengths = non_pad_dec.sum(dim=1)
 
@@ -269,7 +314,7 @@ def train_batches(batch_iter, d_model=128, n_heads=4, n_layers=2,
 
                 with torch.no_grad():
                     o_op, o_rd, o_rs1, o_rs2, o_imm, o_v = \
-                        batch_parse_tokens(tok, orig_lengths, device)
+                        batch_parse_tokens(valid_tok, orig_lengths, device)
                     d_op, d_rd, d_rs1, d_rs2, d_imm, d_v = \
                         batch_parse_tokens(sampled, orig_lengths, device)
                     both_v = o_v & d_v
@@ -318,8 +363,10 @@ def train_batches(batch_iter, d_model=128, n_heads=4, n_layers=2,
             dec_logits = None
             recon_acc = 0.0
 
-        loss = mse_loss + dt_loss + dr_loss + equiv_weight * eq_loss \
-            + recon_weight * recon_loss
+        loss = (mag_weight * mag_loss
+                + mse_loss + dt_loss + dr_loss
+                + equiv_weight * eq_loss
+                + recon_weight * recon_loss)
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -341,23 +388,41 @@ def train_batches(batch_iter, d_model=128, n_heads=4, n_layers=2,
                 eta_str = f'  eta {timedelta(seconds=eta_sec)}'
             with torch.no_grad():
                 pv = model.encode(probe_tok, probe_pad)
-            d_add_add = (pv[0] - pv[2]).norm().item()
-            d_canon = (pv[0] - pv[1]).norm().item()
-            d_sll_sll = (pv[1] - pv[3]).norm().item()
-            d_comm = (pv[2] - pv[4]).norm().item()
+                pv_dir = pv / pv.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            # Probe distances computed on normalized direction so
+            # they stay on the same scale as the training pair MSE.
+            d_add_add = (pv_dir[0] - pv_dir[2]).norm().item()
+            d_canon = (pv_dir[0] - pv_dir[1]).norm().item()
+            d_sll_sll = (pv_dir[1] - pv_dir[3]).norm().item()
+            d_comm = (pv_dir[2] - pv_dir[4]).norm().item()
+
+            # Magnitude stats across the last batch, split valid / invalid.
+            with torch.no_grad():
+                valid_mag_mean = (
+                    vec_norms[valid_mask].mean().item()
+                    if valid_mask.any() else float('nan'))
+                invalid_mag_mean = (
+                    vec_norms[~valid_mask].mean().item()
+                    if (~valid_mask).any() else float('nan'))
+                mag_max = vec_norms.max().item()
+
             recon_str = ''
             if dec_logits is not None:
                 recon_str = (f' rl {recon_loss.item():.3f}'
                              f' eq {recon_acc:.0%}')
             print(f'step {step:>6d}  '
                   f'loss {loss_val:.4f} '
-                  f'(mse {mse_loss.item():.4f} '
+                  f'(mag {mag_loss.item():.4f} '
+                  f'mse {mse_loss.item():.4f} '
                   f'dt {dt_loss.item():.3f} '
                   f'dr {dr_loss.item():.3f} '
                   f'eq {eq_loss.item():.4f}'
                   f'{recon_str})  '
                   f'lr {current_lr:.1e}  {ms_per:.0f}ms/step  '
                   f'N={N}{eta_str}  '
+                  f'||T1|| v={valid_mag_mean:.2f} '
+                  f'i={invalid_mag_mean:.2f} '
+                  f'max={mag_max:.2f}  '
                   f'probe[aa={d_add_add:.3f} '
                   f'canon={d_canon:.3f} '
                   f'ss={d_sll_sll:.3f} '

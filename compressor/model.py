@@ -30,7 +30,7 @@ class T1Compressor(nn.Module):
     """
 
     def __init__(self, vocab_size, d_model, n_heads, n_layers, d_out,
-                 max_window=64, dropout=0.0,
+                 max_window=32, dropout=0.0,
                  max_iterations_per_token=4,
                  n_dest_types=2, n_regs=32):
         super().__init__()
@@ -51,9 +51,12 @@ class T1Compressor(nn.Module):
         self.win_encoder = nn.TransformerEncoder(win_layer, n_layers)
         self.proj = nn.Linear(d_model, d_out)
 
-        # Destination classification heads. Read from the normalized
-        # T1 vector to force the encoder to carry destination info
-        # that the scalar exec_distance metric is blind to.
+        # Destination classification heads. Read from the T1 vector
+        # to force the encoder to carry destination info that the
+        # scalar exec_distance metric is blind to. T1 is no longer
+        # normalized (see design note on the ball vs sphere), so
+        # these heads see a vector whose magnitude reflects
+        # validity; training loops invoke them only on valid rows.
         self.dest_type_head = nn.Linear(d_out, n_dest_types)
         self.dest_reg_head = nn.Linear(d_out, n_regs)
 
@@ -88,6 +91,12 @@ class T1Compressor(nn.Module):
         proj = self.proj
 
         def _encode_fn(token_ids, padding_mask):
+            # T1 lives in the unit ball, not on the sphere: the
+            # projection's raw output is the returned vector. Its
+            # magnitude encodes validity/confidence (trained via a
+            # separate magnitude loss); its direction encodes
+            # semantics. Deliberately no F.normalize — see
+            # WHAT_IS_A_THOUGHT.md and Phase 9 of EXPERIMENT_LOG.md.
             B, L = token_ids.shape
             x = tok_emb(token_ids) + pos_emb(
                 torch.arange(L, device=token_ids.device))
@@ -99,7 +108,7 @@ class T1Compressor(nn.Module):
                               last_idx]
             else:
                 last_repr = x[:, -1]
-            return F.normalize(proj(last_repr), dim=-1)
+            return proj(last_repr)
 
         self.encode = _encode_fn
         self.compiled_encode = torch.compile(_encode_fn)
@@ -114,7 +123,8 @@ class T1Compressor(nn.Module):
         """Encode from soft embeddings (for round-trip loss).
 
         Same as encode() but takes pre-computed embeddings instead
-        of token IDs. Shares all weights.
+        of token IDs. Shares all weights. No F.normalize — T1 lives
+        in the unit ball (see encode()).
         """
         B, T, _ = soft_emb.shape
         pos = torch.arange(T, device=soft_emb.device)
@@ -126,7 +136,7 @@ class T1Compressor(nn.Module):
             last_repr = x[torch.arange(B, device=soft_emb.device), last_idx]
         else:
             last_repr = x[:, -1]
-        return F.normalize(self.proj(last_repr), dim=-1)
+        return self.proj(last_repr)
 
     def _encode_window_buf(self, window_buf, window_lens):
         """Encode windows represented as a padded tensor.
