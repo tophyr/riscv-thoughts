@@ -92,7 +92,9 @@ Spearman 0.730). Key findings:
 
 - **Discrete snapping adds distance.** Successful decodes land at
   distance 0.4-0.8 from the target even when the continuous optimum
-  is very close. The discrete token vocabulary is sparse on S^127.
+  is very close. The discrete token vocabulary is sparse in the
+  T1 output space (the sphere in the Phase 1 experiments, the
+  unit ball under the post-Exp 33 magnitude-as-validity framing).
 
 These results validate the proposer+verifier framework: the
 compressor IS usable as a scoring function for search, and search

@@ -37,9 +37,12 @@ makes three independent decisions each iteration:
 Answers: "will having more information result in a more-emittable
 vector?"
 
-**Emit gate (reduce):** compress the window into a vector on S^127
-and output it. Answers: "is the compressed representation of this
-window complete enough to be decodable?"
+**Emit gate (reduce):** compress the window into a T1 vector in
+the unit ball and output it. Answers: "is the compressed
+representation of this window complete enough to be decodable?"
+Confidence is encoded in the vector's magnitude — `||T1|| ≈ 1`
+for emittable complete thoughts, `||T1|| ≈ 0` for non-thoughts
+(partial / spanning / bogus windows).
 
 **Evict gate:** pop the oldest token from the window (FIFO). Answers:
 "does the oldest token in the window still contribute meaningful
@@ -63,7 +66,8 @@ emits T2 vectors. Same gate mechanism at every level.
 **Components:**
 - **Window encoder:** bidirectional transformer (2 layers,
   d_model=128, 4 heads) over window contents. Produces T1
-  candidate on S^127.
+  candidate in the unit ball. Direction carries semantics,
+  magnitude carries validity/confidence.
 - **Gate controller:** GRU processes T1 candidates causally.
   Three independent MLP heads. Accept sees (next token embedding,
   T1 candidate, GRU hidden). Emit and evict see (T1 candidate,
@@ -281,8 +285,16 @@ See TODO.md for the current roadmap and EXPERIMENT_LOG.md for
 full experimental results.
 
 **Losses:**
-- **Pairwise MSE:** N×N MSE between T1 vector distances and
-  nested-log execution distances. Trains encoder geometry.
+- **Pairwise MSE (direction):** N×N MSE between distances of
+  *normalized* T1 vectors (`T1 / ||T1||`) and nested-log execution
+  distances. Trains the directional geometry. Computed only on
+  valid windows.
+- **Magnitude / validity:** MSE between `||T1||` and a binary target
+  (1 for complete single-instruction windows, 0 for partial /
+  spanning / multi-instruction / bogus windows). Trains the encoder
+  to place non-thoughts near the origin and thoughts near the unit
+  sphere. Added after Exp 33 revealed the pre-magnitude
+  encoder didn't linearly encode validity.
 - **Destination CE:** dest_type (register/memory) and dest_reg
   (which register) cross-entropy heads read from the T1 vector.
   Compensates for the scalar exec_distance metric's blindness
@@ -364,6 +376,19 @@ match found." That criterion must be learned.
    alone or equiv loss alone) were insufficient; the combination
    is needed because they address different failure modes.
 
+7. **Validity representation in T1.** Resolved: T1 lives in the
+   unit ball, not on the unit sphere — drop `F.normalize` on the
+   encoder output. Magnitude `||T1||` encodes validity/confidence
+   (1 = valid thought, 0 = not-a-thought at the origin); direction
+   `T1/||T1||` encodes semantics. Encoder trained with invalid-window
+   augmentation and a binary magnitude target. See Exp 31-33:
+   a linear probe of the pre-magnitude encoder for "is this a
+   complete instruction" barely beat the majority baseline,
+   because the encoder was trained only on valid single
+   instructions and had no supervision for the discrimination
+   task. Do *not* renormalize composed thoughts downstream —
+   magnitude carries compositional-coherence signal.
+
 ### Open
 
 7. **Feedback loop stability.** T2 feedback into T1 creates
@@ -374,10 +399,11 @@ match found." That criterion must be learned.
    planned approach. Alternatives (additive conditioning, gating
    modulation) exist. Empirical when T2 is built.
 
-9. **Output space per level.** d_out=128 (S^127) works for T1 but
-   is oversized — PCA shows ~94 of 128 dims carry 90% of variance.
-   d_out sweep in progress (Exp 25). Whether each level needs its
-   own dimensionality is empirical.
+9. **Output space per level.** d_out=128 on S^127 was the original
+   target; Exp 25 PCA showed ~94 effective dims of signal. Current
+   encoder uses d_out=64 in the unit ball; direction carries
+   semantics, magnitude carries the 1-D validity scalar. Whether
+   each level needs its own dimensionality is empirical.
 
 10. **Memory in state delta.** Per-register deltas work for the
     current instruction set. Memory effects (load/store) are

@@ -238,18 +238,34 @@ rather than too large — overcomplete spaces enable shortcut solutions
 **Evolved through experimentation** (see EXPERIMENT_LOG.md for the
 full progression). The current best approach:
 
-**MSE distance matching on the unit sphere.** Normalize compressed
-vectors to the unit hypersphere (S^(d-1)). MSE between pairwise T1
-distances and scaled execution distances. The sphere prevents collapse
-(fixed norms), MSE provides scale (explicit nonzero distance targets),
-and the combination handles both equivalence (target=0 for equivalent
-pairs) and separation (target>0 for different pairs) in one loss.
+**MSE distance matching in the unit ball.** T1 vectors live in the
+unit ball (no `F.normalize` on the encoder output). Semantics live
+in the direction `T1/||T1||`, validity in the magnitude `||T1||`.
+MSE between pairwise *directional* T1 distances (i.e., on normalized
+T1) and scaled execution distances, computed only on valid windows.
+This handles both equivalence (target=0 for equivalent pairs) and
+separation (target>0 for different pairs) in one loss.
 
 Execution distance: log1p(log1p(|data_diff| + |pc_diff|)) averaged
 over random input states. Nested log compresses the dynamic range
 (0 to 2^32) into ~0 to 3.14 while spreading the low end more
 uniformly than single log1p, so near-equivalence contrasts (e.g.,
 ADDI imm=0 vs imm=1) get meaningful gradient.
+
+**Magnitude / validity loss.** MSE between `||T1||` and a binary
+target: 1 for a window that forms exactly one complete RV32I
+instruction, 0 for everything else (partial prefix, spanning
+boundary, multiple instructions, random token bag). Drives the
+encoder to place non-thoughts at the origin, where they are
+structurally distinguishable from any valid thought without
+consuming any direction-space. The magnitude is then a linearly-
+readable "emit here" signal for the downstream gates.
+
+Earlier runs (Exp 19-30) normalized to the unit sphere, which
+forced all compressed windows — valid or not — onto the same
+manifold. Exp 33 showed via a linear probe that the resulting
+T1 did not carry a readable validity signal. The unit-ball
+framing is a direct response; see EXPERIMENT_LOG Phase 9.
 
 **Destination classification heads.** CrossEntropy on dest_type
 (register vs memory) and dest_reg (which register). Provides
