@@ -653,59 +653,89 @@ def streaming_train(batch_iter, d_model=128, n_heads=4, n_layers=2,
         # --- Forward pass (shift-reduce loop) ---
         (iter_t1s, iter_window_tokens,
          iter_gate_log_probs, iter_gate_decisions,
+         iter_gate_logits,
+         iter_window_buf_t, iter_window_lens_t,
          emission_info, emit_counts) = encoder(tok, pad, idx, n_instr)
 
         n_iters = len(iter_t1s)
         if n_iters == 0:
             continue
 
-        # --- Per-iteration decoder evaluation ---
-        # For each iteration, run the decoder on the T1 candidate
-        # against the current window tokens. This gives a per-iteration
-        # reconstruction loss used as REINFORCE reward.
-        iter_recon_losses = []  # per-iteration, shape (B,) each
-
+        # --- Per-iteration decoder evaluation (chunked + length-sorted) ---
+        # Flatten all (iter, batch_item) pairs with non-empty windows,
+        # sort by window length descending, process in chunks. Sorting
+        # keeps each chunk tightly padded; chunking keeps the decoder
+        # forward at a size the GPU can handle efficiently. A single
+        # unchunked forward with global-max padding turned out to be
+        # much slower than many small forwards.
+        flat_iter_idx = []
+        flat_batch_idx = []
+        flat_tokens = []
+        flat_win_sizes = []
         for it in range(n_iters):
-            t1 = iter_t1s[it]  # (B, d_out)
-            win_toks = iter_window_tokens[it]  # list of B token lists
+            wt = iter_window_tokens[it]
+            for b in range(B):
+                if wt[b]:
+                    flat_iter_idx.append(it)
+                    flat_batch_idx.append(b)
+                    flat_tokens.append(wt[b])
+                    flat_win_sizes.append(len(wt[b]))
 
-            # Find sequences with non-empty windows.
-            nonempty = [b for b in range(B) if win_toks[b]]
-            if not nonempty:
-                iter_recon_losses.append(
-                    torch.zeros(B, device=device))
-                continue
+        if not flat_tokens:
+            iter_recon_losses = [
+                torch.zeros(B, device=device) for _ in range(n_iters)]
+        else:
+            DECODER_CHUNK_SIZE = 1024
+            order = sorted(
+                range(len(flat_tokens)),
+                key=lambda i: -flat_win_sizes[i])
 
-            # Prepare decoder targets for non-empty windows.
-            nonempty_toks = [win_toks[b] for b in nonempty]
-            dec_in, dec_tgt, dec_pad = _prepare_decoder_targets(
-                nonempty_toks, device)
+            iter_idx_t = torch.tensor(
+                flat_iter_idx, dtype=torch.long, device=device)
+            batch_idx_t = torch.tensor(
+                flat_batch_idx, dtype=torch.long, device=device)
+            stacked_t1 = torch.stack(iter_t1s)  # (n_iters, B, d_out)
 
-            # Decoder forward.
-            ne_t1 = t1[nonempty]
-            logits = decoder(ne_t1, dec_in, dec_pad)
+            N = len(flat_tokens)
+            per_item_loss = torch.zeros(N, device=device)
+            for start in range(0, N, DECODER_CHUNK_SIZE):
+                chunk_flat_idx = order[start:start + DECODER_CHUNK_SIZE]
+                chunk_tokens = [flat_tokens[i] for i in chunk_flat_idx]
+                chunk_iter = torch.tensor(
+                    [flat_iter_idx[i] for i in chunk_flat_idx],
+                    dtype=torch.long, device=device)
+                chunk_batch = torch.tensor(
+                    [flat_batch_idx[i] for i in chunk_flat_idx],
+                    dtype=torch.long, device=device)
+                chunk_t1 = stacked_t1[chunk_iter, chunk_batch]
 
-            # Per-sequence reconstruction loss.
-            per_tok = F.cross_entropy(
-                logits.reshape(-1, VOCAB_SIZE),
-                dec_tgt.reshape(-1),
-                ignore_index=PAD, reduction='none')
-            per_tok = per_tok.reshape(len(nonempty), -1)
-            non_pad_counts = (~dec_pad).sum(dim=1).clamp(min=1).float()
-            per_seq_loss = per_tok.sum(dim=1) / non_pad_counts
+                dec_in, dec_tgt, dec_pad = _prepare_decoder_targets(
+                    chunk_tokens, device)
+                logits = decoder(chunk_t1, dec_in, dec_pad)
 
-            # Window-size weighting.
-            win_sizes = torch.tensor(
-                [len(win_toks[b]) for b in nonempty],
-                dtype=torch.float32, device=device)
-            per_seq_loss = per_seq_loss * win_sizes
+                pt = F.cross_entropy(
+                    logits.reshape(-1, VOCAB_SIZE),
+                    dec_tgt.reshape(-1),
+                    ignore_index=PAD, reduction='none')
+                pt = pt.reshape(len(chunk_tokens), -1)
+                non_pad_counts = (~dec_pad).sum(dim=1).clamp(min=1).float()
+                chunk_loss = pt.sum(dim=1) / non_pad_counts
+                ws = torch.tensor(
+                    [flat_win_sizes[i] for i in chunk_flat_idx],
+                    dtype=torch.float32, device=device)
+                chunk_loss = chunk_loss * ws
 
-            # Scatter back to full batch.
-            full_loss = torch.zeros(B, device=device)
-            for j, b in enumerate(nonempty):
-                full_loss[b] = per_seq_loss[j]
+                chunk_idx_tensor = torch.tensor(
+                    chunk_flat_idx, dtype=torch.long, device=device)
+                per_item_loss = per_item_loss.scatter(
+                    0, chunk_idx_tensor, chunk_loss)
 
-            iter_recon_losses.append(full_loss)
+            flat_flat_idx = iter_idx_t * B + batch_idx_t
+            losses_flat = torch.zeros(
+                n_iters * B, device=device).scatter(
+                    0, flat_flat_idx, per_item_loss)
+            losses_matrix = losses_flat.view(n_iters, B)
+            iter_recon_losses = [losses_matrix[i] for i in range(n_iters)]
 
         # --- Reconstruction loss for encoder+decoder (normal backprop) ---
         # Average across all iterations and sequences.
@@ -882,3 +912,4 @@ def streaming_train(batch_iter, d_model=128, n_heads=4, n_layers=2,
             break
 
     return encoder, decoder, losses, gate_stats
+
