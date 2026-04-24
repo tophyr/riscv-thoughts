@@ -31,6 +31,7 @@ from .cpu_emulator import (
 
 _GPU_NAMES = frozenset({
     'batch_execute', 'batch_parse_tokens',
+    'batch_is_complete_instruction',
     'instructions_to_tensors', 'random_regs_gpu',
 })
 

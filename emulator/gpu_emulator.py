@@ -415,3 +415,91 @@ def batch_parse_tokens(token_ids, lengths, device):
     imm = torch.where(is_jal, imm_6, imm)
 
     return op, rd, rs1, rs2, imm, valid
+
+
+# Expected token count per opcode type, for POSITIVE immediates.
+# Derived from the tokenizer's encoding: each instruction type is
+# opcode + register fields + N immediate digits, where N is type-
+# specific. A negative immediate inserts a NEG token before the
+# digits, adding 1 to the total length (see _encode_imm in
+# tokenizer.py). R-type has no immediate so its length is fixed.
+#   R-type:      op + 3 regs                      = 4 tokens
+#   I / LOAD /
+#   STORE / JALR: op + 2 regs + [NEG] + 3 digits  = 6 or 7 tokens
+#   BRANCH:      op + 2 regs + [NEG] + 4 digits   = 7 or 8 tokens
+#   LUI / AUIPC: op + 1 reg  + [NEG] + 5 digits   = 7 or 8 tokens
+#   JAL:         op + 1 reg  + [NEG] + 6 digits   = 8 or 9 tokens
+
+
+def batch_is_complete_instruction(token_ids, lengths, device):
+    """Return a (B,) bool: does this token sequence form exactly one
+    complete RV32I instruction?
+
+    Stricter than ``batch_parse_tokens(...)[-1]`` (which only checks
+    that position 0 is a valid opcode). This also verifies the
+    sequence length matches what the opcode type requires, so partial
+    sequences or opcode-prefixed longer blobs are NOT counted as
+    complete. Length accounts for the optional NEG token that the
+    tokenizer prepends to negative immediates.
+    """
+    op, _, _, _, _, valid = batch_parse_tokens(token_ids, lengths, device)
+
+    is_r = torch.zeros_like(valid)
+    for tok in _R_OPS:
+        is_r = is_r | (op == tok)
+    is_i = torch.zeros_like(valid)
+    for tok in _I_OPS:
+        is_i = is_i | (op == tok)
+    is_load = torch.zeros_like(valid)
+    for tok in _LOAD_OPS:
+        is_load = is_load | (op == tok)
+    is_store = torch.zeros_like(valid)
+    for tok in _STORE_OPS:
+        is_store = is_store | (op == tok)
+    is_branch = torch.zeros_like(valid)
+    for tok in _BRANCH_OPS:
+        is_branch = is_branch | (op == tok)
+    is_lui_auipc = (op == _LUI) | (op == _AUIPC)
+    is_jal = (op == _JAL)
+    is_jalr = (op == _JALR)
+
+    lengths_i = lengths.to(torch.int32)
+
+    # Base expected length assumes positive immediate (no NEG token).
+    expected = torch.full_like(lengths_i, -1)
+    expected = torch.where(is_r, torch.full_like(expected, 4), expected)
+    expected = torch.where(
+        is_i | is_load | is_store | is_jalr,
+        torch.full_like(expected, 6), expected)
+    expected = torch.where(
+        is_branch | is_lui_auipc,
+        torch.full_like(expected, 7), expected)
+    expected = torch.where(
+        is_jal, torch.full_like(expected, 8), expected)
+
+    # NEG, if present, sits at the first imm-token position. That's
+    # position 3 for I/LOAD/STORE/JALR/BRANCH (after op + 2 regs) and
+    # position 2 for LUI/AUIPC/JAL (after op + 1 reg). R-type has no
+    # immediate, so no NEG check.
+    neg_pos = torch.zeros_like(lengths_i)
+    neg_pos = torch.where(
+        is_i | is_load | is_store | is_jalr | is_branch,
+        torch.full_like(neg_pos, 3), neg_pos)
+    neg_pos = torch.where(
+        is_lui_auipc | is_jal,
+        torch.full_like(neg_pos, 2), neg_pos)
+
+    T = token_ids.shape[1]
+    B = token_ids.shape[0]
+    safe_pos = neg_pos.clamp(0, T - 1).to(torch.long)
+    arange_B = torch.arange(B, device=device)
+    token_at_neg_pos = token_ids[arange_B, safe_pos]
+    # Only count NEG if the opcode has an immediate (neg_pos > 0) and
+    # the position falls within the sequence's actual length (so we
+    # don't mistake padding or out-of-window tokens for NEG).
+    has_neg = ((token_at_neg_pos == _NEG_TOK)
+               & (neg_pos > 0)
+               & (neg_pos < lengths_i))
+    expected = expected + has_neg.to(torch.int32)
+
+    return valid & (lengths_i == expected)
