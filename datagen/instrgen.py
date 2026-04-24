@@ -138,16 +138,22 @@ _CATEGORY_OPS = {
 }
 
 
-_CONFIG_EXTRA_KEYS = {'equivalences'}
+_CONFIG_EXTRA_KEYS = {'equivalences', 'invalidity'}
 _EQUIVALENCES_KEYS = {'rate', 'max_per_class', 'min_per_class', 'boost'}
+_INVALIDITY_KEYS = {'rate', 'types'}
+_INVALIDITY_TYPE_NAMES = {'partial', 'spanning', 'multi', 'bogus'}
 
 
 def validate_distribution(dist):
     """Validate a config dict.
 
     Required: opcode-category keys with weights summing to 1.0.
-    Optional: 'equivalences' sub-dict with 'rate' (float in [0,1])
-    and 'max_per_class' (positive int).
+    Optional:
+    - 'equivalences' sub-dict with 'rate' (float in [0,1]) and
+      'max_per_class' (positive int).
+    - 'invalidity' sub-dict with 'rate' (float in [0,1]) and
+      'types' dict mapping {partial, spanning, multi, bogus} to
+      non-negative weights.
     """
     keys = set(dist.keys())
     unknown = keys - set(_CATEGORY_OPS.keys()) - _CONFIG_EXTRA_KEYS
@@ -174,6 +180,31 @@ def validate_distribution(dist):
                 f"{eq['max_per_class']}")
         if 'boost' in eq and not isinstance(eq['boost'], dict):
             raise ValueError("equivalences.boost must be a dict")
+    if 'invalidity' in dist:
+        inv = dist['invalidity']
+        if not isinstance(inv, dict):
+            raise ValueError("'invalidity' must be a dict")
+        inv_unknown = set(inv.keys()) - _INVALIDITY_KEYS
+        if inv_unknown:
+            raise ValueError(f'Unknown invalidity keys: {inv_unknown}')
+        if 'rate' in inv and not (0 <= inv['rate'] <= 1):
+            raise ValueError(
+                f"invalidity.rate must be in [0,1], got {inv['rate']}")
+        if 'types' in inv:
+            types = inv['types']
+            if not isinstance(types, dict):
+                raise ValueError("invalidity.types must be a dict")
+            type_unknown = set(types.keys()) - _INVALIDITY_TYPE_NAMES
+            if type_unknown:
+                raise ValueError(
+                    f'Unknown invalidity type names: {type_unknown}')
+            for k, v in types.items():
+                if not isinstance(v, (int, float)) or v < 0:
+                    raise ValueError(
+                        f"invalidity.types[{k!r}] must be non-negative, got {v}")
+            if sum(types.values()) <= 0:
+                raise ValueError(
+                    "invalidity.types must have at least one positive weight")
 
 
 def load_distribution(path):

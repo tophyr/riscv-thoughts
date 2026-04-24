@@ -22,6 +22,9 @@ from emulator import (
 )
 from tokenizer import encode_instruction, PAD
 from .instrgen import random_instruction, validate_distribution, _build_opcode_table
+from .invalidity import (
+    DEFAULT_TYPE_WEIGHTS, build_type_table, generate_invalid,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -77,21 +80,28 @@ def extract_data_val(instr: Instruction,
 
 @dataclass
 class InstructionBatch:
-    """A batch of single instructions with execution results.
+    """A batch of single instructions or invalid token windows.
 
-    Each instruction is executed on n_inputs shared random register
-    states. data_vals and pc_vals capture the per-input outputs.
+    Each valid instruction is executed on n_inputs shared random
+    register states; data_vals and pc_vals capture the per-input
+    outputs. Invalid windows (partial, spanning, multi-instruction,
+    bogus) have their execution-state fields zeroed and are marked
+    via valid_mask=False; the training loop is responsible for
+    filtering.
 
     instructions is populated during generation but set to None after
-    deserialization (the binary format does not store Instruction objects).
+    deserialization (the binary format does not store Instruction
+    objects). Entries may be None even during generation when the
+    row is an invalid window.
     """
-    instructions: list          # list of Instruction objects (None when deserialized)
+    instructions: list          # list of Instruction | None
     token_ids: np.ndarray       # (B, max_len) int64
     padding_mask: np.ndarray    # (B, max_len) bool -- True = padding
-    data_vals: np.ndarray       # (B, n_inputs) int64 -- computed output value per instruction
-    pc_vals: np.ndarray         # (B, n_inputs) int64 -- PC after execution
-    dest_types: np.ndarray      # (B,) int64 -- 0=register, 1=memory
-    dest_regs: np.ndarray       # (B,) int64 -- destination register (0 for stores/branches)
+    data_vals: np.ndarray       # (B, n_inputs) int64 -- zero for invalid rows
+    pc_vals: np.ndarray         # (B, n_inputs) int64 -- zero for invalid rows
+    dest_types: np.ndarray      # (B,) int64 -- zero for invalid rows
+    dest_regs: np.ndarray       # (B,) int64 -- zero for invalid rows
+    valid_mask: np.ndarray      # (B,) bool -- True = valid single instruction
 
 
 # ---------------------------------------------------------------------------
@@ -100,50 +110,83 @@ class InstructionBatch:
 
 def produce_instruction_batch(batch_size: int, n_inputs: int,
                               rng: np.random.Generator,
-                              dist=None) -> InstructionBatch:
-    """Generate one batch of single instructions with execution results.
+                              dist=None,
+                              max_window: int = 32) -> InstructionBatch:
+    """Generate one batch of single instructions and/or invalid windows.
 
     dist: optional config dict (from load_distribution or
-          DEFAULT_DISTRIBUTION). Controls instruction type mix and
-          optionally the equivalence-tuple injection rate via an
-          'equivalences' sub-dict (keys: 'rate', 'max_per_class').
+          DEFAULT_DISTRIBUTION). Controls:
+          - instruction type mix (opcode-category keys)
+          - equivalence-tuple injection rate ('equivalences' sub-dict)
+          - invalid-window augmentation ('invalidity' sub-dict with
+            'rate' and per-type weights). Invalid rows have
+            valid_mask=False and zero execution-state fields.
+    max_window: token-length cap for invalid windows. Must accommodate
+                the longest instruction tokenization (9 tokens). Default
+                matches the T1 encoder's default pos-embedding size.
     """
     if dist is not None:
         validate_distribution(dist)
         opcode_table = _build_opcode_table(dist)
         eq_config = dist.get('equivalences', {})
+        inv_config = dist.get('invalidity', {})
     else:
         opcode_table = None
         eq_config = {}
+        inv_config = {}
 
+    # --- Equivalence injection (valid tuples) ---
     inject_rate = eq_config.get('rate', 0.0)
     max_per_class = eq_config.get('max_per_class', 8)
     min_per_class = eq_config.get('min_per_class', 0)
     boost = eq_config.get('boost', None)
 
     target_inject = int(round(batch_size * inject_rate))
+
+    # --- Invalidity augmentation ---
+    invalid_rate = inv_config.get('rate', 0.0)
+    invalid_types = inv_config.get('types', DEFAULT_TYPE_WEIGHTS)
+    target_invalid = int(round(batch_size * invalid_rate))
+    if target_invalid > 0:
+        type_table = build_type_table(invalid_types)
+    else:
+        type_table = None
+
+    # Cap so that random instructions + injected + invalid sum to batch_size.
+    max_valid_inject = max(0, batch_size - target_invalid - 1)
+    if target_inject > max_valid_inject:
+        target_inject = max_valid_inject
+
     if target_inject > 0:
         from datagen.equivalences import sample_injection_tuples
         injected = sample_injection_tuples(
             target_inject, max_per_class, rng,
             min_per_class=min_per_class, boost=boost)
-        # Cap to leave room for at least one random instruction.
-        if len(injected) >= batch_size:
-            injected = injected[:batch_size - 1]
+        if len(injected) > max_valid_inject:
+            injected = injected[:max_valid_inject]
     else:
         injected = []
 
-    n_random = batch_size - len(injected)
-    instructions: list[Instruction] = []
+    n_random = batch_size - len(injected) - target_invalid
+    instructions: list = []
     encoded: list[list[int]] = []
+    valid_flags: list[bool] = []
 
     for _ in range(n_random):
         instr = random_instruction(rng, opcode_table=opcode_table)
         instructions.append(instr)
         encoded.append(encode_instruction(instr))
+        valid_flags.append(True)
     for instr in injected:
         instructions.append(instr)
         encoded.append(encode_instruction(instr))
+        valid_flags.append(True)
+    for _ in range(target_invalid):
+        toks, _type_name = generate_invalid(
+            rng, opcode_table, max_window, type_table)
+        instructions.append(None)
+        encoded.append(toks)
+        valid_flags.append(False)
 
     max_len = max(len(toks) for toks in encoded)
 
@@ -155,17 +198,29 @@ def produce_instruction_batch(batch_size: int, n_inputs: int,
         token_ids[b, :n] = toks
         padding_mask[b, :n] = False
 
+    valid_mask = np.array(valid_flags, dtype=np.bool_)
+
     data_vals = np.zeros((batch_size, n_inputs), dtype=np.int64)
     pc_vals = np.zeros((batch_size, n_inputs), dtype=np.int64)
-    dest_types = np.array([dest_type(i) for i in instructions], dtype=np.int64)
-    dest_regs_arr = np.array([dest_reg(i) for i in instructions], dtype=np.int64)
+    dest_types = np.zeros(batch_size, dtype=np.int64)
+    dest_regs_arr = np.zeros(batch_size, dtype=np.int64)
 
+    for b, instr in enumerate(instructions):
+        if instr is None:
+            continue
+        dest_types[b] = dest_type(instr)
+        dest_regs_arr[b] = dest_reg(instr)
+
+    # Execute only the valid rows. Invalid rows leave data_vals /
+    # pc_vals at zero — the training loop ignores them via valid_mask.
     ctx = make_ctx()
     for s in range(n_inputs):
         regs = random_regs(rng)
         pc = int(rng.integers(0, 1024)) * 4
 
         for b, instr in enumerate(instructions):
+            if instr is None:
+                continue
             state, final_pc, final_mem = run_instruction(
                 [instr], regs=regs, pc=pc, rng=rng, _ctx=ctx, max_steps=1)
             data_vals[b, s] = extract_data_val(instr, state.regs, final_mem)
@@ -179,6 +234,7 @@ def produce_instruction_batch(batch_size: int, n_inputs: int,
         pc_vals=pc_vals,
         dest_types=dest_types,
         dest_regs=dest_regs_arr,
+        valid_mask=valid_mask,
     )
 
 
@@ -186,16 +242,23 @@ def produce_instruction_batch(batch_size: int, n_inputs: int,
 # Binary I/O -- RVB format
 #
 # Stream format:
-#   Stream header (once):  4-byte magic "RVB\x00" + 1-byte version (1)
+#   Stream header (once):  4-byte magic "RVB\x00" + 1-byte version (2)
+#                          + 7 dtype chars (one per field)
 #   Per batch:             12-byte header (B, max_len, n_inputs as uint32)
 #                          + raw array data in field order:
 #                            token_ids, padding_mask, data_vals,
-#                            pc_vals, dest_types, dest_regs
+#                            pc_vals, dest_types, dest_regs, valid_mask
+#
+# Version history:
+#   1: 6 fields, valid-only batches.
+#   2: 7 fields, adds valid_mask to support invalid-window training
+#      examples (partial, spanning, multi, bogus). V1 files are no
+#      longer readable — regenerate.
 # ---------------------------------------------------------------------------
 
 _MAGIC = b'RVB\x00'
-_VERSION = 1
-_STREAM_HEADER = struct.Struct('<4sB6s')  # magic, version, 6 dtype chars
+_VERSION = 2
+_STREAM_HEADER = struct.Struct('<4sB7s')  # magic, version, 7 dtype chars
 _BATCH_HEADER = struct.Struct('<III')     # B, max_len, n_inputs
 
 _FIELD_DTYPES = (
@@ -205,6 +268,7 @@ _FIELD_DTYPES = (
     np.dtype(np.int64),   # pc_vals
     np.dtype(np.int64),   # dest_types
     np.dtype(np.int64),   # dest_regs
+    np.dtype(np.bool_),   # valid_mask
 )
 _DTYPE_CHARS = b''.join(dt.char.encode() for dt in _FIELD_DTYPES)
 
@@ -217,7 +281,8 @@ def _batch_body_size(B: int, max_len: int, n_inputs: int) -> int:
         B * n_inputs * _FIELD_DTYPES[2].itemsize +   # data_vals
         B * n_inputs * _FIELD_DTYPES[3].itemsize +   # pc_vals
         B * _FIELD_DTYPES[4].itemsize +              # dest_types
-        B * _FIELD_DTYPES[5].itemsize                # dest_regs
+        B * _FIELD_DTYPES[5].itemsize +              # dest_regs
+        B * _FIELD_DTYPES[6].itemsize                # valid_mask
     )
 
 
@@ -227,7 +292,11 @@ def write_stream_header(f):
 
 
 def read_stream_header(f):
-    """Read and validate the RVB stream header."""
+    """Read and validate the RVB stream header.
+
+    V1 files (pre-invalidity) are no longer readable; regenerate
+    with the current pipeline.
+    """
     buf = f.read(_STREAM_HEADER.size)
     if len(buf) < _STREAM_HEADER.size:
         raise ValueError('Missing stream header')
@@ -235,7 +304,10 @@ def read_stream_header(f):
     if magic != _MAGIC:
         raise ValueError(f'Bad magic: {magic!r} (expected {_MAGIC!r})')
     if version != _VERSION:
-        raise ValueError(f'Unsupported version: {version}')
+        raise ValueError(
+            f'Unsupported RVB version: {version} '
+            f'(expected {_VERSION}). V1 files lack valid_mask; '
+            f'regenerate with gen_instr_batches.py.')
     if dtype_chars != _DTYPE_CHARS:
         raise ValueError(f'Dtype mismatch: {dtype_chars!r}')
 
@@ -251,6 +323,7 @@ def write_batch(f, batch: InstructionBatch):
     f.write(batch.pc_vals.tobytes())
     f.write(batch.dest_types.tobytes())
     f.write(batch.dest_regs.tobytes())
+    f.write(batch.valid_mask.tobytes())
 
 
 def read_batch(f) -> InstructionBatch | None:
@@ -277,6 +350,7 @@ def read_batch(f) -> InstructionBatch | None:
         pc_vals=_read_array(_FIELD_DTYPES[3], (B, n_inputs)),
         dest_types=_read_array(_FIELD_DTYPES[4], (B,)),
         dest_regs=_read_array(_FIELD_DTYPES[5], (B,)),
+        valid_mask=_read_array(_FIELD_DTYPES[6], (B,)),
     )
 
 

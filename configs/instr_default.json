@@ -11,5 +11,14 @@
         "rate": 0.05,
         "max_per_class": 8,
         "min_per_class": 2
+    },
+    "invalidity": {
+        "rate": 0.2,
+        "types": {
+            "partial":  0.4,
+            "spanning": 0.3,
+            "multi":    0.2,
+            "bogus":    0.1
+        }
     }
 }
