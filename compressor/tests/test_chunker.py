@@ -21,9 +21,10 @@ from emulator import Instruction, make_ctx, random_regs
 from tokenizer import PAD
 from compressor.model import T1Compressor
 from compressor.chunker import (
-    chunk_rvs_to_t2_batch,
+    chunk_rvs_to_t2_batch, augment_t2_with_invalid,
     TYPE_NON_TERMINATOR, TYPE_LOAD, TYPE_STORE, TYPE_BRANCH,
     TYPE_JUMP, TYPE_CAPPED, TYPE_TAIL,
+    INVALID_SPANNING, INVALID_MULTI, INVALID_OVERLONG,
 )
 from tokenizer import VOCAB_SIZE
 
@@ -250,3 +251,150 @@ def test_valid_mask_all_true(t1_encoder):
     rvs = produce_sequence_batch(8, n_inputs=2, max_block_len=10, rng=rng)
     t2 = chunk_rvs_to_t2_batch(rvs, t1_encoder, max_chunk_len=16)
     assert t2.valid_mask.all()
+
+
+# ---------------------------------------------------------------------------
+# Invalid-chunk augmentation tests
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def valid_t2(t1_encoder):
+    """A valid-only T2Batch generated from a small RVS batch."""
+    rng = np.random.default_rng(100)
+    rvs = produce_sequence_batch(16, n_inputs=2, max_block_len=10, rng=rng)
+    return chunk_rvs_to_t2_batch(rvs, t1_encoder, max_chunk_len=16)
+
+
+def test_augment_invalidity_rate(valid_t2):
+    """The invalidity rate matches what was requested."""
+    rng = np.random.default_rng(200)
+    n_valid = valid_t2.chunk_emissions.shape[0]
+    augmented = augment_t2_with_invalid(
+        valid_t2, invalidity_rate=0.2, rng=rng)
+    n_total = augmented.chunk_emissions.shape[0]
+    n_invalid = (~augmented.valid_mask).sum().item()
+    # n_invalid / n_total should be close to 0.2 (allow off-by-one for rounding).
+    assert abs(n_invalid / n_total - 0.2) < 0.05, (
+        f'rate {n_invalid/n_total:.3f} far from 0.2')
+    # Valids preserved.
+    assert augmented.valid_mask.sum().item() == n_valid
+
+
+def test_augment_zero_rate_is_noop(valid_t2):
+    """invalidity_rate=0 returns the same batch (modulo possible repad)."""
+    n_valid = valid_t2.chunk_emissions.shape[0]
+    augmented = augment_t2_with_invalid(
+        valid_t2, invalidity_rate=0.0, storage_max_chunk_len=16)
+    assert augmented.chunk_emissions.shape[0] == n_valid
+    assert augmented.valid_mask.all()
+
+
+def test_augment_storage_padding(valid_t2):
+    """Output chunk_emissions has the requested storage padding."""
+    rng = np.random.default_rng(201)
+    augmented = augment_t2_with_invalid(
+        valid_t2, invalidity_rate=0.2, storage_max_chunk_len=24, rng=rng)
+    assert augmented.chunk_emissions.shape[1] == 24
+
+
+def test_augment_storage_too_small_raises(valid_t2):
+    """Asking for storage smaller than input padding errors."""
+    with pytest.raises(ValueError, match='smaller'):
+        augment_t2_with_invalid(
+            valid_t2, invalidity_rate=0.2, storage_max_chunk_len=8)
+
+
+def test_augment_invalid_type_codes(valid_t2):
+    """Invalid chunks carry one of the INVALID_* type codes."""
+    rng = np.random.default_rng(202)
+    augmented = augment_t2_with_invalid(
+        valid_t2, invalidity_rate=0.5, rng=rng)
+    invalid_indices = (~augmented.valid_mask).nonzero(as_tuple=True)[0]
+    valid_codes = {INVALID_SPANNING, INVALID_MULTI, INVALID_OVERLONG}
+    for i in invalid_indices.tolist():
+        code = int(augmented.chunk_type[i])
+        assert code in valid_codes, f'unexpected invalid code {code}'
+
+
+def test_augment_invalid_lens_in_range(valid_t2):
+    """Invalid chunk lengths fit in storage."""
+    rng = np.random.default_rng(203)
+    storage = 24
+    augmented = augment_t2_with_invalid(
+        valid_t2, invalidity_rate=0.3,
+        storage_max_chunk_len=storage, rng=rng)
+    invalid_indices = (~augmented.valid_mask).nonzero(as_tuple=True)[0]
+    for i in invalid_indices.tolist():
+        L = int(augmented.chunk_lens[i])
+        assert 1 <= L <= storage
+
+
+def test_augment_overlong_actually_overlong(valid_t2):
+    """Overlong-typed chunks have len > 16."""
+    rng = np.random.default_rng(204)
+    # Force overlong-only.
+    augmented = augment_t2_with_invalid(
+        valid_t2, invalidity_rate=0.3,
+        type_weights={'overlong': 1.0},
+        storage_max_chunk_len=24, rng=rng)
+    invalid_indices = (~augmented.valid_mask).nonzero(as_tuple=True)[0]
+    overlong_count = 0
+    for i in invalid_indices.tolist():
+        if int(augmented.chunk_type[i]) == INVALID_OVERLONG:
+            assert int(augmented.chunk_lens[i]) > 16, (
+                f'overlong-typed chunk has len {int(augmented.chunk_lens[i])}')
+            overlong_count += 1
+    # At least some of the invalids should have actually been overlong
+    # (the rest may have hit the fallback path).
+    assert overlong_count > 0
+
+
+def test_augment_multi_only_correct_length_distribution(valid_t2):
+    """Multi-only augmentation produces lengths that sum two valid chunks."""
+    rng = np.random.default_rng(205)
+    augmented = augment_t2_with_invalid(
+        valid_t2, invalidity_rate=0.5,
+        type_weights={'multi': 1.0},
+        storage_max_chunk_len=24, rng=rng)
+    invalid_indices = (~augmented.valid_mask).nonzero(as_tuple=True)[0]
+    # Most multi-typed chunks should have len ≥ 2 (two chunks combined).
+    for i in invalid_indices.tolist():
+        if int(augmented.chunk_type[i]) == INVALID_MULTI:
+            assert int(augmented.chunk_lens[i]) >= 2
+
+
+def test_augment_invalid_reg_delta_zero(valid_t2):
+    """Invalid chunks have zero reg_delta (they're filtered from direction loss)."""
+    rng = np.random.default_rng(206)
+    augmented = augment_t2_with_invalid(
+        valid_t2, invalidity_rate=0.3, rng=rng)
+    invalid_indices = (~augmented.valid_mask).nonzero(as_tuple=True)[0]
+    for i in invalid_indices.tolist():
+        assert (augmented.reg_delta[i] == 0).all()
+
+
+def test_augment_invalid_provenance_negative(valid_t2):
+    """Invalid chunks have provenance fields set to -1 sentinel."""
+    rng = np.random.default_rng(207)
+    augmented = augment_t2_with_invalid(
+        valid_t2, invalidity_rate=0.3, rng=rng)
+    invalid_indices = (~augmented.valid_mask).nonzero(as_tuple=True)[0]
+    for i in invalid_indices.tolist():
+        assert int(augmented.sequence_idx[i]) == -1
+        assert int(augmented.instr_start[i]) == -1
+        assert int(augmented.instr_end[i]) == -1
+
+
+def test_augment_valid_unchanged(valid_t2):
+    """Valid chunks are passed through unchanged."""
+    rng = np.random.default_rng(208)
+    augmented = augment_t2_with_invalid(
+        valid_t2, invalidity_rate=0.3,
+        storage_max_chunk_len=valid_t2.chunk_emissions.shape[1], rng=rng)
+    n_valid = valid_t2.chunk_emissions.shape[0]
+    # First n_valid rows of augmented match valid_t2.
+    torch.testing.assert_close(
+        augmented.chunk_emissions[:n_valid], valid_t2.chunk_emissions)
+    torch.testing.assert_close(
+        augmented.chunk_lens[:n_valid], valid_t2.chunk_lens)
+    assert augmented.valid_mask[:n_valid].all()
