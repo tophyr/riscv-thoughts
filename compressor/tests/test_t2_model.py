@@ -9,7 +9,10 @@ import numpy as np
 import pytest
 import torch
 
-from compressor.t2_model import T2Compressor
+from compressor.t2_model import (
+    T2Compressor, N_REGS, N_TERMINATOR_CLASSES,
+    TERM_ALU, TERM_LOAD, TERM_STORE, TERM_BRANCH, TERM_JUMP,
+)
 
 
 @pytest.fixture
@@ -115,6 +118,38 @@ def test_zero_length_does_not_crash(model):
     assert (out[0] == 0).all()
     # Row 1 (length 3) should be nonzero in general.
     assert (out[1] != 0).any()
+
+
+def test_aux_heads_present(model):
+    """The model carries modified_regs_head and terminator_type_head."""
+    assert hasattr(model, 'modified_regs_head')
+    assert hasattr(model, 'terminator_type_head')
+    # Output dimensionalities.
+    assert model.modified_regs_head.out_features == N_REGS
+    assert model.terminator_type_head.out_features == N_TERMINATOR_CLASSES
+    # Inputs come from d_out (called on T2 vectors).
+    assert model.modified_regs_head.in_features == model.d_out
+    assert model.terminator_type_head.in_features == model.d_out
+
+
+def test_aux_heads_callable_on_t2(model):
+    """Heads run on T2 output (or any (B, d_out) tensor) without error."""
+    B, T = 4, 8
+    chunks = torch.randn(B, T, 64)
+    lens = torch.tensor([T] * B, dtype=torch.int64)
+    with torch.no_grad():
+        t2 = model(chunks, lens)
+        modified_logits = model.modified_regs_head(t2)
+        term_logits = model.terminator_type_head(t2)
+    assert modified_logits.shape == (B, N_REGS)
+    assert term_logits.shape == (B, N_TERMINATOR_CLASSES)
+
+
+def test_terminator_class_codes_distinct():
+    """The 5 terminator class codes are distinct integers in [0, 5)."""
+    codes = {TERM_ALU, TERM_LOAD, TERM_STORE, TERM_BRANCH, TERM_JUMP}
+    assert codes == {0, 1, 2, 3, 4}
+    assert N_TERMINATOR_CLASSES == 5
 
 
 def test_end_to_end_with_chunker():

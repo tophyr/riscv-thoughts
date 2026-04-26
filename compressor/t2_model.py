@@ -17,15 +17,47 @@ Architecture mirrors T1Compressor's window encoder, lifted one level:
   unit ball, magnitude carries validity, direction carries
   semantics (same convention as T1).
 
-The class is small and intentionally uncomplicated. Following the
-"build, validate, then layer on" pattern: this is the encoder
-forward pass only. Training loop, magnitude-as-validity loss,
-and pair-MSE against register-state-delta distances live in
-compressor/train.py alongside the T2 training entry point.
+Auxiliary heads (mirrors T1's dest_type / dest_reg pattern, lifted
+to chunk-level static structural properties):
+
+- modified_regs_head: BCE over 32-D logits. For each register
+  index, did the chunk modify this register's value in at least
+  one probed input state? Forces T2 to encode WHICH registers
+  the chunk affects.
+- terminator_type_head: 5-class CE. ALU-only / LOAD / STORE /
+  BRANCH / JUMP. Forces T2 to encode the chunk's terminator
+  category, which determines the chunk's external interface
+  (memory effect, control transfer, or pure register state).
+
+Both heads are called from the training loop with normalized
+direction `T2 / ||T2||` (magnitude-invariant classification, same
+consumer-split fix as T1's dest heads).
+
+The dynamic value information (what each modified register's new
+value is, as a function of input state) is encoded implicitly via
+pair-MSE distance against register-state-delta over n_inputs probed
+states — same pattern T1 uses for instruction-output values.
+
+The class is small and intentionally uncomplicated. The training
+loop, magnitude-as-validity loss, pair-MSE on register-state-delta,
+BCE/CE on the aux heads, and the T2 training entry point live in
+compressor/train.py.
 """
 
 import torch
 import torch.nn as nn
+
+
+# Terminator-type classes for the aux head. Maps the chunker's
+# fine-grained TYPE_* codes to a 5-class space the head predicts.
+TERM_ALU    = 0  # CAPPED + TAIL (no terminator at end of chunk)
+TERM_LOAD   = 1
+TERM_STORE  = 2
+TERM_BRANCH = 3
+TERM_JUMP   = 4
+
+N_TERMINATOR_CLASSES = 5
+N_REGS = 32
 
 
 class T2Compressor(nn.Module):
@@ -36,6 +68,11 @@ class T2Compressor(nn.Module):
     No F.normalize on the output — T2 magnitude carries validity, the
     same magnitude-as-validity framing as T1. Training is responsible
     for shaping ||T2|| against the chunker's valid_mask.
+
+    Aux heads (modified_regs_head, terminator_type_head) are members
+    but are not called from forward(); the training loop calls them
+    with normalized direction `T2 / ||T2||` so classification is
+    magnitude-invariant.
     """
 
     def __init__(self, d_in: int = 64, d_model: int = 256,
@@ -64,6 +101,13 @@ class T2Compressor(nn.Module):
         # Output projection to d_out. Deliberately no F.normalize:
         # magnitude is the validity signal.
         self.proj = nn.Linear(d_model, d_out)
+
+        # Auxiliary heads (read normalized direction during training,
+        # see module docstring). Static structural properties — they
+        # don't depend on dynamic register values, those come via
+        # pair-MSE.
+        self.modified_regs_head = nn.Linear(d_out, N_REGS)
+        self.terminator_type_head = nn.Linear(d_out, N_TERMINATOR_CLASSES)
 
     def forward(self, chunk_emissions: torch.Tensor,
                 chunk_lens: torch.Tensor) -> torch.Tensor:
