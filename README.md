@@ -67,20 +67,34 @@ held-out autoregressive decodings are execution-equivalent to the
 original without explicit equivalence training on the decoder —
 equivalence tolerance emerges from the encoder's collapsing geometry.
 
-**T1 encoder retraining — in progress.** The trained encoder
-places valid instructions on the unit sphere but does not
-discriminate valid windows from partial / spanning / bogus ones
-(Exp 33 linear probe barely beats majority baseline). Retraining
-with invalid-window augmentation and magnitude-as-validity: T1
-now lives in the unit ball, with `||T1||` as a learned
-confidence scalar and direction as semantics.
+**T1 encoder retraining — done.** Encoder retrained with T1
+in the unit ball: magnitude carries validity, direction carries
+semantics. Trained with invalid-window augmentation (partial,
+spanning, multi-instruction, bogus) and a magnitude loss
+against a binary `is_complete` target.
 
-**T1 gates — paused pending encoder retraining.** Shift-reduce
-architecture with GRU-controlled accept/emit/evict gates. Earlier
-REINFORCE + supervised gate-training attempts (Phase 9) plateaued
-at ~70% emit accuracy — the emit head reads T1, and the
-pre-magnitude T1 didn't carry the validity signal it needed to
-read. Resumes once the encoder is retrained.
+- Probe: 99.8% magnitude-threshold accuracy distinguishing
+  valid from invalid windows. Mean ‖T1‖ = 1.000±0.010 for
+  valid, <0.01 for invalid.
+- Equivalence eval: 11/13 PASS at 50K steps (12/13 baseline
+  at 100K). Comparable; would close the gap with longer
+  training.
+
+**T1 gates — reframed.** Once magnitude carries validity, the
+gates have nothing semantic to learn — emit just thresholds
+‖T1‖, accept does the inverse, and evict at T1 is purely a
+structural state-tracker (it becomes genuinely cross-level at
+T2+ where it has real signal from the layer above). To be
+trained for architectural consistency or skipped; not a
+research blocker either way.
+
+**Next: T2 design.** A T2 thought is a register-state
+transformation block: a maximal contiguous sequence of
+instructions where only the last may be a memory access or
+control-flow change. Termination at memory ops keeps T2
+bounded. See WHAT_IS_A_THOUGHT.md "Method vs. Cognition" for
+the framing of why we pick concrete unit definitions for
+benchmarking.
 
 **GPU batch emulator.** All 37 RV32I opcodes executable in parallel
 via `torch.where`, 1.69ms for B=4096. Enables fully-GPU REINFORCE

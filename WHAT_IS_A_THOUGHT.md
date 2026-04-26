@@ -151,6 +151,76 @@ address as the thought it pertains to.
 
 ---
 
+## Method vs. Cognition: Two Different Questions
+
+Two questions get conflated whenever we discuss thought
+representations, and the conflation produces a kind of
+discomfort that's worth naming:
+
+**(A) "What is a thought?"** — A question about cognition,
+philosophy, perhaps neuroscience. Whatever answer we propose
+is necessarily provisional and probably wrong in interesting
+ways. It's the kind of question whose right answer might only
+be visible from a vantage point we don't yet have.
+
+**(B) "Can a recursive streaming encoder build a smooth-geometry
+arithmetic-capable single-point representation of a token
+string?"** — An engineering question with a yes/no answer.
+Testable. Either the machinery works at level n+1 the way it
+works at level n, or it doesn't.
+
+These are different questions, and the work in this project is
+overwhelmingly about (B). When we declare a unit definition at
+some level — "a T1 thought is one complete RV32I instruction; a
+T2 thought is a register-state transformation block terminated
+by a memory or control-flow op" — that *feels* like answering
+(A), but it isn't. We're picking benchmarks for the method, not
+declarations about cognition.
+
+A cleaner frame: the unit definitions are like the test inputs
+for a numerical method. To verify a sorting algorithm, you have
+to pick specific sequences to sort. The choice of test sequences
+doesn't constitute a definition of "what sortable means" — it's
+just how you exercise the algorithm. Once you know the algorithm
+works on a class of inputs, you can apply it to inputs you
+didn't pick.
+
+This implies a phased relationship between (B) and (A):
+
+**Phase 1.** Pick concrete unit definitions at each level.
+Test that the recursive shift-reduce / magnitude-as-validity
+machinery works at those levels. Heavy-handed unit definitions
+are appropriate here because we're benchmarking, not making
+ontological claims.
+
+**Phase 2.** Once the machinery works under prescribed
+boundaries, run experiments where the boundary signal is
+weakened — train T2 with looser supervision and see what
+boundaries emerge. Closer to (A), still using contrived
+domains where we can verify what the system found.
+
+**Phase 3.** Apply the method to natural language, where
+sharp boundaries don't exist a priori, and see what shape
+"thoughts" the system finds without external definition.
+This is the regime where (A)'s question becomes empirically
+addressable through (B)'s machinery.
+
+The order matters. You can't run the Phase-3 experiment until
+you know the encoder is *capable* of building the right kind
+of representation, and you only learn that from Phase-1 work
+where you control the boundaries and can verify each piece
+independently.
+
+The discomfort that comes from picking unit definitions in
+Phase 1 — the worry that we're prescribing what thoughts are —
+is the right discomfort to have, but the wrong place to act on
+it. It's the right thing to feel about Phase 3 outputs (where
+the system's emergent definitions might not match human
+intuition) and the wrong thing to feel about Phase 1 design
+choices (where we're just exercising the algorithm).
+
+---
+
 ## Expression Is Search
 
 Given a thought (a compressed point), expression is the process of

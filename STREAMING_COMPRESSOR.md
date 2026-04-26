@@ -125,14 +125,36 @@ boundaries.
 ### Level 2: Instruction Representations → Block Representations
 
 L2 streams over L1's emissions and emits when it has accumulated a
-coherent computational block. In RISC-V, this likely corresponds to
-basic blocks (sequences between branches) — but again, the model
-discovers this.
+**register-state transformation block**: a maximal contiguous
+subsequence of instructions where only the LAST instruction may be
+a memory access (load/store) or control-flow change (branch/jump),
+and all preceding instructions are pure register ALU ops.
 
-A basic block's semantics are fully determined by its input state:
-given registers, PC, and memory, the block produces a deterministic
-output state. The execution comparison at L2 is the machine state delta
-over the entire block.
+Termination at memory ops keeps T2 thoughts bounded: the operations
+inside a thought transform 32 finite-width registers, which has a
+finite (if large) state space. Allowing memory ops mid-thought
+would force T2 to compress unbounded data state through internal
+loads/stores, which is incoherent. Termination at control-flow
+changes is the standard basic-block boundary.
+
+Examples:
+- `[ADD, SUB, SLT, JAL]` — one T2 thought (3 ALU + jump terminator).
+- `[LW]` alone — one T2 thought (single load).
+- `[ADDI, ADD, SW]` — one T2 thought (2 ALU + store terminator).
+- `[LW, LW, LW]` — three T2 thoughts (each load is its own).
+
+A T2 thought's semantics are fully determined by its input register
+state: the block produces a deterministic output state plus, at the
+terminating instruction, an effect (memory address read/written or
+PC change). The execution comparison at L2 is the register-state
+delta over the block plus the terminator's effect.
+
+**Phase note:** This is a chosen unit definition, not an emergent
+one. We pick it to test whether the recursive shift-reduce
+machinery works at level 2. Once that's validated, weaker boundary
+signals can be experimented with — we expect the encoder to
+continue working when boundaries are less prescribed (see the
+"Phase 1/2/3" framing in WHAT_IS_A_THOUGHT.md).
 
 ### Inter-Level Streaming
 

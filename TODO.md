@@ -99,61 +99,119 @@ is compression, so d_out should be sized deliberately.
       thesis validation. Revisit if gate training needs higher
       decoder quality.
 
-### Step 4b: Encoder retraining — magnitude as validity ← NEXT
-Triggered by Phase 9 / Exp 33: the frozen encoder from Step 3
-places all compressed windows on the unit sphere with no
-readable validity signal, so any gate architecture reading T1
-cannot linearly discriminate emit points. Fix: move T1 into
-the unit ball and train magnitude as validity.
+### Step 4b: Encoder retraining — magnitude as validity
+Triggered by Phase 9 / Exp 33: the prior encoder placed all
+compressed windows on the unit sphere with no readable validity
+signal. Fix: move T1 into the unit ball and train magnitude as
+validity.
 
-- [ ] Drop `F.normalize` in the encoder (both `encode`/`encode_soft`
-      paths); output a raw B^d vector
-- [ ] Extend `train_batches` with on-the-fly invalid-window
-      augmentation: partial (prefix of one instr), spanning
-      (instr + prefix of next), multi-instruction concatenated,
-      bogus (random token bag)
-- [ ] Add magnitude loss: MSE between `||T1||` and a binary target
-      (1 for complete single-instr, 0 otherwise)
-- [ ] Compute the existing pair MSE + destination CE only on valid
-      windows, using normalized direction `T1/||T1||` for the pair
-      distance metric
-- [ ] Log `||T1||.max()` per step and add soft magnitude
-      regularization only if it drifts above 1
-- [ ] Probe against held-out windows: linear probe on T1 → validity
-      should reach near-perfect accuracy before we trust the
-      encoder for gate training
-- [ ] Re-run equivalence eval on direction-only T1 to confirm
-      the Step 3 geometry (13/13 PASS) is preserved
+- [x] Drop `F.normalize` in the encoder.
+- [x] Extend `train_batches` with on-the-fly invalid-window
+      augmentation (partial / spanning / multi / bogus). Built
+      into the CPU pipeline via the `invalidity` config block.
+- [x] Magnitude loss: MSE of `||T1||` against a binary target.
+- [x] Pair MSE + destination CE on valid rows only, using
+      normalized direction `T1/||T1||` (dest heads) and the
+      direction tensor (pair MSE).
+- [x] Log `||T1||` per step (valid/invalid means + max). No
+      regularization added — magnitudes settled cleanly at
+      ~1.0/0.02/1.05.
+- [x] Architectural cleanup: dest heads read normalized
+      direction (magnitude-invariant classification); decoder
+      reads raw T1 (graceful degradation via cross-attention
+      magnitude scaling).
+- [x] Probe `runs/20260424_190609`: 99.8% magnitude-threshold
+      accuracy; valid mean 1.000±0.010, invalid means <0.01.
+- [x] Equivalence eval at 50K steps: 11/13 PASS, 1 WEAK
+      (commutative_xor at 0.385), 1 FAIL (sign_test, same as
+      old encoder; not a regression). Geometry preserved.
+- [ ] (Optional) longer training to close commutative_xor.
+      Not blocking.
 
-### Step 5: Gates (supervised + REINFORCE) — paused
-Phase 9 gate-training attempts (Exp 31) plateaued at ~70%
-emit accuracy because T1 didn't carry validity. Resumes after
-Step 4b.
+### Step 5: T1 gates — reframed
+Original plan: train accept/emit/evict via REINFORCE +
+decoder-quality reward. New understanding (post-magnitude-as-
+validity): T1 gates are essentially trivial — emit just
+thresholds `||T1||`; accept just thresholds it the other way
+plus `has_input_remaining`; evict at T1 is purely a structural
+state-tracker (genuinely cross-level at T2+ where it has
+non-trivial signal from the level above).
 
-- [ ] Freeze retrained encoder + decoder
-- [ ] Supervised BCE on emit against `batch_is_complete_instruction`
-      (now NEG-aware as of the Exp 32 fix)
-- [ ] Train GRU gate controller; REINFORCE on accept/evict
-- [ ] Verify: >90% of emissions at instruction boundaries
+- [ ] (For architectural consistency only) Train T1 gate heads
+      with structural-rule supervision against the frozen new
+      encoder. Will learn near-trivial functions; useful as
+      placeholders for the symmetric three-heads-per-level
+      architecture.
+- [ ] (Decision pending) OR skip learned T1 gates entirely
+      and use procedural shift-reduce for T1, defer learned
+      gates to T2+ where they have real signal.
 
-### Step 6: Assembly + fine-tune
-- [ ] Unfreeze all components
-- [ ] Fine-tune jointly on RVS sequence data
-- [ ] Losses: reconstruction (window-size weighted) + pairwise MSE
-      + round-trip
-- [ ] Verify: assembled system matches step 4 accuracy
+### Step 6: Assembly + decoder retrain
+- [ ] Decoder retrain against the new ball-encoder. Same
+      REINFORCE + execution-equivalence reward as Exp 30, but
+      conditioned on raw T1 (graceful degradation property).
+- [ ] End-to-end T1 eval: encoder → emit → decoder → token
+      reconstruction accuracy on held-out sequences.
+- [ ] (Optional) Joint fine-tune across encoder + decoder +
+      gates if any of the components plateau.
 
-## After: T2 Stacking
+## Next: T2 Design and Implementation
 
-### Step 7: T2 compressor
-- [ ] Same shift-reduce architecture, consuming T1 emission vectors
-- [ ] T2 feedback into T1 via cross-attention
-- [ ] Fine-tune T1+T2 jointly
-- [ ] Verify: T2 discovers block boundaries
+### Step 7: T2 unit definition (DONE in design)
+- [x] Defined: a T2 thought = maximal contiguous subsequence
+      of instructions where only the last may be a memory
+      access or control-flow change. See WHAT_IS_A_THOUGHT.md
+      "Method vs. Cognition" for the framing of why we make
+      this choice now.
+
+### Step 8: T2 data pipeline
+- [ ] Generate RVS sequences with T2 boundaries marked
+      (boundary positions are computable from the instruction
+      stream — every memory op or control-flow op terminates
+      a T2 thought).
+- [ ] Optionally: extend the sequence generator to bias toward
+      varied T2 sizes (long ALU runs vs. memory-heavy code).
+- [ ] Format: probably a new RVT2 (or extend RVS) carrying
+      token sequence + per-instruction T2-boundary flag.
+
+### Step 9: T2 encoder
+- [ ] Architecture: same shift-reduce shape as T1, but
+      consumes a stream of T1 emission vectors (d_out=64) not
+      tokens. No embedding lookup at the input.
+- [ ] Window encoder: transformer over a sequence of d-dim
+      vectors. Attention is over T1 thoughts, not tokens.
+- [ ] Magnitude-as-validity: same pattern as T1. `||T2|| ≈ 1`
+      for complete T2 windows, `≈ 0` for invalid.
+- [ ] Invalidity classes for T2 augmentation: partial (k<n
+      instructions of a block), spanning (tail of block A +
+      head of block B), multi (multiple blocks concatenated),
+      bogus (random T1 emissions, possibly from different
+      programs). Define equivalents to RVB v2's invalidity.
+
+### Step 10: T2 training
+- [ ] Two-stage: (a) freeze T1, train T2 on (T1 emissions →
+      T2 vector) pairs; (b) joint fine-tune.
+- [ ] Equivalence at T2: register-state-delta over the block.
+      Pairwise MSE on directional T2 distance vs. block-level
+      execution distance. Same shape as T1 training.
+- [ ] Equivalence manifest at T2: TBD. Block-level identities
+      (e.g., `[ADDI x1 x1 1] · 5 ≡ [ADDI x1 x1 5]`) are an
+      obvious starting point.
+
+### Step 11: T1 ↔ T2 cross-level integration
+- [ ] T2 → T1 evict signal. T2's accept gate firing tells T1
+      "I've absorbed this emission, you can evict it." Either
+      cross-attention from T2 state, or a separate channel.
+- [ ] At this point evict has real, learnable signal at T1 —
+      the cross-level absorption acknowledgment. Train T1
+      evict head against this.
 
 ## Future
 
-- Longer sequences (scale beyond max_block_len=5)
-- T3+ stacking
-- Decoder improvements (Gumbel-softmax for differentiable decoding,
-  execution-equivalent grading instead of token-exact matching)
+- Longer sequences (scale beyond max_block_len=5).
+- T3 stacking (sequences of T2 blocks → function-like units).
+- Decoder improvements (Gumbel-softmax differentiable decoding;
+  execution-equivalent grading instead of token-exact matching).
+- Phase-2/Phase-3 experiments (loosened boundary supervision;
+  natural language). See WHAT_IS_A_THOUGHT.md "Method vs.
+  Cognition" for the framing.

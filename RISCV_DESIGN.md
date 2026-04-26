@@ -43,13 +43,29 @@ them, record machine states. Generate equivalent sequences via known
 transformations. The supply of training pairs with exact equivalence
 labels and exact distance measurements is unlimited.
 
-**Natural hierarchy.** Tokens → instructions → basic blocks (sequences
-between branches) → functions → programs. Each level composes the level
-below with well-defined semantics. The hierarchy is inherent in the
-computational structure, not imposed by the architecture. Critically,
-the same compression-and-search framework applies at each level
-transition (T0→T1, T1→T2, etc.) — the mechanism is uniform, only
-the content changes.
+**Natural hierarchy.** Tokens → instructions → register-state
+transformation blocks → functions → programs. Each level composes
+the level below with well-defined semantics. The hierarchy is
+inherent in the computational structure, not imposed by the
+architecture. Critically, the same compression-and-search framework
+applies at each level transition (T0→T1, T1→T2, etc.) — the
+mechanism is uniform, only the content changes.
+
+The level-by-level units we test against:
+- **T1 thought** = one complete RV32I instruction (single
+  syntactic unit on a token stream).
+- **T2 thought** = one register-state transformation block: a
+  maximal contiguous subsequence of instructions where only the
+  LAST may be a memory access (load/store) or control-flow change
+  (branch/jump). Termination at memory ops keeps T2 bounded —
+  inside a thought, only register state evolves, which is finite.
+  Termination at control flow is the standard basic-block boundary.
+- **T3 thought** = function-like unit (sequence of T2 blocks).
+  TBD when we get there.
+
+These are chosen unit definitions for benchmarking the recursive
+shift-reduce machinery, not declarations about cognition. See
+WHAT_IS_A_THOUGHT.md "Method vs. Cognition" for the framing.
 
 **Structural validity is cheaply testable.** Unlike natural language
 (where words are open-class and new ones can be coined freely), RV32I
@@ -187,10 +203,14 @@ The T1 space should exhibit the geometric properties the theory
 predicts: smoothness, factored structure, interpolation coherence.
 
 **T1 → T2: Sequence compression.** Once T1 works, sequences of T1
-instruction vectors compress to T2 block-level representations. This
-is where data flow, register dependencies, and computational structure
-emerge. T2 is the first level that corresponds to what the theory
-calls a "thought" — a compressed representation of a computation.
+instruction vectors compress to T2 block-level representations
+(register-state transformation blocks; see Premise above). Inside
+a T2 thought, only register state evolves — the terminating
+instruction commits the block's effect to memory or transfers
+control. This is where data flow, register dependencies, and
+computational structure emerge. T2 is the first level that
+corresponds to what the theory calls a "thought" — a compressed
+representation of a computation.
 
 The same compression-and-search mechanism applies at both levels. The
 same decoder architecture that lowers T1→T0 should lower T2→T1. The
