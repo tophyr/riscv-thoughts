@@ -239,10 +239,17 @@ def train_batches(batch_iter, d_model=128, n_heads=4, n_layers=2,
         mag_loss = F.mse_loss(vec_norms, mag_targets)
 
         # Destination classification — only meaningful on valid rows.
+        # Heads read direction (T1 / ||T1||), not raw T1: dest_type and
+        # dest_reg are properties of the instruction's identity, not of
+        # how confident we are in the window's validity. Reading raw
+        # T1 here would couple classifier scale to encoder magnitude,
+        # giving the heads a gradient incentive to inflate ||T1||
+        # during early training and producing magnitude-dependent
+        # behavior on streaming-mode inputs at inference time.
         if valid_mask.any():
             valid_idx = valid_mask.nonzero(as_tuple=True)[0]
-            dt_logits = model.dest_type_head(vecs[valid_idx])
-            dr_logits = model.dest_reg_head(vecs[valid_idx])
+            dt_logits = model.dest_type_head(vec_dirs[valid_idx])
+            dr_logits = model.dest_reg_head(vec_dirs[valid_idx])
             dt_loss = F.cross_entropy(dt_logits, dt_targets[valid_idx])
             reg_mask = (dt_targets[valid_idx] == 0)
             if reg_mask.any():
@@ -295,7 +302,14 @@ def train_batches(batch_iter, d_model=128, n_heads=4, n_layers=2,
                 token_lists, device)
 
             # Decoder forward — vecs NOT detached so REINFORCE
-            # gradient flows through decoder to encoder.
+            # gradient flows through decoder to encoder. Decoder reads
+            # raw T1 (not normalized direction) so cross-attention
+            # conditioning strength scales linearly with ||T1||.
+            # At inference: high-magnitude inputs produce confident,
+            # specific reconstructions; low-magnitude inputs produce
+            # high-entropy unconditioned-language-model output. No
+            # threshold needed for "invalid" handling — degradation
+            # is continuous and automatic.
             dec_logits = decoder(vecs[valid_idx], dec_in, dec_pad)
             non_pad_dec = ~dec_pad
             orig_lengths = non_pad_dec.sum(dim=1)
