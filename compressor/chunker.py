@@ -18,10 +18,25 @@ do at T1: it splits the T1 emission stream at the same boundaries
 the gates would (eventually) learn. This lets us train T2 without
 first solving T1 gates.
 
-This module produces *valid* chunks only. Invalid-chunk augmentation
-(partial / spanning / multi / bogus / overlong, analogous to RVB
-v2's invalidity) lives in a separate module and is added at training
-time by the caller.
+`chunk_rvs_to_t2_batch` produces only valid chunks. Invalid-chunk
+augmentation (spanning / multi / overlong) is added by
+`augment_t2_with_invalid`.
+
+Why no "partial" at T2: strict prefixes of valid chunks are
+themselves valid by the structural rules (≤1 non-pure instr at
+the end, length in range), so partial doesn't produce a
+meaningful invalid window the way it does at T1.
+
+Why no "bogus" at T2: every T1 emission is by construction a
+valid T1 output, so concatenating random emissions produces
+sequences that are structurally indistinguishable from spanning/
+multi (just noisier). The only ways to construct "actually bogus"
+T2 inputs would be (a) low-magnitude T1 vectors, which require a
+threshold we deliberately avoid in the smooth-magnitude framing,
+or (b) off-distribution random vectors, which doesn't generalize
+to a real failure mode. T2 should learn its response to such
+inputs from the spanning/multi/overlong signal — emergence
+rather than enumeration.
 """
 
 from dataclasses import dataclass
@@ -295,4 +310,255 @@ def chunk_rvs_to_t2_batch(rvs: SequenceBatch, t1_encoder,
         sequence_idx=torch.from_numpy(sequence_idx_np).to(device),
         instr_start=torch.from_numpy(instr_start_np).to(device),
         instr_end=torch.from_numpy(instr_end_np).to(device),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Invalid-chunk augmentation
+# ---------------------------------------------------------------------------
+
+# Invalidity type codes (continue numbering from TYPE_*).
+INVALID_SPANNING = 7
+INVALID_MULTI    = 8
+INVALID_OVERLONG = 9
+
+DEFAULT_INVALIDITY_WEIGHTS = {
+    'spanning': 0.45,
+    'multi':    0.35,
+    'overlong': 0.20,
+}
+
+
+def _build_invalidity_table(weights):
+    """Normalize a {type_name: weight} dict into a [(weight, name)] list."""
+    positive = {k: v for k, v in weights.items() if v > 0}
+    if not positive:
+        raise ValueError(
+            'invalidity weights must have at least one positive entry')
+    total = sum(positive.values())
+    return [(v / total, k) for k, v in positive.items()]
+
+
+def _sample_invalidity_type(rng, table):
+    roll = rng.random()
+    c = 0.0
+    for w, name in table:
+        c += w
+        if roll < c:
+            return name
+    return table[-1][1]
+
+
+def _gen_invalid_multi(t2, rng, max_total_len):
+    """Concatenate two complete valid chunks. Total length ≤ max_total_len."""
+    n = int(t2.chunk_emissions.shape[0])
+    for _ in range(20):
+        a, b = rng.integers(0, n), rng.integers(0, n)
+        len_a = int(t2.chunk_lens[a])
+        len_b = int(t2.chunk_lens[b])
+        L = len_a + len_b
+        if 2 <= L <= max_total_len:
+            emissions = torch.cat([
+                t2.chunk_emissions[a, :len_a],
+                t2.chunk_emissions[b, :len_b],
+            ])
+            return emissions, L, INVALID_MULTI
+    # Fallback: just shrink. Rare under typical batch sizes.
+    a = int(rng.integers(0, n))
+    len_a = int(t2.chunk_lens[a])
+    return t2.chunk_emissions[a, :len_a], len_a, INVALID_MULTI
+
+
+def _gen_invalid_spanning(t2, rng, max_total_len):
+    """Tail of chunk A (including its terminator) + head of chunk B.
+
+    j ∈ [1, len(A)], k ∈ [1, len(B)]; excludes the (j=len(A), k=len(B))
+    case which is just multi.
+    """
+    n = int(t2.chunk_emissions.shape[0])
+    for _ in range(20):
+        a, b = rng.integers(0, n), rng.integers(0, n)
+        len_a = int(t2.chunk_lens[a])
+        len_b = int(t2.chunk_lens[b])
+        if len_a < 1 or len_b < 1:
+            continue
+        j = int(rng.integers(1, len_a + 1))   # [1, len_a]
+        k = int(rng.integers(1, len_b + 1))   # [1, len_b]
+        if j == len_a and k == len_b:
+            continue  # full + full = multi
+        L = j + k
+        if not (2 <= L <= max_total_len):
+            continue
+        # tail of A (last j positions): A[len_a - j : len_a]
+        # head of B (first k positions): B[0 : k]
+        emissions = torch.cat([
+            t2.chunk_emissions[a, len_a - j : len_a],
+            t2.chunk_emissions[b, :k],
+        ])
+        return emissions, L, INVALID_SPANNING
+    # Fallback to multi.
+    return _gen_invalid_multi(t2, rng, max_total_len)
+
+
+def _gen_invalid_overlong(t2, rng, max_total_len, min_overlong=17):
+    """Concatenate enough valid chunks to exceed the validity length cap.
+
+    If max_total_len < min_overlong, falls back to multi (we can't fit
+    an overlong chunk in the storage allotted).
+    """
+    if max_total_len < min_overlong:
+        return _gen_invalid_multi(t2, rng, max_total_len)
+    n = int(t2.chunk_emissions.shape[0])
+    target_L = int(rng.integers(min_overlong, max_total_len + 1))
+    parts = []
+    cur_L = 0
+    for _ in range(20):
+        if cur_L >= target_L:
+            break
+        ci = int(rng.integers(0, n))
+        len_c = int(t2.chunk_lens[ci])
+        if len_c == 0:
+            continue
+        # If adding this chunk would overshoot, take a prefix of it.
+        take = min(len_c, target_L - cur_L)
+        parts.append(t2.chunk_emissions[ci, :take])
+        cur_L += take
+    if not parts or cur_L < min_overlong:
+        # Couldn't reach overlong with available chunks; fall back to multi.
+        return _gen_invalid_multi(t2, rng, max_total_len)
+    emissions = torch.cat(parts, dim=0)
+    return emissions, cur_L, INVALID_OVERLONG
+
+
+_INVALIDITY_GENERATORS = {
+    'spanning': _gen_invalid_spanning,
+    'multi':    _gen_invalid_multi,
+    'overlong': _gen_invalid_overlong,
+}
+
+
+def augment_t2_with_invalid(
+    t2: T2Batch,
+    invalidity_rate: float = 0.2,
+    type_weights=None,
+    storage_max_chunk_len: int = 24,
+    rng=None,
+) -> T2Batch:
+    """Add invalid T2 chunks to an all-valid T2Batch.
+
+    invalidity_rate: target fraction of invalid chunks in the
+        returned batch. n_invalid = round(n_valid * r / (1 - r))
+        so that n_invalid / (n_valid + n_invalid) ≈ r.
+    type_weights: dict over {spanning, multi, overlong}.
+        Defaults to DEFAULT_INVALIDITY_WEIGHTS.
+    storage_max_chunk_len: tensor padding cap for chunk_emissions
+        in the returned batch. Must accommodate the longest invalid
+        chunk plus all valid chunks (which are bounded by the
+        chunker's max_chunk_len, typically 16).
+
+    The returned batch's chunk_emissions has shape
+    (n_valid + n_invalid, storage_max_chunk_len, d_out). All other
+    fields are zero on invalid rows except valid_mask=False,
+    chunk_lens, chunk_type (INVALID_*), and chunk_emissions.
+    """
+    if type_weights is None:
+        type_weights = DEFAULT_INVALIDITY_WEIGHTS
+    if rng is None:
+        rng = np.random.default_rng()
+
+    n_valid = int(t2.chunk_emissions.shape[0])
+    if n_valid == 0 or invalidity_rate <= 0:
+        # Nothing to augment from / no invalids requested. Return
+        # a re-padded version if storage_max_chunk_len differs.
+        return _repad(t2, storage_max_chunk_len)
+
+    n_invalid = int(round(n_valid * invalidity_rate / (1 - invalidity_rate)))
+    if n_invalid <= 0:
+        return _repad(t2, storage_max_chunk_len)
+
+    if storage_max_chunk_len < t2.chunk_emissions.shape[1]:
+        raise ValueError(
+            f'storage_max_chunk_len={storage_max_chunk_len} is smaller '
+            f'than the input batch padding {t2.chunk_emissions.shape[1]}')
+
+    type_table = _build_invalidity_table(type_weights)
+    device = t2.chunk_emissions.device
+    d_out = t2.chunk_emissions.shape[-1]
+    n_inputs = t2.reg_delta.shape[1]
+
+    # Generate n_invalid invalid chunks.
+    invalid_emissions = torch.zeros(
+        n_invalid, storage_max_chunk_len, d_out, device=device)
+    invalid_lens = np.zeros(n_invalid, dtype=np.int64)
+    invalid_types = np.zeros(n_invalid, dtype=np.int8)
+    for k in range(n_invalid):
+        type_name = _sample_invalidity_type(rng, type_table)
+        gen = _INVALIDITY_GENERATORS[type_name]
+        emissions, L, type_code = gen(t2, rng, storage_max_chunk_len)
+        invalid_emissions[k, :L] = emissions
+        invalid_lens[k] = L
+        invalid_types[k] = type_code
+
+    # Repad valid chunks to storage_max_chunk_len.
+    valid_padded = _repad(t2, storage_max_chunk_len)
+
+    # Concatenate.
+    final_emissions = torch.cat(
+        [valid_padded.chunk_emissions, invalid_emissions], dim=0)
+    final_lens = torch.cat([
+        valid_padded.chunk_lens,
+        torch.from_numpy(invalid_lens).to(device),
+    ])
+    final_valid = torch.cat([
+        valid_padded.valid_mask,
+        torch.zeros(n_invalid, dtype=torch.bool, device=device),
+    ])
+    final_reg_delta = torch.cat([
+        valid_padded.reg_delta,
+        torch.zeros(n_invalid, n_inputs, 32, dtype=torch.int32, device=device),
+    ])
+    final_chunk_type = torch.cat([
+        valid_padded.chunk_type,
+        torch.from_numpy(invalid_types).to(device),
+    ])
+    # Provenance fields are not meaningful for invalids; fill with -1.
+    fill = torch.full((n_invalid,), -1, dtype=torch.int32, device=device)
+    final_seq_idx = torch.cat([valid_padded.sequence_idx, fill])
+    final_start = torch.cat([valid_padded.instr_start, fill])
+    final_end = torch.cat([valid_padded.instr_end, fill])
+
+    return T2Batch(
+        chunk_emissions=final_emissions,
+        chunk_lens=final_lens,
+        valid_mask=final_valid,
+        reg_delta=final_reg_delta,
+        chunk_type=final_chunk_type,
+        sequence_idx=final_seq_idx,
+        instr_start=final_start,
+        instr_end=final_end,
+    )
+
+
+def _repad(t2: T2Batch, storage_max_chunk_len: int) -> T2Batch:
+    """Re-pad chunk_emissions to a possibly-larger max_chunk_len."""
+    cur = t2.chunk_emissions.shape[1]
+    if cur == storage_max_chunk_len:
+        return t2
+    if cur > storage_max_chunk_len:
+        raise ValueError(
+            f'cannot shrink padding from {cur} to {storage_max_chunk_len}')
+    n, _, d = t2.chunk_emissions.shape
+    repadded = torch.zeros(n, storage_max_chunk_len, d,
+                            device=t2.chunk_emissions.device,
+                            dtype=t2.chunk_emissions.dtype)
+    repadded[:, :cur] = t2.chunk_emissions
+    return T2Batch(
+        chunk_emissions=repadded,
+        chunk_lens=t2.chunk_lens,
+        valid_mask=t2.valid_mask,
+        reg_delta=t2.reg_delta,
+        chunk_type=t2.chunk_type,
+        sequence_idx=t2.sequence_idx,
+        instr_start=t2.instr_start,
+        instr_end=t2.instr_end,
     )
