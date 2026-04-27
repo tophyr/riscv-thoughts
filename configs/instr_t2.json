@@ -1,0 +1,15 @@
+{
+    "R_ALU": 0.40,
+    "I_ALU": 0.35,
+    "LOAD": 0.05,
+    "STORE": 0.04,
+    "BRANCH": 0.03,
+    "UPPER": 0.10,
+    "JAL": 0.02,
+    "JALR": 0.01,
+    "equivalences": {
+        "rate": 0.05,
+        "max_per_class": 8,
+        "min_per_class": 2
+    }
+}
