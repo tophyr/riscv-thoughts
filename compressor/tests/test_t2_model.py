@@ -121,13 +121,15 @@ def test_zero_length_does_not_crash(model):
 
 
 def test_aux_heads_present(model):
-    """The model carries modified_regs_head and terminator_type_head."""
-    assert hasattr(model, 'modified_regs_head')
-    assert hasattr(model, 'terminator_type_head')
+    """The model carries reg_effect, modified_regs, and terminator_type heads."""
+    for name in ('reg_effect_head', 'modified_regs_head', 'terminator_type_head'):
+        assert hasattr(model, name), f'missing {name}'
     # Output dimensionalities.
+    assert model.reg_effect_head.out_features == N_REGS
     assert model.modified_regs_head.out_features == N_REGS
     assert model.terminator_type_head.out_features == N_TERMINATOR_CLASSES
     # Inputs come from d_out (called on T2 vectors).
+    assert model.reg_effect_head.in_features == model.d_out
     assert model.modified_regs_head.in_features == model.d_out
     assert model.terminator_type_head.in_features == model.d_out
 
@@ -139,8 +141,10 @@ def test_aux_heads_callable_on_t2(model):
     lens = torch.tensor([T] * B, dtype=torch.int64)
     with torch.no_grad():
         t2 = model(chunks, lens)
+        reg_effect = model.reg_effect_head(t2)
         modified_logits = model.modified_regs_head(t2)
         term_logits = model.terminator_type_head(t2)
+    assert reg_effect.shape == (B, N_REGS)
     assert modified_logits.shape == (B, N_REGS)
     assert term_logits.shape == (B, N_TERMINATOR_CLASSES)
 
