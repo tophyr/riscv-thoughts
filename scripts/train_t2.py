@@ -60,6 +60,10 @@ def main():
     p.add_argument('--validity-max-chunk-len', type=int, default=16,
                    help='Cap above which a chunk is structurally invalid')
     p.add_argument('--invalidity-rate', type=float, default=0.2)
+    p.add_argument('--target-valid-chunks-per-step', type=int, default=1024,
+                   help='Accumulate RVS batches until we have this many '
+                        'valid chunks, then take one training step. '
+                        'Decouples T2 batch size from RVS batch size.')
 
     # Training.
     p.add_argument('--lr', type=float, default=3e-4)
@@ -107,6 +111,7 @@ def main():
         max_chunk_len=args.max_chunk_len,
         validity_max_chunk_len=args.validity_max_chunk_len,
         invalidity_rate=args.invalidity_rate,
+        target_valid_chunks_per_step=args.target_valid_chunks_per_step,
         lr=args.lr,
         device=args.device,
         n_steps=args.n_steps,

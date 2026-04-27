@@ -1004,6 +1004,7 @@ def train_t2(batch_iter, t1_encoder,
              max_chunk_len: int = 24,
              validity_max_chunk_len: int = 16,
              invalidity_rate: float = 0.2,
+             target_valid_chunks_per_step: int = 1024,
              lr: float = 3e-4, device: str = 'auto',
              n_steps=None, log_every: int = 100, lr_min: float = 1e-6,
              mag_weight: float = 1.0,
@@ -1014,13 +1015,15 @@ def train_t2(batch_iter, t1_encoder,
     """Train the T2 encoder over chunked T1-emission sequences.
 
     Pipeline per step:
-    1. Read an RVS batch from batch_iter.
-    2. Run the chunker (frozen T1 encoder + structural splitter)
-       to produce a valid-only T2Batch.
-    3. Augment with invalid chunks (spanning / multi / overlong)
-       at the configured rate.
-    4. Forward T2Compressor on chunk_emissions + chunk_lens.
-    5. Compute four losses:
+    1. Read RVS batches from batch_iter until accumulated valid
+       chunks reach target_valid_chunks_per_step. (Each RVS batch
+       typically yields ~few chunks per sequence; the accumulator
+       decouples training-step batch size from RVS batch size.)
+    2. augment_t2_with_invalid adds spanning/multi/overlong invalid
+       chunks at the configured rate (final batch is ~ target /
+       (1 - invalidity_rate)).
+    3. Forward T2Compressor on chunk_emissions + chunk_lens.
+    4. Compute four losses:
        - mag_loss: MSE of ||T2|| against valid_mask. All chunks.
        - reg_effect_loss: per-register pairwise MSE on loglog'd
          register-delta differences. Valid chunks only.
@@ -1028,10 +1031,15 @@ def train_t2(batch_iter, t1_encoder,
          was modified. Valid chunks only.
        - term_type_loss: 5-class CE on terminator category.
          Valid chunks only.
-    6. Sum, backprop, optimizer step.
+    5. Sum, backprop, optimizer step.
 
     The frozen T1 encoder is used inside the chunker only — it
     stays in eval mode with parameters non-trainable.
+
+    target_valid_chunks_per_step controls the T2 training batch
+    size; per-register pairwise MSE allocates O(B²·n_inputs·32)
+    memory, so 1024 is a reasonable default (~512MB at fp32 with
+    n_inputs=4). Larger values are bounded by GPU memory.
 
     Returns (t2_model, losses).
     """
@@ -1043,7 +1051,7 @@ def train_t2(batch_iter, t1_encoder,
         TERM_ALU, TERM_LOAD, TERM_STORE, TERM_BRANCH, TERM_JUMP,
     )
     from .chunker import (
-        chunk_rvs_to_t2_batch, augment_t2_with_invalid,
+        chunk_rvs_to_t2_batch, augment_t2_with_invalid, concat_t2_batches,
         TYPE_LOAD, TYPE_STORE, TYPE_BRANCH, TYPE_JUMP,
         TYPE_CAPPED, TYPE_TAIL, TYPE_NON_TERMINATOR,
     )
@@ -1086,14 +1094,27 @@ def train_t2(batch_iter, t1_encoder,
     losses = []
     step = 0
     t0 = time.time()
+    pending = []           # valid-only T2Batches awaiting accumulation
+    pending_n = 0          # total valid chunks in pending
 
     for rvs_batch in batch_iter:
-        # 1+2: chunk and augment.
+        # 1: accumulate valid chunks across RVS batches until we have
+        # enough for one training step.
         valid_only = chunk_rvs_to_t2_batch(
             rvs_batch, t1_encoder,
             max_chunk_len=validity_max_chunk_len, device=device)
+        if valid_only.chunk_emissions.shape[0] > 0:
+            pending.append(valid_only)
+            pending_n += valid_only.chunk_emissions.shape[0]
+        if pending_n < target_valid_chunks_per_step:
+            continue
+
+        # 2: concat accumulated chunks, augment with invalids, train.
+        accumulated = concat_t2_batches(pending)
+        pending = []
+        pending_n = 0
         t2_batch = augment_t2_with_invalid(
-            valid_only,
+            accumulated,
             invalidity_rate=invalidity_rate,
             storage_max_chunk_len=max_chunk_len,
             rng=chunker_rng)
@@ -1101,64 +1122,77 @@ def train_t2(batch_iter, t1_encoder,
         if t2_batch.chunk_emissions.shape[0] == 0:
             continue
 
-        # 3: forward T2.
-        t2_vecs = t2(t2_batch.chunk_emissions, t2_batch.chunk_lens)
-        vec_norms = t2_vecs.norm(dim=-1)
-        vec_dirs = t2_vecs / vec_norms.clamp(min=1e-8).unsqueeze(-1)
+        # 3+4: forward T2 + loss computation under bf16 autocast.
+        # Memory-dominant tensors here are the (B_v, B_v, n_inputs, 32)
+        # pair-MSE intermediates; bf16 halves their footprint. Master
+        # weights and gradients remain fp32 via autocast's standard
+        # pattern. Mirrors T1's use of bf16 for exec_distance_scalar.
+        autocast_dtype = (torch.bfloat16
+                          if device.startswith('cuda') else torch.float32)
+        with torch.autocast(device_type=('cuda' if device.startswith('cuda')
+                                         else 'cpu'),
+                            dtype=autocast_dtype):
+            t2_vecs = t2(t2_batch.chunk_emissions, t2_batch.chunk_lens)
+            vec_norms = t2_vecs.norm(dim=-1)
+            vec_dirs = t2_vecs / vec_norms.clamp(min=1e-8).unsqueeze(-1)
 
-        # 4a: magnitude / validity loss (all rows).
-        mag_targets = t2_batch.valid_mask.float()
-        mag_loss = F.mse_loss(vec_norms, mag_targets)
+            # 4a: magnitude / validity loss (all rows).
+            mag_targets = t2_batch.valid_mask.to(t2_vecs.dtype)
+            mag_loss = F.mse_loss(vec_norms, mag_targets)
 
-        valid_mask = t2_batch.valid_mask
-        n_valid = int(valid_mask.sum().item())
+            valid_mask = t2_batch.valid_mask
+            n_valid = int(valid_mask.sum().item())
 
-        if n_valid >= 2:
-            valid_idx = valid_mask.nonzero(as_tuple=True)[0]
-            v_dirs = vec_dirs[valid_idx]                # (B_v, d_out)
-            v_reg_delta = t2_batch.reg_delta[valid_idx].float()  # (B_v, n_inputs, 32)
+            if n_valid >= 2:
+                valid_idx = valid_mask.nonzero(as_tuple=True)[0]
+                v_dirs = vec_dirs[valid_idx]                # (B_v, d_out)
+                # Cast register deltas to bf16 explicitly: int32 -> bf16
+                # for the pair-MSE chain. Precision near zero matters
+                # (loglog'd output is in [0, ~3.14]), and bf16 has
+                # plenty of mantissa for that range. Large int deltas
+                # lose mantissa precision but the loglog flattens them.
+                v_reg_delta = t2_batch.reg_delta[valid_idx].to(autocast_dtype)
+                # (B_v, n_inputs, 32)
 
-            # 4b: per-register pairwise MSE.
-            # Pairwise register-delta differences across the batch:
-            #   delta_pair[a, b, s, r] = reg_delta[a, s, r] - reg_delta[b, s, r]
-            # Then loglog and average over input states:
-            #   exec_per_reg[a, b, r] = mean_s log1p(log1p(|delta_pair[..., r]|))
-            delta_pair = (v_reg_delta.unsqueeze(1)
-                          - v_reg_delta.unsqueeze(0))      # (B_v, B_v, n_inputs, 32)
-            exec_per_reg = torch.log1p(
-                torch.log1p(delta_pair.abs())).mean(dim=2)  # (B_v, B_v, 32)
+                # 4b: per-register pairwise MSE.
+                #   delta_pair[a, b, s, r] = reg_delta[a, s, r] - reg_delta[b, s, r]
+                #   exec_per_reg[a, b, r]  = mean_s log1p(log1p(|delta_pair[..., r]|))
+                delta_pair = (v_reg_delta.unsqueeze(1)
+                              - v_reg_delta.unsqueeze(0))      # (B_v, B_v, n_inputs, 32)
+                exec_per_reg = torch.log1p(
+                    torch.log1p(delta_pair.abs())).mean(dim=2)  # (B_v, B_v, 32)
 
-            reg_effect_out = t2.reg_effect_head(v_dirs)     # (B_v, 32)
-            model_per_reg = (reg_effect_out.unsqueeze(1)
-                             - reg_effect_out.unsqueeze(0)).abs()  # (B_v, B_v, 32)
+                reg_effect_out = t2.reg_effect_head(v_dirs)     # (B_v, 32)
+                model_per_reg = (reg_effect_out.unsqueeze(1)
+                                 - reg_effect_out.unsqueeze(0)).abs()
 
-            N = v_dirs.shape[0]
-            tri = torch.triu_indices(N, N, offset=1, device=device)
-            target = exec_per_reg[tri[0], tri[1]]             # (n_pairs, 32)
-            pred = model_per_reg[tri[0], tri[1]]              # (n_pairs, 32)
-            reg_effect_loss = (pred - target).square().mean()
+                N = v_dirs.shape[0]
+                tri = torch.triu_indices(N, N, offset=1, device=device)
+                target = exec_per_reg[tri[0], tri[1]]             # (n_pairs, 32)
+                pred = model_per_reg[tri[0], tri[1]]              # (n_pairs, 32)
+                reg_effect_loss = (pred - target).square().mean()
 
-            # 4c: modified_regs BCE.
-            modified_target = (v_reg_delta != 0).any(dim=1).float()  # (B_v, 32)
-            modified_logits = t2.modified_regs_head(v_dirs)
-            modified_regs_loss = F.binary_cross_entropy_with_logits(
-                modified_logits, modified_target)
+                # 4c: modified_regs BCE.
+                modified_target = (v_reg_delta != 0).any(dim=1).to(t2_vecs.dtype)
+                modified_logits = t2.modified_regs_head(v_dirs)
+                modified_regs_loss = F.binary_cross_entropy_with_logits(
+                    modified_logits, modified_target)
 
-            # 4d: terminator_type CE.
-            chunk_type = t2_batch.chunk_type[valid_idx].long()
-            term_target = term_lut[chunk_type]
-            term_logits = t2.terminator_type_head(v_dirs)
-            term_type_loss = F.cross_entropy(term_logits, term_target)
-        else:
-            reg_effect_loss = torch.tensor(0.0, device=device)
-            modified_regs_loss = torch.tensor(0.0, device=device)
-            term_type_loss = torch.tensor(0.0, device=device)
-            N = n_valid
+                # 4d: terminator_type CE.
+                chunk_type = t2_batch.chunk_type[valid_idx].long()
+                term_target = term_lut[chunk_type]
+                term_logits = t2.terminator_type_head(v_dirs)
+                term_type_loss = F.cross_entropy(term_logits, term_target)
+            else:
+                reg_effect_loss = torch.tensor(0.0, device=device)
+                modified_regs_loss = torch.tensor(0.0, device=device)
+                term_type_loss = torch.tensor(0.0, device=device)
+                N = n_valid
 
-        loss = (mag_weight * mag_loss
-                + reg_effect_weight * reg_effect_loss
-                + modified_regs_weight * modified_regs_loss
-                + term_type_weight * term_type_loss)
+            loss = (mag_weight * mag_loss
+                    + reg_effect_weight * reg_effect_loss
+                    + modified_regs_weight * modified_regs_loss
+                    + term_type_weight * term_type_loss)
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
