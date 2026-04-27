@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Train the T2 compressor over chunked T1-emission sequences.
+"""Train the T2 compressor over RVC chunked-T1-emission batches.
 
-Reads RVS sequence batches from stdin, runs them through a frozen T1
-encoder + the T2 chunker (structurally splits at memory ops, control
-flow changes, or a max-length cap), augments with invalid chunks
-(spanning / multi / overlong), and trains T2Compressor with:
+Reads RVC chunk batches from stdin (produced upstream by chunk_t2.py),
+runs each chunk's per-instruction tokens through a frozen T1 encoder
+to produce T2 input emissions, and trains T2Compressor with:
 - magnitude-as-validity loss
 - per-register pairwise MSE on loglog'd register-state-delta differences
 - modified-regs BCE
 - terminator-type CE
 
 Usage:
-    gen_seq_batches.py --n-batches 5000 --config configs/instr_t2.json |
+    gen_seq_batches.py --n-batches 5000 |
+        chunk_t2.py --invalidity-rate 0.2 |
         train_t2.py --t1-encoder runs/<stamp>/encoder.pt \
                     --n-steps 5000 --d-out 256
 """
@@ -28,7 +28,7 @@ import torch
 
 from compressor.model import T1Compressor
 from compressor.train import train_t2, load_checkpoint
-from datagen import SequenceBatchReader
+from datagen.chunkgen import ChunkBatchReader
 from tokenizer import VOCAB_SIZE
 from scripts._common import resolve_device
 
@@ -56,14 +56,17 @@ def main():
     p.add_argument('--n-layers', type=int, default=2)
     p.add_argument('--d-out', type=int, default=256)
     p.add_argument('--max-chunk-len', type=int, default=24,
-                   help='Storage cap for chunk_emissions; ≥ overlong size')
-    p.add_argument('--validity-max-chunk-len', type=int, default=16,
-                   help='Cap above which a chunk is structurally invalid')
-    p.add_argument('--invalidity-rate', type=float, default=0.2)
+                   help='Instruction-axis padding for T2 input. Must '
+                        'match upstream chunk_t2.py --storage-max-chunk-len.')
     p.add_argument('--target-valid-chunks-per-step', type=int, default=1024,
-                   help='Accumulate RVS batches until we have this many '
-                        'valid chunks, then take one training step. '
-                        'Decouples T2 batch size from RVS batch size.')
+                   help='Accumulate RVC batches until total chunks reach '
+                        'this many, then take one training step. '
+                        'Decouples T2 batch size from upstream RVC '
+                        'batch size.')
+    p.add_argument('--pair-mse-chunk-size', type=int, default=128,
+                   help='Chunk size for pair-MSE memory reduction via '
+                        'gradient checkpointing. Smaller = less peak '
+                        'memory, more recompute.')
 
     # Training.
     p.add_argument('--lr', type=float, default=3e-4)
@@ -77,8 +80,6 @@ def main():
     p.add_argument('--modified-regs-weight', type=float, default=1.0)
     p.add_argument('--term-type-weight', type=float, default=1.0)
 
-    # Save/RNG.
-    p.add_argument('--chunker-seed', type=int, default=0)
     p.add_argument('--save', type=str, default=None,
                    help='Save directory (default: runs/<timestamp>_t2)')
     p.add_argument('--no-save', action='store_true',
@@ -99,7 +100,7 @@ def main():
         max_window=args.t1_max_window).to(device)
     t1.load_state_dict(load_checkpoint(args.t1_encoder, device), strict=False)
 
-    reader = SequenceBatchReader(sys.stdin.buffer)
+    reader = ChunkBatchReader(sys.stdin.buffer)
     t2_model, losses = train_t2(
         batch_iter=reader,
         t1_encoder=t1,
@@ -109,9 +110,8 @@ def main():
         n_layers=args.n_layers,
         d_out=args.d_out,
         max_chunk_len=args.max_chunk_len,
-        validity_max_chunk_len=args.validity_max_chunk_len,
-        invalidity_rate=args.invalidity_rate,
         target_valid_chunks_per_step=args.target_valid_chunks_per_step,
+        pair_mse_chunk_size=args.pair_mse_chunk_size,
         lr=args.lr,
         device=args.device,
         n_steps=args.n_steps,
@@ -120,7 +120,6 @@ def main():
         reg_effect_weight=args.reg_effect_weight,
         modified_regs_weight=args.modified_regs_weight,
         term_type_weight=args.term_type_weight,
-        chunker_seed=args.chunker_seed,
     )
 
     print(f'\nDone: {len(losses)} steps, '

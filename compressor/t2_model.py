@@ -124,6 +124,13 @@ class T2Compressor(nn.Module):
         self.modified_regs_head = nn.Linear(d_out, N_REGS)
         self.terminator_type_head = nn.Linear(d_out, N_TERMINATOR_CLASSES)
 
+        # Compile the forward pass with dynamic shapes so batch size
+        # can vary across calls without retracing. Same compile pattern
+        # T1Compressor uses for compiled_encode. The pair-MSE pathway
+        # in train_t2 uses gradient checkpointing and is NOT compiled
+        # (compile + checkpoint don't compose well).
+        self.compiled_forward = torch.compile(self.forward, dynamic=True)
+
     def forward(self, chunk_emissions: torch.Tensor,
                 chunk_lens: torch.Tensor) -> torch.Tensor:
         """Encode a batch of T1-emission chunks to T2 vectors.

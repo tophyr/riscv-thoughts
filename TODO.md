@@ -164,47 +164,76 @@ non-trivial signal from the level above).
       "Method vs. Cognition" for the framing of why we make
       this choice now.
 
-### Step 8: T2 data pipeline
-- [ ] Generate RVS sequences with T2 boundaries marked
-      (boundary positions are computable from the instruction
-      stream — every memory op or control-flow op terminates
-      a T2 thought).
-- [ ] Optionally: extend the sequence generator to bias toward
-      varied T2 sizes (long ALU runs vs. memory-heavy code).
-- [ ] Format: probably a new RVT2 (or extend RVS) carrying
-      token sequence + per-instruction T2-boundary flag.
+### Step 8: T2 data pipeline (DONE)
+- [x] RVC binary format: per-chunk per-instruction token spans +
+      chunk metadata (length, validity, type, reg_delta). See
+      `datagen/chunkgen.py`.
+- [x] CPU-only chunker pipe tool: `scripts/chunk_t2.py` reads
+      RVS, emits RVC. Mux-friendly via existing pipeline tools.
+- [x] Invalidity augmentation at the chunker (spanning / multi
+      / overlong) parametrizable via config-style weights.
 
-### Step 9: T2 encoder
-- [ ] Architecture: same shift-reduce shape as T1, but
-      consumes a stream of T1 emission vectors (d_out=64) not
-      tokens. No embedding lookup at the input.
-- [ ] Window encoder: transformer over a sequence of d-dim
-      vectors. Attention is over T1 thoughts, not tokens.
-- [ ] Magnitude-as-validity: same pattern as T1. `||T2|| ≈ 1`
-      for complete T2 windows, `≈ 0` for invalid.
-- [ ] Invalidity classes for T2 augmentation: partial (k<n
-      instructions of a block), spanning (tail of block A +
-      head of block B), multi (multiple blocks concatenated),
-      bogus (random T1 emissions, possibly from different
-      programs). Define equivalents to RVB v2's invalidity.
+### Step 9: T2 encoder (DONE in design + first run)
+- [x] Architecture: bidirectional transformer over the chunk's
+      T1 emissions, same shape as T1's window encoder lifted
+      one level. d_in=64 (T1's d_out), d_model=256, n_heads=4,
+      n_layers=2, d_out=256. Magnitude-as-validity in B^256.
+- [x] Aux heads: reg_effect (32-D linear, used for per-register
+      pair-MSE), modified_regs (32-D BCE), terminator_type
+      (5-class CE). All read normalized direction.
+- [x] Compiled forward pass via torch.compile (dynamic=True).
 
-### Step 10: T2 training
-- [ ] Two-stage: (a) freeze T1, train T2 on (T1 emissions →
-      T2 vector) pairs; (b) joint fine-tune.
-- [ ] Equivalence at T2: register-state-delta over the block.
-      Pairwise MSE on directional T2 distance vs. block-level
-      execution distance. Same shape as T1 training.
-- [ ] Equivalence manifest at T2: TBD. Block-level identities
-      (e.g., `[ADDI x1 x1 1] · 5 ≡ [ADDI x1 x1 5]`) are an
-      obvious starting point.
+### Step 10: T2 training (FIRST RUN COMPLETE — partial success)
+- [x] train_t2() in compressor/train.py with four-loss
+      structure: mag + reg_effect (per-register pair-MSE,
+      chunked via gradient checkpointing for memory) +
+      modified_regs + term_type.
+- [x] bf16 autocast in the loss-computation block; halves peak
+      memory in the dominant pair-MSE intermediates.
+- [x] Pipeline architecture: gen_seq_batches | chunk_t2 |
+      train_t2; mux'd 4 parallel gen workers feed the
+      single-trainer GPU at 99% utilization on this machine
+      alone (no remote-data-gen needed).
+- [x] First training run (Exp 41): 5000 steps at target=16K,
+      ~4h wall, completed cleanly. `runs/20260427_022927_t2`.
+- [x] Validity probe (Exp 42): 99.0% magnitude-threshold
+      accuracy. Magnitude-as-validity transferred from T1.
+- [x] Equivalence probe (Exp 43): commutative_swap and
+      double_to_shl1 collapse cleanly; x0_writes_nop and
+      indep_reorder partial; **NON_EQUIV control collapses
+      too** (T2 doesn't discriminate operand-level changes
+      within a fixed chunk shape).
+- [ ] Diagnose / fix `reg_effect_loss` plateau at 0.91. Could
+      be loss-weight imbalance, pair-MSE noise floor, or
+      pair-sampling sparsity. See Phase 11 conclusions.
 
-### Step 11: T1 ↔ T2 cross-level integration
+### Step 11: T1 ↔ T2 cross-level integration (DEFERRED)
+Pending T2 semantic-quality fix (Step 10 follow-up). Once T2
+discriminates operand-level changes meaningfully:
+
 - [ ] T2 → T1 evict signal. T2's accept gate firing tells T1
       "I've absorbed this emission, you can evict it." Either
       cross-attention from T2 state, or a separate channel.
 - [ ] At this point evict has real, learnable signal at T1 —
       the cross-level absorption acknowledgment. Train T1
       evict head against this.
+
+### Step 10b: T2 training quality follow-ups (NEW)
+Targeted at the operand-level discrimination gap surfaced in
+Exp 43.
+
+- [ ] Loss-weight rebalancing experiment: keep mag/term/mod at
+      1.0, raise reg_effect_weight (e.g., 5x) to prevent the
+      easy aux losses from dominating early training.
+- [ ] Loss-curriculum experiment: warm up aux losses first,
+      then ramp up reg_effect_weight as they saturate.
+- [ ] Probe the reg_effect_head output distribution
+      (predictions vs targets per register) to distinguish
+      "metric noise floor" from "encoder underfitting".
+- [ ] More probed input states (n_inputs=8 or 16) for cleaner
+      pair-MSE targets.
+- [ ] Longer training runs (10K-20K steps) under the rebalanced
+      losses.
 
 ## Future
 

@@ -159,8 +159,9 @@ def test_terminator_class_codes_distinct():
 def test_end_to_end_with_chunker():
     """Smoke test: chunker output flows into T2Compressor cleanly."""
     from datagen.seqgen import produce_sequence_batch
+    from datagen.chunkgen import chunk_rvs
     from compressor.model import T1Compressor
-    from compressor.chunker import chunk_rvs_to_t2_batch
+    from compressor.chunker import encode_chunkbatch
     from tokenizer import VOCAB_SIZE
 
     rng = np.random.default_rng(42)
@@ -169,7 +170,8 @@ def test_end_to_end_with_chunker():
     t1 = T1Compressor(VOCAB_SIZE, d_model=32, n_heads=2, n_layers=1,
                       d_out=8, max_window=32)
     t1.eval()
-    t2_batch = chunk_rvs_to_t2_batch(rvs, t1, max_chunk_len=16)
+    cb = chunk_rvs(rvs, max_chunk_len=16)
+    t2_batch = encode_chunkbatch(cb, t1)
 
     torch.manual_seed(1)
     t2_model = T2Compressor(d_in=8, d_model=32, n_heads=2, n_layers=1,
