@@ -3,6 +3,7 @@
 - train_batches(): N×N pairwise MSE on single-instruction batches (step 1)
 - train_sequences(): fixed-window training on sequence batches (context experiments)
 - streaming_train(): shift-reduce compressor with REINFORCE gate training
+- train_t2(): T2 encoder training over chunked T1-emission sequences
 """
 
 import time
@@ -991,4 +992,216 @@ def streaming_train(batch_iter, d_model=128, n_heads=4, n_layers=2,
             break
 
     return encoder, decoder, losses, gate_stats
+
+
+# ---------------------------------------------------------------------------
+# T2 training
+# ---------------------------------------------------------------------------
+
+def train_t2(batch_iter, t1_encoder,
+             d_in: int = 64, d_model: int = 256,
+             n_heads: int = 4, n_layers: int = 2, d_out: int = 256,
+             max_chunk_len: int = 24,
+             validity_max_chunk_len: int = 16,
+             invalidity_rate: float = 0.2,
+             lr: float = 3e-4, device: str = 'auto',
+             n_steps=None, log_every: int = 100, lr_min: float = 1e-6,
+             mag_weight: float = 1.0,
+             reg_effect_weight: float = 1.0,
+             modified_regs_weight: float = 1.0,
+             term_type_weight: float = 1.0,
+             chunker_seed: int = 0):
+    """Train the T2 encoder over chunked T1-emission sequences.
+
+    Pipeline per step:
+    1. Read an RVS batch from batch_iter.
+    2. Run the chunker (frozen T1 encoder + structural splitter)
+       to produce a valid-only T2Batch.
+    3. Augment with invalid chunks (spanning / multi / overlong)
+       at the configured rate.
+    4. Forward T2Compressor on chunk_emissions + chunk_lens.
+    5. Compute four losses:
+       - mag_loss: MSE of ||T2|| against valid_mask. All chunks.
+       - reg_effect_loss: per-register pairwise MSE on loglog'd
+         register-delta differences. Valid chunks only.
+       - modified_regs_loss: 32-D BCE on whether each register
+         was modified. Valid chunks only.
+       - term_type_loss: 5-class CE on terminator category.
+         Valid chunks only.
+    6. Sum, backprop, optimizer step.
+
+    The frozen T1 encoder is used inside the chunker only — it
+    stays in eval mode with parameters non-trainable.
+
+    Returns (t2_model, losses).
+    """
+    # Local imports to avoid hardening the module-level cycle:
+    # compressor.t2_model and compressor.chunker both depend on
+    # things that train.py already imports.
+    from .t2_model import (
+        T2Compressor, N_REGS,
+        TERM_ALU, TERM_LOAD, TERM_STORE, TERM_BRANCH, TERM_JUMP,
+    )
+    from .chunker import (
+        chunk_rvs_to_t2_batch, augment_t2_with_invalid,
+        TYPE_LOAD, TYPE_STORE, TYPE_BRANCH, TYPE_JUMP,
+        TYPE_CAPPED, TYPE_TAIL, TYPE_NON_TERMINATOR,
+    )
+
+    if device == 'auto':
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    torch.set_float32_matmul_precision('high')
+
+    # Freeze T1 encoder.
+    t1_encoder.eval()
+    for p in t1_encoder.parameters():
+        p.requires_grad = False
+
+    t2 = T2Compressor(d_in=d_in, d_model=d_model, n_heads=n_heads,
+                     n_layers=n_layers, d_out=d_out,
+                     max_chunk_len=max_chunk_len).to(device)
+    opt = torch.optim.Adam(t2.parameters(), lr=lr)
+    scheduler = None
+    if n_steps:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=n_steps, eta_min=lr_min)
+
+    # Chunker / invalidity RNG. Distinct from any other rngs in the
+    # pipeline so that the augmentation pattern is reproducible.
+    chunker_rng = np.random.default_rng(chunker_seed)
+
+    # Lookup table from chunker TYPE_* codes to model TERM_* codes.
+    # Indexed by chunk_type's int value.
+    term_lut = torch.zeros(11, dtype=torch.long, device=device)
+    term_lut[TYPE_NON_TERMINATOR] = TERM_ALU
+    term_lut[TYPE_LOAD]   = TERM_LOAD
+    term_lut[TYPE_STORE]  = TERM_STORE
+    term_lut[TYPE_BRANCH] = TERM_BRANCH
+    term_lut[TYPE_JUMP]   = TERM_JUMP
+    term_lut[TYPE_CAPPED] = TERM_ALU
+    term_lut[TYPE_TAIL]   = TERM_ALU
+    # Invalid types (7-10) are filtered out before this is consulted.
+
+    losses = []
+    step = 0
+    t0 = time.time()
+
+    for rvs_batch in batch_iter:
+        # 1+2: chunk and augment.
+        valid_only = chunk_rvs_to_t2_batch(
+            rvs_batch, t1_encoder,
+            max_chunk_len=validity_max_chunk_len, device=device)
+        t2_batch = augment_t2_with_invalid(
+            valid_only,
+            invalidity_rate=invalidity_rate,
+            storage_max_chunk_len=max_chunk_len,
+            rng=chunker_rng)
+
+        if t2_batch.chunk_emissions.shape[0] == 0:
+            continue
+
+        # 3: forward T2.
+        t2_vecs = t2(t2_batch.chunk_emissions, t2_batch.chunk_lens)
+        vec_norms = t2_vecs.norm(dim=-1)
+        vec_dirs = t2_vecs / vec_norms.clamp(min=1e-8).unsqueeze(-1)
+
+        # 4a: magnitude / validity loss (all rows).
+        mag_targets = t2_batch.valid_mask.float()
+        mag_loss = F.mse_loss(vec_norms, mag_targets)
+
+        valid_mask = t2_batch.valid_mask
+        n_valid = int(valid_mask.sum().item())
+
+        if n_valid >= 2:
+            valid_idx = valid_mask.nonzero(as_tuple=True)[0]
+            v_dirs = vec_dirs[valid_idx]                # (B_v, d_out)
+            v_reg_delta = t2_batch.reg_delta[valid_idx].float()  # (B_v, n_inputs, 32)
+
+            # 4b: per-register pairwise MSE.
+            # Pairwise register-delta differences across the batch:
+            #   delta_pair[a, b, s, r] = reg_delta[a, s, r] - reg_delta[b, s, r]
+            # Then loglog and average over input states:
+            #   exec_per_reg[a, b, r] = mean_s log1p(log1p(|delta_pair[..., r]|))
+            delta_pair = (v_reg_delta.unsqueeze(1)
+                          - v_reg_delta.unsqueeze(0))      # (B_v, B_v, n_inputs, 32)
+            exec_per_reg = torch.log1p(
+                torch.log1p(delta_pair.abs())).mean(dim=2)  # (B_v, B_v, 32)
+
+            reg_effect_out = t2.reg_effect_head(v_dirs)     # (B_v, 32)
+            model_per_reg = (reg_effect_out.unsqueeze(1)
+                             - reg_effect_out.unsqueeze(0)).abs()  # (B_v, B_v, 32)
+
+            N = v_dirs.shape[0]
+            tri = torch.triu_indices(N, N, offset=1, device=device)
+            target = exec_per_reg[tri[0], tri[1]]             # (n_pairs, 32)
+            pred = model_per_reg[tri[0], tri[1]]              # (n_pairs, 32)
+            reg_effect_loss = (pred - target).square().mean()
+
+            # 4c: modified_regs BCE.
+            modified_target = (v_reg_delta != 0).any(dim=1).float()  # (B_v, 32)
+            modified_logits = t2.modified_regs_head(v_dirs)
+            modified_regs_loss = F.binary_cross_entropy_with_logits(
+                modified_logits, modified_target)
+
+            # 4d: terminator_type CE.
+            chunk_type = t2_batch.chunk_type[valid_idx].long()
+            term_target = term_lut[chunk_type]
+            term_logits = t2.terminator_type_head(v_dirs)
+            term_type_loss = F.cross_entropy(term_logits, term_target)
+        else:
+            reg_effect_loss = torch.tensor(0.0, device=device)
+            modified_regs_loss = torch.tensor(0.0, device=device)
+            term_type_loss = torch.tensor(0.0, device=device)
+            N = n_valid
+
+        loss = (mag_weight * mag_loss
+                + reg_effect_weight * reg_effect_loss
+                + modified_regs_weight * modified_regs_loss
+                + term_type_weight * term_type_loss)
+
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        if scheduler:
+            scheduler.step()
+
+        loss_val = loss.item()
+        losses.append(loss_val)
+        step += 1
+
+        if step % log_every == 0:
+            elapsed = time.time() - t0
+            ms_per = elapsed / step * 1000
+            current_lr = scheduler.get_last_lr()[0] if scheduler else lr
+            eta_str = ''
+            if n_steps:
+                eta_sec = int(max(0, n_steps - step) * ms_per / 1000)
+                eta_str = f'  eta {timedelta(seconds=eta_sec)}'
+
+            with torch.no_grad():
+                valid_mag_mean = (
+                    vec_norms[valid_mask].mean().item()
+                    if valid_mask.any() else float('nan'))
+                invalid_mag_mean = (
+                    vec_norms[~valid_mask].mean().item()
+                    if (~valid_mask).any() else float('nan'))
+                mag_max = vec_norms.max().item()
+
+            print(f'step {step:>6d}  '
+                  f'loss {loss_val:.4f} '
+                  f'(mag {mag_loss.item():.4f} '
+                  f'reg {reg_effect_loss.item():.4f} '
+                  f'mod {modified_regs_loss.item():.4f} '
+                  f'term {term_type_loss.item():.4f})  '
+                  f'lr {current_lr:.1e}  {ms_per:.0f}ms/step  '
+                  f'N_v={N}/{t2_batch.chunk_emissions.shape[0]}{eta_str}  '
+                  f'||T2|| v={valid_mag_mean:.2f} '
+                  f'i={invalid_mag_mean:.2f} '
+                  f'max={mag_max:.2f}')
+
+        if n_steps and step >= n_steps:
+            break
+
+    return t2, losses
 
