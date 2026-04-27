@@ -562,3 +562,30 @@ def _repad(t2: T2Batch, storage_max_chunk_len: int) -> T2Batch:
         instr_start=t2.instr_start,
         instr_end=t2.instr_end,
     )
+
+
+def concat_t2_batches(batches) -> T2Batch:
+    """Concatenate a list of T2Batches along the chunk dimension.
+
+    All inputs must share the same chunk_emissions padding width
+    (max_chunk_len) and per_inputs / register-delta dimensions.
+    Empty inputs are skipped. Returns an empty T2Batch if all inputs
+    are empty.
+    """
+    nonempty = [b for b in batches if b.chunk_emissions.shape[0] > 0]
+    if not nonempty:
+        # Re-use shape from the first batch if it exists, else punt.
+        if not batches:
+            raise ValueError('concat_t2_batches: no batches to concat')
+        b0 = batches[0]
+        return b0
+    return T2Batch(
+        chunk_emissions=torch.cat([b.chunk_emissions for b in nonempty], dim=0),
+        chunk_lens=torch.cat([b.chunk_lens for b in nonempty], dim=0),
+        valid_mask=torch.cat([b.valid_mask for b in nonempty], dim=0),
+        reg_delta=torch.cat([b.reg_delta for b in nonempty], dim=0),
+        chunk_type=torch.cat([b.chunk_type for b in nonempty], dim=0),
+        sequence_idx=torch.cat([b.sequence_idx for b in nonempty], dim=0),
+        instr_start=torch.cat([b.instr_start for b in nonempty], dim=0),
+        instr_end=torch.cat([b.instr_end for b in nonempty], dim=0),
+    )
