@@ -88,13 +88,24 @@ T2+ where it has real signal from the layer above). To be
 trained for architectural consistency or skipped; not a
 research blocker either way.
 
-**Next: T2 design.** A T2 thought is a register-state
-transformation block: a maximal contiguous sequence of
-instructions where only the last may be a memory access or
-control-flow change. Termination at memory ops keeps T2
-bounded. See WHAT_IS_A_THOUGHT.md "Method vs. Cognition" for
-the framing of why we pick concrete unit definitions for
-benchmarking.
+**T2 compressor — first training complete (partial success).**
+T2 trained to completion at target=16K, 5000 steps, ~4h wall.
+Magnitude-as-validity transferred cleanly (99.0% threshold
+accuracy on a held-out validity probe). However, an equivalence
+probe surfaced that T2 underdiscriminates operand-level changes:
+chunks that differ only in one source register collapse together
+in T2 space. Diagnosis: `reg_effect_loss` (per-register pair-MSE)
+plateaued at ~0.91 throughout training while the structural aux
+losses saturated to near-zero. Loss-weight rebalancing and longer
+training are the immediate follow-ups. See EXPERIMENT_LOG.md
+Phase 11 for full analysis.
+
+**Pipeline.** Three-stage CPU-then-GPU pipe:
+`gen_seq_batches | chunk_t2 | train_t2`. Boundary detection +
+invalidity augmentation are CPU-only data-prep (in
+`datagen/chunkgen.py`); the trainer only does T1 + T2 forward
+passes and gradient updates. 4 parallel `gen_seq_batches` workers
+sustain 99% GPU utilization on a single 16-core machine.
 
 **GPU batch emulator.** All 37 RV32I opcodes executable in parallel
 via `torch.where`, 1.69ms for B=4096. Enables fully-GPU REINFORCE

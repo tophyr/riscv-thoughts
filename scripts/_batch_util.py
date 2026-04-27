@@ -1,7 +1,7 @@
 """Shared utilities for batch pipeline scripts.
 
-Supports RVS (sequence) and RVB (single-instruction) stream formats
-via auto-detection from the 4-byte magic.
+Supports RVS (sequence), RVB (single-instruction), and RVC (T2-chunked)
+stream formats via auto-detection from the 4-byte magic.
 """
 
 import os
@@ -23,6 +23,14 @@ from datagen.batchgen import (
     read_stream_header as _rvb_read_header,
     write_stream_header as _rvb_write_header,
     read_batch_bytes as _rvb_read_bytes,
+)
+from datagen.chunkgen import (
+    _BATCH_HEADER as _RVC_BATCH_HEADER,
+    _batch_body_size as _rvc_body_size,
+    _DTYPE_CHARS as _RVC_DTYPE_CHARS,
+    read_stream_header as _rvc_read_header,
+    write_stream_header as _rvc_write_header,
+    read_batch_bytes as _rvc_read_bytes,
 )
 
 # Stream headers vary per format: magic + version + N dtype chars,
@@ -68,6 +76,17 @@ def _validate_rvb(data):
     return vals
 
 
+def _validate_rvc(data):
+    vals = _RVC_BATCH_HEADER.unpack(data[:_RVC_BATCH_HEADER.size])
+    B, max_n_instrs, max_instr_tokens, n_inputs = vals
+    if not (0 < B <= _MAX_B
+            and 0 < max_n_instrs <= _MAX_TOKENS
+            and 0 < max_instr_tokens <= _MAX_TOKENS
+            and 0 < n_inputs <= _MAX_INPUTS):
+        raise ValueError(f'Invalid RVC header: {vals}')
+    return vals
+
+
 RVS = StreamFmt('rvs', 1, _RVS_DTYPE_CHARS,
                 _rvs_read_header, _rvs_write_header,
                 _rvs_read_bytes, _RVS_BATCH_HEADER, _rvs_body_size,
@@ -78,7 +97,12 @@ RVB = StreamFmt('rvb', 2, _RVB_DTYPE_CHARS,
                 _rvb_read_bytes, _RVB_BATCH_HEADER, _rvb_body_size,
                 _validate_rvb)
 
-_FORMATS = {b'RVS\x00': RVS, b'RVB\x00': RVB}
+RVC = StreamFmt('rvc', 1, _RVC_DTYPE_CHARS,
+                _rvc_read_header, _rvc_write_header,
+                _rvc_read_bytes, _RVC_BATCH_HEADER, _rvc_body_size,
+                _validate_rvc)
+
+_FORMATS = {b'RVS\x00': RVS, b'RVB\x00': RVB, b'RVC\x00': RVC}
 
 
 def detect_format(f):

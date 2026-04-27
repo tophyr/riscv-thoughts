@@ -998,48 +998,159 @@ def streaming_train(batch_iter, d_model=128, n_heads=4, n_layers=2,
 # T2 training
 # ---------------------------------------------------------------------------
 
+def _full_pair_mse_per_register(reg_effect_out, v_reg_delta):
+    """Per-register pair-MSE loss without chunking.
+
+    Materializes the full (B_v, B_v, n_inputs, 32) tensor in one shot.
+    Used when memory permits; faster than the chunked version because
+    no checkpoint recompute and fewer kernel launches.
+
+    The exec_per_reg chain is computed under torch.no_grad() because
+    v_reg_delta is a constant (not a model output / not requires_grad).
+    Without explicit no_grad the autograd graph would retain the
+    intermediate (B, B, n_inputs, 32) tensors for backward — billions
+    of bytes that aren't needed.
+    """
+    B = reg_effect_out.shape[0]
+    if B < 2:
+        return (torch.zeros((), device=reg_effect_out.device),
+                torch.tensor(0, device=reg_effect_out.device))
+
+    with torch.no_grad():
+        delta_pair = v_reg_delta.unsqueeze(1) - v_reg_delta.unsqueeze(0)
+        exec_per_reg = torch.log1p(
+            torch.log1p(delta_pair.abs())).mean(dim=2)  # (B, B, 32)
+
+    model_per_reg = (reg_effect_out.unsqueeze(1)
+                     - reg_effect_out.unsqueeze(0)).abs()  # (B, B, 32)
+    per_pair = (model_per_reg - exec_per_reg).square().mean(dim=-1)  # (B, B)
+
+    # Upper-triangle mean.
+    i = torch.arange(B, device=reg_effect_out.device)
+    mask = i.unsqueeze(1) < i.unsqueeze(0)  # (B, B)
+    masked = per_pair * mask.to(per_pair.dtype)
+    n_pairs = mask.sum()
+    loss = masked.sum() / n_pairs.clamp(min=1).to(masked.dtype)
+    return loss, n_pairs
+
+
+def _chunked_pair_mse_per_register(reg_effect_out, v_reg_delta,
+                                    chunk_size: int = 128):
+    """Per-register pair-MSE loss, computed in chunks via checkpointing.
+
+    Mathematically identical to materializing the full
+    (B_v, B_v, n_inputs, 32) tensor and computing pair-MSE in one
+    shot. Memory-bounded: peak holds ~(chunk_size, B_v, ...) for
+    one slice at a time.
+
+    Implementation: torch.utils.checkpoint runs the per-slice
+    computation without storing intermediates during forward, then
+    re-runs it during backward to compute gradients. Trades ~2x
+    compute on the pair-MSE chain for an O(B²/chunk_size) memory
+    reduction. Pair-MSE isn't the training-loop's dominant compute
+    (T1 encode + T2 transformer dominate), so the wallclock
+    penalty is small.
+
+    Returns (scalar loss, total pair count).
+    """
+    from torch.utils.checkpoint import checkpoint as _checkpoint
+
+    B = reg_effect_out.shape[0]
+    if B < 2:
+        return (torch.zeros((), device=reg_effect_out.device),
+                torch.tensor(0, device=reg_effect_out.device))
+
+    def _slice_step(re_slice, rd_slice, re_full, rd_full, a_start: int, B: int):
+        # Pair distances for slice [a_start, a_start+C) × [0, B):
+        # delta_pair: (C, B, n_inputs, 32)
+        # Exec chain under no_grad — rd_* are constants, no backward
+        # path through them.
+        with torch.no_grad():
+            delta_pair = rd_slice.unsqueeze(1) - rd_full.unsqueeze(0)
+            exec_per_reg = torch.log1p(
+                torch.log1p(delta_pair.abs())).mean(dim=2)    # (C, B, 32)
+        model_per_reg = (re_slice.unsqueeze(1)
+                         - re_full.unsqueeze(0)).abs()        # (C, B, 32)
+        # Squared error, mean over the 32 register channels.
+        per_pair = (model_per_reg - exec_per_reg).square().mean(dim=-1)
+
+        # Upper-triangle mask: pair (a, b) where a < b. Within this
+        # slice, row i corresponds to a = a_start + i, col j is b.
+        # a_start and B are passed as Python ints so the arange calls
+        # don't force GPU->CPU syncs (use_reentrant=False checkpoint
+        # accepts non-tensor args).
+        C = re_slice.shape[0]
+        i = torch.arange(C, device=re_slice.device)
+        j = torch.arange(B, device=re_slice.device)
+        mask = (a_start + i.unsqueeze(1)) < j.unsqueeze(0)  # (C, B)
+
+        masked = per_pair * mask.to(per_pair.dtype)
+        return masked.sum(), mask.sum()
+
+    total_loss = torch.zeros((), device=reg_effect_out.device,
+                             dtype=reg_effect_out.dtype)
+    total_n = torch.zeros((), device=reg_effect_out.device,
+                          dtype=torch.long)
+
+    for a_start in range(0, B, chunk_size):
+        a_end = min(a_start + chunk_size, B)
+        re_slice = reg_effect_out[a_start:a_end]
+        rd_slice = v_reg_delta[a_start:a_end]
+        slice_sum, slice_n = _checkpoint(
+            _slice_step, re_slice, rd_slice,
+            reg_effect_out, v_reg_delta, a_start, B,
+            use_reentrant=False)
+        total_loss = total_loss + slice_sum
+        total_n = total_n + slice_n
+
+    loss = total_loss / total_n.clamp(min=1).to(total_loss.dtype)
+    return loss, total_n
+
+
 def train_t2(batch_iter, t1_encoder,
              d_in: int = 64, d_model: int = 256,
              n_heads: int = 4, n_layers: int = 2, d_out: int = 256,
              max_chunk_len: int = 24,
-             validity_max_chunk_len: int = 16,
-             invalidity_rate: float = 0.2,
              target_valid_chunks_per_step: int = 1024,
+             pair_mse_chunk_size: int = 128,
              lr: float = 3e-4, device: str = 'auto',
              n_steps=None, log_every: int = 100, lr_min: float = 1e-6,
              mag_weight: float = 1.0,
              reg_effect_weight: float = 1.0,
              modified_regs_weight: float = 1.0,
-             term_type_weight: float = 1.0,
-             chunker_seed: int = 0):
-    """Train the T2 encoder over chunked T1-emission sequences.
+             term_type_weight: float = 1.0):
+    """Train the T2 encoder over RVC chunked-T1-emission batches.
+
+    batch_iter yields RVC ChunkBatches (per-chunk per-instruction
+    token spans + chunk metadata). Boundary detection and invalidity
+    augmentation are upstream in the data pipeline (datagen/chunkgen.py
+    via scripts/chunk_t2.py); this loop only runs T1 encoder forward
+    and trains T2.
 
     Pipeline per step:
-    1. Read RVS batches from batch_iter until accumulated valid
-       chunks reach target_valid_chunks_per_step. (Each RVS batch
-       typically yields ~few chunks per sequence; the accumulator
-       decouples training-step batch size from RVS batch size.)
-    2. augment_t2_with_invalid adds spanning/multi/overlong invalid
-       chunks at the configured rate (final batch is ~ target /
-       (1 - invalidity_rate)).
-    3. Forward T2Compressor on chunk_emissions + chunk_lens.
-    4. Compute four losses:
+    1. Read RVC batches from batch_iter, run frozen T1 encoder on each
+       batch's per-instruction tokens to produce T2Batches of
+       emissions, accumulate until reaching
+       target_valid_chunks_per_step total chunks (valid + invalid
+       counted together; invalidity augmentation already done upstream).
+    2. Forward T2Compressor on chunk_emissions + chunk_lens.
+    3. Compute four losses:
        - mag_loss: MSE of ||T2|| against valid_mask. All chunks.
        - reg_effect_loss: per-register pairwise MSE on loglog'd
-         register-delta differences. Valid chunks only.
+         register-delta differences (chunked via gradient
+         checkpointing). Valid chunks only.
        - modified_regs_loss: 32-D BCE on whether each register
          was modified. Valid chunks only.
        - term_type_loss: 5-class CE on terminator category.
          Valid chunks only.
-    5. Sum, backprop, optimizer step.
+    4. Sum, backprop, optimizer step.
 
-    The frozen T1 encoder is used inside the chunker only — it
-    stays in eval mode with parameters non-trainable.
+    The frozen T1 encoder stays in eval mode with parameters
+    non-trainable.
 
     target_valid_chunks_per_step controls the T2 training batch
     size; per-register pairwise MSE allocates O(B²·n_inputs·32)
-    memory, so 1024 is a reasonable default (~512MB at fp32 with
-    n_inputs=4). Larger values are bounded by GPU memory.
+    memory bounded to a chunk via gradient checkpointing.
 
     Returns (t2_model, losses).
     """
@@ -1051,7 +1162,7 @@ def train_t2(batch_iter, t1_encoder,
         TERM_ALU, TERM_LOAD, TERM_STORE, TERM_BRANCH, TERM_JUMP,
     )
     from .chunker import (
-        chunk_rvs_to_t2_batch, augment_t2_with_invalid, concat_t2_batches,
+        encode_chunkbatch, concat_t2_batches,
         TYPE_LOAD, TYPE_STORE, TYPE_BRANCH, TYPE_JUMP,
         TYPE_CAPPED, TYPE_TAIL, TYPE_NON_TERMINATOR,
     )
@@ -1075,10 +1186,6 @@ def train_t2(batch_iter, t1_encoder,
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             opt, T_max=n_steps, eta_min=lr_min)
 
-    # Chunker / invalidity RNG. Distinct from any other rngs in the
-    # pipeline so that the augmentation pattern is reproducible.
-    chunker_rng = np.random.default_rng(chunker_seed)
-
     # Lookup table from chunker TYPE_* codes to model TERM_* codes.
     # Indexed by chunk_type's int value.
     term_lut = torch.zeros(11, dtype=torch.long, device=device)
@@ -1094,30 +1201,25 @@ def train_t2(batch_iter, t1_encoder,
     losses = []
     step = 0
     t0 = time.time()
-    pending = []           # valid-only T2Batches awaiting accumulation
-    pending_n = 0          # total valid chunks in pending
+    pending = []           # T2Batches awaiting accumulation
+    pending_n = 0          # total chunks (valid + invalid) in pending
 
-    for rvs_batch in batch_iter:
-        # 1: accumulate valid chunks across RVS batches until we have
-        # enough for one training step.
-        valid_only = chunk_rvs_to_t2_batch(
-            rvs_batch, t1_encoder,
-            max_chunk_len=validity_max_chunk_len, device=device)
-        if valid_only.chunk_emissions.shape[0] > 0:
-            pending.append(valid_only)
-            pending_n += valid_only.chunk_emissions.shape[0]
+    for rvc_batch in batch_iter:
+        # 1: encode the RVC batch's per-instruction tokens through T1
+        # to produce a T2Batch of emissions; accumulate until we have
+        # enough for one training step. Augmentation already happened
+        # upstream in the data pipeline (scripts/chunk_t2.py).
+        t2_in = encode_chunkbatch(rvc_batch, t1_encoder, device=device)
+        if t2_in.chunk_emissions.shape[0] > 0:
+            pending.append(t2_in)
+            pending_n += t2_in.chunk_emissions.shape[0]
         if pending_n < target_valid_chunks_per_step:
             continue
 
-        # 2: concat accumulated chunks, augment with invalids, train.
-        accumulated = concat_t2_batches(pending)
+        # 2: concat accumulated batches and train one step.
+        t2_batch = concat_t2_batches(pending)
         pending = []
         pending_n = 0
-        t2_batch = augment_t2_with_invalid(
-            accumulated,
-            invalidity_rate=invalidity_rate,
-            storage_max_chunk_len=max_chunk_len,
-            rng=chunker_rng)
 
         if t2_batch.chunk_emissions.shape[0] == 0:
             continue
@@ -1132,7 +1234,8 @@ def train_t2(batch_iter, t1_encoder,
         with torch.autocast(device_type=('cuda' if device.startswith('cuda')
                                          else 'cpu'),
                             dtype=autocast_dtype):
-            t2_vecs = t2(t2_batch.chunk_emissions, t2_batch.chunk_lens)
+            t2_vecs = t2.compiled_forward(
+                t2_batch.chunk_emissions, t2_batch.chunk_lens)
             vec_norms = t2_vecs.norm(dim=-1)
             vec_dirs = t2_vecs / vec_norms.clamp(min=1e-8).unsqueeze(-1)
 
@@ -1155,22 +1258,19 @@ def train_t2(batch_iter, t1_encoder,
                 # (B_v, n_inputs, 32)
 
                 # 4b: per-register pairwise MSE.
-                #   delta_pair[a, b, s, r] = reg_delta[a, s, r] - reg_delta[b, s, r]
-                #   exec_per_reg[a, b, r]  = mean_s log1p(log1p(|delta_pair[..., r]|))
-                delta_pair = (v_reg_delta.unsqueeze(1)
-                              - v_reg_delta.unsqueeze(0))      # (B_v, B_v, n_inputs, 32)
-                exec_per_reg = torch.log1p(
-                    torch.log1p(delta_pair.abs())).mean(dim=2)  # (B_v, B_v, 32)
-
+                # pair_mse_chunk_size <= 0 selects the unchunked path
+                # (no checkpoint, materializes full pair tensor — faster
+                # if it fits in memory). Positive value selects the
+                # checkpointed chunked path.
                 reg_effect_out = t2.reg_effect_head(v_dirs)     # (B_v, 32)
-                model_per_reg = (reg_effect_out.unsqueeze(1)
-                                 - reg_effect_out.unsqueeze(0)).abs()
-
+                if pair_mse_chunk_size <= 0:
+                    reg_effect_loss, _ = _full_pair_mse_per_register(
+                        reg_effect_out, v_reg_delta)
+                else:
+                    reg_effect_loss, _ = _chunked_pair_mse_per_register(
+                        reg_effect_out, v_reg_delta,
+                        chunk_size=pair_mse_chunk_size)
                 N = v_dirs.shape[0]
-                tri = torch.triu_indices(N, N, offset=1, device=device)
-                target = exec_per_reg[tri[0], tri[1]]             # (n_pairs, 32)
-                pred = model_per_reg[tri[0], tri[1]]              # (n_pairs, 32)
-                reg_effect_loss = (pred - target).square().mean()
 
                 # 4c: modified_regs BCE.
                 modified_target = (v_reg_delta != 0).any(dim=1).to(t2_vecs.dtype)
