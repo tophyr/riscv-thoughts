@@ -17,26 +17,33 @@ Architecture mirrors T1Compressor's window encoder, lifted one level:
   unit ball, magnitude carries validity, direction carries
   semantics (same convention as T1).
 
-Auxiliary heads (mirrors T1's dest_type / dest_reg pattern, lifted
-to chunk-level static structural properties):
+Auxiliary heads (clean lift of T1's pair-MSE + dest_type + dest_reg
+pattern, generalized to multi-register chunks):
 
-- modified_regs_head: BCE over 32-D logits. For each register
-  index, did the chunk modify this register's value in at least
-  one probed input state? Forces T2 to encode WHICH registers
-  the chunk affects.
+- reg_effect_head: Linear (d_out -> 32). Used for per-register
+  pairwise MSE in the training loop (NOT BCE, despite the 32-D
+  shape). For each (chunk_pair, register_r) the encoder is trained
+  such that |reg_effect_head(T2_dir[a])[r] - reg_effect_head(T2_dir[b])[r]|
+  matches `mean_s log1p(log1p(|delta_r[a, s] - delta_r[b, s]|))`.
+  This is T1's scalar pair-MSE generalized to a 32-channel
+  per-register-dimension. Encodes "what value each register gets"
+  via relational structure.
+- modified_regs_head: Linear (d_out -> 32) used as 32-D BCE.
+  For each register index, did the chunk modify this register's
+  value in at least one probed input state? Disambiguates
+  "agreed on a value" from "neither touched the register" —
+  both cases produce zero pair-distance under reg_effect_head
+  alone. T1 analog: dest_reg head lifted to multi-write.
 - terminator_type_head: 5-class CE. ALU-only / LOAD / STORE /
   BRANCH / JUMP. Forces T2 to encode the chunk's terminator
-  category, which determines the chunk's external interface
-  (memory effect, control transfer, or pure register state).
+  category — the chunk's external interface (memory effect,
+  control transfer, or pure register state). T1 analog:
+  dest_type head, with more classes since chunks have richer
+  terminator structure.
 
-Both heads are called from the training loop with normalized
-direction `T2 / ||T2||` (magnitude-invariant classification, same
-consumer-split fix as T1's dest heads).
-
-The dynamic value information (what each modified register's new
-value is, as a function of input state) is encoded implicitly via
-pair-MSE distance against register-state-delta over n_inputs probed
-states — same pattern T1 uses for instruction-output values.
+All heads are called from the training loop with normalized
+direction `T2 / ||T2||` (magnitude-invariant; same consumer-split
+fix as T1's dest heads after the magnitude-as-validity retrain).
 
 The class is small and intentionally uncomplicated. The training
 loop, magnitude-as-validity loss, pair-MSE on register-state-delta,
@@ -103,9 +110,17 @@ class T2Compressor(nn.Module):
         self.proj = nn.Linear(d_model, d_out)
 
         # Auxiliary heads (read normalized direction during training,
-        # see module docstring). Static structural properties — they
-        # don't depend on dynamic register values, those come via
-        # pair-MSE.
+        # see module docstring).
+        #
+        # reg_effect_head: per-register pair-MSE channel. Output is
+        #   continuous; |head[a,r] - head[b,r]| is matched to
+        #   loglog'd execution distance per register, per pair.
+        # modified_regs_head: 32-D BCE on whether each register was
+        #   touched. Disambiguates "agreed on a value" from "neither
+        #   wrote" (both produce zero pair-distance otherwise).
+        # terminator_type_head: 5-class CE on the chunk's terminator
+        #   category (ALU-only / LOAD / STORE / BRANCH / JUMP).
+        self.reg_effect_head = nn.Linear(d_out, N_REGS)
         self.modified_regs_head = nn.Linear(d_out, N_REGS)
         self.terminator_type_head = nn.Linear(d_out, N_TERMINATOR_CLASSES)
 
