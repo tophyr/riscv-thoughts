@@ -1,29 +1,34 @@
 """Training data generation.
 
-Two formats:
-    datagen.seqgen — instruction sequence batches (RVS format)
-    datagen.batchgen — single-instruction batches (RVB format)
+Three modules:
+    datagen.generate    — instruction generation, relabeling,
+                          equivalences, group-collection rules
+    datagen.batch       — Chunk + Batch + RVT format, pack/unpack,
+                          pair construction, full pipeline
+    datagen.compare     — GVN equivalence + behavioral chunk distance
+    datagen.invalidity  — invalid-window generators (validity training)
 
-Import from the specific module for I/O functions, or use the
-pipeline tools (batch_slice, batch_cat, etc.) which auto-detect.
+One binary format (RVT) carries the unified batch (chunks + optional
+pair structure + validity flags). The pipeline tools auto-detect via
+the format magic.
 """
 
-# Shared instruction generation.
-from .instrgen import (
+from .generate import (
     random_instruction, validate_distribution, load_distribution,
-    DEFAULT_DISTRIBUTION,
+    DEFAULT_DISTRIBUTION, random_basic_block,
+    random_perm, relabel, random_relabel,
+    MANIFEST, sample_binding, materialize, sample_injection_tuples,
+    single, until_branch, until_transformation, length_cap, either,
+    collect_groups,
 )
 
-# Sequence data.
-from .seqgen import (
-    SequenceBatch, SequenceBatchReader,
-    random_basic_block,
-    execute_sequence, produce_sequence_batch,
+from .batch import (
+    Chunk, Batch, RVT_FORMAT,
+    pack_batch, padding_mask, unpack_chunks,
+    generate_chunks, build_pairs, collect_into_batches,
 )
 
-# Single-instruction data.
-from .batchgen import (
-    InstructionBatch, InstructionBatchReader,
-    produce_instruction_batch, extract_data_val,
-    dest_type, dest_reg,
+from .compare import (
+    gvn_equivalent, chunk_distance, chunk_distance_cached,
+    precompute_chunk, make_anchor_states,
 )

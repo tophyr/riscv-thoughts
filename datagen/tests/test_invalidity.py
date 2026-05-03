@@ -15,7 +15,7 @@ from datagen.invalidity import (
     DEFAULT_TYPE_WEIGHTS, build_type_table,
     gen_partial, gen_spanning, gen_multi, gen_bogus, generate_invalid,
 )
-from datagen.instrgen import DEFAULT_DISTRIBUTION, _build_opcode_table
+from datagen.generate import DEFAULT_DISTRIBUTION, _build_opcode_table
 from emulator import batch_is_complete_instruction
 
 

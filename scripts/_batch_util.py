@@ -1,45 +1,21 @@
-"""Shared utilities for batch pipeline scripts.
+"""Shared utilities for tools (scripts/).
 
-Supports RVS (sequence), RVB (single-instruction), and RVC (T2-chunked)
-stream formats via auto-detection from the 4-byte magic.
+One stream format: RVT (unified training batch). The pipe tools and
+mux dispatch on the format magic anyway; the registry approach is
+preserved so adding a new format later is one entry.
 """
 
 import os
 import struct
 import sys
 
-from datagen.seqgen import (
-    _BATCH_HEADER as _RVS_BATCH_HEADER,
-    _batch_body_size as _rvs_body_size,
-    _DTYPE_CHARS as _RVS_DTYPE_CHARS,
-    read_stream_header as _rvs_read_header,
-    write_stream_header as _rvs_write_header,
-    read_batch_bytes as _rvs_read_bytes,
-)
-from datagen.batchgen import (
-    _BATCH_HEADER as _RVB_BATCH_HEADER,
-    _batch_body_size as _rvb_body_size,
-    _DTYPE_CHARS as _RVB_DTYPE_CHARS,
-    read_stream_header as _rvb_read_header,
-    write_stream_header as _rvb_write_header,
-    read_batch_bytes as _rvb_read_bytes,
-)
-from datagen.chunkgen import (
-    _BATCH_HEADER as _RVC_BATCH_HEADER,
-    _batch_body_size as _rvc_body_size,
-    _DTYPE_CHARS as _RVC_DTYPE_CHARS,
-    read_stream_header as _rvc_read_header,
-    write_stream_header as _rvc_write_header,
-    read_batch_bytes as _rvc_read_bytes,
-)
+from datagen.batch import RVT_FORMAT
 
-# Stream headers vary per format: magic + version + N dtype chars,
-# where N is format-specific. Read in two stages.
 _MAGIC_AND_VERSION = struct.Struct('<4sB')
 
 _MAX_B = 1_000_000
-_MAX_TOKENS = 10_000
-_MAX_INPUTS = 10_000
+_MAX_TOKENS = 100_000
+_MAX_PAIRS = 10_000_000
 
 
 class StreamFmt:
@@ -58,59 +34,29 @@ class StreamFmt:
         self.validate = validate
 
 
-def _validate_rvs(data):
-    vals = _RVS_BATCH_HEADER.unpack(data[:_RVS_BATCH_HEADER.size])
-    B, max_tokens, max_instrs, n_inputs = vals
-    if not (0 < B <= _MAX_B and 0 < max_tokens <= _MAX_TOKENS
-            and 0 < n_inputs <= _MAX_INPUTS):
-        raise ValueError(f'Invalid RVS header: {vals}')
-    return vals
-
-
-def _validate_rvb(data):
-    vals = _RVB_BATCH_HEADER.unpack(data[:_RVB_BATCH_HEADER.size])
-    B, max_len, n_inputs = vals
-    if not (0 < B <= _MAX_B and 0 < max_len <= _MAX_TOKENS
-            and 0 < n_inputs <= _MAX_INPUTS):
-        raise ValueError(f'Invalid RVB header: {vals}')
-    return vals
-
-
-def _validate_rvc(data):
-    vals = _RVC_BATCH_HEADER.unpack(data[:_RVC_BATCH_HEADER.size])
-    B, max_n_instrs, max_instr_tokens, n_inputs = vals
+def _validate_rvt(data):
+    vals = RVT_FORMAT.batch_header.unpack(
+        data[:RVT_FORMAT.batch_header.size])
+    B, max_tokens, P = vals
     if not (0 < B <= _MAX_B
-            and 0 < max_n_instrs <= _MAX_TOKENS
-            and 0 < max_instr_tokens <= _MAX_TOKENS
-            and 0 < n_inputs <= _MAX_INPUTS):
-        raise ValueError(f'Invalid RVC header: {vals}')
+            and 0 < max_tokens <= _MAX_TOKENS
+            and 0 <= P <= _MAX_PAIRS):
+        raise ValueError(f'Invalid RVT header: {vals}')
     return vals
 
 
-RVS = StreamFmt('rvs', 1, _RVS_DTYPE_CHARS,
-                _rvs_read_header, _rvs_write_header,
-                _rvs_read_bytes, _RVS_BATCH_HEADER, _rvs_body_size,
-                _validate_rvs)
+RVT = StreamFmt('rvt', RVT_FORMAT.version, RVT_FORMAT.dtype_chars,
+                RVT_FORMAT.read_stream_header, RVT_FORMAT.write_stream_header,
+                RVT_FORMAT.read_batch_bytes, RVT_FORMAT.batch_header,
+                RVT_FORMAT.body_size, _validate_rvt)
 
-RVB = StreamFmt('rvb', 2, _RVB_DTYPE_CHARS,
-                _rvb_read_header, _rvb_write_header,
-                _rvb_read_bytes, _RVB_BATCH_HEADER, _rvb_body_size,
-                _validate_rvb)
-
-RVC = StreamFmt('rvc', 1, _RVC_DTYPE_CHARS,
-                _rvc_read_header, _rvc_write_header,
-                _rvc_read_bytes, _RVC_BATCH_HEADER, _rvc_body_size,
-                _validate_rvc)
-
-_FORMATS = {b'RVS\x00': RVS, b'RVB\x00': RVB, b'RVC\x00': RVC}
+_FORMATS = {b'RVT\x00': RVT}
 
 
 def detect_format(f):
     """Read stream header, auto-detect format, validate.
 
-    Returns the StreamFmt. Consumes the header bytes. Stream
-    headers are variable-length: 4-byte magic + 1-byte version +
-    N dtype chars, where N depends on the format.
+    Returns the StreamFmt. Consumes the header bytes.
     """
     mv = f.read(_MAGIC_AND_VERSION.size)
     if len(mv) < _MAGIC_AND_VERSION.size:
@@ -136,8 +82,7 @@ def detect_format(f):
 def peek_format(f):
     """Peek at magic bytes without consuming the header.
 
-    Uses BufferedReader.peek so it works on non-seekable streams
-    (pipes, FIFOs from process substitution).
+    Uses BufferedReader.peek so it works on non-seekable streams.
     """
     buf = b''
     while len(buf) < 4:
@@ -157,3 +102,27 @@ def binary_stdout():
     out = os.fdopen(os.dup(sys.stdout.fileno()), 'wb')
     sys.stdout = sys.stderr
     return out
+
+
+def read_batch_or_error(fmt, f, *, lenient=False):
+    """Read one full batch with structured error handling.
+
+    Returns (data, error) where exactly one is None:
+      (bytes, None)  → batch read OK
+      (None, None)   → clean EOF (or lenient EOFError absorbed)
+      (None, str)    → validation failure (always reported), or hard
+                       EOFError when lenient=False
+    """
+    try:
+        data = fmt.read_bytes(f)
+    except EOFError as e:
+        if lenient:
+            return None, None
+        return None, str(e)
+    if data is None:
+        return None, None
+    try:
+        fmt.validate(data)
+    except ValueError as e:
+        return None, str(e)
+    return data, None

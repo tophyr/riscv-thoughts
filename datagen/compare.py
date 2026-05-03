@@ -1,0 +1,846 @@
+"""Equivalence and distance reasoning over RV32I instruction chunks.
+
+Two outputs from the same machinery, differing only in granularity:
+
+  gvn_equivalent(a, b) -> bool
+      Yes/no: are these chunks GVN-equivalent (isomorphic dataflow
+      DAGs under register relabeling, commutativity, and dead-write
+      elimination)?
+
+  chunk_distance(a, b) -> float >= 0
+      Continuous: how different are these chunks behaviorally?
+      Equivalence-preserving augmentations (relabeling, commutative
+      arg swap, dead writes, cross-syntax aliases like XOR x,x ≡
+      ADDI x,0,0) all collapse to 0; structurally and behaviorally
+      different chunks get a smooth nonzero distance.
+
+Shared infrastructure:
+  - SSA construction (to_ssa) — converts an instruction list into a
+    dataflow DAG with INPUT leaves for live-in registers, anchored
+    leaves for PC and memory state, and op nodes for each instruction.
+  - DCE (live_nodes) — backward reachability from outputs.
+  - Value numbering (value_number) — assigns recursive structural
+    keys; two nodes share a key iff they compute the same function
+    under the chosen input bijection. Used by gvn_equivalent.
+  - Partial bijection enumeration (partial_bijections) — yields
+    candidate input mappings for both equivalence and distance search.
+  - SSA-numpy evaluator (eval_ssa_numpy) — evaluates an SSA graph on
+    N anchor states using vectorized numpy ops. ~10× faster than per-
+    state Python emulator dispatch and bit-equal for chunker-respecting
+    chunks. Used by chunk_distance for behavioral evaluation.
+
+V1 scope: ALU R/I-type, LUI, AUIPC, B-type, JAL, JALR. Memory ops
+(LOAD/STORE) raise NotImplementedError in chunk_distance; gvn_equivalent
+handles them at the SSA level via anchored MEM_IN leaves.
+"""
+
+from dataclasses import dataclass, field
+from itertools import combinations, permutations
+
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+
+from emulator import (
+    Instruction, run as run_instructions, make_ctx,
+    R_TYPE, I_TYPE, B_TYPE, LOAD_TYPE, STORE_TYPE,
+)
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Special pseudo-register slots, out of 0..31 so they don't collide
+# with real registers. PC and MEM are anchored — they always identify
+# with their counterpart in the other chunk, never permuted.
+PC_REG = 32
+MEM_REG = 33
+
+# Truly commutative ops: f(a, b) = f(b, a) under all input values.
+# - ADD, XOR, OR, AND: R/I-type ALU symmetries (I-type variants are
+#   NOT commutative because the immediate operand is structurally
+#   distinct from the register operand).
+# - BEQ_COND / BNE_COND: equality and inequality comparators are
+#   symmetric.
+COMMUTATIVE_OPS = frozenset({
+    'ADD', 'XOR', 'OR', 'AND',
+    'BEQ_COND', 'BNE_COND',
+})
+
+# Branch ops produce a boolean comparator node tagged with the
+# branch's condition. We name these `<OP>_COND` so they're distinct
+# in SSA from the branch itself (which becomes a SELECT_PC).
+_BRANCH_COND_OP = {
+    'BEQ': 'BEQ_COND',  'BNE': 'BNE_COND',
+    'BLT': 'BLT_COND',  'BGE': 'BGE_COND',
+    'BLTU': 'BLTU_COND', 'BGEU': 'BGEU_COND',
+}
+
+# JALR clears the low bit of the computed target: AND with 0xFFFFFFFE.
+_JALR_TARGET_MASK = 0xFFFFFFFE
+
+# Full RV32I op set we support in SSA. Anything outside this raises.
+SUPPORTED_OPS = (
+    R_TYPE | I_TYPE | B_TYPE | LOAD_TYPE | STORE_TYPE
+    | {'LUI', 'AUIPC', 'JAL', 'JALR'}
+)
+
+# Lower 5 bits of shift amounts per RV32I spec.
+_SHIFT_MASK = np.int32(0x1f)
+
+# Penalty when one chunk reads/writes PC and the other doesn't.
+# Anchored membership is a hard categorical match in the distance
+# metric.
+ANCHORED_MISMATCH_PENALTY = 100.0
+
+# An input register's behavioral magnitude must exceed this to enter
+# the bijection search. Set just above floating-point noise so that
+# "no observable effect on any output" reliably filters out.
+BEHAVIORAL_RELEVANCE_THRESHOLD = 1e-9
+
+
+class UnsupportedOpError(ValueError):
+    """Raised when a chunk contains an instruction the SSA layer
+    doesn't support. With full RV32I coverage this should be
+    unreachable in practice — kept as a defensive guard."""
+
+
+# ---------------------------------------------------------------------------
+# SSA dataflow representation
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SSANode:
+    """A node in the SSA dataflow graph.
+
+    op identifies the node's kind:
+      - 'INPUT'      : regular register read before any write (payload = phys reg)
+      - 'PC_IN'      : anchored PC input leaf (no payload)
+      - 'MEM_IN'     : anchored memory-state input leaf (no payload)
+      - 'CONST_IMM'  : immediate value (payload = int)
+      - 'CONST_ZERO' : constant 0 (payload = 0); used for x0 reads
+      - 'LUI'        : payload = imm value (constant load)
+      - any RV32I R/I-type opcode      : ALU op (operands are SSA ids)
+      - 'BEQ_COND'..'BGEU_COND'        : branch comparator (boolean)
+      - 'SELECT_PC'                    : conditional PC = (cond, taken, not_taken)
+      - any LOAD opcode (LB, LBU, ...) : LOAD_w(MEM, addr) -> value
+      - any STORE opcode (SB, SH, SW)  : STORE_w(MEM, addr, value) -> new MEM
+    """
+    op: str
+    operands: tuple = ()
+    payload: object = None
+
+
+@dataclass
+class SSAGraph:
+    """SSA representation of a chunk.
+
+    nodes:           list of SSANode by id
+    input_regs:      regular phys regs read before written, in order
+                     of first read. Each appears at most once. PC/MEM
+                     are NOT here (they're anchored).
+    input_node_id:   regular phys reg → SSA id of its INPUT leaf
+    output_versions: phys reg (or PC_REG / MEM_REG) → SSA id of the
+                     register's final value, only for slots that the
+                     chunk modifies. x0 is never here.
+    """
+    nodes: list = field(default_factory=list)
+    input_regs: list = field(default_factory=list)
+    input_node_id: dict = field(default_factory=dict)
+    output_versions: dict = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# SSA construction
+# ---------------------------------------------------------------------------
+
+def to_ssa(instrs):
+    """Convert a list[Instruction] to an SSAGraph."""
+    g = SSAGraph()
+    initial_id = {}  # phys reg → first-read leaf id (regular + PC/MEM)
+
+    def new_node(op, operands=(), payload=None):
+        nid = len(g.nodes)
+        g.nodes.append(SSANode(op=op, operands=operands, payload=payload))
+        return nid
+
+    # x0 is always zero. Reads of x0 reuse this single node.
+    zero_id = new_node('CONST_ZERO', payload=0)
+    current = {0: zero_id}
+
+    def read(r):
+        if r in current:
+            return current[r]
+        if r == PC_REG:
+            nid = new_node('PC_IN')
+        elif r == MEM_REG:
+            nid = new_node('MEM_IN')
+        else:
+            nid = new_node('INPUT', payload=r)
+            g.input_node_id[r] = nid
+            g.input_regs.append(r)
+        current[r] = nid
+        initial_id[r] = nid
+        return nid
+
+    def const(value):
+        return new_node('CONST_IMM', payload=int(value))
+
+    def write(r, nid):
+        if r == 0:
+            return  # x0 writes are nops
+        current[r] = nid
+
+    def pc_at(position):
+        """SSA id for PC at instruction position i. PC at position i
+        is PC_IN + 4*i. Position 0 returns the raw PC_IN leaf; later
+        positions wrap it in an ADD with a constant offset."""
+        pc_in = read(PC_REG)
+        if position == 0:
+            return pc_in
+        return new_node('ADD', operands=(pc_in, const(4 * position)))
+
+    for i, instr in enumerate(instrs):
+        op = instr.opcode
+        if op not in SUPPORTED_OPS:
+            raise UnsupportedOpError(f'opcode {op!r} not supported')
+
+        if op in R_TYPE:
+            rd, rs1, rs2 = instr.args
+            v1 = read(rs1)
+            v2 = read(rs2)
+            write(rd, new_node(op, operands=(v1, v2)))
+        elif op in I_TYPE:
+            rd, rs1, imm = instr.args
+            v1 = read(rs1)
+            v_imm = const(imm)
+            write(rd, new_node(op, operands=(v1, v_imm)))
+        elif op == 'LUI':
+            rd, imm = instr.args
+            write(rd, new_node('LUI', payload=int(imm)))
+        elif op == 'AUIPC':
+            rd, imm = instr.args
+            # rd = PC_at_i + (imm << 12). Combined into one ADD.
+            pc_i = pc_at(i)
+            write(rd, new_node('ADD',
+                               operands=(pc_i, const(int(imm) << 12))))
+        elif op == 'JAL':
+            rd, imm = instr.args
+            # rd = address of next instruction = PC_in + 4*(i+1).
+            write(rd, pc_at(i + 1))
+            # PC' = PC_at_i + imm.
+            write(PC_REG, new_node('ADD',
+                                   operands=(pc_at(i), const(imm))))
+        elif op == 'JALR':
+            rd, rs1, imm = instr.args
+            write(rd, pc_at(i + 1))
+            v1 = read(rs1)
+            sum_id = new_node('ADD', operands=(v1, const(imm)))
+            write(PC_REG, new_node('AND',
+                                   operands=(sum_id, const(_JALR_TARGET_MASK))))
+        elif op in B_TYPE:
+            rs1, rs2, imm = instr.args
+            v1 = read(rs1)
+            v2 = read(rs2)
+            cond = new_node(_BRANCH_COND_OP[op], operands=(v1, v2))
+            pc_i = pc_at(i)
+            taken = new_node('ADD', operands=(pc_i, const(imm)))
+            not_taken = new_node('ADD', operands=(pc_i, const(4)))
+            write(PC_REG, new_node('SELECT_PC',
+                                   operands=(cond, taken, not_taken)))
+        elif op in LOAD_TYPE:
+            rd, imm, rs1 = instr.args
+            v1 = read(rs1)
+            addr = new_node('ADD', operands=(v1, const(imm)))
+            mem = read(MEM_REG)
+            write(rd, new_node(op, operands=(mem, addr)))
+        elif op in STORE_TYPE:
+            rs2, imm, rs1 = instr.args
+            v1 = read(rs1)
+            val = read(rs2)
+            addr = new_node('ADD', operands=(v1, const(imm)))
+            mem = read(MEM_REG)
+            write(MEM_REG, new_node(op, operands=(mem, addr, val)))
+        else:
+            raise UnsupportedOpError(f'opcode {op!r} fell through dispatch')
+
+    # Outputs: any slot whose final SSA id differs from its initial-leaf
+    # id (or which never had an initial leaf — written without being
+    # read first). x0 never counts.
+    for r, nid in current.items():
+        if r == 0:
+            continue
+        if r in initial_id and initial_id[r] == nid:
+            continue
+        g.output_versions[r] = nid
+
+    return g
+
+
+# ---------------------------------------------------------------------------
+# DCE + SSA helpers
+# ---------------------------------------------------------------------------
+
+def live_nodes(g):
+    """Return SSA node ids reachable backward from outputs. Dead nodes
+    don't contribute to the chunk's externally-observable effect, so
+    equivalence and distance must ignore them."""
+    live = set()
+    frontier = list(g.output_versions.values())
+    while frontier:
+        nid = frontier.pop()
+        if nid in live:
+            continue
+        live.add(nid)
+        frontier.extend(g.nodes[nid].operands)
+    return live
+
+
+def live_input_regs(g, live):
+    """Regular phys regs whose INPUT leaf is in `live`."""
+    return [r for r in g.input_regs if g.input_node_id[r] in live]
+
+
+def _has_anchored_inputs(g, live):
+    """(has_pc_in, has_mem_in) — anchored-input membership."""
+    has_pc = any(g.nodes[nid].op == 'PC_IN' for nid in live)
+    has_mem = any(g.nodes[nid].op == 'MEM_IN' for nid in live)
+    return has_pc, has_mem
+
+
+def _split_outputs(g):
+    """Split output_versions into (regular_dict, pc_id_or_None,
+    mem_id_or_None)."""
+    reg = {r: nid for r, nid in g.output_versions.items()
+           if r != PC_REG and r != MEM_REG}
+    pc = g.output_versions.get(PC_REG)
+    mem = g.output_versions.get(MEM_REG)
+    return reg, pc, mem
+
+
+# ---------------------------------------------------------------------------
+# Value numbering
+# ---------------------------------------------------------------------------
+
+def value_number(g, input_abstract_id, live=None):
+    """Assign a recursive structural VN key to each (live) SSA node.
+
+    Two nodes from different graphs share a VN key iff they compute the
+    same function under the given input mapping. Used by gvn_equivalent
+    to test structural equivalence under a candidate input bijection.
+
+    input_abstract_id: dict mapping regular phys reg → abstract input
+                       id (the bijection's choice). Anchored leaves
+                       (PC_IN, MEM_IN) get fixed keys.
+    live:              optional set of node ids to compute keys for.
+    """
+    keys = {}
+    for nid, node in enumerate(g.nodes):
+        if live is not None and nid not in live:
+            continue
+        op = node.op
+        if op == 'INPUT':
+            key = ('INPUT', input_abstract_id[node.payload])
+        elif op == 'PC_IN':
+            key = ('PC_IN',)
+        elif op == 'MEM_IN':
+            key = ('MEM_IN',)
+        elif op == 'CONST_ZERO':
+            key = ('CONST', 0)
+        elif op == 'CONST_IMM':
+            key = ('CONST', node.payload)
+        elif op == 'LUI':
+            key = ('LUI', node.payload)
+        elif op in COMMUTATIVE_OPS:
+            op_keys = tuple(sorted(keys[o] for o in node.operands))
+            key = (op,) + op_keys
+        else:
+            op_keys = tuple(keys[o] for o in node.operands)
+            key = (op,) + op_keys
+        keys[nid] = key
+    return keys
+
+
+# ---------------------------------------------------------------------------
+# Partial bijection enumeration — shared by gvn_equivalent and chunk_distance
+# ---------------------------------------------------------------------------
+
+def partial_bijections(set_a, set_b):
+    """Yield all partial bijections of size k = min(|a|, |b|) as
+    paired ordered tuples (a_subset, b_subset) where a_subset[i] is
+    matched to b_subset[i]."""
+    a = tuple(set_a)
+    b = tuple(set_b)
+    k = min(len(a), len(b))
+    if k == 0:
+        yield (), ()
+        return
+    if len(a) <= len(b):
+        for chosen in combinations(b, k):
+            for perm in permutations(chosen):
+                yield a, perm
+    else:
+        for chosen in combinations(a, k):
+            for perm in permutations(chosen):
+                yield perm, b
+
+
+# ---------------------------------------------------------------------------
+# GVN equivalence — binary yes/no
+# ---------------------------------------------------------------------------
+
+def gvn_equivalent(instrs_a, instrs_b):
+    """Return True iff the two chunks are GVN-equivalent.
+
+    Equivalent iff their dataflow DAGs are isomorphic under some
+    bijection between live regular input register sets, with
+    commutative ops matching modulo argument order, and PC/MEM
+    inputs/outputs matched on identity (not interchangeable with
+    regular regs).
+    """
+    a = to_ssa(instrs_a)
+    b = to_ssa(instrs_b)
+    live_a = live_nodes(a)
+    live_b = live_nodes(b)
+
+    inputs_a = live_input_regs(a, live_a)
+    inputs_b = live_input_regs(b, live_b)
+    if len(inputs_a) != len(inputs_b):
+        return False
+    if _has_anchored_inputs(a, live_a) != _has_anchored_inputs(b, live_b):
+        return False
+
+    reg_out_a, pc_out_a, mem_out_a = _split_outputs(a)
+    reg_out_b, pc_out_b, mem_out_b = _split_outputs(b)
+    if len(reg_out_a) != len(reg_out_b):
+        return False
+    if (pc_out_a is None) != (pc_out_b is None):
+        return False
+    if (mem_out_a is None) != (mem_out_b is None):
+        return False
+
+    if not a.output_versions and not b.output_versions:
+        return True
+
+    n = len(inputs_a)
+    b_abstract = {r: i for i, r in enumerate(inputs_b)}
+    keys_b = value_number(b, b_abstract, live=live_b)
+    reg_out_keys_b = sorted(keys_b[reg_out_b[r]] for r in reg_out_b)
+    pc_key_b = keys_b[pc_out_b] if pc_out_b is not None else None
+    mem_key_b = keys_b[mem_out_b] if mem_out_b is not None else None
+
+    perms = permutations(range(n)) if n > 0 else [()]
+    for perm in perms:
+        a_abstract = {inputs_a[i]: perm[i] for i in range(n)}
+        keys_a = value_number(a, a_abstract, live=live_a)
+        reg_out_keys_a = sorted(keys_a[reg_out_a[r]] for r in reg_out_a)
+        if reg_out_keys_a != reg_out_keys_b:
+            continue
+        if pc_out_a is not None and keys_a[pc_out_a] != pc_key_b:
+            continue
+        if mem_out_a is not None and keys_a[mem_out_a] != mem_key_b:
+            continue
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Anchor states + SSA-numpy evaluator
+# ---------------------------------------------------------------------------
+
+def make_anchor_states(n_states, seed):
+    """Generate shared anchor states for distance computation. Two
+    chunks compared via chunk_distance must use the same anchor states."""
+    rng = np.random.default_rng(seed)
+    anchor_states = rng.integers(
+        np.iinfo(np.int32).min, np.iinfo(np.int32).max,
+        size=(n_states, 32), dtype=np.int32)
+    anchor_states[:, 0] = 0
+    return anchor_states
+
+
+def _eval_ssa_numpy(ssa, chunk_len, anchor_states, live=None):
+    """Evaluate an SSA graph on N input states using numpy ops.
+
+    Walks node ids in order (topologically valid by construction).
+    Each node produces an (N,) int32 or bool array; one numpy op
+    per node, vectorized across all N states.
+
+    For chunker-respecting chunks (only the last instruction may be
+    control flow), bit-equal to the Python emulator. For chunks with
+    intra-chunk control flow the semantics differ (SSA evaluates every
+    node regardless of runtime PC dispatch) — chunk_distance's contract
+    excludes those cases.
+    """
+    n_states = anchor_states.shape[0]
+    values = {}
+    nodes = ssa.nodes
+
+    for nid, node in enumerate(nodes):
+        if live is not None and nid not in live:
+            continue
+        op = node.op
+
+        if op == 'INPUT':
+            values[nid] = anchor_states[:, node.payload].copy()
+        elif op == 'CONST_ZERO':
+            values[nid] = np.zeros(n_states, dtype=np.int32)
+        elif op == 'CONST_IMM':
+            values[nid] = np.full(
+                n_states, int(node.payload), dtype=np.int64
+            ).astype(np.int32)
+        elif op == 'LUI':
+            values[nid] = np.full(
+                n_states, int(node.payload) << 12, dtype=np.int64
+            ).astype(np.int32)
+        elif op == 'PC_IN':
+            values[nid] = np.zeros(n_states, dtype=np.int32)
+        elif op == 'MEM_IN':
+            raise NotImplementedError('SSA-numpy eval does not support memory')
+
+        elif op in ('ADD', 'ADDI'):
+            a, b = node.operands
+            values[nid] = (values[a].astype(np.int64)
+                           + values[b].astype(np.int64)).astype(np.int32)
+        elif op == 'SUB':
+            a, b = node.operands
+            values[nid] = (values[a].astype(np.int64)
+                           - values[b].astype(np.int64)).astype(np.int32)
+        elif op in ('XOR', 'XORI'):
+            a, b = node.operands
+            values[nid] = values[a] ^ values[b]
+        elif op in ('OR', 'ORI'):
+            a, b = node.operands
+            values[nid] = values[a] | values[b]
+        elif op in ('AND', 'ANDI'):
+            a, b = node.operands
+            values[nid] = values[a] & values[b]
+
+        elif op in ('SLL', 'SLLI'):
+            a, b = node.operands
+            shift = (values[b] & _SHIFT_MASK).astype(np.uint32)
+            values[nid] = (values[a].astype(np.uint32)
+                           << shift).astype(np.int32)
+        elif op in ('SRL', 'SRLI'):
+            a, b = node.operands
+            shift = (values[b] & _SHIFT_MASK).astype(np.uint32)
+            values[nid] = (values[a].astype(np.uint32)
+                           >> shift).astype(np.int32)
+        elif op in ('SRA', 'SRAI'):
+            a, b = node.operands
+            shift = (values[b] & _SHIFT_MASK)
+            values[nid] = (values[a] >> shift).astype(np.int32)
+
+        elif op in ('SLT', 'SLTI'):
+            a, b = node.operands
+            values[nid] = (values[a] < values[b]).astype(np.int32)
+        elif op in ('SLTU', 'SLTIU'):
+            a, b = node.operands
+            values[nid] = (values[a].astype(np.uint32)
+                           < values[b].astype(np.uint32)).astype(np.int32)
+
+        elif op == 'BEQ_COND':
+            a, b = node.operands
+            values[nid] = (values[a] == values[b])
+        elif op == 'BNE_COND':
+            a, b = node.operands
+            values[nid] = (values[a] != values[b])
+        elif op == 'BLT_COND':
+            a, b = node.operands
+            values[nid] = (values[a] < values[b])
+        elif op == 'BGE_COND':
+            a, b = node.operands
+            values[nid] = (values[a] >= values[b])
+        elif op == 'BLTU_COND':
+            a, b = node.operands
+            values[nid] = (values[a].astype(np.uint32)
+                           < values[b].astype(np.uint32))
+        elif op == 'BGEU_COND':
+            a, b = node.operands
+            values[nid] = (values[a].astype(np.uint32)
+                           >= values[b].astype(np.uint32))
+
+        elif op == 'SELECT_PC':
+            cond, taken, not_taken = node.operands
+            values[nid] = np.where(
+                values[cond], values[taken], values[not_taken]
+            ).astype(np.int32)
+
+        else:
+            raise ValueError(f'unsupported SSA op {op!r} in numpy eval')
+
+    out_regs = anchor_states.copy()
+    out_pcs = None
+    for r, nid in ssa.output_versions.items():
+        if r == PC_REG:
+            out_pcs = (values[nid].astype(np.int64) & 0xFFFFFFFF)
+        elif r == MEM_REG:
+            pass
+        else:
+            out_regs[:, r] = values[nid]
+
+    if out_pcs is None:
+        out_pcs = np.full(n_states, 4 * chunk_len, dtype=np.int64)
+
+    return out_regs, out_pcs
+
+
+def _exec_on_states(chunk, states, ctx):
+    """Reference Python-emulator evaluator. Used by tests to verify
+    SSA-numpy. Hot path uses _eval_ssa_numpy."""
+    n = states.shape[0]
+    out_regs = np.zeros_like(states)
+    out_pcs = np.zeros(n, dtype=np.int64)
+    for i in range(n):
+        state, pc, _ = run_instructions(chunk, regs=states[i], pc=0, _ctx=ctx)
+        out_regs[i] = state.regs
+        out_pcs[i] = pc
+    return out_regs, out_pcs
+
+
+# ---------------------------------------------------------------------------
+# Chunk distance — continuous behavioral metric
+# ---------------------------------------------------------------------------
+
+def _loglog(x):
+    """log1p(log1p(|x|)) on a numpy array."""
+    return np.log1p(np.log1p(np.abs(x).astype(np.float64)))
+
+
+def _has_memory_ops(chunk):
+    return any(instr.opcode in LOAD_TYPE or instr.opcode in STORE_TYPE
+               for instr in chunk)
+
+
+def _output_magnitudes(out_regs, in_states, output_regs):
+    """For each output register, mean loglog'd |delta| across states.
+    Used as smooth edit cost for unmatched outputs."""
+    if not output_regs:
+        return {}
+    deltas = out_regs[:, output_regs] - in_states[:, output_regs]
+    mags = _loglog(deltas).mean(axis=0)
+    return {r: float(m) for r, m in zip(output_regs, mags)}
+
+
+def _actually_modified(out_regs, in_states, ssa_candidates):
+    """Filter SSA's candidate output regs to those whose value
+    actually differs from the initial state in at least one anchor
+    state. SSA over-claims when intra-chunk control flow drops some
+    writes; execution truth drives the matched-output set."""
+    if not ssa_candidates:
+        return []
+    out_view = out_regs[:, ssa_candidates]
+    in_view = in_states[:, ssa_candidates]
+    any_diff = (out_view != in_view).any(axis=0)
+    return [r for r, d in zip(ssa_candidates, any_diff) if d]
+
+
+def _input_magnitudes(ssa, live, syntactic_inputs, anchor_states,
+                      baseline_out_regs, baseline_out_pcs, chunk_len,
+                      output_regs, has_pc_out):
+    """Per syntactic input, behavioral magnitude: how much do outputs
+    change when this input's values are perturbed?
+
+    Magnitude = max-across-output-slots of mean-per-state loglog'd
+    abs-output-difference. Magnitude near 0 → input is behaviorally
+    irrelevant → filter out of bijection search. Magnitude > 0 →
+    weights the unaligned-input edit cost.
+    """
+    mags = {}
+    for r in syntactic_inputs:
+        perturbed = anchor_states.copy()
+        perturbed[:, r] = ~perturbed[:, r]
+        perturbed[:, 0] = 0  # x0 always 0
+
+        out_regs, out_pcs = _eval_ssa_numpy(ssa, chunk_len, perturbed, live)
+
+        per_slot_means = []
+        if output_regs:
+            reg_diffs = (out_regs[:, output_regs].astype(np.int64) -
+                         baseline_out_regs[:, output_regs].astype(np.int64))
+            slot_means = _loglog(reg_diffs).mean(axis=0)
+            per_slot_means.extend(slot_means.tolist())
+        if has_pc_out:
+            pc_diffs = out_pcs.astype(np.int64) - baseline_out_pcs.astype(np.int64)
+            per_slot_means.append(float(_loglog(pc_diffs).mean()))
+
+        mags[r] = max(per_slot_means) if per_slot_means else 0.0
+    return mags
+
+
+@dataclass
+class Precomputed:
+    """Per-chunk data cached across many distance computations.
+
+    pc_explicit indicates whether some live SSA op writes PC. For
+    chunks that don't write PC explicitly, the implicit final PC =
+    4*chunk_len; these chunks contribute no PC residual when paired
+    with another non-explicit chunk.
+    """
+    chunk: list                  # list[Instruction]
+    ssa: SSAGraph                # for σ-permuted re-evaluation
+    live: set                    # live SSA node ids after DCE
+    inputs: list                 # all live regular inputs (syntactic)
+    behavioral_inputs: list      # subset of `inputs` with magnitude > threshold
+    input_mags: dict             # reg → behavioral magnitude
+    reg_outs: list               # actually-modified regular output regs
+    out_regs: np.ndarray         # (n_states, 32) anchor exec result
+    out_pcs: np.ndarray          # (n_states,) final PC per state
+    out_mags: dict               # reg → loglog'd output magnitude
+    pc_explicit: bool            # does any live SSA op write PC
+
+
+def precompute_chunk(chunk, anchor_states):
+    """SSA + DCE + anchor execution + sensitivity analysis.
+
+    Raises NotImplementedError on memory ops (V1 distance scope).
+    """
+    if _has_memory_ops(chunk):
+        raise NotImplementedError(
+            'chunk_distance V1 does not support memory ops (LOAD/STORE)')
+
+    ssa = to_ssa(chunk)
+    live = live_nodes(ssa)
+    has_pc_in, has_mem_in = _has_anchored_inputs(ssa, live)
+    reg_out, pc_out, mem_out = _split_outputs(ssa)
+    assert mem_out is None and not has_mem_in
+
+    out_regs, out_pcs = _eval_ssa_numpy(ssa, len(chunk), anchor_states, live)
+
+    ssa_reg_outs = sorted(reg_out.keys())
+    actual_reg_outs = _actually_modified(out_regs, anchor_states, ssa_reg_outs)
+    out_mags = _output_magnitudes(out_regs, anchor_states, actual_reg_outs)
+
+    inputs = live_input_regs(ssa, live)
+    pc_explicit = pc_out is not None
+
+    input_mags = _input_magnitudes(
+        ssa, live, inputs, anchor_states,
+        out_regs, out_pcs, len(chunk),
+        actual_reg_outs, pc_explicit)
+    behavioral_inputs = [r for r in inputs
+                         if input_mags[r] > BEHAVIORAL_RELEVANCE_THRESHOLD]
+
+    return Precomputed(
+        chunk=chunk,
+        ssa=ssa,
+        live=live,
+        inputs=inputs,
+        behavioral_inputs=behavioral_inputs,
+        input_mags=input_mags,
+        reg_outs=actual_reg_outs,
+        out_regs=out_regs,
+        out_pcs=out_pcs,
+        out_mags=out_mags,
+        pc_explicit=pc_explicit,
+    )
+
+
+def chunk_distance_cached(pre_a, pre_b, anchor_states):
+    """Symmetric distance between two Precomputed chunks.
+
+    Implementation note: the underlying directional distance (which
+    permutes b's input state under σ but leaves a's at baseline) isn't
+    symmetric in a/b. We average both directions to recover symmetry.
+    The 2× cost vs a single direction is the price.
+    """
+    d_ab = _chunk_distance_directional(pre_a, pre_b, anchor_states)
+    d_ba = _chunk_distance_directional(pre_b, pre_a, anchor_states)
+    return 0.5 * (d_ab + d_ba)
+
+
+def _chunk_distance_directional(pre_a, pre_b, anchor_states):
+    """One-directional distance: a is at baseline, b is re-evaluated
+    under σ-permuted states for each candidate bijection."""
+    if (not pre_a.reg_outs and not pre_b.reg_outs
+            and not pre_a.pc_explicit and not pre_b.pc_explicit):
+        return 0.0
+
+    inputs_a = pre_a.behavioral_inputs
+    inputs_b = pre_b.behavioral_inputs
+
+    bijections = list(partial_bijections(inputs_a, inputs_b))
+    if not bijections:
+        bijections = [((), ())]
+
+    # PC is compared only when at least one chunk explicitly writes it.
+    # If both are ALU-only (implicit PC = 4*chunk_len), PC values are
+    # length-determined and not meaningful behavioral signal. This
+    # preserves cross-syntax equivalence between chunks computing the
+    # same register-state transformation with different lengths
+    # (e.g., double-ADD ≡ SLLI must reach distance 0).
+    compare_pc = pre_a.pc_explicit or pre_b.pc_explicit
+
+    best = float('inf')
+    for a_keys, b_keys in bijections:
+        b_states = anchor_states.copy()
+        if a_keys:
+            for ra, rb in zip(a_keys, b_keys):
+                b_states[:, rb] = anchor_states[:, ra]
+            b_states[:, 0] = 0
+
+        b_out_regs, b_out_pcs = _eval_ssa_numpy(
+            pre_b.ssa, len(pre_b.chunk), b_states, pre_b.live)
+
+        # Hungarian on regular outputs by per-state loglog'd absolute-
+        # value residual.
+        if pre_a.reg_outs and pre_b.reg_outs:
+            ra_vals = pre_a.out_regs[:, pre_a.reg_outs]
+            rb_vals = b_out_regs[:, pre_b.reg_outs]
+            diff = (ra_vals[:, :, None].astype(np.int64)
+                    - rb_vals[:, None, :].astype(np.int64))
+            cost = _loglog(diff).mean(axis=0)
+            row_ind, col_ind = linear_sum_assignment(cost)
+            matched_residual = float(cost[row_ind, col_ind].sum())
+            matched_a = {pre_a.reg_outs[i] for i in row_ind}
+            matched_b = {pre_b.reg_outs[j] for j in col_ind}
+        else:
+            matched_residual = 0.0
+            matched_a = set()
+            matched_b = set()
+
+        # Edit costs: behavioral magnitudes of unaligned slots.
+        unaligned_out_cost = (
+            sum(pre_a.out_mags[r]
+                for r in pre_a.reg_outs if r not in matched_a)
+            + sum(pre_b.out_mags[r]
+                  for r in pre_b.reg_outs if r not in matched_b)
+        )
+        unaligned_a_inputs = set(inputs_a) - set(a_keys)
+        unaligned_b_inputs = set(inputs_b) - set(b_keys)
+        unaligned_in_cost = (
+            sum(pre_a.input_mags[r] for r in unaligned_a_inputs)
+            + sum(pre_b.input_mags[r] for r in unaligned_b_inputs)
+        )
+
+        if compare_pc:
+            pc_residual = float(_loglog(
+                pre_a.out_pcs.astype(np.int64) - b_out_pcs.astype(np.int64)
+            ).mean())
+        else:
+            pc_residual = 0.0
+
+        total = (matched_residual + unaligned_out_cost
+                 + unaligned_in_cost + pc_residual)
+        if total < best:
+            best = total
+        if best <= 0.0:
+            break
+
+    return best
+
+
+def chunk_distance(chunk_a, chunk_b, n_states=16, seed=0):
+    """Compute the behavioral distance between two chunks.
+
+    Returns >= 0. 0 iff behaviorally equivalent on the sampled anchor
+    states (probabilistic). For batched use across many partner pairs,
+    prefer precompute_chunk + chunk_distance_cached so anchor execution
+    + sensitivity analysis is amortized.
+
+    Raises NotImplementedError if either chunk has memory ops.
+    """
+    anchor_states = make_anchor_states(n_states, seed)
+    pre_a = precompute_chunk(chunk_a, anchor_states)
+    pre_b = precompute_chunk(chunk_b, anchor_states)
+    return chunk_distance_cached(pre_a, pre_b, anchor_states)

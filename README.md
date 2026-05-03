@@ -100,12 +100,11 @@ losses saturated to near-zero. Loss-weight rebalancing and longer
 training are the immediate follow-ups. See EXPERIMENT_LOG.md
 Phase 11 for full analysis.
 
-**Pipeline.** Three-stage CPU-then-GPU pipe:
-`gen_seq_batches | chunk_t2 | train_t2`. Boundary detection +
-invalidity augmentation are CPU-only data-prep (in
-`datagen/chunkgen.py`); the trainer only does T1 + T2 forward
-passes and gradient updates. 4 parallel `gen_seq_batches` workers
-sustain 99% GPU utilization on a single 16-core machine.
+**Pipeline.** Multi-stage CPU-then-GPU pipe:
+`gen_chunk_batches | to_pair_batches | train_compressor`. CPU stages
+generate instruction chunks and compute pair distances; the trainer
+only does forward passes and gradient updates. Multiple parallel
+upstream workers via `mux_batches` saturate the GPU.
 
 **GPU batch emulator.** All 37 RV32I opcodes executable in parallel
 via `torch.where`, 1.69ms for B=4096. Enables fully-GPU REINFORCE

@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from scripts._batch_util import binary_stdout, detect_format
+from scripts._batch_util import binary_stdout, detect_format, read_batch_or_error
 
 
 def main():
@@ -37,14 +37,14 @@ def main():
                     sys.exit(1)
                 count = 0
                 while True:
-                    try:
-                        data = fmt.read_bytes(f)
-                    except EOFError as e:
-                        print(f'WARNING: {path}: {e}', file=sys.stderr)
-                        if not args.lenient:
-                            sys.exit(1)
+                    data, err = read_batch_or_error(
+                        fmt, f, lenient=args.lenient)
+                    if data is None and err is None:
                         break
                     if data is None:
+                        print(f'WARNING: {path}: {err}', file=sys.stderr)
+                        if not args.lenient:
+                            sys.exit(1)
                         break
                     out.write(data)
                     count += 1

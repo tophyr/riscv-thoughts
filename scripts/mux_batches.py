@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
-"""Multiplex multiple binary batch streams into one (RVS or RVB).
+"""Multiplex multiple RVT batch streams into one.
 
-Spawns generator workers or reads from files/pipes. All inputs
-must be the same format.
+Spawns gen_batches.py workers and/or reads from files/pipes. All
+inputs must be the same format (currently only RVT exists).
 
 Usage:
-    # Single-instruction batches:
-    mux_batches.py --gen instr --gen-count 16 --n-batches 1000 > corpus.bin
-
-    # Sequence batches:
-    mux_batches.py --gen seq --gen-count 16 --n-batches 1000 > seqs.bin
+    # Spawn N parallel gen_batches workers:
+    mux_batches.py --gen-count 16 --n-batches 1000 \\
+        --rule branch+cap=8 --twins 3 --partners 20 > corpus.rvt
 
     # File inputs (auto-detected):
-    mux_batches.py 1:local.bin 8:remote.bin > combined.bin
+    mux_batches.py 1:local.rvt 8:remote.rvt > combined.rvt
 """
 
 import argparse
@@ -25,7 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from scripts._batch_util import binary_stdout, detect_format, peek_format, RVS, RVB
+from scripts._batch_util import binary_stdout, peek_format, RVT
 
 
 def _reader(f, q, idx, fmt):
@@ -160,39 +158,29 @@ def main():
     p.add_argument('--shuffle-seed', type=int, default=42)
     p.add_argument('-v', '--verbose', action='count', default=0)
 
-    g = p.add_argument_group('generator spawning')
-    g.add_argument('--gen', choices=['instr', 'seq'], default=None,
-                   help='Type of generator to spawn')
+    g = p.add_argument_group('gen_batches spawning')
     g.add_argument('--gen-count', type=int, default=0, metavar='N',
-                   help='Spawn N generator workers')
+                   help='Spawn N gen_batches workers')
     g.add_argument('--gen-weight', type=float, default=1.0)
     g.add_argument('--n-batches', type=int, default=1000)
-    g.add_argument('--batch-size', type=int, default=None)
-    g.add_argument('--n-inputs', type=int, default=None)
-    g.add_argument('--max-block-len', type=int, default=5,
-                   help='For seq generator')
+    g.add_argument('--batch-size', type=int, default=128)
+    g.add_argument('--rule', default='branch+cap=8')
+    g.add_argument('--twins', type=int, default=3)
+    g.add_argument('--partners', type=int, default=20)
+    g.add_argument('--n-states', type=int, default=8)
+    g.add_argument('--anchor-seed', type=int, default=0)
+    g.add_argument('--inject-invalid', type=float, default=None)
+    g.add_argument('--inject-equiv', type=float, default=None)
     g.add_argument('--config', type=str, default=None,
-                   help='JSON config file for instr generator distribution')
+                   help='JSON config file for opcode distribution')
     g.add_argument('--seed', type=int, default=42)
 
     args = p.parse_args()
 
-    if not args.inputs and not args.gen:
-        p.error('Provide input files and/or --gen TYPE --gen-count N')
+    if not args.inputs and args.gen_count == 0:
+        p.error('Provide input files and/or --gen-count N')
 
-    # Determine format and defaults.
-    if args.gen == 'instr':
-        fmt = RVB
-        batch_size = args.batch_size or 4096
-        n_inputs = args.n_inputs or 32
-    elif args.gen == 'seq':
-        fmt = RVS
-        batch_size = args.batch_size or 256
-        n_inputs = args.n_inputs or 4
-    else:
-        fmt = None
-        batch_size = args.batch_size or 4096
-        n_inputs = args.n_inputs or 32
+    fmt = RVT  # Single format; mux preserves it.
 
     out = binary_stdout()
     files = []
@@ -207,9 +195,7 @@ def main():
             has_explicit_weight = True
         f = open(path, 'rb')
         file_fmt = peek_format(f)
-        if fmt is None:
-            fmt = file_fmt
-        elif file_fmt.name != fmt.name:
+        if file_fmt.name != fmt.name:
             print(f'ERROR: {path}: format {file_fmt.name} != {fmt.name}',
                   file=sys.stderr)
             sys.exit(1)
@@ -217,20 +203,21 @@ def main():
         weights.append(weight)
         file_handles.append(f)
 
-    if args.gen and args.gen_count > 0:
-        if args.gen == 'instr':
-            script = str(Path(__file__).resolve().parent / 'gen_instr_batches.py')
-            base_cmd = [sys.executable, script,
-                        '--batch-size', str(batch_size),
-                        '--n-inputs', str(n_inputs)]
-            if args.config:
-                base_cmd += ['--config', args.config]
-        else:
-            script = str(Path(__file__).resolve().parent / 'gen_seq_batches.py')
-            base_cmd = [sys.executable, script,
-                        '--batch-size', str(batch_size),
-                        '--n-inputs', str(n_inputs),
-                        '--max-block-len', str(args.max_block_len)]
+    if args.gen_count > 0:
+        script = str(Path(__file__).resolve().parent / 'gen_batches.py')
+        base_cmd = [sys.executable, script,
+                    '--rule', args.rule,
+                    '--batch-size', str(args.batch_size),
+                    '--twins', str(args.twins),
+                    '--partners', str(args.partners),
+                    '--n-states', str(args.n_states),
+                    '--anchor-seed', str(args.anchor_seed)]
+        if args.inject_invalid is not None:
+            base_cmd += ['--inject-invalid', str(args.inject_invalid)]
+        if args.inject_equiv is not None:
+            base_cmd += ['--inject-equiv', str(args.inject_equiv)]
+        if args.config:
+            base_cmd += ['--config', args.config]
         if args.verbose >= 2:
             base_cmd.append('-v')
 
