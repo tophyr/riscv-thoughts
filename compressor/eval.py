@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from scipy import stats
 
 from datagen.batch import padding_mask
+from datagen.compare import pairwise_distance_canonical
 from datagen.generate import (
     DEFAULT_DISTRIBUTION, _build_opcode_table,
     MANIFEST, sample_binding, materialize, random_instruction,
@@ -36,13 +37,21 @@ from .train import encode_instrs, prepare_decoder_targets
 # ===========================================================================
 
 @torch.no_grad()
-def pair_distance_correlation(encoder, batches, *, device, max_batches=100):
-    """Pearson/Spearman correlation between encoder pairwise distance
-    and target distance over each batch's pre-computed pair structure.
+def pair_distance_correlation(encoder, batches, *, device, max_batches=100,
+                              scale=10.0):
+    """Pearson/Spearman correlation between encoder direction-distance
+    and tanh-compressed behavioral_distance over each batch's pair
+    structure.
+
+    Matches the formulation in compressor.train.behavioral_loss:
+    vectors are direction-normalized (magnitude is for validity, not
+    behavioral); targets are compressed via 2*tanh(d/scale) into the
+    [0, 2] range that L2 between unit vectors lives in.
 
     batches: iterable of datagen.batch.Batch (RVT). Pairs with target
              distance 0 (cluster siblings) and pairs with computed
-             chunk_distance both contribute.
+             behavioral_distance both contribute.
+    scale:   should match the training-time --behavioral-scale.
 
     Returns: {'pearson': r, 'spearman': r, 'n_pairs': int}.
     """
@@ -53,15 +62,45 @@ def pair_distance_correlation(encoder, batches, *, device, max_batches=100):
     for i, batch in enumerate(batches):
         if i >= max_batches:
             break
-        if batch.pair_indices.shape[0] == 0:
-            continue
         tok = torch.from_numpy(batch.tokens).to(device)
         pad = torch.from_numpy(padding_mask(batch)).to(device)
         vecs = encoder.encode(tok, pad)
-        ij = torch.from_numpy(batch.pair_indices.astype(np.int64)).to(device)
-        d_pred = (vecs[ij[:, 0]] - vecs[ij[:, 1]]).norm(dim=-1)
-        model_dists.append(d_pred.cpu().numpy())
-        target_dists.append(batch.distances.copy())
+
+        # Dispatch on the batch's payload mode (matches train_encoder).
+        if batch.row_outputs.shape[0] > 0:
+            # Row-outputs mode: form (B, B) target on-device, take all
+            # off-diagonal pairs where both rows are pair_valid.
+            ro = torch.from_numpy(batch.row_outputs).to(device)
+            n_in = torch.from_numpy(batch.row_n_inputs).to(device).long()
+            in_mags = torch.from_numpy(batch.row_input_mags).to(device)
+            hrd = torch.from_numpy(batch.row_has_rd).to(device)
+            rmag = torch.from_numpy(batch.row_rd_mag).to(device)
+            pvalid = torch.from_numpy(batch.pair_valid).to(device)
+            if not pvalid.any():
+                continue
+            target_d = pairwise_distance_canonical(
+                ro, n_in, in_mags, hrd, rmag)              # (B, B)
+            vecs_n = F.normalize(vecs, dim=-1, eps=1e-12)
+            cos_sim = vecs_n @ vecs_n.T                    # (B, B)
+            d_pred = 1.0 - cos_sim
+            d_target = 2.0 * torch.tanh(target_d / scale)
+            mask = pvalid[:, None] & pvalid[None, :]
+            eye = torch.eye(
+                pvalid.shape[0], dtype=torch.bool, device=device)
+            mask = mask & ~eye
+            model_dists.append(d_pred[mask].cpu().numpy())
+            target_dists.append(d_target[mask].cpu().numpy())
+        else:
+            if batch.pair_indices.shape[0] == 0:
+                continue
+            ij = torch.from_numpy(
+                batch.pair_indices.astype(np.int64)).to(device)
+            cos_sim = F.cosine_similarity(
+                vecs[ij[:, 0]], vecs[ij[:, 1]], dim=-1, eps=1e-12)
+            d_pred = 1.0 - cos_sim
+            d_target = 2.0 * np.tanh(batch.distances / scale)
+            model_dists.append(d_pred.cpu().numpy())
+            target_dists.append(d_target)
 
     if not model_dists:
         return {'pearson': float('nan'), 'spearman': float('nan'),

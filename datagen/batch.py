@@ -29,10 +29,11 @@ import numpy as np
 
 from emulator import Instruction
 from tokenizer import PAD, encode_instruction
-from tokenizer.tokenizer import decode_instruction
+from tokenizer.tokenizer import MAX_INSTR_TOKENS, decode_instruction
 
 from .compare import (
-    chunk_distance_cached, make_anchor_states, precompute_chunk,
+    behavioral_distance_cached, make_anchor_states, precompute_chunk,
+    precompute_row_outputs,
 )
 from .generate import (
     DEFAULT_DISTRIBUTION, _build_opcode_table, validate_distribution,
@@ -206,27 +207,63 @@ class Chunk:
 
 @dataclass
 class Batch:
-    """Serialized batch: flat tokens + validity flags + pair structure.
+    """Serialized batch: flat tokens + validity + per-instruction
+    segmentation + one of two pair-distance payloads.
 
-    All arrays sized for B chunks; pair_indices and distances sized
-    for P pairs (P can be 0).
+    Two mutually exclusive pair-distance modes (training-side
+    branches on which is populated):
+
+      Pair mode (multi-instruction chunks):
+        pair_indices (P, 2) and distances (P,) carry pre-computed
+        scalar pair distances from per-pair CPU loop. row_* fields
+        all have first-dim = 0.
+
+      Row-outputs mode (single-instruction T1 chunks):
+        Per-row canonical execution data carried in the row_*
+        fields, sized RB = B. The (B, B) target distance matrix
+        forms at training time on-device via
+        `pairwise_distance_canonical`. pair_indices/distances are
+        empty (P = 0). pair_valid masks which rows are
+        behaviorally-meaningful (False for invalid windows and
+        mem-op rows whose distance is undefined in V1 scope).
+
+    All other arrays sized for B chunks; instr_lens sized for
+    max_n_instrs columns (0 past actual count, 0 for invalid).
     """
-    tokens:       np.ndarray   # (B, max_tokens) int64
-    token_lens:   np.ndarray   # (B,) int32
-    valid:        np.ndarray   # (B,) bool
-    pair_indices: np.ndarray   # (P, 2) int32
-    distances:    np.ndarray   # (P,) float32
+    tokens:         np.ndarray   # (B, max_tokens) int64
+    token_lens:     np.ndarray   # (B,) int32
+    valid:          np.ndarray   # (B,) bool — complete instruction window
+    instr_lens:     np.ndarray   # (B, max_n_instrs) int32
+    pair_indices:   np.ndarray   # (P, 2) int32 — pair-mode only
+    distances:      np.ndarray   # (P,) float32 — pair-mode only
+    # Row-outputs mode payload (RB=B if active, RB=0 otherwise):
+    row_outputs:    np.ndarray   # (RB, K, n_anchors, n_channels) float32
+    row_n_inputs:   np.ndarray   # (RB,) int8 — count of behavioral inputs
+    row_input_mags: np.ndarray   # (RB, K, max_in) float32 — canonical-order
+    row_has_rd:     np.ndarray   # (RB,) bool
+    row_rd_mag:     np.ndarray   # (RB,) float32
+    pair_valid:     np.ndarray   # (RB,) bool — meaningful row_outputs
 
 
 RVT_FORMAT = BinaryFormat(
-    magic=b'RVT\x00', version=1,
-    header_fields=['B', 'max_tokens', 'P'],
+    magic=b'RVT\x00', version=3,
+    header_fields=['B', 'max_tokens', 'max_n_instrs', 'P',
+                   'RB', 'K', 'n_anchors', 'n_channels', 'max_in'],
     body_fields=[
         BodyField('tokens', np.dtype(np.int64), ('B', 'max_tokens')),
         BodyField('token_lens', np.dtype(np.int32), ('B',)),
         BodyField('valid', np.dtype(np.bool_), ('B',)),
+        BodyField('instr_lens', np.dtype(np.int32), ('B', 'max_n_instrs')),
         BodyField('pair_indices', np.dtype(np.int32), ('P', 2)),
         BodyField('distances', np.dtype(np.float32), ('P',)),
+        BodyField('row_outputs', np.dtype(np.float32),
+                  ('RB', 'K', 'n_anchors', 'n_channels')),
+        BodyField('row_n_inputs', np.dtype(np.int8), ('RB',)),
+        BodyField('row_input_mags', np.dtype(np.float32),
+                  ('RB', 'K', 'max_in')),
+        BodyField('row_has_rd', np.dtype(np.bool_), ('RB',)),
+        BodyField('row_rd_mag', np.dtype(np.float32), ('RB',)),
+        BodyField('pair_valid', np.dtype(np.bool_), ('RB',)),
     ],
 )
 
@@ -235,39 +272,162 @@ RVT_FORMAT = BinaryFormat(
 # Pack / unpack
 # ===========================================================================
 
-def pack_batch(chunks, pairs, distances):
-    """Build a Batch from chunks + (parallel) pair lists.
+@dataclass
+class RowOutputsPayload:
+    """Per-row arrays produced by build_row_outputs and consumed by
+    pack_batch when in row-outputs mode. All sized for actual rows
+    (length-actual_B); pack_batch pads to target_B."""
+    row_outputs: np.ndarray     # (actual_B, K, n_anchors, n_channels) float
+    n_inputs: np.ndarray        # (actual_B,) int8
+    input_mags: np.ndarray      # (actual_B, K, max_in) float
+    has_rd: np.ndarray          # (actual_B,) bool
+    rd_mag: np.ndarray          # (actual_B,) float
+    pair_valid: np.ndarray      # (actual_B,) bool
+
+
+def pack_batch(chunks, pairs, distances, *,
+               target_B=None, target_max_tokens=None,
+               target_max_n_instrs=None, target_P=None,
+               row_outputs_payload=None):
+    """Build a Batch from chunks + (parallel) pair lists, optionally
+    with row-outputs payload.
 
     chunks:    list[Chunk]
-    pairs:     iterable of (i, j) into chunks (must reference valid rows)
-    distances: iterable of float aligned with pairs
+    pairs:     iterable of (i, j) into chunks (must reference valid rows).
+               Pass empty in row-outputs mode.
+    distances: iterable of float aligned with pairs. Pass empty in
+               row-outputs mode.
+
+    target_*:  optional fixed shape parameters. If specified, arrays
+               are padded out to these exact sizes (raises ValueError
+               on overflow). When None, computed from the data —
+               which means each batch can have a different shape, and
+               downstream PyTorch caching allocators fragment over
+               training runs of any meaningful length. Pass these
+               from collect_into_batches for fixed-shape output.
+               Padding rows have valid=False, token_lens=0,
+               instr_lens=0; padding pairs are (0, 0) with distance
+               0.0 — naturally zero loss, no special handling needed
+               in training.
+
+    row_outputs_payload:
+        Optional RowOutputsPayload. When supplied, the row-* fields
+        are populated (RB = target_B). When None, RB = 0 and the
+        row-* body fields are empty — pair-indices mode.
     """
     if not chunks:
         raise ValueError('pack_batch requires at least one chunk')
-    B = len(chunks)
-    max_tokens = max(len(c.tokens) for c in chunks)
+
+    actual_B = len(chunks)
+    actual_max_tokens = max(len(c.tokens) for c in chunks)
+
+    n_instrs_per_chunk = [
+        len(c.instructions) if c.valid and c.instructions is not None
+        else 0
+        for c in chunks
+    ]
+    actual_max_n_instrs = max(max(n_instrs_per_chunk, default=0), 1)
+
+    pairs_list = list(pairs)
+    distances_list = list(distances)
+    actual_P = len(pairs_list)
+    if len(distances_list) != actual_P:
+        raise ValueError(
+            f'pairs ({actual_P}) and distances ({len(distances_list)}) '
+            f'length mismatch')
+
+    # Resolve target shapes (data-driven if not specified).
+    B = target_B if target_B is not None else actual_B
+    max_tokens = (target_max_tokens if target_max_tokens is not None
+                  else actual_max_tokens)
+    max_n_instrs = (target_max_n_instrs if target_max_n_instrs is not None
+                    else actual_max_n_instrs)
+    P = target_P if target_P is not None else actual_P
+
+    if actual_B > B:
+        raise ValueError(
+            f'B={actual_B} exceeds target_B={B}')
+    if actual_max_tokens > max_tokens:
+        raise ValueError(
+            f'max_tokens={actual_max_tokens} exceeds '
+            f'target_max_tokens={max_tokens}')
+    if actual_max_n_instrs > max_n_instrs:
+        raise ValueError(
+            f'max_n_instrs={actual_max_n_instrs} exceeds '
+            f'target_max_n_instrs={max_n_instrs}')
+    if actual_P > P:
+        raise ValueError(
+            f'P={actual_P} exceeds target_P={P}')
+
     tokens = np.full((B, max_tokens), PAD, dtype=np.int64)
     token_lens = np.zeros(B, dtype=np.int32)
     valid = np.zeros(B, dtype=bool)
+    instr_lens = np.zeros((B, max_n_instrs), dtype=np.int32)
     for i, c in enumerate(chunks):
         n = len(c.tokens)
         tokens[i, :n] = c.tokens
         token_lens[i] = n
         valid[i] = c.valid
-    pairs = list(pairs)
-    distances = list(distances)
-    if pairs:
-        pair_arr = np.asarray(pairs, dtype=np.int32).reshape(-1, 2)
-        dist_arr = np.asarray(distances, dtype=np.float32)
-        if dist_arr.shape[0] != pair_arr.shape[0]:
-            raise ValueError(
-                f'pairs ({pair_arr.shape[0]}) and distances '
-                f'({dist_arr.shape[0]}) length mismatch')
+        if c.valid and c.instructions is not None:
+            for j, instr in enumerate(c.instructions):
+                instr_lens[i, j] = len(encode_instruction(instr))
+
+    pair_arr = np.zeros((P, 2), dtype=np.int32)
+    dist_arr = np.zeros(P, dtype=np.float32)
+    if pairs_list:
+        pair_arr[:actual_P] = np.asarray(
+            pairs_list, dtype=np.int32).reshape(-1, 2)
+        dist_arr[:actual_P] = np.asarray(distances_list, dtype=np.float32)
+
+    if row_outputs_payload is None:
+        # pair-indices mode: row-outputs fields are empty.
+        row_outputs_arr = np.zeros((0, 0, 0, 0), dtype=np.float32)
+        n_inputs_arr = np.zeros((0,), dtype=np.int8)
+        input_mags_arr = np.zeros((0, 0, 0), dtype=np.float32)
+        has_rd_arr = np.zeros((0,), dtype=bool)
+        rd_mag_arr = np.zeros((0,), dtype=np.float32)
+        pair_valid_arr = np.zeros((0,), dtype=bool)
     else:
-        pair_arr = np.zeros((0, 2), dtype=np.int32)
-        dist_arr = np.zeros(0, dtype=np.float32)
+        # row-outputs mode: RB = B; pad payload's actual_B to B.
+        p = row_outputs_payload
+        if p.row_outputs.shape[0] != actual_B:
+            raise ValueError(
+                f'row_outputs_payload.row_outputs first dim '
+                f'({p.row_outputs.shape[0]}) must equal '
+                f'actual_B ({actual_B})')
+        K, n_anchors, n_channels = p.row_outputs.shape[1:]
+        max_in = p.input_mags.shape[2]
+
+        row_outputs_arr = np.zeros((B, K, n_anchors, n_channels),
+                                   dtype=np.float32)
+        row_outputs_arr[:actual_B] = p.row_outputs.astype(
+            np.float32, copy=False)
+
+        n_inputs_arr = np.zeros((B,), dtype=np.int8)
+        n_inputs_arr[:actual_B] = p.n_inputs.astype(np.int8, copy=False)
+
+        input_mags_arr = np.zeros((B, K, max_in), dtype=np.float32)
+        input_mags_arr[:actual_B] = p.input_mags.astype(
+            np.float32, copy=False)
+
+        has_rd_arr = np.zeros((B,), dtype=bool)
+        has_rd_arr[:actual_B] = p.has_rd
+
+        rd_mag_arr = np.zeros((B,), dtype=np.float32)
+        rd_mag_arr[:actual_B] = p.rd_mag.astype(np.float32, copy=False)
+
+        pair_valid_arr = np.zeros((B,), dtype=bool)
+        pair_valid_arr[:actual_B] = p.pair_valid
+
     return Batch(tokens=tokens, token_lens=token_lens, valid=valid,
-                 pair_indices=pair_arr, distances=dist_arr)
+                 instr_lens=instr_lens,
+                 pair_indices=pair_arr, distances=dist_arr,
+                 row_outputs=row_outputs_arr,
+                 row_n_inputs=n_inputs_arr,
+                 row_input_mags=input_mags_arr,
+                 row_has_rd=has_rd_arr,
+                 row_rd_mag=rd_mag_arr,
+                 pair_valid=pair_valid_arr)
 
 
 def padding_mask(batch):
@@ -288,7 +448,7 @@ def unpack_chunks(batch):
 # Generation: chunks -> twins -> pairs -> Batch
 # ===========================================================================
 
-# Memory ops aren't supported by chunk_distance V1; pair construction
+# Memory ops aren't supported by behavioral_distance V1; pair construction
 # filters chunks containing them.
 _MEM_OPS = frozenset({'LB', 'LBU', 'LH', 'LHU', 'LW', 'SB', 'SH', 'SW'})
 
@@ -321,9 +481,9 @@ def build_pairs(chunks, twins, partners, anchor_states, rng):
     of size (twins + 1). Within a cluster every (a, b) pair has
     distance 0 (relabeling is equivalence-preserving). Across clusters,
     `partners - twins` random non-cluster partners per row get their
-    distance computed via chunk_distance.
+    distance computed via behavioral_distance.
 
-    Memory-op chunks are dropped (chunk_distance V1 doesn't support them).
+    Memory-op chunks are dropped (behavioral_distance V1 doesn't support them).
 
     Returns (chunks_out, pair_indices, distances) where chunks_out
     extends `chunks` with the new twins.
@@ -406,10 +566,88 @@ def build_pairs(chunks, twins, partners, anchor_states, rng):
         picks = rng.choice(pool, size=n_random, replace=replace)
         for j in picks.tolist():
             pair_indices.append((i, int(j)))
-            distances.append(float(chunk_distance_cached(
+            distances.append(float(behavioral_distance_cached(
                 _pre(i), _pre(int(j)), anchor_states)))
 
     return chunks_out, pair_indices, distances
+
+
+# Row-outputs mode constants. K=2 covers the rs1↔rs2 swap; max_in=2
+# covers single-instruction max input cardinality. Pinned in the wire
+# format so consumers don't need a per-batch reshape.
+_ROW_K = 2
+_ROW_MAX_IN = 2
+_ROW_N_CHANNELS = 2  # (rd_value, pc_value)
+
+
+def build_row_outputs(chunks, twins, anchor_states, rng):
+    """Add `twins` relabeled copies of each valid non-mem-op single-
+    instruction source chunk and compute the per-row canonical outputs
+    payload for every row.
+
+    Like `build_pairs` but for the row-outputs mode: the per-pair
+    distance computation is deferred to training-time on-GPU via
+    `pairwise_distance_canonical`. This function only produces the
+    per-row data.
+
+    All chunks must be single-instruction (or invalid windows). Memory
+    ops are kept in the chunks list (so the encoder still sees their
+    tokens for magnitude-validity training) but their row_outputs is
+    zero and pair_valid is False — distance loss skips them.
+
+    Returns (chunks_out, payload) where chunks_out extends `chunks`
+    with twin rows and payload is a RowOutputsPayload sized for
+    chunks_out.
+    """
+    chunks_out = []
+    rows = []  # list of (row_outputs, n_inputs, input_mags, has_rd, rd_mag, pair_valid)
+
+    n_anchors = anchor_states.shape[0]
+    zero_row_outputs = np.zeros(
+        (_ROW_K, n_anchors, _ROW_N_CHANNELS), dtype=np.float64)
+    zero_input_mags = np.zeros((_ROW_K, _ROW_MAX_IN), dtype=np.float64)
+    empty_row = (zero_row_outputs, 0, zero_input_mags,
+                 False, 0.0, False)
+
+    for ch in chunks:
+        chunks_out.append(ch)
+        if (not ch.valid
+                or ch.instructions is None
+                or len(ch.instructions) != 1
+                or _has_mem_ops(ch.instructions)):
+            # Invalid window, multi-instruction (shouldn't occur in
+            # row-outputs mode), or mem-op chunk: zero row, not
+            # pair-valid.
+            rows.append(empty_row)
+            continue
+
+        instr = ch.instructions[0]
+        ro = precompute_row_outputs(instr, anchor_states)
+        rows.append((ro.row_outputs, ro.n_inputs, ro.input_mags,
+                     ro.has_rd, ro.rd_mag, True))
+
+        for _ in range(twins):
+            twin_instrs = random_relabel(ch.instructions, rng)
+            chunks_out.append(_make_valid_chunk(twin_instrs))
+            if _has_mem_ops(twin_instrs):
+                # Relabeling shouldn't introduce mem ops, but be defensive.
+                rows.append(empty_row)
+                continue
+            twin_ro = precompute_row_outputs(twin_instrs[0], anchor_states)
+            rows.append((twin_ro.row_outputs, twin_ro.n_inputs,
+                         twin_ro.input_mags, twin_ro.has_rd, twin_ro.rd_mag,
+                         True))
+
+    n_rows = len(rows)
+    payload = RowOutputsPayload(
+        row_outputs=np.stack([r[0] for r in rows]),
+        n_inputs=np.array([r[1] for r in rows], dtype=np.int8),
+        input_mags=np.stack([r[2] for r in rows]),
+        has_rd=np.array([r[3] for r in rows], dtype=bool),
+        rd_mag=np.array([r[4] for r in rows], dtype=np.float32),
+        pair_valid=np.array([r[5] for r in rows], dtype=bool),
+    )
+    return chunks_out, payload
 
 
 # ===========================================================================
@@ -446,7 +684,9 @@ def generate_chunks(rule, rng, *, opcode_table=None,
 def collect_into_batches(chunks_iter, *, batch_size, twins, partners,
                          anchor_states, rng,
                          invalid_rate=0.0, invalid_provider=None,
-                         max_invalid_window=None):
+                         max_invalid_window=None,
+                         max_chunk_len=None,
+                         row_outputs_mode=False):
     """Consume a Chunk stream, build Batches of `batch_size` rows.
 
     invalid_rate>0 mixes invalid windows in at the given fraction of
@@ -456,12 +696,51 @@ def collect_into_batches(chunks_iter, *, batch_size, twins, partners,
     Each batch ends up with `n_invalid = round(batch_size * invalid_rate)`
     invalid rows + `batch_size - n_invalid` valid source slots; twins
     are added on top of the valid-source slots, growing the batch.
+
+    max_chunk_len: maximum number of instructions per chunk under the
+                   chunking rule. When specified, every emitted batch
+                   has identical shape — B, max_tokens, max_n_instrs,
+                   and P all padded to deterministic upper bounds.
+                   This prevents PyTorch's caching allocator from
+                   fragmenting over a long training run with stochas-
+                   tically-varying batch shapes (a real OOM trigger
+                   we hit at ~step 500 of t1_cosine_full). When None,
+                   shapes are data-driven (legacy behavior).
+
+    row_outputs_mode: if True, switch to single-instruction T1 row-
+                   outputs path. partners is ignored (no per-pair
+                   distance computation); per-row canonical outputs
+                   are computed and shipped instead, and the (B, B)
+                   target distance matrix forms at training time.
+                   Requires single-instruction chunks (e.g. --rule
+                   single).
     """
     if invalid_rate > 0 and invalid_provider is None:
         raise ValueError('invalid_rate > 0 requires invalid_provider')
 
     n_invalid = int(round(batch_size * invalid_rate))
     n_valid_sources = batch_size - n_invalid
+
+    # Compute fixed-shape upper bounds when max_chunk_len is given.
+    # These match the batch shape that would be produced if EVERY
+    # valid source were paired (no mem-op filtering): all valid
+    # sources contribute (twins+1) rows; invalids contribute 1 row
+    # each. Mem-op filtering and length variation produce smaller
+    # actual shapes, which then get padded up to these targets.
+    if max_chunk_len is not None:
+        cluster_size = twins + 1
+        target_B = n_valid_sources * cluster_size + n_invalid
+        target_max_n_instrs = max_chunk_len
+        target_max_tokens = max_chunk_len * MAX_INSTR_TOKENS
+        if max_invalid_window is not None:
+            target_max_tokens = max(target_max_tokens, max_invalid_window)
+        target_P = (0 if row_outputs_mode
+                    else n_valid_sources * cluster_size * partners)
+    else:
+        target_B = None
+        target_max_n_instrs = None
+        target_max_tokens = None
+        target_P = None
 
     buf = []
     for ch in chunks_iter:
@@ -472,7 +751,24 @@ def collect_into_batches(chunks_iter, *, batch_size, twins, partners,
             invalids = [_make_invalid_chunk(invalid_provider())
                         for _ in range(n_invalid)]
             mixed = valid_sources + invalids
-            chunks_out, pairs, dists = build_pairs(
-                mixed, twins=twins, partners=partners,
-                anchor_states=anchor_states, rng=rng)
-            yield pack_batch(chunks_out, pairs, dists)
+            if row_outputs_mode:
+                chunks_out, payload = build_row_outputs(
+                    mixed, twins=twins,
+                    anchor_states=anchor_states, rng=rng)
+                yield pack_batch(
+                    chunks_out, [], [],
+                    target_B=target_B,
+                    target_max_tokens=target_max_tokens,
+                    target_max_n_instrs=target_max_n_instrs,
+                    target_P=target_P,
+                    row_outputs_payload=payload)
+            else:
+                chunks_out, pairs, dists = build_pairs(
+                    mixed, twins=twins, partners=partners,
+                    anchor_states=anchor_states, rng=rng)
+                yield pack_batch(
+                    chunks_out, pairs, dists,
+                    target_B=target_B,
+                    target_max_tokens=target_max_tokens,
+                    target_max_n_instrs=target_max_n_instrs,
+                    target_P=target_P)

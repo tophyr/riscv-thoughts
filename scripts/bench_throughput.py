@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read RVS/RVB/RVC batches from stdin and report throughput.
+"""Read RVT batches from stdin and report throughput.
 
 Counts batches per second and bytes per second over a rolling window.
 Used as the terminal stage in pipeline benchmarks: any pipeline that

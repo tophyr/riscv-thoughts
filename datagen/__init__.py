@@ -29,6 +29,6 @@ from .batch import (
 )
 
 from .compare import (
-    gvn_equivalent, chunk_distance, chunk_distance_cached,
+    gvn_equivalent, behavioral_distance, behavioral_distance_cached,
     precompute_chunk, make_anchor_states,
 )

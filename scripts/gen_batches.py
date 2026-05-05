@@ -75,6 +75,23 @@ def _parse_rule(spec):
     raise ValueError(f'Unknown rule: {spec!r}')
 
 
+def _max_chunk_len_for_rule(spec):
+    """Return the upper bound on instructions-per-chunk implied by
+    `spec`. None for cap-less rules where there's no fixed bound; that
+    case keeps batches data-shaped (legacy variable-shape behavior)."""
+    s = spec.strip()
+    if s == 'single':
+        return 1
+    if s.startswith('cap='):
+        return int(s[4:])
+    if s.startswith('branch+cap='):
+        return int(s[len('branch+cap='):])
+    if s.startswith('transform+cap='):
+        return int(s[len('transform+cap='):])
+    # 'branch' and 'transform' (no cap) — variable max chunk length.
+    return None
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -95,7 +112,7 @@ def main():
                    help='Partners per source (>= --twins; '
                         'K-T are random non-cluster).')
     p.add_argument('--n-states', type=int, default=8,
-                   help='Anchor states for chunk_distance.')
+                   help='Anchor states for behavioral_distance.')
     p.add_argument('--anchor-seed', type=int, default=0,
                    help='Anchor-states RNG seed (must match across workers).')
 
@@ -120,6 +137,7 @@ def main():
         sys.exit('--partners must be >= --twins')
 
     rule = _parse_rule(args.rule)
+    max_chunk_len = _max_chunk_len_for_rule(args.rule)
     rng = np.random.default_rng(args.seed)
     anchor_states = make_anchor_states(args.n_states, args.anchor_seed)
 
@@ -161,6 +179,11 @@ def main():
         eq_min_per_class=eq_min_per_class,
         eq_boost=eq_boost,
     )
+    # Single-instruction rule → row-outputs mode (per-row canonical
+    # outputs shipped, training forms (B,B) target distance on-GPU).
+    # Multi-instruction rules keep the per-pair CPU distance path.
+    row_outputs_mode = (args.rule.strip() == 'single')
+
     batches_iter = collect_into_batches(
         chunks_iter,
         batch_size=args.batch_size,
@@ -168,6 +191,8 @@ def main():
         anchor_states=anchor_states, rng=rng,
         invalid_rate=inv_rate, invalid_provider=invalid_provider,
         max_invalid_window=args.max_invalid_window,
+        max_chunk_len=max_chunk_len,
+        row_outputs_mode=row_outputs_mode,
     )
 
     out = binary_stdout()

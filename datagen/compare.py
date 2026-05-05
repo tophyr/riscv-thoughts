@@ -7,7 +7,7 @@ Two outputs from the same machinery, differing only in granularity:
       DAGs under register relabeling, commutativity, and dead-write
       elimination)?
 
-  chunk_distance(a, b) -> float >= 0
+  behavioral_distance(a, b) -> float >= 0
       Continuous: how different are these chunks behaviorally?
       Equivalence-preserving augmentations (relabeling, commutative
       arg swap, dead writes, cross-syntax aliases like XOR x,x ≡
@@ -27,10 +27,10 @@ Shared infrastructure:
   - SSA-numpy evaluator (eval_ssa_numpy) — evaluates an SSA graph on
     N anchor states using vectorized numpy ops. ~10× faster than per-
     state Python emulator dispatch and bit-equal for chunker-respecting
-    chunks. Used by chunk_distance for behavioral evaluation.
+    chunks. Used by behavioral_distance for behavioral evaluation.
 
 V1 scope: ALU R/I-type, LUI, AUIPC, B-type, JAL, JALR. Memory ops
-(LOAD/STORE) raise NotImplementedError in chunk_distance; gvn_equivalent
+(LOAD/STORE) raise NotImplementedError in behavioral_distance; gvn_equivalent
 handles them at the SSA level via anchored MEM_IN leaves.
 """
 
@@ -88,15 +88,17 @@ SUPPORTED_OPS = (
 # Lower 5 bits of shift amounts per RV32I spec.
 _SHIFT_MASK = np.int32(0x1f)
 
-# Penalty when one chunk reads/writes PC and the other doesn't.
-# Anchored membership is a hard categorical match in the distance
-# metric.
-ANCHORED_MISMATCH_PENALTY = 100.0
-
 # An input register's behavioral magnitude must exceed this to enter
 # the bijection search. Set just above floating-point noise so that
 # "no observable effect on any output" reliably filters out.
 BEHAVIORAL_RELEVANCE_THRESHOLD = 1e-9
+
+# Cap on the bijection search size. The number of partial bijections
+# is P(max(|a|, |b|), min(|a|, |b|)) — factorial in the smaller set.
+# 8! = 40320 is fast and bounded; above that we fall back to the
+# empty bijection (no input symmetry discovery; distance is an upper
+# bound for those pathological chunks).
+MAX_BIJECTION_SIZE = 8
 
 
 class UnsupportedOpError(ValueError):
@@ -362,7 +364,7 @@ def value_number(g, input_abstract_id, live=None):
 
 
 # ---------------------------------------------------------------------------
-# Partial bijection enumeration — shared by gvn_equivalent and chunk_distance
+# Partial bijection enumeration — shared by gvn_equivalent and behavioral_distance
 # ---------------------------------------------------------------------------
 
 def partial_bijections(set_a, set_b):
@@ -450,7 +452,7 @@ def gvn_equivalent(instrs_a, instrs_b):
 
 def make_anchor_states(n_states, seed):
     """Generate shared anchor states for distance computation. Two
-    chunks compared via chunk_distance must use the same anchor states."""
+    chunks compared via behavioral_distance must use the same anchor states."""
     rng = np.random.default_rng(seed)
     anchor_states = rng.integers(
         np.iinfo(np.int32).min, np.iinfo(np.int32).max,
@@ -469,7 +471,7 @@ def _eval_ssa_numpy(ssa, chunk_len, anchor_states, live=None):
     For chunker-respecting chunks (only the last instruction may be
     control flow), bit-equal to the Python emulator. For chunks with
     intra-chunk control flow the semantics differ (SSA evaluates every
-    node regardless of runtime PC dispatch) — chunk_distance's contract
+    node regardless of runtime PC dispatch) — behavioral_distance's contract
     excludes those cases.
     """
     n_states = anchor_states.shape[0]
@@ -607,6 +609,7 @@ def _loglog(x):
     return np.log1p(np.log1p(np.abs(x).astype(np.float64)))
 
 
+# Forward declaration; defined later in this file. Used by precompute_row_outputs.
 def _has_memory_ops(chunk):
     return any(instr.opcode in LOAD_TYPE or instr.opcode in STORE_TYPE
                for instr in chunk)
@@ -697,7 +700,7 @@ def precompute_chunk(chunk, anchor_states):
     """
     if _has_memory_ops(chunk):
         raise NotImplementedError(
-            'chunk_distance V1 does not support memory ops (LOAD/STORE)')
+            'behavioral_distance V1 does not support memory ops (LOAD/STORE)')
 
     ssa = to_ssa(chunk)
     live = live_nodes(ssa)
@@ -736,7 +739,227 @@ def precompute_chunk(chunk, anchor_states):
     )
 
 
-def chunk_distance_cached(pre_a, pre_b, anchor_states):
+# ---------------------------------------------------------------------------
+# Row-outputs path (single-instruction T1)
+# ---------------------------------------------------------------------------
+#
+# For single-instruction T1 chunks, the bijection space is uniform
+# (K <= 2: identity + rs1↔rs2 swap), the SSA execution is one numpy
+# op per node, and the per-pair distance has a tractable closed form.
+# So instead of the per-pair CPU loop pre-computing scalar distances,
+# the generator can ship per-row data and the consumer (training
+# script) forms the (B, B) target distance matrix as one fused
+# tensor op via `pairwise_distance_canonical`.
+#
+# Math identity: `pairwise_distance_canonical` reproduces
+# `behavioral_distance_cached` for single-instruction chunks. All
+# four terms — matched_residual, pc_residual, unaligned_in_cost,
+# unaligned_out_cost — are computed; the bijection min over K=2×K=2
+# is the analog of `partial_bijections` over input register sets of
+# size <= 2.
+#
+# Multi-instruction chunks keep the existing per-pair CPU loop. The
+# bijection space and SSA shape are too irregular to vectorize cleanly
+# (K up to 8! at MAX_BIJECTION_SIZE=8, variable graph shape per chunk).
+
+# Canonical input register slots: a row's first behavioral input
+# sources from anchor_states[:, _CANON_IN0], second from _CANON_IN1
+# (or swapped, for K=1). Any 1..31 pair works equivalently as long as
+# the same pair is used for every row in a batch.
+_CANON_IN0 = 1
+_CANON_IN1 = 2
+
+
+@dataclass
+class RowOutputs:
+    """Per-row data for the canonical broadcast distance.
+
+    Shape conventions:
+      K              = 2 (max bijection candidates for single instr)
+      max_in         = 2 (max behavioral inputs for single instr)
+      n_anchors      = anchor_states.shape[0]
+      n_channels     = 2 (rd_value, pc_value)
+    """
+    row_outputs: np.ndarray   # (K, n_anchors, n_channels) float64 — exec outputs
+    n_inputs: int             # 0, 1, or 2 — count of behavioral inputs
+    input_mags: np.ndarray    # (K, max_in) float64 — input mags in canonical
+                              # position order under each k (zero past n_inputs)
+    has_rd: bool              # does this row write a non-x0 register?
+    rd_mag: float             # magnitude of rd output (0 if not has_rd)
+
+
+def precompute_row_outputs(instr, anchor_states):
+    """Per-row data for single-instruction broadcast distance.
+
+    Uses precompute_chunk for sensitivity analysis (input magnitudes,
+    output magnitudes, pc_explicit) so behavioral semantics match
+    the per-pair path. Then runs canonical SSA execution under K=2
+    bijection candidates (identity + rs1↔rs2 swap) to produce the
+    per-row output tensor.
+
+    Raises NotImplementedError on memory ops (V1 distance scope).
+    """
+    chunk = [instr]
+    pre = precompute_chunk(chunk, anchor_states)
+
+    inputs = pre.behavioral_inputs   # filtered: only inputs whose
+                                     # value actually affects outputs
+    n_inputs = len(inputs)
+    has_rd = bool(pre.reg_outs)
+    rd = pre.reg_outs[0] if has_rd else None
+    rd_mag = float(pre.out_mags[rd]) if has_rd else 0.0
+    pc_explicit = pre.pc_explicit
+
+    K = 2
+    n_anchors = anchor_states.shape[0]
+    canon_slots = (_CANON_IN0, _CANON_IN1)
+    row_outputs = np.zeros((K, n_anchors, 2), dtype=np.float64)
+
+    for k in range(K):
+        if k == 1 and n_inputs < 2:
+            row_outputs[k] = row_outputs[0]
+            continue
+        order = canon_slots if k == 0 else (canon_slots[1], canon_slots[0])
+        # Place canonical anchor values at the row's actual input
+        # register positions. Other positions retain their anchor
+        # values; x0 is forced to 0.
+        state = anchor_states.copy()
+        for actual_reg, canon_reg in zip(inputs, order):
+            state[:, actual_reg] = anchor_states[:, canon_reg]
+        state[:, 0] = 0
+
+        out_regs, out_pcs = _eval_ssa_numpy(
+            pre.ssa, len(chunk), state, pre.live)
+
+        row_outputs[k, :, 0] = out_regs[:, rd] if rd is not None else 0.0
+        # PC channel: explicit value or fall-through 4*chunk_len.
+        # Both implicit → both rows have same constant → 0 residual.
+        row_outputs[k, :, 1] = (
+            out_pcs if pc_explicit else (4 * len(chunk)))
+
+    # input_mags arranged in canonical position order under each k.
+    # Syntactic order: inputs[0] = first behavioral input, etc.
+    # Under k=0: syntactic slot s lives at canonical position s.
+    # Under k=1: syntactic slot s lives at canonical position (1-s),
+    #            but only meaningful when n_inputs == 2; for smaller
+    #            n_inputs, k=1 duplicates k=0.
+    input_mags = np.zeros((K, 2), dtype=np.float64)
+    syntactic_mags = [float(pre.input_mags[r]) for r in inputs]
+    for k in range(K):
+        if k == 1 and n_inputs < 2:
+            input_mags[k] = input_mags[0]
+            continue
+        for slot, mag in enumerate(syntactic_mags):
+            pos = slot if k == 0 else (1 - slot)
+            input_mags[k, pos] = mag
+
+    return RowOutputs(
+        row_outputs=row_outputs,
+        n_inputs=n_inputs,
+        input_mags=input_mags,
+        has_rd=has_rd,
+        rd_mag=rd_mag,
+    )
+
+
+def pairwise_distance_canonical(row_outputs, n_inputs, input_mags,
+                                has_rd, rd_mag):
+    """Form a (B, B) target distance matrix from packed per-row data.
+
+    All inputs are batched arrays — first dim is B. Works on numpy or
+    torch (broadcasting + the small set of element-wise ops common to
+    both). For training, pass torch tensors on the model's device and
+    the (B, B) result lives on-device, ready to consume in the loss.
+
+    Args:
+      row_outputs:  (B, K, n_anchors, n_channels) — exec outputs under
+                    each bijection candidate. Channel 0 = rd_value,
+                    channel 1 = pc_value (4*chunk_len for ALU
+                    fall-through).
+      n_inputs:     (B,) int — count of behavioral inputs per row.
+      input_mags:   (B, K, max_in) — per-row input magnitudes in
+                    canonical position order under each k.
+      has_rd:       (B,) bool — does this row write a non-x0 register.
+      rd_mag:       (B,) float — magnitude of the rd output (0 if not
+                    has_rd, by convention).
+
+    Returns:
+      (B, B) float matrix where d[i, j] is the bijection-min sum of
+      matched_residual_rd + pc_residual + unaligned_out_cost +
+      unaligned_in_cost. Matches behavioral_distance_cached on
+      single-instruction chunks.
+    """
+    is_torch = hasattr(row_outputs, 'log1p') and not isinstance(
+        row_outputs, np.ndarray)
+    xp = _xp_of(row_outputs)
+
+    B, K, n_anchors, n_channels = row_outputs.shape
+
+    # Channel residuals: log1p(log1p(|Δ|)).mean(over anchors).
+    # diff shape: (B, B, K, K, n_anchors, n_channels).
+    diff = (row_outputs[:, None, :, None]
+            - row_outputs[None, :, None, :])
+    twice = _abs_log1p_log1p(diff, is_torch)
+    chan_resid = twice.mean(dim=-2) if is_torch else twice.mean(axis=-2)
+    # → (B, B, K, K, n_channels). Channel 0 = rd, channel 1 = pc.
+    rd_resid = chan_resid[..., 0]
+    pc_resid = chan_resid[..., 1]
+
+    # rd contribution: matched_residual when both have rd, else
+    # unaligned_out_cost = the present row's rd_mag (0 when neither).
+    has_rd_a = has_rd[:, None, None, None]    # (B, 1, 1, 1)
+    has_rd_b = has_rd[None, :, None, None]    # (1, B, 1, 1)
+    rd_mag_a = rd_mag[:, None, None, None]
+    rd_mag_b = rd_mag[None, :, None, None]
+    both_rd = has_rd_a & has_rd_b
+    rd_contrib = xp.where(both_rd, rd_resid, rd_mag_a + rd_mag_b)
+
+    # Unaligned input cost: per canonical position p, if exactly one
+    # row has an input at p, add that row's input_mags at p.
+    max_in = input_mags.shape[-1]
+    if is_torch:
+        p_view = xp.arange(max_in, device=row_outputs.device).reshape(
+            1, 1, 1, 1, max_in)
+    else:
+        p_view = xp.arange(max_in).reshape(1, 1, 1, 1, max_in)
+    n_a = n_inputs[:, None, None, None, None]    # (B, 1, 1, 1, 1)
+    n_b = n_inputs[None, :, None, None, None]    # (1, B, 1, 1, 1)
+    has_in_a = p_view < n_a    # (B, 1, 1, 1, max_in)
+    has_in_b = p_view < n_b    # (1, B, 1, 1, max_in)
+    a_only = has_in_a & ~has_in_b    # (B, B, 1, 1, max_in)
+    b_only = has_in_b & ~has_in_a
+
+    mags_a = input_mags[:, None, :, None, :]   # (B, 1, K, 1, max_in)
+    mags_b = input_mags[None, :, None, :, :]   # (1, B, 1, K, max_in)
+    cost_from_a = (mags_a * a_only).sum(dim=-1) if is_torch else (
+        mags_a * a_only).sum(axis=-1)   # (B, B, K, 1)
+    cost_from_b = (mags_b * b_only).sum(dim=-1) if is_torch else (
+        mags_b * b_only).sum(axis=-1)   # (B, B, 1, K)
+    unaligned_in = cost_from_a + cost_from_b   # (B, B, K, K) by broadcast
+
+    total_per_kk = rd_contrib + pc_resid + unaligned_in   # (B, B, K, K)
+
+    if is_torch:
+        return total_per_kk.amin(dim=(-1, -2))
+    return total_per_kk.min(axis=(-1, -2))
+
+
+def _xp_of(arr):
+    """Return the array library (numpy or torch) for `arr`."""
+    if isinstance(arr, np.ndarray):
+        return np
+    import torch
+    return torch
+
+
+def _abs_log1p_log1p(x, is_torch):
+    """log1p(log1p(|x|)) — works on numpy or torch."""
+    if is_torch:
+        return x.abs().log1p().log1p()
+    return np.log1p(np.log1p(np.abs(x).astype(np.float64)))
+
+
+def behavioral_distance_cached(pre_a, pre_b, anchor_states):
     """Symmetric distance between two Precomputed chunks.
 
     Implementation note: the underlying directional distance (which
@@ -744,12 +967,12 @@ def chunk_distance_cached(pre_a, pre_b, anchor_states):
     symmetric in a/b. We average both directions to recover symmetry.
     The 2× cost vs a single direction is the price.
     """
-    d_ab = _chunk_distance_directional(pre_a, pre_b, anchor_states)
-    d_ba = _chunk_distance_directional(pre_b, pre_a, anchor_states)
+    d_ab = _behavioral_distance_directional(pre_a, pre_b, anchor_states)
+    d_ba = _behavioral_distance_directional(pre_b, pre_a, anchor_states)
     return 0.5 * (d_ab + d_ba)
 
 
-def _chunk_distance_directional(pre_a, pre_b, anchor_states):
+def _behavioral_distance_directional(pre_a, pre_b, anchor_states):
     """One-directional distance: a is at baseline, b is re-evaluated
     under σ-permuted states for each candidate bijection."""
     if (not pre_a.reg_outs and not pre_b.reg_outs
@@ -759,9 +982,18 @@ def _chunk_distance_directional(pre_a, pre_b, anchor_states):
     inputs_a = pre_a.behavioral_inputs
     inputs_b = pre_b.behavioral_inputs
 
-    bijections = list(partial_bijections(inputs_a, inputs_b))
-    if not bijections:
-        bijections = [((), ())]
+    # Cap the bijection search. The number of partial bijections grows
+    # as P(max(|a|,|b|), min(|a|,|b|)) — factorial in the smaller set.
+    # Beyond ~8 inputs the search is both too slow per call and too
+    # heavy in memory (a 12-input behavioral_distance call would allocate
+    # ~335 GB). For chunks above the cap, fall back to the empty
+    # bijection: distance is then an upper bound (no input symmetry
+    # discovery), pair signal is noisier, but the call terminates.
+    k = min(len(inputs_a), len(inputs_b))
+    if k <= MAX_BIJECTION_SIZE:
+        bijections = partial_bijections(inputs_a, inputs_b)
+    else:
+        bijections = iter([((), ())])
 
     # PC is compared only when at least one chunk explicitly writes it.
     # If both are ALU-only (implicit PC = 4*chunk_len), PC values are
@@ -830,12 +1062,12 @@ def _chunk_distance_directional(pre_a, pre_b, anchor_states):
     return best
 
 
-def chunk_distance(chunk_a, chunk_b, n_states=16, seed=0):
+def behavioral_distance(chunk_a, chunk_b, n_states=16, seed=0):
     """Compute the behavioral distance between two chunks.
 
     Returns >= 0. 0 iff behaviorally equivalent on the sampled anchor
     states (probabilistic). For batched use across many partner pairs,
-    prefer precompute_chunk + chunk_distance_cached so anchor execution
+    prefer precompute_chunk + behavioral_distance_cached so anchor execution
     + sensitivity analysis is amortized.
 
     Raises NotImplementedError if either chunk has memory ops.
@@ -843,4 +1075,4 @@ def chunk_distance(chunk_a, chunk_b, n_states=16, seed=0):
     anchor_states = make_anchor_states(n_states, seed)
     pre_a = precompute_chunk(chunk_a, anchor_states)
     pre_b = precompute_chunk(chunk_b, anchor_states)
-    return chunk_distance_cached(pre_a, pre_b, anchor_states)
+    return behavioral_distance_cached(pre_a, pre_b, anchor_states)

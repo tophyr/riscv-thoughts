@@ -247,7 +247,7 @@ def main():
         if n_file:
             parts.append(f'{n_file} file inputs')
         if n_gen:
-            parts.append(f'{n_gen} spawned {args.gen} workers')
+            parts.append(f'{n_gen} spawned gen_batches workers')
         print(f'Muxing {" + ".join(parts)}, mode={mode}, '
               f'format={fmt.name}', file=sys.stderr)
 

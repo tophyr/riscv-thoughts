@@ -21,7 +21,7 @@ from compressor.eval import (
 )
 from datagen.batch import generate_chunks, collect_into_batches
 from datagen.compare import make_anchor_states
-from datagen.generate import length_cap
+from datagen.generate import single
 
 
 # Fixed eval seeds — deterministic data across runs so metrics are comparable.
@@ -32,13 +32,18 @@ _ANCHOR_SEED = 1002
 @pytest.fixture(scope='session')
 def eval_batches(device):
     """A small, fixed set of RVT batches for acceptance evaluation.
-    Mirrors the training-time generation but with frozen seeds."""
+
+    Uses `single()` rule — single-instruction chunks — to match the T1
+    encoder's training distribution. When we add a T2 acceptance suite,
+    it'll need its own multi-instruction-chunk fixture.
+    """
     rng = np.random.default_rng(_EVAL_SEED)
     anchors = make_anchor_states(8, seed=_ANCHOR_SEED)
     gen = collect_into_batches(
-        generate_chunks(length_cap(2), rng),
+        generate_chunks(single(), rng),
         batch_size=64, twins=2, partners=8,
         anchor_states=anchors, rng=rng,
+        row_outputs_mode=True,   # match train_encoder's T1 path
     )
     return [next(gen) for _ in range(20)]
 

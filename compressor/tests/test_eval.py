@@ -24,7 +24,7 @@ from datagen.batch import (
     _make_valid_chunk,
 )
 from datagen.compare import make_anchor_states
-from datagen.generate import length_cap, random_instruction
+from datagen.generate import single, random_instruction
 from tokenizer import VOCAB_SIZE
 
 
@@ -46,7 +46,7 @@ def batches():
     rng = np.random.default_rng(0)
     anchors = make_anchor_states(4, seed=0)
     gen = collect_into_batches(
-        generate_chunks(length_cap(2), rng),
+        generate_chunks(single(), rng),
         batch_size=8, twins=1, partners=2,
         anchor_states=anchors, rng=rng,
     )

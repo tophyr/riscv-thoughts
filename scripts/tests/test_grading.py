@@ -114,7 +114,7 @@ class TestEndToEndGrading:
             f'--d-model {D_MODEL} --n-heads {N_HEADS} --n-layers {N_LAYERS} '
             f'--d-out {D_OUT} --max-window {MAX_WINDOW} '
             f'--n-steps {N_STEPS} --log-every {LOG_EVERY} '
-            f'--pair-weight 1.0 --valid-weight 0.5 '
+            f'--behavioral-weight 1.0 --valid-weight 0.5 '
             f'--save {run_dir}'
         )
         out, err, rc = _shell(cmd, timeout=600)

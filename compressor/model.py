@@ -51,14 +51,18 @@ class T1Compressor(nn.Module):
         self.win_encoder = nn.TransformerEncoder(win_layer, n_layers)
         self.proj = nn.Linear(d_model, d_out)
 
-        # Destination classification heads. Read from the T1 vector
-        # to force the encoder to carry destination info that the
-        # scalar exec_distance metric is blind to. T1 is no longer
-        # normalized (see design note on the ball vs sphere), so
-        # these heads see a vector whose magnitude reflects
-        # validity; training loops invoke them only on valid rows.
+        # Operand classification heads. Read from the T1 vector to
+        # force the encoder to carry register-identity info that the
+        # bijection-symmetric behavioral_distance metric is blind to.
+        # Two source slots cover RV32I's max source-register count
+        # (R-type, B-type, STORE = 2 sources; everything else <=1).
+        # x0 represents "no source" for unused slots. Training loops
+        # invoke these only on valid rows (CE ignore_index=-100 for
+        # invalid).
         self.dest_type_head = nn.Linear(d_out, n_dest_types)
         self.dest_reg_head = nn.Linear(d_out, n_regs)
+        self.src_reg_head_0 = nn.Linear(d_out, n_regs)
+        self.src_reg_head_1 = nn.Linear(d_out, n_regs)
 
         self.gru = nn.GRUCell(d_out, d_model)
 
@@ -519,3 +523,53 @@ class Decoder(nn.Module):
             tgt_mask=causal_mask,
             tgt_key_padding_mask=target_padding_mask)
         return self.head(out)
+
+
+class T2Compressor(nn.Module):
+    """Encode a sequence of T1 emission vectors (one per source
+    instruction) into a single T2 vector per chunk.
+
+    Fixed-window only — no gates, no streaming. The whole chunk is
+    fed in at once, attention-pooled by a learned query, projected to
+    d_out. Pair-MSE training uses the same behavioral_distance metric over
+    the source instructions.
+
+    Shape:
+      input:        t1_seq           (B, n_instrs, d_t1)
+                    padding_mask     (B, n_instrs) bool — True where padded
+      output:       t2_vec           (B, d_out)
+    """
+
+    def __init__(self, d_t1, d_model, n_heads, n_layers, d_out,
+                 max_chunk_len=32, dropout=0.0):
+        super().__init__()
+        self.d_t1 = d_t1
+        self.d_model = d_model
+        self.d_out = d_out
+        self.max_chunk_len = max_chunk_len
+
+        self.input_proj = nn.Linear(d_t1, d_model)
+        self.pos_emb = nn.Embedding(max_chunk_len, d_model)
+
+        layer = nn.TransformerEncoderLayer(
+            d_model, n_heads, dim_feedforward=d_model * 4,
+            dropout=dropout, batch_first=True)
+        self.encoder = nn.TransformerEncoder(layer, n_layers)
+
+        # Attention pool: a learned query attends over the encoded
+        # sequence, producing one (B, d_model) vector per chunk.
+        self.pool_query = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.pool_attn = nn.MultiheadAttention(
+            d_model, n_heads, dropout=dropout, batch_first=True)
+
+        self.proj = nn.Linear(d_model, d_out)
+
+    def encode(self, t1_seq, padding_mask):
+        B, N, _ = t1_seq.shape
+        x = self.input_proj(t1_seq)
+        positions = torch.arange(N, device=t1_seq.device).expand(B, N)
+        x = x + self.pos_emb(positions)
+        x = self.encoder(x, src_key_padding_mask=padding_mask)
+        q = self.pool_query.expand(B, -1, -1)
+        pooled, _ = self.pool_attn(q, x, x, key_padding_mask=padding_mask)
+        return self.proj(pooled.squeeze(1))

@@ -82,6 +82,26 @@ def test_invalid_chunk_carries_no_instructions():
     assert ch.tokens == [5, 6, 7, 8]
 
 
+def test_instr_lens_populated_for_valid_chunks():
+    """Each row's instr_lens reflects per-instruction token counts;
+    invalid rows are all-zero."""
+    chunks = [
+        _instrs_to_chunk([Instruction('ADDI', 1, 0, 5)]),               # 1 instr
+        _instrs_to_chunk([Instruction('ADD', 2, 1, 1),
+                          Instruction('SUB', 3, 1, 2)]),                # 2 instrs
+        _make_invalid_chunk([5, 6, 7]),
+    ]
+    batch = pack_batch(chunks, pairs=[], distances=[])
+    # Row 0: one instruction, length matches its token count.
+    assert batch.instr_lens[0, 0] == int(batch.token_lens[0])
+    # Row 1: two instructions, sum matches token_lens.
+    assert batch.instr_lens[1, 0] + batch.instr_lens[1, 1] == int(batch.token_lens[1])
+    # Row 1: only first two slots populated.
+    assert (batch.instr_lens[1, 2:] == 0).all()
+    # Row 2: invalid, all-zero instr_lens.
+    assert (batch.instr_lens[2] == 0).all()
+
+
 # ---------------------------------------------------------------------------
 # RVT binary I/O
 # ---------------------------------------------------------------------------
@@ -108,6 +128,7 @@ def test_round_trip():
     assert np.array_equal(b.tokens, got.tokens)
     assert np.array_equal(b.token_lens, got.token_lens)
     assert np.array_equal(b.valid, got.valid)
+    assert np.array_equal(b.instr_lens, got.instr_lens)
     assert np.array_equal(b.pair_indices, got.pair_indices)
     assert np.allclose(b.distances, got.distances)
 

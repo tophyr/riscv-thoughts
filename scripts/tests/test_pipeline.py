@@ -159,6 +159,60 @@ class TestMuxBatches:
         assert 'Batches:      4' in slice_info(out)
 
 
+class TestBenchThroughput:
+    def test_final_summary(self):
+        """Pipe N batches; expect `Final: N batches` on stderr."""
+        data = gen(n_batches=4)
+        _, err, rc = run([PYTHON, 'scripts/bench_throughput.py',
+                          '--log-every-sec', '5'], stdin=data)
+        assert rc == 0, err
+        assert 'Final: 4 batches' in err, err
+
+    def test_max_batches_caps(self):
+        """--max-batches stops the count even with more available."""
+        data = gen(n_batches=10)
+        _, err, rc = run([
+            PYTHON, 'scripts/bench_throughput.py',
+            '--log-every-sec', '5', '--max-batches', '3'],
+            stdin=data)
+        assert rc == 0, err
+        assert 'Final: 3 batches' in err, err
+
+    def test_errors_on_bad_input(self):
+        """Non-RVT input fails with a clear error."""
+        _, err, rc = run([PYTHON, 'scripts/bench_throughput.py'],
+                         stdin=b'NOT-A-VALID-STREAM-HEADER')
+        assert rc != 0
+        assert 'Unknown format' in err or 'Missing' in err, err
+
+    def test_emits_periodic_log(self):
+        """Live pipe with small --log-every-sec should emit at least
+        one periodic status line. gen_batches' behavioral_distance gives
+        enough wall time to fire the timer."""
+        gen_proc = __import__('subprocess').Popen([
+            PYTHON, 'scripts/gen_batches.py',
+            '--rule', 'cap=2', '--batch-size', '32',
+            '--twins', '2', '--partners', '4', '--n-states', '4',
+            '-n', '20', '--seed', '42'],
+            stdout=__import__('subprocess').PIPE,
+            stderr=__import__('subprocess').DEVNULL,
+            cwd=str(ROOT))
+        try:
+            r = subprocess.run([
+                PYTHON, 'scripts/bench_throughput.py',
+                '--log-every-sec', '0.05'],
+                stdin=gen_proc.stdout, capture_output=True,
+                cwd=str(ROOT), timeout=60)
+        finally:
+            gen_proc.wait(timeout=10)
+        err = r.stderr.decode()
+        assert r.returncode == 0, err
+        # At least one periodic line of the form `[N.Ns] total=...`.
+        import re
+        assert re.search(r'^\[\s*\d+\.\d+s\] total=', err, re.MULTILINE), err
+        assert 'Final: 20 batches' in err, err
+
+
 class TestTraining:
     def test_encoder_train_smoke(self):
         """gen_batches | train_encoder smoke (single step)."""

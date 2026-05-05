@@ -37,10 +37,20 @@ class StreamFmt:
 def _validate_rvt(data):
     vals = RVT_FORMAT.batch_header.unpack(
         data[:RVT_FORMAT.batch_header.size])
-    B, max_tokens, P = vals
+    # Header fields: B, max_tokens, max_n_instrs, P, RB, K, n_anchors,
+    # n_channels, max_in. RB / K / n_anchors / n_channels / max_in are
+    # 0 in pair-mode batches and equal to B / 2 / n_states / 2 / 2 in
+    # row-outputs mode.
+    B, max_tokens, max_n_instrs, P, RB, K, n_anchors, n_channels, max_in = vals
     if not (0 < B <= _MAX_B
             and 0 < max_tokens <= _MAX_TOKENS
-            and 0 <= P <= _MAX_PAIRS):
+            and 0 < max_n_instrs <= _MAX_TOKENS
+            and 0 <= P <= _MAX_PAIRS
+            and 0 <= RB <= _MAX_B
+            and 0 <= K <= 16
+            and 0 <= n_anchors <= 256
+            and 0 <= n_channels <= 16
+            and 0 <= max_in <= 16):
         raise ValueError(f'Invalid RVT header: {vals}')
     return vals
 
@@ -98,8 +108,19 @@ def peek_format(f):
 
 
 def binary_stdout():
-    """Return a binary fd for stdout, redirecting Python stdout to stderr."""
-    out = os.fdopen(os.dup(sys.stdout.fileno()), 'wb')
+    """Return a binary fd for stdout, redirecting Python stdout to stderr.
+
+    Force blocking mode on the fd: GNU `tee` (and other stream-pipe
+    consumers) flip pipes non-blocking on their side as a performance
+    optimization, and the flag is shared across the kernel's open file
+    description with the writing peer. Without this guard, Python's
+    BufferedWriter.write() raises BlockingIOError mid-batch when the
+    downstream consumer is briefly slow, leaving the reader with a
+    truncated body.
+    """
+    fd = os.dup(sys.stdout.fileno())
+    os.set_blocking(fd, True)
+    out = os.fdopen(fd, 'wb')
     sys.stdout = sys.stderr
     return out
 

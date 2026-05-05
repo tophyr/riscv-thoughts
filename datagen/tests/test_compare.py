@@ -6,7 +6,7 @@ import pytest
 
 from emulator import Instruction
 from datagen.compare import (
-    gvn_equivalent, chunk_distance, chunk_distance_cached,
+    gvn_equivalent, behavioral_distance, behavioral_distance_cached,
     make_anchor_states, precompute_chunk,
     to_ssa, live_nodes,
     PC_REG, MEM_REG, COMMUTATIVE_OPS,
@@ -86,45 +86,45 @@ def test_commutative_ops_listed_correctly():
 class TestChunkDistance:
     def test_identical_is_zero(self):
         a = [Instruction('ADDI', 5, 1, 7), Instruction('ADD', 6, 5, 5)]
-        assert chunk_distance(a, a) == 0.0
+        assert behavioral_distance(a, a) == 0.0
 
     def test_random_relabel_is_zero(self):
         rng = np.random.default_rng(0)
         a = [Instruction('ADDI', 5, 1, 7), Instruction('ADD', 6, 5, 5)]
         for _ in range(5):
             b = random_relabel(a, rng)
-            d = chunk_distance(a, b)
+            d = behavioral_distance(a, b)
             assert d == 0.0, f'relabeled distance was {d}, expected 0'
 
     def test_commutative_swap_is_zero(self):
         a = [Instruction('ADD', 5, 1, 2)]
         b = [Instruction('ADD', 5, 2, 1)]
-        assert chunk_distance(a, b) == 0.0
+        assert behavioral_distance(a, b) == 0.0
 
     def test_double_shift_equiv_slli(self):
         # x5 = x1 << 2  ≡  x5 = x1 << 1; x5 = x5 << 1
         a = [Instruction('SLLI', 5, 1, 2)]
         b = [Instruction('SLLI', 5, 1, 1), Instruction('SLLI', 5, 5, 1)]
-        d = chunk_distance(a, b)
+        d = behavioral_distance(a, b)
         assert d == 0.0, f'double-shift distance was {d}, expected 0'
 
     def test_distinct_imm_is_positive(self):
         a = [Instruction('ADDI', 5, 1, 7)]
         b = [Instruction('ADDI', 5, 1, 8)]
-        assert chunk_distance(a, b) > 0.0
+        assert behavioral_distance(a, b) > 0.0
 
     def test_symmetric(self):
         a = [Instruction('ADDI', 5, 1, 7), Instruction('ADD', 6, 5, 5)]
         b = [Instruction('ADD', 7, 1, 1)]
-        d_ab = chunk_distance(a, b)
-        d_ba = chunk_distance(b, a)
+        d_ab = behavioral_distance(a, b)
+        d_ba = behavioral_distance(b, a)
         assert abs(d_ab - d_ba) < 1e-6, (d_ab, d_ba)
 
     def test_memory_ops_raise(self):
         a = [Instruction('LW', 5, 0, 1)]
         b = [Instruction('LW', 5, 0, 1)]
         with pytest.raises(NotImplementedError):
-            chunk_distance(a, b)
+            behavioral_distance(a, b)
 
     def test_cached_matches_uncached(self):
         a = [Instruction('ADDI', 5, 1, 7), Instruction('XOR', 6, 5, 1)]
@@ -132,8 +132,8 @@ class TestChunkDistance:
         anchor = make_anchor_states(8, seed=0)
         pre_a = precompute_chunk(a, anchor)
         pre_b = precompute_chunk(b, anchor)
-        d_cached = chunk_distance_cached(pre_a, pre_b, anchor)
-        d_uncached = chunk_distance(a, b, n_states=8, seed=0)
+        d_cached = behavioral_distance_cached(pre_a, pre_b, anchor)
+        d_uncached = behavioral_distance(a, b, n_states=8, seed=0)
         assert abs(d_cached - d_uncached) < 1e-6
 
 
