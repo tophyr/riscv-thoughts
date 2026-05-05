@@ -100,6 +100,14 @@ BEHAVIORAL_RELEVANCE_THRESHOLD = 1e-9
 # bound for those pathological chunks).
 MAX_BIJECTION_SIZE = 8
 
+# Canonical anchor-position list for register input sourcing during
+# SSA evaluation. A row's behavioral inputs are sourced from these
+# positions instead of from the row's actual register positions, so
+# the residual and magnitudes don't leak the row's register names.
+# Length = 2 * MAX_BIJECTION_SIZE so a paired evaluation with full
+# unaligned on both sides still has a distinct slot per input.
+_CANON_POSITIONS = list(range(1, 1 + 2 * MAX_BIJECTION_SIZE))
+
 
 class UnsupportedOpError(ValueError):
     """Raised when a chunk contains an instruction the SSA layer
@@ -461,6 +469,45 @@ def make_anchor_states(n_states, seed):
     return anchor_states
 
 
+def _canonical_state(anchor_states, inputs, canon_positions):
+    """Build an anchor-state copy where each row input register is
+    re-sourced from a canonical anchor position. inputs[i] takes its
+    value from anchor_states[:, canon_positions[i]]. Two rows whose
+    inputs are placed at the same canonical positions then read
+    identical values regardless of which actual register names they
+    use, so SSA evaluation is GVN-invariant under register relabeling.
+    """
+    state = anchor_states.copy()
+    for actual_reg, canon_reg in zip(inputs, canon_positions):
+        if actual_reg == 0:
+            continue
+        state[:, actual_reg] = anchor_states[:, canon_reg]
+    state[:, 0] = 0
+    return state
+
+
+def _pair_canon_positions(inputs_a, inputs_b, a_keys, b_keys):
+    """Assign canonical positions for a pair under bijection σ
+    (a_keys[i] ↔ b_keys[i]). Matched inputs share canon positions
+    0..m-1; a's unaligned inputs use m..k_a-1; b's unaligned inputs
+    use k_a..k_a+k_b-m-1. Returns two lists in the syntactic input
+    order of inputs_a and inputs_b."""
+    m = len(a_keys)
+    a_to_pos = {a_keys[i]: _CANON_POSITIONS[i] for i in range(m)}
+    b_to_pos = {b_keys[i]: _CANON_POSITIONS[i] for i in range(m)}
+    next_pos = m
+    for r in inputs_a:
+        if r not in a_to_pos:
+            a_to_pos[r] = _CANON_POSITIONS[next_pos]
+            next_pos += 1
+    for r in inputs_b:
+        if r not in b_to_pos:
+            b_to_pos[r] = _CANON_POSITIONS[next_pos]
+            next_pos += 1
+    return ([a_to_pos[r] for r in inputs_a],
+            [b_to_pos[r] for r in inputs_b])
+
+
 def _eval_ssa_numpy(ssa, chunk_len, anchor_states, live=None):
     """Evaluate an SSA graph on N input states using numpy ops.
 
@@ -648,10 +695,15 @@ def _input_magnitudes(ssa, live, syntactic_inputs, anchor_states,
     abs-output-difference. Magnitude near 0 → input is behaviorally
     irrelevant → filter out of bijection search. Magnitude > 0 →
     weights the unaligned-input edit cost.
+
+    Perturbations and baseline both run on the canonical state, so
+    magnitudes are register-name-invariant — two GVN-equivalent rows
+    produce identical input_mags.
     """
     mags = {}
     for r in syntactic_inputs:
-        perturbed = anchor_states.copy()
+        perturbed = _canonical_state(
+            anchor_states, syntactic_inputs, _CANON_POSITIONS)
         perturbed[:, r] = ~perturbed[:, r]
         perturbed[:, 0] = 0  # x0 always 0
 
@@ -708,14 +760,20 @@ def precompute_chunk(chunk, anchor_states):
     reg_out, pc_out, mem_out = _split_outputs(ssa)
     assert mem_out is None and not has_mem_in
 
-    out_regs, out_pcs = _eval_ssa_numpy(ssa, len(chunk), anchor_states, live)
-
-    ssa_reg_outs = sorted(reg_out.keys())
-    actual_reg_outs = _actually_modified(out_regs, anchor_states, ssa_reg_outs)
-    out_mags = _output_magnitudes(out_regs, anchor_states, actual_reg_outs)
-
     inputs = live_input_regs(ssa, live)
     pc_explicit = pc_out is not None
+
+    # Baseline executes on a canonical state: the chunk's syntactic
+    # inputs are sourced from canonical anchor positions (canon_0,
+    # canon_1, ... in syntactic order). All outputs and magnitudes
+    # below are register-name-invariant — two GVN-equivalent chunks
+    # produce identical canonical out_regs / out_pcs / mags.
+    canon_state = _canonical_state(anchor_states, inputs, _CANON_POSITIONS)
+    out_regs, out_pcs = _eval_ssa_numpy(ssa, len(chunk), canon_state, live)
+
+    ssa_reg_outs = sorted(reg_out.keys())
+    actual_reg_outs = _actually_modified(out_regs, canon_state, ssa_reg_outs)
+    out_mags = _output_magnitudes(out_regs, canon_state, actual_reg_outs)
 
     input_mags = _input_magnitudes(
         ssa, live, inputs, anchor_states,
@@ -762,14 +820,6 @@ def precompute_chunk(chunk, anchor_states):
 # bijection space and SSA shape are too irregular to vectorize cleanly
 # (K up to 8! at MAX_BIJECTION_SIZE=8, variable graph shape per chunk).
 
-# Canonical input register slots: a row's first behavioral input
-# sources from anchor_states[:, _CANON_IN0], second from _CANON_IN1
-# (or swapped, for K=1). Any 1..31 pair works equivalently as long as
-# the same pair is used for every row in a batch.
-_CANON_IN0 = 1
-_CANON_IN1 = 2
-
-
 @dataclass
 class RowOutputs:
     """Per-row data for the canonical broadcast distance.
@@ -791,20 +841,17 @@ class RowOutputs:
 def precompute_row_outputs(instr, anchor_states):
     """Per-row data for single-instruction broadcast distance.
 
-    Uses precompute_chunk for sensitivity analysis (input magnitudes,
-    output magnitudes, pc_explicit) so behavioral semantics match
-    the per-pair path. Then runs canonical SSA execution under K=2
-    bijection candidates (identity + rs1↔rs2 swap) to produce the
-    per-row output tensor.
+    Reuses precompute_chunk's canonical baseline for K=0; runs one
+    additional SSA evaluation for K=1 (rs1↔rs2 swap) when the row has
+    two distinct behavioral inputs.
 
     Raises NotImplementedError on memory ops (V1 distance scope).
     """
     chunk = [instr]
     pre = precompute_chunk(chunk, anchor_states)
 
-    inputs = pre.behavioral_inputs   # filtered: only inputs whose
-                                     # value actually affects outputs
-    n_inputs = len(inputs)
+    behavioral = pre.behavioral_inputs
+    n_inputs = len(behavioral)
     has_rd = bool(pre.reg_outs)
     rd = pre.reg_outs[0] if has_rd else None
     rd_mag = float(pre.out_mags[rd]) if has_rd else 0.0
@@ -812,39 +859,28 @@ def precompute_row_outputs(instr, anchor_states):
 
     K = 2
     n_anchors = anchor_states.shape[0]
-    canon_slots = (_CANON_IN0, _CANON_IN1)
     row_outputs = np.zeros((K, n_anchors, 2), dtype=np.float64)
 
-    for k in range(K):
-        if k == 1 and n_inputs < 2:
-            row_outputs[k] = row_outputs[0]
-            continue
-        order = canon_slots if k == 0 else (canon_slots[1], canon_slots[0])
-        # Place canonical anchor values at the row's actual input
-        # register positions. Other positions retain their anchor
-        # values; x0 is forced to 0.
-        state = anchor_states.copy()
-        for actual_reg, canon_reg in zip(inputs, order):
-            state[:, actual_reg] = anchor_states[:, canon_reg]
-        state[:, 0] = 0
+    pc_value = pre.out_pcs if pc_explicit else (4 * len(chunk))
+    rd_value = pre.out_regs[:, rd] if rd is not None else 0.0
+    row_outputs[0, :, 0] = rd_value
+    row_outputs[0, :, 1] = pc_value
 
+    if n_inputs >= 2:
+        swapped = list(pre.inputs)
+        swapped[0], swapped[1] = swapped[1], swapped[0]
+        state = _canonical_state(anchor_states, swapped, _CANON_POSITIONS)
         out_regs, out_pcs = _eval_ssa_numpy(
             pre.ssa, len(chunk), state, pre.live)
-
-        row_outputs[k, :, 0] = out_regs[:, rd] if rd is not None else 0.0
-        # PC channel: explicit value or fall-through 4*chunk_len.
-        # Both implicit → both rows have same constant → 0 residual.
-        row_outputs[k, :, 1] = (
+        row_outputs[1, :, 0] = (
+            out_regs[:, rd] if rd is not None else 0.0)
+        row_outputs[1, :, 1] = (
             out_pcs if pc_explicit else (4 * len(chunk)))
+    else:
+        row_outputs[1] = row_outputs[0]
 
-    # input_mags arranged in canonical position order under each k.
-    # Syntactic order: inputs[0] = first behavioral input, etc.
-    # Under k=0: syntactic slot s lives at canonical position s.
-    # Under k=1: syntactic slot s lives at canonical position (1-s),
-    #            but only meaningful when n_inputs == 2; for smaller
-    #            n_inputs, k=1 duplicates k=0.
     input_mags = np.zeros((K, 2), dtype=np.float64)
-    syntactic_mags = [float(pre.input_mags[r]) for r in inputs]
+    syntactic_mags = [float(pre.input_mags[r]) for r in behavioral]
     for k in range(K):
         if k == 1 and n_inputs < 2:
             input_mags[k] = input_mags[0]
@@ -973,8 +1009,14 @@ def behavioral_distance_cached(pre_a, pre_b, anchor_states):
 
 
 def _behavioral_distance_directional(pre_a, pre_b, anchor_states):
-    """One-directional distance: a is at baseline, b is re-evaluated
-    under σ-permuted states for each candidate bijection."""
+    """One-directional distance under best partial bijection σ.
+
+    Both rows are evaluated on σ-aware canonical states: matched
+    inputs share canonical positions; unaligned inputs on each side
+    use distinct positions. This makes the residual register-name-
+    invariant — two GVN-equivalent chunks differing only in register
+    naming produce identical canonical outputs.
+    """
     if (not pre_a.reg_outs and not pre_b.reg_outs
             and not pre_a.pc_explicit and not pre_b.pc_explicit):
         return 0.0
@@ -1005,19 +1047,20 @@ def _behavioral_distance_directional(pre_a, pre_b, anchor_states):
 
     best = float('inf')
     for a_keys, b_keys in bijections:
-        b_states = anchor_states.copy()
-        if a_keys:
-            for ra, rb in zip(a_keys, b_keys):
-                b_states[:, rb] = anchor_states[:, ra]
-            b_states[:, 0] = 0
+        a_canon_pos, b_canon_pos = _pair_canon_positions(
+            inputs_a, inputs_b, a_keys, b_keys)
+        a_state = _canonical_state(anchor_states, inputs_a, a_canon_pos)
+        b_state = _canonical_state(anchor_states, inputs_b, b_canon_pos)
 
+        a_out_regs, a_out_pcs = _eval_ssa_numpy(
+            pre_a.ssa, len(pre_a.chunk), a_state, pre_a.live)
         b_out_regs, b_out_pcs = _eval_ssa_numpy(
-            pre_b.ssa, len(pre_b.chunk), b_states, pre_b.live)
+            pre_b.ssa, len(pre_b.chunk), b_state, pre_b.live)
 
         # Hungarian on regular outputs by per-state loglog'd absolute-
         # value residual.
         if pre_a.reg_outs and pre_b.reg_outs:
-            ra_vals = pre_a.out_regs[:, pre_a.reg_outs]
+            ra_vals = a_out_regs[:, pre_a.reg_outs]
             rb_vals = b_out_regs[:, pre_b.reg_outs]
             diff = (ra_vals[:, :, None].astype(np.int64)
                     - rb_vals[:, None, :].astype(np.int64))
@@ -1047,7 +1090,7 @@ def _behavioral_distance_directional(pre_a, pre_b, anchor_states):
 
         if compare_pc:
             pc_residual = float(_loglog(
-                pre_a.out_pcs.astype(np.int64) - b_out_pcs.astype(np.int64)
+                a_out_pcs.astype(np.int64) - b_out_pcs.astype(np.int64)
             ).mean())
         else:
             pc_residual = 0.0
