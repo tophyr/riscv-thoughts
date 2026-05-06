@@ -83,7 +83,11 @@ def main():
                         '(max instructions per chunk).')
 
     p.add_argument('--lr', type=float, default=3e-4)
-    p.add_argument('--n-steps', type=int, required=True)
+    p.add_argument('--n-steps', type=int, required=True,
+                   help='Cosine-LR T_max and ETA display. NOT a hard cap on '
+                        'duration — training reads until stdin EOF. Bound the '
+                        'pipeline upstream with `batch_slice --count N` to '
+                        'control how many batches the trainer sees.')
     p.add_argument('--log-every', type=int, default=100)
     p.add_argument('--behavioral-weight', type=float, default=1.0)
     p.add_argument('--behavioral-scale', type=float, default=10.0,
@@ -91,6 +95,16 @@ def main():
     p.add_argument('--valid-weight', type=float, default=0.0,
                    help='Magnitude-validity loss weight. 0 (default) for '
                         'corpora without invalid windows.')
+    p.add_argument('--live-in-weight', type=float, default=0.1,
+                   help='BCE on live_in_head (which regs are read).')
+    p.add_argument('--live-out-weight', type=float, default=0.1,
+                   help='BCE on live_out_head (which regs are written).')
+    p.add_argument('--pc-writes-weight', type=float, default=0.1,
+                   help='BCE on pc_writes_head (does chunk write PC).')
+    p.add_argument('--in-slot-weight', type=float, default=0.1,
+                   help='Mean CE over per-input-slot register heads.')
+    p.add_argument('--out-slot-weight', type=float, default=0.1,
+                   help='Mean CE over per-output-slot register heads.')
 
     p.add_argument('--device', default='auto')
     p.add_argument('--save', type=str, default=None,
@@ -130,6 +144,11 @@ def main():
         behavioral_weight=args.behavioral_weight,
         behavioral_scale=args.behavioral_scale,
         valid_weight=args.valid_weight,
+        live_in_weight=args.live_in_weight,
+        live_out_weight=args.live_out_weight,
+        pc_writes_weight=args.pc_writes_weight,
+        in_slot_weight=args.in_slot_weight,
+        out_slot_weight=args.out_slot_weight,
         device=device,
         on_log=_on_log,
     )

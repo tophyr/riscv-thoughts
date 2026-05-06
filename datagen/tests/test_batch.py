@@ -211,7 +211,7 @@ def test_build_pairs_clusters_have_zero_sibling_distance():
         _instrs_to_chunk([Instruction('XOR', 3, 1, 1)]),
         _instrs_to_chunk([Instruction('OR', 4, 1, 2)]),
     ]
-    out, pairs, dists = build_pairs(
+    out, pairs, dists, _aux = build_pairs(
         chunks, twins=2, partners=4, anchor_states=anchors, rng=rng)
     # Each cluster: 1 source + 2 twins.
     assert len(out) == 3 * 3
@@ -227,7 +227,7 @@ def test_build_pairs_drops_memory_op_chunks():
         _instrs_to_chunk([Instruction('ADD', 2, 3, 4)]),
         _instrs_to_chunk([Instruction('SUB', 5, 6, 7)]),
     ]
-    out, pairs, dists = build_pairs(
+    out, pairs, dists, _aux = build_pairs(
         chunks, twins=1, partners=2, anchor_states=anchors, rng=rng)
     # The mem-op chunk is unpaired (no twins added for it).
     # 1 unpaired + 2 sources × 2 cluster_size = 1 + 4 = 5.

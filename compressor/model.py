@@ -541,12 +541,16 @@ class T2Compressor(nn.Module):
     """
 
     def __init__(self, d_t1, d_model, n_heads, n_layers, d_out,
-                 max_chunk_len=32, dropout=0.0):
+                 max_chunk_len=32, dropout=0.0,
+                 n_regs=32, max_input_slots=32, max_output_slots=16):
         super().__init__()
         self.d_t1 = d_t1
         self.d_model = d_model
         self.d_out = d_out
         self.max_chunk_len = max_chunk_len
+        self.n_regs = n_regs
+        self.max_input_slots = max_input_slots
+        self.max_output_slots = max_output_slots
 
         self.input_proj = nn.Linear(d_t1, d_model)
         self.pos_emb = nn.Embedding(max_chunk_len, d_model)
@@ -563,6 +567,17 @@ class T2Compressor(nn.Module):
             d_model, n_heads, dropout=dropout, batch_first=True)
 
         self.proj = nn.Linear(d_model, d_out)
+
+        # Aux register-identity heads (T2 supervised signal). All
+        # consumers project from F.normalize(t2_vecs) to keep
+        # magnitude reserved for validity (Phase 9 unit-ball design).
+        self.live_in_head = nn.Linear(d_out, n_regs)
+        self.live_out_head = nn.Linear(d_out, n_regs)
+        self.pc_writes_head = nn.Linear(d_out, 1)
+        self.in_slot_heads = nn.ModuleList(
+            [nn.Linear(d_out, n_regs) for _ in range(max_input_slots)])
+        self.out_slot_heads = nn.ModuleList(
+            [nn.Linear(d_out, n_regs) for _ in range(max_output_slots)])
 
     def encode(self, t1_seq, padding_mask):
         B, N, _ = t1_seq.shape

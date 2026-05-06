@@ -42,7 +42,11 @@ def main():
                         'the longest chunk (9 tokens × max instructions).')
 
     p.add_argument('--lr', type=float, default=3e-4)
-    p.add_argument('--n-steps', type=int, required=True)
+    p.add_argument('--n-steps', type=int, required=True,
+                   help='Cosine-LR T_max and ETA display. NOT a hard cap on '
+                        'duration — training reads until stdin EOF. Bound the '
+                        'pipeline upstream with `batch_slice --count N` to '
+                        'control how many batches the trainer sees.')
     p.add_argument('--log-every', type=int, default=100)
 
     p.add_argument('--behavioral-weight', type=float, default=1.0)

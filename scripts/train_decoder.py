@@ -48,7 +48,7 @@ def _batch_to_decoder_inputs(batch, encoder, device):
     if not valid.any():
         return None, None, None, None
 
-    tok = torch.from_numpy(batch.tokens).to(device)
+    tok = torch.from_numpy(batch.tokens).to(device).long()
     pad = torch.from_numpy(padding_mask(batch)).to(device)
     with torch.no_grad():
         vecs_all = encoder.encode(tok, pad)

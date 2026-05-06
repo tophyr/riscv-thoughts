@@ -224,10 +224,11 @@ def main():
         for i in range(args.gen_count):
             cmd = base_cmd + ['--n-batches', str(args.n_batches),
                               '--seed', str(args.seed + i)]
+            # Inherit stderr unconditionally — silent workers hide
+            # crashes (Python tracebacks land here), and that's exactly
+            # what you want to see if a worker dies mid-stream.
             proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE,
-                stderr=sys.stderr if args.verbose >= 2
-                else subprocess.DEVNULL)
+                cmd, stdout=subprocess.PIPE, stderr=sys.stderr)
             procs.append(proc)
             files.append(proc.stdout)
             weights.append(args.gen_weight)

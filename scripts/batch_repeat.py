@@ -136,6 +136,10 @@ def main():
     p.add_argument('--epochs', type=int, default=None,
                    help='Stop after pool_size * EPOCHS emissions. '
                         'Default: emit indefinitely.')
+    p.add_argument('--final-passes', type=int, default=None,
+                   help='After stdin EOF, emit FINAL_PASSES additional '
+                        'full passes through the pool, then close. '
+                        'Default: emit indefinitely after EOF.')
     p.add_argument('--forever', action='store_true',
                    help='Explicit infinite emission. Default behavior; '
                         'kept for backward compatibility.')
@@ -151,8 +155,12 @@ def main():
 
     if args.epochs is not None and args.forever:
         sys.exit('--epochs and --forever are mutually exclusive')
+    if args.epochs is not None and args.final_passes is not None:
+        sys.exit('--epochs and --final-passes are mutually exclusive')
     if args.epochs is not None and args.epochs < 1:
         sys.exit('--epochs must be >= 1')
+    if args.final_passes is not None and args.final_passes < 1:
+        sys.exit('--final-passes must be >= 1')
     if args.pool_size < 1:
         sys.exit('--pool-size must be >= 1')
 
@@ -198,6 +206,8 @@ def main():
 
     cursor = 0
     n_emitted = 0
+    n_emitted_post_eof = 0
+    final_pool_size = None
     try:
         while True:
             with cv:
@@ -220,10 +230,15 @@ def main():
                 else:
                     idx = int(rng.integers(0, pool_size))
                 data = pool[idx]
+                eof_now = stats.eof
 
             try:
                 out.write(data)
                 n_emitted += 1
+                if eof_now:
+                    if final_pool_size is None:
+                        final_pool_size = pool_size
+                    n_emitted_post_eof += 1
             except BrokenPipeError:
                 return
 
@@ -234,6 +249,11 @@ def main():
             if args.epochs is not None and stats.fill_announced:
                 if n_emitted >= stats.pool_size * args.epochs:
                     return
+
+            if (args.final_passes is not None
+                    and final_pool_size is not None
+                    and n_emitted_post_eof >= final_pool_size * args.final_passes):
+                return
     finally:
         logger_stop.set()
         if args.verbose:

@@ -3,9 +3,10 @@
 # Cluster-style RVT corpus generator.
 #
 # Combines a remote 96-worker gen_batches pool (over a compressed netcat
-# link) with a local 8-worker pool, caps the combined stream at
-# NUM_BATCHES, and emits the result on stdout. Pipe into train_encoder,
-# train_decoder, batch_repeat, bench_throughput, batch_slice, etc.
+# link) with a local 8-worker pool. Each worker generates
+# BATCHES_PER_WORKER batches, then exits; the script ends when all
+# workers have drained. Pipe stdout to a file (or to a downstream
+# consumer like batch_repeat / train_*).
 #
 # Generation knobs are applied identically to both mux_batches
 # invocations so local and remote workers produce the same shape of
@@ -16,8 +17,8 @@
 # example pattern rather than a turnkey tool.
 #
 # Usage:
-#   multinode_gen.sh NUM_BATCHES > /tmp/corpus.rvt
-#   multinode_gen.sh NUM_BATCHES | scripts/train_encoder.py --n-steps NN ...
+#   multinode_gen.sh BATCHES_PER_WORKER > /tmp/corpus.rvt
+#   multinode_gen.sh 2500              # → 104 * 2500 = 260,000 batches
 #
 # Override generation knobs via env vars:
 #   BATCH_SIZE      (default 128)
@@ -35,7 +36,7 @@
 set -euo pipefail
 
 PYTHON=.venv/bin/python
-NUM_BATCHES=$1
+BATCHES_PER_WORKER=$1
 BATCH_SIZE=${BATCH_SIZE:-128}
 TWINS=${TWINS:-3}
 PARTNERS=${PARTNERS:-20}
@@ -92,7 +93,7 @@ ssh ${REMOTE} "bash ${REMOTE_DIR}/scripts/multinode_remote.sh \
     --rule ${RULE} \
     --batch-size ${BATCH_SIZE} \
     --twins ${TWINS} --partners ${PARTNERS} --n-states ${N_STATES} \
-    --n-batches ${NUM_BATCHES} \
+    --n-batches ${BATCHES_PER_WORKER} \
     --config ${CONFIG} \
     ${EXTRA_ARGS}" &
 SSH_PID=$!
@@ -102,15 +103,14 @@ sleep 5
 kill -0 $SSH_PID 2>/dev/null || { echo "ERROR: remote process died" >&2; exit 1; }
 
 # Local mux: 8 local workers plus the remote netcat stream as an
-# additional input. batch_slice caps the combined stream at exactly
-# NUM_BATCHES, then exits cleanly (closing the upstream pipes).
+# additional input. mux exits on its own once all inputs (8 workers +
+# remote stream) have closed, so total batches = 104 * BATCHES_PER_WORKER.
 ${PYTHON} scripts/mux_batches.py \
     --gen-count 8 \
     --rule ${RULE} \
     --batch-size ${BATCH_SIZE} \
     --twins ${TWINS} --partners ${PARTNERS} --n-states ${N_STATES} \
-    --n-batches ${NUM_BATCHES} \
+    --n-batches ${BATCHES_PER_WORKER} \
     --config ${CONFIG} \
     ${EXTRA_ARGS} \
-    <(nc odin 6464 -d | unlz4) \
-  | ${PYTHON} scripts/batch_slice.py --count ${NUM_BATCHES}
+    <(nc odin 6464 -d | unlz4)

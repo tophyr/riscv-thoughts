@@ -32,6 +32,7 @@ from tokenizer import PAD, encode_instruction
 from tokenizer.tokenizer import MAX_INSTR_TOKENS, decode_instruction
 
 from .compare import (
+    AUX_CE_IGNORE, MAX_INPUT_SLOTS, MAX_OUTPUT_SLOTS, N_REGS,
     behavioral_distance_cached, make_anchor_states, precompute_chunk,
     precompute_row_outputs,
 )
@@ -230,7 +231,7 @@ class Batch:
     All other arrays sized for B chunks; instr_lens sized for
     max_n_instrs columns (0 past actual count, 0 for invalid).
     """
-    tokens:         np.ndarray   # (B, max_tokens) int64
+    tokens:         np.ndarray   # (B, max_tokens) int8
     token_lens:     np.ndarray   # (B,) int32
     valid:          np.ndarray   # (B,) bool — complete instruction window
     instr_lens:     np.ndarray   # (B, max_n_instrs) int32
@@ -243,14 +244,22 @@ class Batch:
     row_has_rd:     np.ndarray   # (RB,) bool
     row_rd_mag:     np.ndarray   # (RB,) float32
     pair_valid:     np.ndarray   # (RB,) bool — meaningful row_outputs
+    # T2 aux register-identity targets — always sized B; rows without a
+    # valid Precomputed (invalid windows, mem-op chunks) get zero
+    # masks and AUX_CE_IGNORE in the slot arrays.
+    live_in_mask:   np.ndarray   # (B, N_REGS) bool — behavioral inputs
+    live_out_mask:  np.ndarray   # (B, N_REGS) bool — actually-modified regs
+    pc_writes:      np.ndarray   # (B,) bool — pc_explicit flag
+    in_slot_regs:   np.ndarray   # (B, MAX_INPUT_SLOTS) int8 — reg or AUX_CE_IGNORE
+    out_slot_regs:  np.ndarray   # (B, MAX_OUTPUT_SLOTS) int8
 
 
 RVT_FORMAT = BinaryFormat(
-    magic=b'RVT\x00', version=3,
+    magic=b'RVT\x00', version=5,
     header_fields=['B', 'max_tokens', 'max_n_instrs', 'P',
                    'RB', 'K', 'n_anchors', 'n_channels', 'max_in'],
     body_fields=[
-        BodyField('tokens', np.dtype(np.int64), ('B', 'max_tokens')),
+        BodyField('tokens', np.dtype(np.int8), ('B', 'max_tokens')),
         BodyField('token_lens', np.dtype(np.int32), ('B',)),
         BodyField('valid', np.dtype(np.bool_), ('B',)),
         BodyField('instr_lens', np.dtype(np.int32), ('B', 'max_n_instrs')),
@@ -264,6 +273,13 @@ RVT_FORMAT = BinaryFormat(
         BodyField('row_has_rd', np.dtype(np.bool_), ('RB',)),
         BodyField('row_rd_mag', np.dtype(np.float32), ('RB',)),
         BodyField('pair_valid', np.dtype(np.bool_), ('RB',)),
+        BodyField('live_in_mask', np.dtype(np.bool_), ('B', N_REGS)),
+        BodyField('live_out_mask', np.dtype(np.bool_), ('B', N_REGS)),
+        BodyField('pc_writes', np.dtype(np.bool_), ('B',)),
+        BodyField('in_slot_regs', np.dtype(np.int8),
+                  ('B', MAX_INPUT_SLOTS)),
+        BodyField('out_slot_regs', np.dtype(np.int8),
+                  ('B', MAX_OUTPUT_SLOTS)),
     ],
 )
 
@@ -285,10 +301,54 @@ class RowOutputsPayload:
     pair_valid: np.ndarray      # (actual_B,) bool
 
 
+@dataclass
+class AuxPayload:
+    """Per-row T2 register-identity targets. Length = actual_B; rows
+    without a valid Precomputed (invalid windows, mem-op chunks) get
+    zero masks, pc_writes=False, and AUX_CE_IGNORE in the slot arrays."""
+    live_in_mask: np.ndarray    # (actual_B, N_REGS) bool
+    live_out_mask: np.ndarray   # (actual_B, N_REGS) bool
+    pc_writes: np.ndarray       # (actual_B,) bool
+    in_slot_regs: np.ndarray    # (actual_B, MAX_INPUT_SLOTS) int8
+    out_slot_regs: np.ndarray   # (actual_B, MAX_OUTPUT_SLOTS) int8
+
+
+def _empty_aux(n):
+    """Build an AuxPayload sized for n rows with no behavioral targets
+    (used when callers don't have Precomputed objects available; T2
+    aux losses skip via the AUX_CE_IGNORE sentinel)."""
+    return AuxPayload(
+        live_in_mask=np.zeros((n, N_REGS), dtype=bool),
+        live_out_mask=np.zeros((n, N_REGS), dtype=bool),
+        pc_writes=np.zeros((n,), dtype=bool),
+        in_slot_regs=np.full((n, MAX_INPUT_SLOTS), AUX_CE_IGNORE,
+                             dtype=np.int8),
+        out_slot_regs=np.full((n, MAX_OUTPUT_SLOTS), AUX_CE_IGNORE,
+                              dtype=np.int8),
+    )
+
+
+def _aux_from_precomputeds(precomputeds):
+    """Build an AuxPayload from a list of (Precomputed | None). None
+    entries produce zero-mask / AUX_CE_IGNORE rows."""
+    n = len(precomputeds)
+    aux = _empty_aux(n)
+    for i, pre in enumerate(precomputeds):
+        if pre is None:
+            continue
+        aux.live_in_mask[i] = pre.live_in_mask
+        aux.live_out_mask[i] = pre.live_out_mask
+        aux.pc_writes[i] = pre.pc_explicit
+        aux.in_slot_regs[i] = pre.in_slot_regs
+        aux.out_slot_regs[i] = pre.out_slot_regs
+    return aux
+
+
 def pack_batch(chunks, pairs, distances, *,
                target_B=None, target_max_tokens=None,
                target_max_n_instrs=None, target_P=None,
-               row_outputs_payload=None):
+               row_outputs_payload=None,
+               aux_payload=None):
     """Build a Batch from chunks + (parallel) pair lists, optionally
     with row-outputs payload.
 
@@ -314,6 +374,11 @@ def pack_batch(chunks, pairs, distances, *,
         Optional RowOutputsPayload. When supplied, the row-* fields
         are populated (RB = target_B). When None, RB = 0 and the
         row-* body fields are empty — pair-indices mode.
+
+    aux_payload:
+        Optional AuxPayload of T2 register-identity targets. When
+        None, all aux fields are zero-mask / AUX_CE_IGNORE — T2 aux
+        losses on those rows are skipped via the sentinel.
     """
     if not chunks:
         raise ValueError('pack_batch requires at least one chunk')
@@ -359,7 +424,7 @@ def pack_batch(chunks, pairs, distances, *,
         raise ValueError(
             f'P={actual_P} exceeds target_P={P}')
 
-    tokens = np.full((B, max_tokens), PAD, dtype=np.int64)
+    tokens = np.full((B, max_tokens), PAD, dtype=np.int8)
     token_lens = np.zeros(B, dtype=np.int32)
     valid = np.zeros(B, dtype=bool)
     instr_lens = np.zeros((B, max_n_instrs), dtype=np.int32)
@@ -419,6 +484,22 @@ def pack_batch(chunks, pairs, distances, *,
         pair_valid_arr = np.zeros((B,), dtype=bool)
         pair_valid_arr[:actual_B] = p.pair_valid
 
+    aux = aux_payload if aux_payload is not None else _empty_aux(actual_B)
+    if aux.live_in_mask.shape[0] != actual_B:
+        raise ValueError(
+            f'aux_payload first dim ({aux.live_in_mask.shape[0]}) must '
+            f'equal actual_B ({actual_B})')
+    live_in_arr = np.zeros((B, N_REGS), dtype=bool)
+    live_in_arr[:actual_B] = aux.live_in_mask
+    live_out_arr = np.zeros((B, N_REGS), dtype=bool)
+    live_out_arr[:actual_B] = aux.live_out_mask
+    pc_writes_arr = np.zeros((B,), dtype=bool)
+    pc_writes_arr[:actual_B] = aux.pc_writes
+    in_slot_arr = np.full((B, MAX_INPUT_SLOTS), AUX_CE_IGNORE, dtype=np.int8)
+    in_slot_arr[:actual_B] = aux.in_slot_regs
+    out_slot_arr = np.full((B, MAX_OUTPUT_SLOTS), AUX_CE_IGNORE, dtype=np.int8)
+    out_slot_arr[:actual_B] = aux.out_slot_regs
+
     return Batch(tokens=tokens, token_lens=token_lens, valid=valid,
                  instr_lens=instr_lens,
                  pair_indices=pair_arr, distances=dist_arr,
@@ -427,7 +508,12 @@ def pack_batch(chunks, pairs, distances, *,
                  row_input_mags=input_mags_arr,
                  row_has_rd=has_rd_arr,
                  row_rd_mag=rd_mag_arr,
-                 pair_valid=pair_valid_arr)
+                 pair_valid=pair_valid_arr,
+                 live_in_mask=live_in_arr,
+                 live_out_mask=live_out_arr,
+                 pc_writes=pc_writes_arr,
+                 in_slot_regs=in_slot_arr,
+                 out_slot_regs=out_slot_arr)
 
 
 def padding_mask(batch):
@@ -525,7 +611,10 @@ def build_pairs(chunks, twins, partners, anchor_states, rng):
     # Build cluster -> indices map.
     n_clusters = next_cluster
     if n_clusters == 0 or partners == 0:
-        return chunks_out, [], []
+        # Still need aux for whatever rows we have (invalid windows,
+        # mem-op chunks). Empty cluster_id array → all None.
+        return chunks_out, [], [], _aux_from_precomputeds(
+            [None] * len(chunks_out))
 
     cluster_members = {c: [] for c in range(n_clusters)}
     for idx, c in enumerate(cluster_id):
@@ -565,11 +654,22 @@ def build_pairs(chunks, twins, partners, anchor_states, rng):
         replace = len(pool) < n_random
         picks = rng.choice(pool, size=n_random, replace=replace)
         for j in picks.tolist():
+            d = float(behavioral_distance_cached(
+                _pre(i), _pre(int(j)), anchor_states))
+            # Pairs whose canonical-positions overflow on both
+            # directions return inf; drop rather than poison training.
+            if d == float('inf'):
+                continue
             pair_indices.append((i, int(j)))
-            distances.append(float(behavioral_distance_cached(
-                _pre(i), _pre(int(j)), anchor_states)))
+            distances.append(d)
 
-    return chunks_out, pair_indices, distances
+    # Aux targets: every paired row gets its Precomputed; mem-op /
+    # invalid rows get None → empty aux row.
+    aux_pre = [_pre(i) if cluster_id[i] >= 0 else None
+               for i in range(len(chunks_out))]
+    aux = _aux_from_precomputeds(aux_pre)
+
+    return chunks_out, pair_indices, distances, aux
 
 
 # Row-outputs mode constants. K=2 covers the rs1↔rs2 swap; max_in=2
@@ -595,12 +695,14 @@ def build_row_outputs(chunks, twins, anchor_states, rng):
     tokens for magnitude-validity training) but their row_outputs is
     zero and pair_valid is False — distance loss skips them.
 
-    Returns (chunks_out, payload) where chunks_out extends `chunks`
-    with twin rows and payload is a RowOutputsPayload sized for
-    chunks_out.
+    Returns (chunks_out, payload, aux) where chunks_out extends
+    `chunks` with twin rows, payload is a RowOutputsPayload sized for
+    chunks_out, and aux is the parallel AuxPayload of T2 register-
+    identity targets.
     """
     chunks_out = []
-    rows = []  # list of (row_outputs, n_inputs, input_mags, has_rd, rd_mag, pair_valid)
+    rows = []
+    pres = []   # parallel to chunks_out; None for invalid/mem-op rows
 
     n_anchors = anchor_states.shape[0]
     zero_row_outputs = np.zeros(
@@ -609,36 +711,36 @@ def build_row_outputs(chunks, twins, anchor_states, rng):
     empty_row = (zero_row_outputs, 0, zero_input_mags,
                  False, 0.0, False)
 
-    for ch in chunks:
-        chunks_out.append(ch)
+    def _process(ch):
         if (not ch.valid
                 or ch.instructions is None
                 or len(ch.instructions) != 1
                 or _has_mem_ops(ch.instructions)):
-            # Invalid window, multi-instruction (shouldn't occur in
-            # row-outputs mode), or mem-op chunk: zero row, not
-            # pair-valid.
-            rows.append(empty_row)
-            continue
-
+            return empty_row, None
         instr = ch.instructions[0]
-        ro = precompute_row_outputs(instr, anchor_states)
-        rows.append((ro.row_outputs, ro.n_inputs, ro.input_mags,
-                     ro.has_rd, ro.rd_mag, True))
+        pre = precompute_chunk(ch.instructions, anchor_states)
+        ro = precompute_row_outputs(instr, anchor_states, pre=pre)
+        return ((ro.row_outputs, ro.n_inputs, ro.input_mags,
+                 ro.has_rd, ro.rd_mag, True), pre)
+
+    for ch in chunks:
+        chunks_out.append(ch)
+        row, pre = _process(ch)
+        rows.append(row)
+        pres.append(pre)
+
+        if pre is None:
+            # Invalid / mem-op / multi-instr: no twins.
+            continue
 
         for _ in range(twins):
             twin_instrs = random_relabel(ch.instructions, rng)
-            chunks_out.append(_make_valid_chunk(twin_instrs))
-            if _has_mem_ops(twin_instrs):
-                # Relabeling shouldn't introduce mem ops, but be defensive.
-                rows.append(empty_row)
-                continue
-            twin_ro = precompute_row_outputs(twin_instrs[0], anchor_states)
-            rows.append((twin_ro.row_outputs, twin_ro.n_inputs,
-                         twin_ro.input_mags, twin_ro.has_rd, twin_ro.rd_mag,
-                         True))
+            twin_chunk = _make_valid_chunk(twin_instrs)
+            chunks_out.append(twin_chunk)
+            twin_row, twin_pre = _process(twin_chunk)
+            rows.append(twin_row)
+            pres.append(twin_pre)
 
-    n_rows = len(rows)
     payload = RowOutputsPayload(
         row_outputs=np.stack([r[0] for r in rows]),
         n_inputs=np.array([r[1] for r in rows], dtype=np.int8),
@@ -647,7 +749,8 @@ def build_row_outputs(chunks, twins, anchor_states, rng):
         rd_mag=np.array([r[4] for r in rows], dtype=np.float32),
         pair_valid=np.array([r[5] for r in rows], dtype=bool),
     )
-    return chunks_out, payload
+    aux = _aux_from_precomputeds(pres)
+    return chunks_out, payload, aux
 
 
 # ===========================================================================
@@ -752,7 +855,7 @@ def collect_into_batches(chunks_iter, *, batch_size, twins, partners,
                         for _ in range(n_invalid)]
             mixed = valid_sources + invalids
             if row_outputs_mode:
-                chunks_out, payload = build_row_outputs(
+                chunks_out, payload, aux = build_row_outputs(
                     mixed, twins=twins,
                     anchor_states=anchor_states, rng=rng)
                 yield pack_batch(
@@ -761,9 +864,10 @@ def collect_into_batches(chunks_iter, *, batch_size, twins, partners,
                     target_max_tokens=target_max_tokens,
                     target_max_n_instrs=target_max_n_instrs,
                     target_P=target_P,
-                    row_outputs_payload=payload)
+                    row_outputs_payload=payload,
+                    aux_payload=aux)
             else:
-                chunks_out, pairs, dists = build_pairs(
+                chunks_out, pairs, dists, aux = build_pairs(
                     mixed, twins=twins, partners=partners,
                     anchor_states=anchor_states, rng=rng)
                 yield pack_batch(
@@ -771,4 +875,5 @@ def collect_into_batches(chunks_iter, *, batch_size, twins, partners,
                     target_B=target_B,
                     target_max_tokens=target_max_tokens,
                     target_max_n_instrs=target_max_n_instrs,
-                    target_P=target_P)
+                    target_P=target_P,
+                    aux_payload=aux)

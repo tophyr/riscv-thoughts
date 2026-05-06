@@ -62,7 +62,7 @@ def pair_distance_correlation(encoder, batches, *, device, max_batches=100,
     for i, batch in enumerate(batches):
         if i >= max_batches:
             break
-        tok = torch.from_numpy(batch.tokens).to(device)
+        tok = torch.from_numpy(batch.tokens).to(device).long()
         pad = torch.from_numpy(padding_mask(batch)).to(device)
         vecs = encoder.encode(tok, pad)
 
@@ -291,7 +291,7 @@ def decoder_accuracy(encoder, decoder, batches, *,
         valid = batch.valid
         if not valid.any():
             continue
-        tok = torch.from_numpy(batch.tokens).to(device)
+        tok = torch.from_numpy(batch.tokens).to(device).long()
         pad = torch.from_numpy(padding_mask(batch)).to(device)
         vecs_all = encoder.encode(tok, pad)
         valid_idx = np.flatnonzero(valid)

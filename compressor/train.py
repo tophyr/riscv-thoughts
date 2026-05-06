@@ -383,11 +383,12 @@ def train_encoder(batch_iter, *,
     t0 = time.time()
     t_last = t0
 
+    # Trains until stdin EOF — pipeline upstream (batch_slice / batch_repeat /
+    # multinode_gen) controls total batch count. n_steps shapes the cosine
+    # scheduler and ETA display; if the pipeline runs longer the LR stays at
+    # lr_min, if shorter the schedule is truncated.
     for batch in batch_iter:
-        if n_steps is not None and step >= n_steps:
-            break
-
-        tok = torch.from_numpy(batch.tokens).to(device)
+        tok = torch.from_numpy(batch.tokens).to(device).long()
         pad = torch.from_numpy(padding_mask(batch)).to(device)
         valid = torch.from_numpy(batch.valid).to(device)
 
@@ -521,8 +522,9 @@ def _split_to_per_instruction(batch):
     arrays + a mapping back to (chunk, slot).
 
     Returns:
-        instr_tokens: (N_instr_total, MAX_INSTR_TOKENS) int64 — padded
+        instr_tokens: (N_instr_total, MAX_INSTR_TOKENS) int8 — padded
                       with PAD past each instruction's actual length.
+                      Caller must .long() before nn.Embedding.
         instr_pad:    (N_instr_total, MAX_INSTR_TOKENS) bool — True
                       where padded.
         chunk_idx:    (N_instr_total,) int64 — which row in the
@@ -535,7 +537,7 @@ def _split_to_per_instruction(batch):
     n_per_chunk = (batch.instr_lens > 0).sum(axis=1).astype(np.int32)
     total = int(n_per_chunk.sum())
     if total == 0:
-        empty = np.zeros((0, _MAX_INSTR_TOKENS), dtype=np.int64)
+        empty = np.zeros((0, _MAX_INSTR_TOKENS), dtype=np.int8)
         return (
             empty,
             np.ones((0, _MAX_INSTR_TOKENS), dtype=bool),
@@ -544,7 +546,7 @@ def _split_to_per_instruction(batch):
             n_per_chunk,
         )
 
-    instr_tokens = np.full((total, _MAX_INSTR_TOKENS), PAD, dtype=np.int64)
+    instr_tokens = np.full((total, _MAX_INSTR_TOKENS), PAD, dtype=np.int8)
     instr_pad = np.ones((total, _MAX_INSTR_TOKENS), dtype=bool)
     chunk_idx = np.empty(total, dtype=np.int64)
     slot_idx = np.empty(total, dtype=np.int64)
@@ -571,6 +573,9 @@ def train_t2_encoder(batch_iter, t1_encoder, *,
                      lr=3e-4, n_steps=None, log_every=100, lr_min=1e-6,
                      behavioral_weight=1.0, behavioral_scale=10.0,
                      valid_weight=0.0,
+                     live_in_weight=0.1, live_out_weight=0.1,
+                     pc_writes_weight=0.1,
+                     in_slot_weight=0.1, out_slot_weight=0.1,
                      device='auto',
                      on_log=None):
     """Train a T2 encoder on top of a frozen T1 encoder.
@@ -585,6 +590,11 @@ def train_t2_encoder(batch_iter, t1_encoder, *,
       5. Pair-MSE on (||t2_a - t2_b|| - distance)^2 over batch.pair_indices.
       6. Optional magnitude-validity loss (defaults off — corpora
          generated without --inject-invalid have no negative class).
+      7. Aux register-identity supervision (BCE on live_in/out masks
+         and pc_writes; CE on slot-positional register predictions).
+
+    Aux heads project from F.normalize(t2_vecs) so register-identity
+    info is encoded into direction, not magnitude.
 
     on_log: optional callable(step, t2, losses) called after each log
             point. Use it to checkpoint mid-run.
@@ -614,17 +624,18 @@ def train_t2_encoder(batch_iter, t1_encoder, *,
     t0 = time.time()
     t_last = t0
 
+    # Trains until stdin EOF — pipeline upstream (batch_slice / batch_repeat /
+    # multinode_gen) controls total batch count. n_steps shapes the cosine
+    # scheduler and ETA display; if the pipeline runs longer the LR stays at
+    # lr_min, if shorter the schedule is truncated.
     for batch in batch_iter:
-        if n_steps is not None and step >= n_steps:
-            break
-
         # 1-3. Per-instruction T1 encode → per-chunk T1 sequences.
         instr_tokens, instr_pad, chunk_idx, slot_idx, n_per_chunk = \
             _split_to_per_instruction(batch)
         if instr_tokens.shape[0] == 0:
             continue
 
-        instr_tok_t = torch.from_numpy(instr_tokens).to(device)
+        instr_tok_t = torch.from_numpy(instr_tokens).to(device).long()
         instr_pad_t = torch.from_numpy(instr_pad).to(device)
         with torch.no_grad():
             t1_vecs = t1_encoder.encode(instr_tok_t, instr_pad_t)
@@ -670,7 +681,70 @@ def train_t2_encoder(batch_iter, t1_encoder, *,
         else:
             valid_loss = torch.tensor(0.0, device=device)
 
-        total = behavioral_weight * behavioral + valid_weight * valid_loss
+        # 7. Aux register-identity heads (project from direction only).
+        t2_vecs_dir = F.normalize(t2_vecs, dim=-1)
+        live_in_t = torch.from_numpy(batch.live_in_mask).to(device).float()
+        live_out_t = torch.from_numpy(batch.live_out_mask).to(device).float()
+        pc_writes_t = torch.from_numpy(batch.pc_writes).to(device).float()
+        in_slot_t = torch.from_numpy(
+            batch.in_slot_regs.astype(np.int64)).to(device)
+        out_slot_t = torch.from_numpy(
+            batch.out_slot_regs.astype(np.int64)).to(device)
+
+        # Mask BCE losses to rows with at least one positive — invalid /
+        # mem-op rows have all-zero masks and shouldn't drive learning.
+        any_in = live_in_t.any(dim=-1)
+        any_out = live_out_t.any(dim=-1)
+        aux_active = any_in | any_out
+
+        if aux_active.any():
+            li_logits = t2.live_in_head(t2_vecs_dir)
+            lo_logits = t2.live_out_head(t2_vecs_dir)
+            pc_logits = t2.pc_writes_head(t2_vecs_dir).squeeze(-1)
+            li_loss = F.binary_cross_entropy_with_logits(
+                li_logits[aux_active], live_in_t[aux_active])
+            lo_loss = F.binary_cross_entropy_with_logits(
+                lo_logits[aux_active], live_out_t[aux_active])
+            pc_loss = F.binary_cross_entropy_with_logits(
+                pc_logits[aux_active], pc_writes_t[aux_active])
+
+            in_slot_loss = torch.tensor(0.0, device=device)
+            n_in = 0
+            for k, head in enumerate(t2.in_slot_heads):
+                targets = in_slot_t[:, k]
+                if not (targets != _CE_IGNORE).any():
+                    continue
+                logits = head(t2_vecs_dir)
+                in_slot_loss = in_slot_loss + F.cross_entropy(
+                    logits, targets, ignore_index=_CE_IGNORE)
+                n_in += 1
+            in_slot_loss = in_slot_loss / max(1, n_in)
+
+            out_slot_loss = torch.tensor(0.0, device=device)
+            n_out = 0
+            for k, head in enumerate(t2.out_slot_heads):
+                targets = out_slot_t[:, k]
+                if not (targets != _CE_IGNORE).any():
+                    continue
+                logits = head(t2_vecs_dir)
+                out_slot_loss = out_slot_loss + F.cross_entropy(
+                    logits, targets, ignore_index=_CE_IGNORE)
+                n_out += 1
+            out_slot_loss = out_slot_loss / max(1, n_out)
+        else:
+            li_loss = torch.tensor(0.0, device=device)
+            lo_loss = torch.tensor(0.0, device=device)
+            pc_loss = torch.tensor(0.0, device=device)
+            in_slot_loss = torch.tensor(0.0, device=device)
+            out_slot_loss = torch.tensor(0.0, device=device)
+
+        total = (behavioral_weight * behavioral
+                 + valid_weight * valid_loss
+                 + live_in_weight * li_loss
+                 + live_out_weight * lo_loss
+                 + pc_writes_weight * pc_loss
+                 + in_slot_weight * in_slot_loss
+                 + out_slot_weight * out_slot_loss)
         opt.zero_grad(set_to_none=True)
         total.backward()
         torch.nn.utils.clip_grad_norm_(t2.parameters(), 1.0)
@@ -684,6 +758,11 @@ def train_t2_encoder(batch_iter, t1_encoder, *,
             'total': float(total),
             'behavioral': float(behavioral),
             'valid': float(valid_loss),
+            'live_in': float(li_loss),
+            'live_out': float(lo_loss),
+            'pc_writes': float(pc_loss),
+            'in_slot': float(in_slot_loss),
+            'out_slot': float(out_slot_loss),
             'n_chunks': B,
             'n_instrs': int(n_per_chunk.sum()),
         }
@@ -695,7 +774,10 @@ def train_t2_encoder(batch_iter, t1_encoder, *,
             eta = ((n_steps - step) * ms_per_step / 1000) if n_steps else 0
             print(
                 f'step {step:>5d}  loss {record["total"]:.4f} '
-                f'(behavioral {record["behavioral"]:.4f} valid {record["valid"]:.4f}) '
+                f'(beh {record["behavioral"]:.4f} val {record["valid"]:.4f} '
+                f'li {record["live_in"]:.3f} lo {record["live_out"]:.3f} '
+                f'pc {record["pc_writes"]:.3f} '
+                f'is {record["in_slot"]:.3f} os {record["out_slot"]:.3f}) '
                 f'B={record["n_chunks"]} I={record["n_instrs"]}  '
                 f'lr {lr_now:.1e}  {ms_per_step:.0f}ms/step  '
                 f'eta {timedelta(seconds=int(eta))}')

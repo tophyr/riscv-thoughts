@@ -41,7 +41,6 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from emulator import (
-    Instruction, run as run_instructions, make_ctx,
     R_TYPE, I_TYPE, B_TYPE, LOAD_TYPE, STORE_TYPE,
 )
 
@@ -100,13 +99,35 @@ BEHAVIORAL_RELEVANCE_THRESHOLD = 1e-9
 # bound for those pathological chunks).
 MAX_BIJECTION_SIZE = 8
 
+N_REGS = 32
+
 # Canonical anchor-position list for register input sourcing during
 # SSA evaluation. A row's behavioral inputs are sourced from these
 # positions instead of from the row's actual register positions, so
 # the residual and magnitudes don't leak the row's register names.
-# Length = 2 * MAX_BIJECTION_SIZE so a paired evaluation with full
-# unaligned on both sides still has a distinct slot per input.
-_CANON_POSITIONS = list(range(1, 1 + 2 * MAX_BIJECTION_SIZE))
+# All 31 non-x0 register slots are usable. A paired evaluation needs
+# up to |inputs_a| + |inputs_b| - matched distinct positions; with
+# branch+cap=8 chunks producing up to 16 inputs each, that approaches
+# 32. Position 0 stays reserved for x0 (always reads zero); pairs whose
+# unaligned input count exceeds 31 raise CanonPositionOverflow so the
+# caller can skip rather than silently aliasing positions.
+_CANON_POSITIONS = list(range(1, N_REGS))
+
+# Per-row aux target shapes. T2's slot-positional CE heads supervise
+# which actual register is at each structural slot — input slot i is
+# the i-th behavioral input in syntactic-first-read order; output
+# slot i is the i-th SSA-write-order output. Sized for 16-instruction
+# chunks with margin; rare to fill more than ~8 slots in practice.
+MAX_INPUT_SLOTS = 32
+MAX_OUTPUT_SLOTS = 16
+AUX_CE_IGNORE = -100
+
+
+class CanonPositionOverflow(Exception):
+    """Raised when a pair's combined unaligned input count exceeds
+    the 31 available canonical positions (positions 1..31; position 0
+    is reserved for x0). Pairs that overflow can't be evaluated under
+    the GVN-invariant canonical metric and should be skipped."""
 
 
 class UnsupportedOpError(ValueError):
@@ -491,17 +512,27 @@ def _pair_canon_positions(inputs_a, inputs_b, a_keys, b_keys):
     (a_keys[i] ↔ b_keys[i]). Matched inputs share canon positions
     0..m-1; a's unaligned inputs use m..k_a-1; b's unaligned inputs
     use k_a..k_a+k_b-m-1. Returns two lists in the syntactic input
-    order of inputs_a and inputs_b."""
+    order of inputs_a and inputs_b. Raises CanonPositionOverflow if
+    the combined position count exceeds the 31 available slots."""
     m = len(a_keys)
     a_to_pos = {a_keys[i]: _CANON_POSITIONS[i] for i in range(m)}
     b_to_pos = {b_keys[i]: _CANON_POSITIONS[i] for i in range(m)}
     next_pos = m
+    n_avail = len(_CANON_POSITIONS)
     for r in inputs_a:
         if r not in a_to_pos:
+            if next_pos >= n_avail:
+                raise CanonPositionOverflow(
+                    f'pair needs >{n_avail} canon positions '
+                    f'(|a|={len(inputs_a)} |b|={len(inputs_b)} m={m})')
             a_to_pos[r] = _CANON_POSITIONS[next_pos]
             next_pos += 1
     for r in inputs_b:
         if r not in b_to_pos:
+            if next_pos >= n_avail:
+                raise CanonPositionOverflow(
+                    f'pair needs >{n_avail} canon positions '
+                    f'(|a|={len(inputs_a)} |b|={len(inputs_b)} m={m})')
             b_to_pos[r] = _CANON_POSITIONS[next_pos]
             next_pos += 1
     return ([a_to_pos[r] for r in inputs_a],
@@ -634,19 +665,6 @@ def _eval_ssa_numpy(ssa, chunk_len, anchor_states, live=None):
     return out_regs, out_pcs
 
 
-def _exec_on_states(chunk, states, ctx):
-    """Reference Python-emulator evaluator. Used by tests to verify
-    SSA-numpy. Hot path uses _eval_ssa_numpy."""
-    n = states.shape[0]
-    out_regs = np.zeros_like(states)
-    out_pcs = np.zeros(n, dtype=np.int64)
-    for i in range(n):
-        state, pc, _ = run_instructions(chunk, regs=states[i], pc=0, _ctx=ctx)
-        out_regs[i] = state.regs
-        out_pcs[i] = pc
-    return out_regs, out_pcs
-
-
 # ---------------------------------------------------------------------------
 # Chunk distance — continuous behavioral metric
 # ---------------------------------------------------------------------------
@@ -743,6 +761,11 @@ class Precomputed:
     out_pcs: np.ndarray          # (n_states,) final PC per state
     out_mags: dict               # reg → loglog'd output magnitude
     pc_explicit: bool            # does any live SSA op write PC
+    # Per-row aux targets (T2 register-identity supervision).
+    live_in_mask: np.ndarray     # (N_REGS,) bool — behavioral inputs as mask
+    live_out_mask: np.ndarray    # (N_REGS,) bool — actually-modified regs as mask
+    in_slot_regs: np.ndarray     # (MAX_INPUT_SLOTS,) int8 — reg or AUX_CE_IGNORE
+    out_slot_regs: np.ndarray    # (MAX_OUTPUT_SLOTS,) int8 — reg or AUX_CE_IGNORE
 
 
 def precompute_chunk(chunk, anchor_states):
@@ -756,7 +779,7 @@ def precompute_chunk(chunk, anchor_states):
 
     ssa = to_ssa(chunk)
     live = live_nodes(ssa)
-    has_pc_in, has_mem_in = _has_anchored_inputs(ssa, live)
+    _, has_mem_in = _has_anchored_inputs(ssa, live)
     reg_out, pc_out, mem_out = _split_outputs(ssa)
     assert mem_out is None and not has_mem_in
 
@@ -782,6 +805,26 @@ def precompute_chunk(chunk, anchor_states):
     behavioral_inputs = [r for r in inputs
                          if input_mags[r] > BEHAVIORAL_RELEVANCE_THRESHOLD]
 
+    # Aux targets: live-in/out masks + per-slot register IDs.
+    live_in_mask = np.zeros(N_REGS, dtype=bool)
+    for r in behavioral_inputs:
+        live_in_mask[r] = True
+    live_out_mask = np.zeros(N_REGS, dtype=bool)
+    for r in actual_reg_outs:
+        live_out_mask[r] = True
+
+    in_slot_regs = np.full(MAX_INPUT_SLOTS, AUX_CE_IGNORE, dtype=np.int8)
+    for i, r in enumerate(behavioral_inputs[:MAX_INPUT_SLOTS]):
+        in_slot_regs[i] = r
+
+    # SSA-write-order: sort the actually-modified regs by their final-
+    # write SSA node id (later id = later write).
+    write_ordered = sorted(actual_reg_outs,
+                           key=lambda r: ssa.output_versions[r])
+    out_slot_regs = np.full(MAX_OUTPUT_SLOTS, AUX_CE_IGNORE, dtype=np.int8)
+    for i, r in enumerate(write_ordered[:MAX_OUTPUT_SLOTS]):
+        out_slot_regs[i] = r
+
     return Precomputed(
         chunk=chunk,
         ssa=ssa,
@@ -794,6 +837,10 @@ def precompute_chunk(chunk, anchor_states):
         out_pcs=out_pcs,
         out_mags=out_mags,
         pc_explicit=pc_explicit,
+        live_in_mask=live_in_mask,
+        live_out_mask=live_out_mask,
+        in_slot_regs=in_slot_regs,
+        out_slot_regs=out_slot_regs,
     )
 
 
@@ -838,17 +885,22 @@ class RowOutputs:
     rd_mag: float             # magnitude of rd output (0 if not has_rd)
 
 
-def precompute_row_outputs(instr, anchor_states):
+def precompute_row_outputs(instr, anchor_states, *, pre=None):
     """Per-row data for single-instruction broadcast distance.
 
     Reuses precompute_chunk's canonical baseline for K=0; runs one
     additional SSA evaluation for K=1 (rs1↔rs2 swap) when the row has
     two distinct behavioral inputs.
 
+    Pass `pre` to skip the internal precompute_chunk call when the
+    caller already has it (avoids duplicate SSA work in build pipelines
+    that also extract aux targets from the same Precomputed).
+
     Raises NotImplementedError on memory ops (V1 distance scope).
     """
     chunk = [instr]
-    pre = precompute_chunk(chunk, anchor_states)
+    if pre is None:
+        pre = precompute_chunk(chunk, anchor_states)
 
     behavioral = pre.behavioral_inputs
     n_inputs = len(behavioral)
@@ -928,8 +980,6 @@ def pairwise_distance_canonical(row_outputs, n_inputs, input_mags,
     is_torch = hasattr(row_outputs, 'log1p') and not isinstance(
         row_outputs, np.ndarray)
     xp = _xp_of(row_outputs)
-
-    B, K, n_anchors, n_channels = row_outputs.shape
 
     # Channel residuals: log1p(log1p(|Δ|)).mean(over anchors).
     # diff shape: (B, B, K, K, n_anchors, n_channels).
@@ -1031,8 +1081,12 @@ def _behavioral_distance_directional(pre_a, pre_b, anchor_states):
     # ~335 GB). For chunks above the cap, fall back to the empty
     # bijection: distance is then an upper bound (no input symmetry
     # discovery), pair signal is noisier, but the call terminates.
-    k = min(len(inputs_a), len(inputs_b))
-    if k <= MAX_BIJECTION_SIZE:
+    # The cap must check max(|a|,|b|): partial_bijections yields
+    # C(max, min) * min! candidates, so a chunk with |a|=8 paired
+    # against |b|=16 expands to ~519M bijections (8!*C(16,8)) and
+    # hangs the worker. Both sides must be within MAX_BIJECTION_SIZE.
+    if (len(inputs_a) <= MAX_BIJECTION_SIZE
+            and len(inputs_b) <= MAX_BIJECTION_SIZE):
         bijections = partial_bijections(inputs_a, inputs_b)
     else:
         bijections = iter([((), ())])
@@ -1045,36 +1099,83 @@ def _behavioral_distance_directional(pre_a, pre_b, anchor_states):
     # (e.g., double-ADD ≡ SLLI must reach distance 0).
     compare_pc = pre_a.pc_explicit or pre_b.pc_explicit
 
-    best = float('inf')
+    # Materialize bijections + canonical-state pairs in a single pass,
+    # skipping any that overflow the canon position pool. We then run
+    # SSA evaluation once across all bijections by stacking states
+    # along a new leading axis (vectorized across the bijection loop).
+    valid_bij = []        # list of (a_keys, b_keys)
+    a_states_list = []    # each (n_states, 32)
+    b_states_list = []
     for a_keys, b_keys in bijections:
-        a_canon_pos, b_canon_pos = _pair_canon_positions(
-            inputs_a, inputs_b, a_keys, b_keys)
-        a_state = _canonical_state(anchor_states, inputs_a, a_canon_pos)
-        b_state = _canonical_state(anchor_states, inputs_b, b_canon_pos)
+        try:
+            a_canon_pos, b_canon_pos = _pair_canon_positions(
+                inputs_a, inputs_b, a_keys, b_keys)
+        except CanonPositionOverflow:
+            continue
+        valid_bij.append((a_keys, b_keys))
+        a_states_list.append(
+            _canonical_state(anchor_states, inputs_a, a_canon_pos))
+        b_states_list.append(
+            _canonical_state(anchor_states, inputs_b, b_canon_pos))
 
-        a_out_regs, a_out_pcs = _eval_ssa_numpy(
-            pre_a.ssa, len(pre_a.chunk), a_state, pre_a.live)
-        b_out_regs, b_out_pcs = _eval_ssa_numpy(
-            pre_b.ssa, len(pre_b.chunk), b_state, pre_b.live)
+    if not valid_bij:
+        return float('inf')
 
-        # Hungarian on regular outputs by per-state loglog'd absolute-
-        # value residual.
-        if pre_a.reg_outs and pre_b.reg_outs:
-            ra_vals = a_out_regs[:, pre_a.reg_outs]
-            rb_vals = b_out_regs[:, pre_b.reg_outs]
-            diff = (ra_vals[:, :, None].astype(np.int64)
-                    - rb_vals[:, None, :].astype(np.int64))
-            cost = _loglog(diff).mean(axis=0)
+    n_bij = len(valid_bij)
+    n_states = anchor_states.shape[0]
+
+    # Stack and flatten so _eval_ssa_numpy treats (B*n_states) as one
+    # big batch of independent input states. SSA eval has no inter-state
+    # coupling, so this is mathematically identical to running it
+    # n_bij times — just amortizes numpy's per-op dispatch overhead.
+    a_states_batch = np.stack(a_states_list, axis=0)  # (n_bij, n_states, 32)
+    b_states_batch = np.stack(b_states_list, axis=0)
+    a_flat = a_states_batch.reshape(n_bij * n_states, 32)
+    b_flat = b_states_batch.reshape(n_bij * n_states, 32)
+
+    a_out_flat, a_pcs_flat = _eval_ssa_numpy(
+        pre_a.ssa, len(pre_a.chunk), a_flat, pre_a.live)
+    b_out_flat, b_pcs_flat = _eval_ssa_numpy(
+        pre_b.ssa, len(pre_b.chunk), b_flat, pre_b.live)
+
+    a_out = a_out_flat.reshape(n_bij, n_states, 32)
+    b_out = b_out_flat.reshape(n_bij, n_states, 32)
+    a_pcs = a_pcs_flat.reshape(n_bij, n_states)
+    b_pcs = b_pcs_flat.reshape(n_bij, n_states)
+
+    # Vectorized cost matrix across bijections. Hungarian itself stays
+    # serial per bijection (scipy has no batched solver and the cost
+    # matrices are tiny — ≤8x8).
+    if pre_a.reg_outs and pre_b.reg_outs:
+        ra_vals = a_out[:, :, pre_a.reg_outs]   # (n_bij, n_states, n_a_outs)
+        rb_vals = b_out[:, :, pre_b.reg_outs]   # (n_bij, n_states, n_b_outs)
+        diff = (ra_vals[:, :, :, None].astype(np.int64)
+                - rb_vals[:, :, None, :].astype(np.int64))
+        cost_batch = _loglog(diff).mean(axis=1)  # (n_bij, n_a_outs, n_b_outs)
+    else:
+        cost_batch = None
+
+    # PC residual vectorized: one scalar per bijection.
+    if compare_pc:
+        pc_resid_batch = _loglog(
+            a_pcs.astype(np.int64) - b_pcs.astype(np.int64)
+        ).mean(axis=1)
+    else:
+        pc_resid_batch = np.zeros(n_bij, dtype=np.float64)
+
+    best = float('inf')
+    for i, (a_keys, b_keys) in enumerate(valid_bij):
+        if cost_batch is not None:
+            cost = cost_batch[i]
             row_ind, col_ind = linear_sum_assignment(cost)
             matched_residual = float(cost[row_ind, col_ind].sum())
-            matched_a = {pre_a.reg_outs[i] for i in row_ind}
-            matched_b = {pre_b.reg_outs[j] for j in col_ind}
+            matched_a = {pre_a.reg_outs[r] for r in row_ind}
+            matched_b = {pre_b.reg_outs[c] for c in col_ind}
         else:
             matched_residual = 0.0
             matched_a = set()
             matched_b = set()
 
-        # Edit costs: behavioral magnitudes of unaligned slots.
         unaligned_out_cost = (
             sum(pre_a.out_mags[r]
                 for r in pre_a.reg_outs if r not in matched_a)
@@ -1088,15 +1189,8 @@ def _behavioral_distance_directional(pre_a, pre_b, anchor_states):
             + sum(pre_b.input_mags[r] for r in unaligned_b_inputs)
         )
 
-        if compare_pc:
-            pc_residual = float(_loglog(
-                a_out_pcs.astype(np.int64) - b_out_pcs.astype(np.int64)
-            ).mean())
-        else:
-            pc_residual = 0.0
-
         total = (matched_residual + unaligned_out_cost
-                 + unaligned_in_cost + pc_residual)
+                 + unaligned_in_cost + float(pc_resid_batch[i]))
         if total < best:
             best = total
         if best <= 0.0:
