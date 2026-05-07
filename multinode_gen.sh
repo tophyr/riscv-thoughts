@@ -89,7 +89,7 @@ fi
 
 ssh ${REMOTE} "bash ${REMOTE_DIR}/scripts/multinode_remote.sh \
     ${REMOTE_DIR} ${REMOTE_PYTHON} \
-    --gen-count 96 \
+    --gen-count 48 \
     --rule ${RULE} \
     --batch-size ${BATCH_SIZE} \
     --twins ${TWINS} --partners ${PARTNERS} --n-states ${N_STATES} \
@@ -113,4 +113,4 @@ ${PYTHON} scripts/mux_batches.py \
     --n-batches ${BATCHES_PER_WORKER} \
     --config ${CONFIG} \
     ${EXTRA_ARGS} \
-    <(nc odin 6464 -d | unlz4)
+    <(nc odin 6464 -d)

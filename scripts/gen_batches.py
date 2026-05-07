@@ -30,7 +30,9 @@ Pipeline shape:
 """
 
 import argparse
+import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -198,20 +200,34 @@ def main():
     out = binary_stdout()
     RVT_FORMAT.write_stream_header(out)
     written = 0
+    pid = os.getpid()
+    bi = iter(batches_iter)
+    print(f'[pid={pid}] worker_start seed={args.seed} target={args.n_batches}',
+          file=sys.stderr, flush=True)
     try:
-        for batch in batches_iter:
-            RVT_FORMAT.write_batch(out, batch)
-            written += 1
-            if args.verbose and written % 50 == 0:
-                print(f'{written}/{args.n_batches} batches', file=sys.stderr)
-            if written >= args.n_batches:
+        while written < args.n_batches:
+            t0 = time.monotonic()
+            try:
+                batch = next(bi)
+            except StopIteration:
                 break
+            t1 = time.monotonic()
+            RVT_FORMAT.write_batch(out, batch)
+            t2 = time.monotonic()
+            written += 1
+            compute_ms = (t1 - t0) * 1000
+            write_ms = (t2 - t1) * 1000
+            n_pairs = int(batch.pair_indices.shape[0])
+            print(f'[pid={pid}] batch={written} '
+                  f'compute_ms={compute_ms:.0f} write_ms={write_ms:.0f} '
+                  f'n_pairs={n_pairs}',
+                  file=sys.stderr, flush=True)
     except BrokenPipeError:
         pass
 
     out.close()
-    if args.verbose:
-        print(f'Done: {written} batches', file=sys.stderr)
+    print(f'[pid={pid}] worker_end written={written}',
+          file=sys.stderr, flush=True)
 
 
 if __name__ == '__main__':

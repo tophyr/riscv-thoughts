@@ -22,10 +22,15 @@ segmentation isn't preserved across the wire — relabeling happens at
 generation time when the source list[Instruction] is still in hand.
 """
 
+import os
 import struct
+import sys
+import time
 from dataclasses import dataclass
 
 import numpy as np
+
+_PID = os.getpid()
 
 from emulator import Instruction
 from tokenizer import PAD, encode_instruction
@@ -640,6 +645,13 @@ def build_pairs(chunks, twins, partners, anchor_states, rng):
             pool_per_cluster[c] = [i for i in paired_rows
                                    if cluster_id[i] != c]
 
+    # Per-pair timing aggregated by full shape — to test the hypothesis
+    # that time-per-pair is invariant by (n_inputs, n_outputs) shape.
+    # Bucket key: (kin_min, kin_max, kout_min, kout_max) — bijection
+    # cost is symmetric in a/b after the cap check; output Hungarian
+    # cost depends on n_outputs.
+    pair_stats = {}  # bucket -> [count, total_ms, max_ms]
+
     for i in paired_rows:
         c = cluster_id[i]
         siblings = [j for j in cluster_members[c] if j != i]
@@ -654,14 +666,46 @@ def build_pairs(chunks, twins, partners, anchor_states, rng):
         replace = len(pool) < n_random
         picks = rng.choice(pool, size=n_random, replace=replace)
         for j in picks.tolist():
+            pre_i = _pre(i)
+            pre_j = _pre(int(j))
+            ka = len(pre_i.behavioral_inputs)
+            kb = len(pre_j.behavioral_inputs)
+            oa = len(pre_i.reg_outs)
+            ob = len(pre_j.reg_outs)
+            bucket = (min(ka, kb), max(ka, kb),
+                      min(oa, ob), max(oa, ob))
+            t0 = time.monotonic()
             d = float(behavioral_distance_cached(
-                _pre(i), _pre(int(j)), anchor_states))
+                pre_i, pre_j, anchor_states))
+            t1 = time.monotonic()
+            ms = (t1 - t0) * 1000.0
+            stat = pair_stats.get(bucket)
+            if stat is None:
+                pair_stats[bucket] = [1, ms, ms]
+            else:
+                stat[0] += 1
+                stat[1] += ms
+                if ms > stat[2]:
+                    stat[2] = ms
             # Pairs whose canonical-positions overflow on both
             # directions return inf; drop rather than poison training.
             if d == float('inf'):
                 continue
             pair_indices.append((i, int(j)))
             distances.append(d)
+
+    # One-line per-batch summary. Format per bucket:
+    #   <kin_min>x<kin_max>o<kout_min>x<kout_max>:<n>@<avg_ms>/<max_ms>
+    if pair_stats:
+        parts = []
+        for bucket in sorted(pair_stats):
+            n, total_ms, max_ms = pair_stats[bucket]
+            kn_lo, kn_hi, ko_lo, ko_hi = bucket
+            parts.append(
+                f'{kn_lo}x{kn_hi}o{ko_lo}x{ko_hi}:{n}@{total_ms/n:.1f}/{max_ms:.0f}'
+            )
+        print(f'[pid={_PID}] pair_buckets {" ".join(parts)}',
+              file=sys.stderr, flush=True)
 
     # Aux targets: every paired row gets its Precomputed; mem-op /
     # invalid rows get None → empty aux row.

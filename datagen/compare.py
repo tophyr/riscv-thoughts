@@ -37,6 +37,7 @@ handles them at the SSA level via anchored MEM_IN leaves.
 from dataclasses import dataclass, field
 from itertools import combinations, permutations
 
+import numexpr as ne
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
@@ -580,12 +581,16 @@ def _eval_ssa_numpy(ssa, chunk_len, anchor_states, live=None):
 
         elif op in ('ADD', 'ADDI'):
             a, b = node.operands
-            values[nid] = (values[a].astype(np.int64)
-                           + values[b].astype(np.int64)).astype(np.int32)
+            # uint32 modular arithmetic: bit-identical to RV32 ADD's
+            # two's-complement wrap, but the int64 round-trip's
+            # bandwidth and cast cost is gone. .view() is a free
+            # bit-reinterpret (no copy).
+            values[nid] = (values[a].view(np.uint32)
+                           + values[b].view(np.uint32)).view(np.int32)
         elif op == 'SUB':
             a, b = node.operands
-            values[nid] = (values[a].astype(np.int64)
-                           - values[b].astype(np.int64)).astype(np.int32)
+            values[nid] = (values[a].view(np.uint32)
+                           - values[b].view(np.uint32)).view(np.int32)
         elif op in ('XOR', 'XORI'):
             a, b = node.operands
             values[nid] = values[a] ^ values[b]
@@ -685,7 +690,10 @@ def _output_magnitudes(out_regs, in_states, output_regs):
     Used as smooth edit cost for unmatched outputs."""
     if not output_regs:
         return {}
-    deltas = out_regs[:, output_regs] - in_states[:, output_regs]
+    # int64 upcast: int32-int32 deltas can overflow to INT32_MIN, whose
+    # abs is also INT32_MIN, which log1p turns into NaN.
+    deltas = (out_regs[:, output_regs].astype(np.int64)
+              - in_states[:, output_regs].astype(np.int64))
     mags = _loglog(deltas).mean(axis=0)
     return {r: float(m) for r, m in zip(output_regs, mags)}
 
@@ -1146,20 +1154,30 @@ def _behavioral_distance_directional(pre_a, pre_b, anchor_states):
     # Vectorized cost matrix across bijections. Hungarian itself stays
     # serial per bijection (scipy has no batched solver and the cost
     # matrices are tiny — ≤8x8).
+    #
+    # fp32 throughout: int32 register values are exact in fp32 up to
+    # 2^24 magnitude; above that ULP grows to ~256 at 2^31, but the
+    # subsequent loglog compresses that entirely (derivative ~2.3e-11
+    # at x=2e9). Halves memory vs fp64.
     if pre_a.reg_outs and pre_b.reg_outs:
-        ra_vals = a_out[:, :, pre_a.reg_outs]   # (n_bij, n_states, n_a_outs)
-        rb_vals = b_out[:, :, pre_b.reg_outs]   # (n_bij, n_states, n_b_outs)
-        diff = (ra_vals[:, :, :, None].astype(np.int64)
-                - rb_vals[:, :, None, :].astype(np.int64))
-        cost_batch = _loglog(diff).mean(axis=1)  # (n_bij, n_a_outs, n_b_outs)
+        ra_vals = np.ascontiguousarray(
+            a_out[:, :, pre_a.reg_outs]).astype(np.float32, copy=False)
+        rb_vals = np.ascontiguousarray(
+            b_out[:, :, pre_b.reg_outs]).astype(np.float32, copy=False)
+        ra_b = ra_vals[:, :, :, None]
+        rb_b = rb_vals[:, :, None, :]
+        loglog_diff = ne.evaluate('log1p(log1p(abs(ra_b - rb_b)))')
+        cost_batch = loglog_diff.mean(axis=1)
     else:
         cost_batch = None
 
-    # PC residual vectorized: one scalar per bijection.
+    # PC residual vectorized: one scalar per bijection. Same-shape sub
+    # (no broadcast), so plain numpy is cheap; not worth a torch hop.
     if compare_pc:
-        pc_resid_batch = _loglog(
-            a_pcs.astype(np.int64) - b_pcs.astype(np.int64)
-        ).mean(axis=1)
+        a_pcs_f = a_pcs.astype(np.float32, copy=False)
+        b_pcs_f = b_pcs.astype(np.float32, copy=False)
+        diff = np.abs(a_pcs_f - b_pcs_f)
+        pc_resid_batch = np.log1p(np.log1p(diff)).mean(axis=1)
     else:
         pc_resid_batch = np.zeros(n_bij, dtype=np.float64)
 
