@@ -41,7 +41,9 @@ def model():
                         d_out=16, max_iterations_per_token=3)
 
 
-def test_forward_returns_six_things(model):
+def test_forward_returns_nine_outputs(model):
+    """forward() returns the documented 9-tuple, and the unpacked values
+    have the expected container/tensor types."""
     inputs = _build_inputs()
     out = model(*inputs)
     assert len(out) == 9
@@ -49,6 +51,15 @@ def test_forward_returns_six_things(model):
      iter_gate_decisions, iter_gate_logits,
      iter_window_buf, iter_window_lens,
      emission_info, emit_counts) = out
+    assert isinstance(iter_t1s, list) and len(iter_t1s) > 0
+    assert isinstance(iter_window_tokens, list)
+    assert isinstance(iter_gate_log_probs, list)
+    assert isinstance(iter_gate_decisions, list)
+    assert isinstance(iter_gate_logits, list)
+    assert torch.is_tensor(iter_window_buf)
+    assert torch.is_tensor(iter_window_lens)
+    assert isinstance(emission_info, list)
+    assert torch.is_tensor(emit_counts) and emit_counts.shape == (4,)
 
 
 def test_forward_shapes(model):
@@ -107,13 +118,16 @@ def test_emission_info_keys(model):
             assert info['instr_end'] >= info['instr_start']
 
 
-def test_emit_counts_plausible(model):
-    """Each sequence should emit at least once given enough iterations."""
+def test_emit_counts_nonnegative(model):
+    """emit_counts is a per-sequence non-negative integer count. (There
+    is no force-emit fallback — model.py:242 — so a stalled sequence may
+    legitimately emit zero; we only pin the type/non-negativity invariant.
+    Consistency with emission_info is checked by
+    test_emit_counts_match_emission_info.)"""
     inputs = _build_inputs()
     (_, _, _, _, _, _, _, _, emit_counts) = model(*inputs)
-    # With randomized gates and fallback logic, at least some emissions
-    # should happen across the batch.
-    assert emit_counts.sum().item() > 0
+    assert emit_counts.dtype == torch.long
+    assert (emit_counts >= 0).all()
 
 
 def test_deterministic_given_seed(model):

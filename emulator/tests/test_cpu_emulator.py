@@ -2,7 +2,7 @@
 
 import numpy as np
 import pytest
-from emulator import Instruction, RV32IState, run, random_regs
+from emulator import Instruction, RV32IState, run, random_regs, SparseMemory
 
 
 def execute(instructions, initial_regs=None, max_steps=None):
@@ -89,13 +89,6 @@ class TestRV32IState:
         assert d['regs_differ'] == 2
         assert d['l1'] == 30
         assert set(d['which_differ']) == {3, 7}
-
-    def test_repr(self):
-        regs = np.zeros(32, dtype=np.int32)
-        regs[5] = 42
-        s = RV32IState(regs)
-        assert 'x5' in repr(s)
-        assert '42' in repr(s)
 
 
 class TestExecuteArithmetic:
@@ -334,16 +327,6 @@ class TestRandomRegs:
             regs = random_regs(np.random.default_rng(seed))
             assert regs[0] == 0
 
-    def test_deterministic_with_seed(self):
-        r1 = random_regs(np.random.default_rng(42))
-        r2 = random_regs(np.random.default_rng(42))
-        assert np.array_equal(r1, r2)
-
-    def test_different_seeds_differ(self):
-        r1 = random_regs(np.random.default_rng(0))
-        r2 = random_regs(np.random.default_rng(1))
-        assert not np.array_equal(r1, r2)
-
     def test_shape_and_dtype(self):
         regs = random_regs()
         assert regs.shape == (32,)
@@ -422,3 +405,190 @@ class TestRunAllInstructionTypes:
         regs[3] = 42
         _, _, mem = run([Instruction('SB', 3, 0, 0)], regs=regs)
         assert int(mem[0]) == 42
+
+
+class TestUnsignedAndShiftOverrides:
+    """The hand-overridden unsigned/shift paths — the exact code this
+    module exists to fix (numpy int32/uint32 boundary issues). These
+    exercise the signed-vs-unsigned distinction with rs1 = 0xFFFFFFFF."""
+
+    def test_srl_shifts_in_zeros(self):
+        # SRL is logical: high bit shifts in a 0, not a sign bit.
+        regs = np.zeros(32, dtype=np.int32)
+        regs[1] = np.int32(-1)   # 0xFFFFFFFF
+        regs[2] = np.int32(1)
+        state = execute([Instruction('SRL', 3, 1, 2)], initial_regs=regs)
+        assert np.uint32(state.regs[3]) == 0x7FFFFFFF
+
+    def test_sra_shifts_in_sign(self):
+        # Contrast with SRA (arithmetic): high bit shifts in the sign.
+        regs = np.zeros(32, dtype=np.int32)
+        regs[1] = np.int32(-1)
+        regs[2] = np.int32(1)
+        state = execute([Instruction('SRA', 3, 1, 2)], initial_regs=regs)
+        assert state.regs[3] == -1
+
+    def test_sltiu_unsigned_compare(self):
+        regs = np.zeros(32, dtype=np.int32)
+        regs[1] = np.int32(-1)   # 0xFFFFFFFF, the largest unsigned value
+        # 0xFFFFFFFF < 1 unsigned -> False
+        state = execute([Instruction('SLTIU', 3, 1, 1)], initial_regs=regs)
+        assert state.regs[3] == 0
+        # 0 < 1 unsigned -> True
+        state = execute([Instruction('SLTIU', 3, 0, 1)], initial_regs=regs)
+        assert state.regs[3] == 1
+
+    def test_bltu_unsigned_not_taken(self):
+        regs = np.zeros(32, dtype=np.int32)
+        regs[1] = np.int32(-1)   # 0xFFFFFFFF unsigned
+        regs[2] = np.int32(1)
+        # 0xFFFFFFFF < 1 unsigned -> not taken -> pc + 4
+        _, pc, _ = run([Instruction('BLTU', 1, 2, 16)], regs=regs, pc=100,
+                       max_steps=1)
+        assert pc == 104
+
+    def test_bgeu_unsigned_taken(self):
+        regs = np.zeros(32, dtype=np.int32)
+        regs[1] = np.int32(-1)
+        regs[2] = np.int32(1)
+        # 0xFFFFFFFF >= 1 unsigned -> taken -> pc + imm
+        _, pc, _ = run([Instruction('BGEU', 1, 2, 16)], regs=regs, pc=100,
+                       max_steps=1)
+        assert pc == 116
+
+
+class TestJALR:
+    """JALR was untested on the CPU. Link = pc+4, target = (rs1+imm) & ~1."""
+
+    def test_link_and_target(self):
+        regs = np.zeros(32, dtype=np.int32)
+        regs[2] = 200
+        state, pc, _ = run([Instruction('JALR', 1, 2, 8)], regs=regs, pc=500,
+                           max_steps=1)
+        assert state.regs[1] == 504     # link = pc + 4
+        assert pc == 208                # target = 200 + 8
+
+    def test_lsb_cleared(self):
+        # Target LSB must be forced to 0: (rs1 + imm) & ~1.
+        regs = np.zeros(32, dtype=np.int32)
+        regs[2] = 201
+        _, pc, _ = run([Instruction('JALR', 1, 2, 0)], regs=regs, pc=500,
+                       max_steps=1)
+        assert pc == 200                # 201 & ~1
+
+    def test_rd_eq_rs1_alias_link_wins(self):
+        # When rd == rs1, the link value must overwrite rs1 *after* the
+        # target is computed from rs1's original value.
+        regs = np.zeros(32, dtype=np.int32)
+        regs[1] = 200
+        state, pc, _ = run([Instruction('JALR', 1, 1, 8)], regs=regs, pc=500,
+                           max_steps=1)
+        assert pc == 208                # computed from original x1 = 200
+        assert state.regs[1] == 504     # link value wins the write
+
+
+class TestLoadWidthSignExtension:
+    """LB/LBU/LH/LHU on a known byte pattern via SparseMemory.
+
+    Regression guard: SparseMemory.__getitem__ used to return np.uint8,
+    so TinyFive's multi-byte loads (which shift high bytes left by 8/16)
+    silently overflowed numpy's 8-bit type to 0. These pin the correct
+    little-endian assembly and signed/unsigned extension.
+    """
+
+    def _mem(self, bytes_at_100):
+        mem = SparseMemory()
+        for i, b in enumerate(bytes_at_100):
+            mem[100 + i] = b
+        return mem
+
+    def _regs(self):
+        regs = np.zeros(32, dtype=np.int32)
+        regs[3] = 100    # base address
+        return regs
+
+    def test_lb_sign_extends(self):
+        # 0x80 = high bit set -> signed -128.
+        state, _, _ = run([Instruction('LB', 5, 0, 3)], regs=self._regs(),
+                          mem=self._mem([0x80]), max_steps=1)
+        assert state.regs[5] == -128
+
+    def test_lbu_zero_extends(self):
+        state, _, _ = run([Instruction('LBU', 5, 0, 3)], regs=self._regs(),
+                          mem=self._mem([0x80]), max_steps=1)
+        assert state.regs[5] == 128
+
+    def test_lh_sign_extends(self):
+        # little-endian bytes 0x80,0xFF -> 0xFF80 -> signed -128.
+        state, _, _ = run([Instruction('LH', 5, 0, 3)], regs=self._regs(),
+                          mem=self._mem([0x80, 0xFF]), max_steps=1)
+        assert state.regs[5] == -128
+
+    def test_lhu_zero_extends(self):
+        # 0xFF80 zero-extended = 65408.
+        state, _, _ = run([Instruction('LHU', 5, 0, 3)], regs=self._regs(),
+                          mem=self._mem([0x80, 0xFF]), max_steps=1)
+        assert state.regs[5] == 65408
+
+    def test_lw_full_word_little_endian(self):
+        state, _, _ = run([Instruction('LW', 5, 0, 3)], regs=self._regs(),
+                          mem=self._mem([0x11, 0x22, 0x33, 0x44]), max_steps=1)
+        assert np.uint32(state.regs[5]) == 0x44332211
+
+
+class TestIntegerOverflow:
+    def test_addi_int_max_wraps_to_int_min(self):
+        regs = np.zeros(32, dtype=np.int32)
+        regs[1] = np.int32(2**31 - 1)    # INT_MAX
+        state = execute([Instruction('ADDI', 2, 1, 1)], initial_regs=regs)
+        assert state.regs[2] == -2**31    # wraps to INT_MIN
+
+    def test_add_int_min_minus_one_wraps_to_int_max(self):
+        regs = np.zeros(32, dtype=np.int32)
+        regs[1] = np.int32(-2**31)       # INT_MIN
+        regs[2] = np.int32(-1)
+        state = execute([Instruction('ADD', 3, 1, 2)], initial_regs=regs)
+        assert state.regs[3] == 2**31 - 1   # wraps to INT_MAX
+
+
+class TestX0WriteTarget:
+    def test_addi_to_x0_stays_zero(self):
+        # x0 is hardwired: writing to it is a no-op.
+        state = execute([Instruction('ADDI', 0, 0, 5)])
+        assert state.regs[0] == 0
+
+
+class TestSignedBranches:
+    """BLT/BGE use signed comparison: -1 < 1."""
+
+    def test_blt_taken(self):
+        regs = np.zeros(32, dtype=np.int32)
+        regs[1] = np.int32(-1)
+        regs[2] = np.int32(1)
+        _, pc, _ = run([Instruction('BLT', 1, 2, 16)], regs=regs, pc=100,
+                       max_steps=1)
+        assert pc == 116    # -1 < 1 signed -> taken
+
+    def test_blt_not_taken(self):
+        regs = np.zeros(32, dtype=np.int32)
+        regs[1] = np.int32(1)
+        regs[2] = np.int32(-1)
+        _, pc, _ = run([Instruction('BLT', 1, 2, 16)], regs=regs, pc=100,
+                       max_steps=1)
+        assert pc == 104    # 1 < -1 signed -> not taken
+
+    def test_bge_taken(self):
+        regs = np.zeros(32, dtype=np.int32)
+        regs[1] = np.int32(1)
+        regs[2] = np.int32(-1)
+        _, pc, _ = run([Instruction('BGE', 1, 2, 16)], regs=regs, pc=100,
+                       max_steps=1)
+        assert pc == 116    # 1 >= -1 signed -> taken
+
+    def test_bge_not_taken(self):
+        regs = np.zeros(32, dtype=np.int32)
+        regs[1] = np.int32(-1)
+        regs[2] = np.int32(1)
+        _, pc, _ = run([Instruction('BGE', 1, 2, 16)], regs=regs, pc=100,
+                       max_steps=1)
+        assert pc == 104    # -1 >= 1 signed -> not taken

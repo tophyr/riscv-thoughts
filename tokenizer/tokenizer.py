@@ -116,6 +116,9 @@ _B_IMM_DIGITS = 4   # 13-bit signed (multiples of 2)
 _U_IMM_DIGITS = 5   # 20-bit
 _J_IMM_DIGITS = 6   # 21-bit signed (multiples of 2)
 
+# Worst case: JAL = op + rd + NEG + 6 imm digits.
+MAX_INSTR_TOKENS = 1 + 1 + 1 + _J_IMM_DIGITS
+
 
 def encode_instruction(instr: Instruction) -> list[int]:
     """Convert a single Instruction to a list of token IDs."""

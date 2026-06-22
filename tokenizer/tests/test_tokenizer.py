@@ -14,6 +14,9 @@ from tokenizer import (
     encode_sequence, decode_sequence,
     tokens_to_str,
 )
+# MAX_INSTR_TOKENS is not re-exported by the package __init__.
+from tokenizer.tokenizer import MAX_INSTR_TOKENS
+from emulator import ALL_OPCODES, R_TYPE, I_TYPE, B_TYPE, LOAD_TYPE, STORE_TYPE
 
 
 class TestVocabulary:
@@ -57,10 +60,6 @@ class TestEncodeDecodeRType:
     def test_token_count(self):
         tokens = encode_instruction(Instruction('ADD', 5, 3, 7))
         assert len(tokens) == 4  # [OP] [RD] [RS1] [RS2]
-
-    def test_token_str(self):
-        tokens = encode_instruction(Instruction('ADD', 5, 3, 7))
-        assert tokens_to_str(tokens) == 'ADD X5 X3 X7'
 
 
 class TestEncodeDecodeIType:
@@ -334,3 +333,75 @@ class TestTokensToStr:
         s = tokens_to_str(tokens)
         assert s.startswith('<BOS>')
         assert s.endswith('<EOS>')
+
+
+class TestMaxInstrTokens:
+    """MAX_INSTR_TOKENS must bound the longest single-instruction encoding
+    the encoder can actually produce — the worst case is JAL with a
+    negative immediate (op + rd + NEG + 6 hex digits)."""
+
+    def _max_neg_instr(self, op):
+        """A negative-immediate (worst-case length) instruction per type."""
+        if op in R_TYPE:
+            return Instruction(op, 5, 3, 7)        # no immediate
+        if op in I_TYPE:
+            return Instruction(op, 5, 3, -1)
+        if op in LOAD_TYPE:
+            return Instruction(op, 5, -1, 3)        # (rd, imm, rs1)
+        if op in STORE_TYPE:
+            return Instruction(op, 5, -1, 3)        # (rs2, imm, rs1)
+        if op in B_TYPE:
+            return Instruction(op, 1, 2, -8)
+        if op in ('LUI', 'AUIPC'):
+            return Instruction(op, 5, 1)            # U-imm unsigned, fixed 7
+        if op == 'JAL':
+            return Instruction(op, 1, -16)
+        if op == 'JALR':
+            return Instruction(op, 1, 5, -1)
+        raise ValueError(op)
+
+    def test_no_encoding_exceeds_max(self):
+        for op in ALL_OPCODES:
+            n = len(encode_instruction(self._max_neg_instr(op)))
+            assert n <= MAX_INSTR_TOKENS, f'{op} encodes to {n} > {MAX_INSTR_TOKENS}'
+
+    def test_jal_negative_hits_max(self):
+        # The worst case is realized, so the bound is tight, not loose.
+        tokens = encode_instruction(Instruction('JAL', 1, -16))
+        assert len(tokens) == MAX_INSTR_TOKENS
+
+
+class TestNegativeImmediateRoundTrip:
+    def test_jalr_negative_offset(self):
+        instr = Instruction('JALR', 1, 5, -4)
+        tokens = encode_instruction(instr)
+        assert NEG in tokens
+        decoded, pos = decode_instruction(tokens)
+        assert decoded.opcode == 'JALR'
+        assert decoded.args == (1, 5, -4)
+        assert pos == len(tokens)
+
+    def test_store_negative_offset(self):
+        # TinyFive store arg order: (rs2, imm, rs1).
+        instr = Instruction('SW', 5, -8, 3)
+        tokens = encode_instruction(instr)
+        assert NEG in tokens
+        decoded, _ = decode_instruction(tokens)
+        assert decoded.opcode == 'SW'
+        assert decoded.args == (5, -8, 3)
+
+
+class TestImmediateOverflow:
+    """Immediates wider than the encoded hex-digit budget are silently
+    truncated (the encoder masks each digit, so high bits are dropped).
+    JALR uses 3 hex digits = 12 bits, so 0x1000 truncates to 0."""
+
+    def test_jalr_imm_truncates_above_12_bits(self):
+        instr = Instruction('JALR', 1, 5, 0x1000)   # needs a 4th hex digit
+        decoded, _ = decode_instruction(encode_instruction(instr))
+        assert decoded.args[2] == 0                  # 0x1000 & 0xFFF == 0
+
+    def test_jalr_imm_keeps_low_12_bits(self):
+        instr = Instruction('JALR', 1, 5, 0x1ABC)
+        decoded, _ = decode_instruction(encode_instruction(instr))
+        assert decoded.args[2] == 0xABC              # low 12 bits retained

@@ -203,9 +203,10 @@ non-trivial signal from the level above).
       indep_reorder partial; **NON_EQUIV control collapses
       too** (T2 doesn't discriminate operand-level changes
       within a fixed chunk shape).
-- [ ] Diagnose / fix `reg_effect_loss` plateau at 0.91. Could
-      be loss-weight imbalance, pair-MSE noise floor, or
-      pair-sampling sparsity. See Phase 11 conclusions.
+- [x] SUPERSEDED — `reg_effect_loss` (per-register pair-MSE) was
+      removed entirely. Operand discrimination is now carried by
+      `value_predict` + the behavioral binding losses (Phase 12),
+      not pair-MSE. The plateau was the wrong loss, not a tuning bug.
 
 ### Step 11: T1 ↔ T2 cross-level integration (DEFERRED)
 Pending T2 semantic-quality fix (Step 10 follow-up). Once T2
@@ -218,22 +219,29 @@ discriminates operand-level changes meaningfully:
       the cross-level absorption acknowledgment. Train T1
       evict head against this.
 
-### Step 10b: T2 training quality follow-ups (NEW)
-Targeted at the operand-level discrimination gap surfaced in
-Exp 43.
+### Step 10b: T2 geometry follow-ups (current direction)
+T2 converged (Phase 12, `runs/t2_d512_cap4_2M`). `value_predict`
+reconstructs per-chunk well (R² 0.96) but does NOT build an
+operator/effect axis: binding dominates the geometry ~16× and the
+vector uses only ~13 of 512 effective dims. Capacity is not the
+bottleneck — the objective is.
 
-- [ ] Loss-weight rebalancing experiment: keep mag/term/mod at
-      1.0, raise reg_effect_weight (e.g., 5x) to prevent the
-      easy aux losses from dominating early training.
-- [ ] Loss-curriculum experiment: warm up aux losses first,
-      then ramp up reg_effect_weight as they saturate.
-- [ ] Probe the reg_effect_head output distribution
-      (predictions vs targets per register) to distinguish
-      "metric noise floor" from "encoder underfitting".
-- [ ] More probed input states (n_inputs=8 or 16) for cleaner
-      pair-MSE targets.
-- [ ] Longer training runs (10K-20K steps) under the rebalanced
-      losses.
+- [ ] **Oracle `out_regs` pairwise loss (primary lever):** pull/push
+      T2 vectors by their actual register-file outputs on the shared
+      anchors (rename-sensitive behavioral distance, no Hungarian
+      bijection — cheap). Re-run the binding-controlled operator-axis
+      probe; target SE−DE gap well past +0.01.
+- [ ] `out_slot_weight = vp_weight` (1:1): if out_slot revives,
+      starvation is purely the loss ratio; else representation
+      competition. (out_slot is intrinsically easy, vp-starved.)
+- [ ] Small-d to convergence (d=64/128): does out_slot fail
+      identically (starvation) or catastrophically (capacity)?
+      Tests the long-standing "needs capacity" claim against the
+      ~13-effective-dim finding.
+- [ ] Replace double-log value compression with a single signed log
+      (the double-log is a vestige of `behavioral_distance`; it
+      crushes 59% of targets into a 0.41-wide band — a likely
+      contributor to the low rank). Re-probe rank + accuracy.
 
 ## Future
 

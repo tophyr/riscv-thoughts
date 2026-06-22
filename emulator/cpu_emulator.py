@@ -66,7 +66,10 @@ class SparseMemory:
     def __getitem__(self, addr):
         if isinstance(addr, slice):
             return self
-        return np.uint8(self._data.get(int(addr), 0))
+        # Return a Python int, not np.uint8: TinyFive's multi-byte loads
+        # (LH/LHU/LW) shift high bytes left by 8/16/24, which silently
+        # overflow to 0 in numpy uint8 arithmetic (np.uint8(0xFF) << 8 == 0).
+        return self._data.get(int(addr), 0)
 
     def __setitem__(self, addr, val):
         if isinstance(addr, slice):
@@ -204,6 +207,29 @@ def _build_dispatch(m):
         m.x[rd] = _i32((imm << 12) & 0xFFFFFFFF)
         _safe_ipc(4)
 
+    def _sext(value, bits):
+        sign = 1 << (bits - 1)
+        return (value & (sign - 1)) - (value & sign)
+
+    def _load(rd, imm, rs1, width, signed):
+        # TinyFive arg order: (rd, imm, rs1). Assemble little-endian in
+        # Python int space; TinyFive's own LH/LHU/LW overflow numpy's
+        # 8-bit byte type when shifting high bytes left.
+        base = int(m.x[rs1]) + imm
+        value = 0
+        for k in range(width):
+            value |= (int(m.mem[base + k]) & 0xFF) << (8 * k)
+        if signed:
+            value = _sext(value, 8 * width)
+        m.x[rd] = _i32(value & 0xFFFFFFFF)
+        _safe_ipc(4)
+
+    def _lb(rd, imm, rs1):  _load(rd, imm, rs1, 1, True)
+    def _lbu(rd, imm, rs1): _load(rd, imm, rs1, 1, False)
+    def _lh(rd, imm, rs1):  _load(rd, imm, rs1, 2, True)
+    def _lhu(rd, imm, rs1): _load(rd, imm, rs1, 2, False)
+    def _lw(rd, imm, rs1):  _load(rd, imm, rs1, 4, True)
+
     def _beq(rs1, rs2, imm):  _safe_ipc(imm if m.x[rs1] == m.x[rs2] else 4)
     def _bne(rs1, rs2, imm):  _safe_ipc(imm if m.x[rs1] != m.x[rs2] else 4)
     def _blt(rs1, rs2, imm):  _safe_ipc(imm if m.x[rs1] <  m.x[rs2] else 4)
@@ -226,6 +252,11 @@ def _build_dispatch(m):
     dispatch['BGE'] = _bge
     dispatch['BLTU'] = _bltu
     dispatch['BGEU'] = _bgeu
+    dispatch['LB'] = _lb
+    dispatch['LBU'] = _lbu
+    dispatch['LH'] = _lh
+    dispatch['LHU'] = _lhu
+    dispatch['LW'] = _lw
     return dispatch
 
 

@@ -26,7 +26,7 @@ Types:
 import numpy as np
 
 from tokenizer import encode_instruction, VOCAB_SIZE, PAD, BOS, EOS, NEG
-from .instrgen import random_instruction
+from .generate import random_instruction
 
 
 # Default weight distribution over invalid types. Callers can

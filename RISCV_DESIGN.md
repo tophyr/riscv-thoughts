@@ -255,57 +255,43 @@ rather than too large — overcomplete spaces enable shortcut solutions
 
 ### Loss terms
 
-**Evolved through experimentation** (see EXPERIMENT_LOG.md for the
-full progression). The current best approach:
+**Evolved through extensive experimentation** (see EXPERIMENT_LOG.md, esp.
+Phases 9–12). The settled approach is one **behavioral loss set shared by
+T1 and T2** (`compressor.train.binding_losses`) — T1 is the
+single-instruction special case. No pairwise distance-matching, no explicit
+equivalence loss, no syntactic CE heads: equivalence is **emergent**.
 
-**MSE distance matching in the unit ball.** T1 vectors live in the
-unit ball (no `F.normalize` on the encoder output). Semantics live
-in the direction `T1/||T1||`, validity in the magnitude `||T1||`.
-MSE between pairwise *directional* T1 distances (i.e., on normalized
-T1) and scaled execution distances, computed only on valid windows.
-This handles both equivalence (target=0 for equivalent pairs) and
-separation (target>0 for different pairs) in one loss.
+**Magnitude / validity loss.** Soft `(‖v‖ − is_valid)²`: ‖v‖→1 for a
+valid thought (one complete instruction at T1; a well-formed chunk at T2),
+→0 otherwise. Vectors live in open space (no `F.normalize` on the output);
+magnitude carries validity, direction carries semantics. A *hard*
+normalize onto the unit sphere breaks `out_slot` — train TOWARD the
+surface with this soft loss, don't project ONTO it (Phase 12).
 
-Execution distance: log1p(log1p(|data_diff| + |pc_diff|)) averaged
-over random input states. Nested log compresses the dynamic range
-(0 to 2^32) into ~0 to 3.14 while spreading the low end more
-uniformly than single log1p, so near-equivalence contrasts (e.g.,
-ADDI imm=0 vs imm=1) get meaningful gradient.
+**Behavioral binding losses** (read the normalized direction):
+- `live_in` / `live_out`: BCE on which registers are read / written.
+- `pc_writes`: BCE on whether the chunk writes PC.
+- `in_slot` / `out_slot`: read/write ORDER, as ListMLE (Plackett–Luce)
+  over per-register scalar score heads (argsort to decode; duplicate-free).
 
-**Magnitude / validity loss.** MSE between `||T1||` and a binary
-target: 1 for a window that forms exactly one complete RV32I
-instruction, 0 for everything else (partial prefix, spanning
-boundary, multiple instructions, random token bag). Drives the
-encoder to place non-thoughts at the origin, where they are
-structurally distinguishable from any valid thought without
-consuming any direction-space. The magnitude is then a linearly-
-readable "emit here" signal for the downstream gates.
+**Value-prediction (`value_predict`).** Per-anchor, per-output-slot MSE:
+from `(vector, input-slot values)` predict each output register's value,
+on a fixed set of sampled anchor input states. This is the function/effect
+signal. It is a competent per-chunk *reconstructor* but, being per-chunk,
+does **not** by itself cluster behaviorally-equivalent chunks (Phase 12) —
+the indicated fix is an oracle `out_regs` pairwise loss.
 
-Earlier runs (Exp 19-30) normalized to the unit sphere, which
-forced all compressed windows — valid or not — onto the same
-manifold. Exp 33 showed via a linear probe that the resulting
-T1 did not carry a readable validity signal. The unit-ball
-framing is a direct response; see EXPERIMENT_LOG Phase 9.
+**Emergent equivalence.** With the behavioral targets alone, provably
+equivalent instructions/chunks collapse without any equivalence loss
+(e.g. `ADD x,y,y` ≡ `SLLI x,y,1` land nearly coincident). The
+`behavioral_distance` (GVN / Hungarian-bijection) oracle that earlier
+phases trained against is retained only as a dormant offline check.
 
-**Destination classification heads.** CrossEntropy on dest_type
-(register vs memory) and dest_reg (which register). Provides
-structural gradient signal that the scalar exec_distance metric
-is blind to (exec_distance doesn't distinguish which register
-was written, only the computed value).
-
-**Explicit equivalence loss.** Per-step, encodes canonical tuples
-from the equivalence manifest (datagen/equivalences.py) and
-minimizes within-class pairwise squared distances (target=0).
-Combined with low-rate injection of manifest tuples into the
-main batch, this reaches 12/13 manifest classes PASS in 100K
-steps.
-
-**What didn't work:** Pearson correlation (scale-invariant, allows
-nonzero intercept — equivalences don't collapse), weighted Pearson
-(degenerate near-zero-variance statistics in the equivalence region),
-attract-only losses without sphere (global collapse), ranking loss
-(collapsed to zero immediately). See EXPERIMENT_LOG.md experiments
-1-11 for details.
+**What didn't work (removed):** Pearson/ranking losses (collapse or no
+separation), per-register pair-MSE (`reg_effect_loss` — noisy, never
+converged, undiscriminating on operands), explicit equivalence-collapse
+loss, syntactic dest/src CE heads, `rename_equiv` (wrong-sign for the
+equivariance goal), and unit-sphere normalization. See EXPERIMENT_LOG.md.
 
 ### Training data volume
 

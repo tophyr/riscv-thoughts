@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
-"""Multiplex multiple binary batch streams into one (RVS or RVB).
+"""Multiplex multiple RVT batch streams into one.
 
-Spawns generator workers or reads from files/pipes. All inputs
-must be the same format.
+Spawns gen_batches.py workers and/or reads from files/pipes. All
+inputs must be the same format (currently only RVT exists). Worker
+configuration is NOT redeclared here: everything after `--` is forwarded
+verbatim to each spawned gen_batches worker (mux only appends a per-worker
+--seed so the workers diverge).
 
 Usage:
-    # Single-instruction batches:
-    mux_batches.py --gen instr --gen-count 16 --n-batches 1000 > corpus.bin
-
-    # Sequence batches:
-    mux_batches.py --gen seq --gen-count 16 --n-batches 1000 > seqs.bin
+    # Spawn N parallel gen_batches workers (worker flags after `--`):
+    mux_batches.py --gen-count 16 -- \\
+        --rule branch+cap=8 --twins 3 -n 1000 > corpus.rvt
 
     # File inputs (auto-detected):
-    mux_batches.py 1:local.bin 8:remote.bin > combined.bin
+    mux_batches.py 1:local.rvt 8:remote.rvt > combined.rvt
+
+    # Mix spawned workers + a file/pipe input:
+    mux_batches.py --gen-count 8 8:remote.rvt -- --rule cap=8 -n 500
 """
 
 import argparse
@@ -25,12 +29,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from scripts._batch_util import binary_stdout, detect_format, peek_format, RVS, RVB
+from scripts._streamfmt import binary_stdout, peek_format, RVT
 
 
 def _reader(f, q, idx, fmt):
     try:
-        fmt.read_header(f)
         while True:
             data = fmt.read_bytes(f)
             if data is None:
@@ -43,7 +46,6 @@ def _reader(f, q, idx, fmt):
 
 def _reader_per_q(f, per_q, idx, fmt):
     try:
-        fmt.read_header(f)
         while True:
             data = fmt.read_bytes(f)
             if data is None:
@@ -152,47 +154,50 @@ def _parse_weighted_input(s):
 
 
 def main():
-    p = argparse.ArgumentParser(description='Mux binary batch streams.')
+    # Everything after `--` is forwarded verbatim to each spawned
+    # gen_batches worker. Split it off before argparse, otherwise the
+    # `inputs` positional (nargs='*') would swallow the forwarded flags.
+    argv = sys.argv[1:]
+    if '--' in argv:
+        sep = argv.index('--')
+        mux_argv, gen_extra = argv[:sep], argv[sep + 1:]
+    else:
+        mux_argv, gen_extra = argv, []
+
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('inputs', nargs='*',
-                   help='Input files, optionally weight-prefixed')
+                   help='Input files, optionally weight-prefixed (W:path)')
     p.add_argument('--mode', choices=['fifo', 'round-robin', 'weighted'],
-                   default=None)
+                   default=None,
+                   help='How to interleave inputs: fifo (as-ready), '
+                        'round-robin (one batch each), or weighted. To '
+                        'concatenate files in order, just `cat` them.')
     p.add_argument('--shuffle-seed', type=int, default=42)
     p.add_argument('-v', '--verbose', action='count', default=0)
 
-    g = p.add_argument_group('generator spawning')
-    g.add_argument('--gen', choices=['instr', 'seq'], default=None,
-                   help='Type of generator to spawn')
+    g = p.add_argument_group(
+        'gen_batches spawning',
+        'Configure spawned workers with their own flags after `--` '
+        '(e.g. `--gen-count 16 -- --rule branch+cap=8 -n 1000`).')
     g.add_argument('--gen-count', type=int, default=0, metavar='N',
-                   help='Spawn N generator workers')
-    g.add_argument('--gen-weight', type=float, default=1.0)
-    g.add_argument('--n-batches', type=int, default=1000)
-    g.add_argument('--batch-size', type=int, default=None)
-    g.add_argument('--n-inputs', type=int, default=None)
-    g.add_argument('--max-block-len', type=int, default=5,
-                   help='For seq generator')
-    g.add_argument('--config', type=str, default=None,
-                   help='JSON config file for instr generator distribution')
-    g.add_argument('--seed', type=int, default=42)
+                   help='Spawn N gen_batches workers')
+    g.add_argument('--gen-weight', type=float, default=1.0,
+                   help='Mux weight for each spawned worker stream')
+    g.add_argument('--seed', type=int, default=42,
+                   help='Base RNG seed; worker i gets --seed (base + i) so '
+                        'workers produce distinct streams')
 
-    args = p.parse_args()
+    args = p.parse_args(mux_argv)
 
-    if not args.inputs and not args.gen:
-        p.error('Provide input files and/or --gen TYPE --gen-count N')
+    if not args.inputs and args.gen_count == 0:
+        p.error('Provide input files and/or --gen-count N')
+    if gen_extra and args.gen_count == 0:
+        p.error('Arguments after `--` configure spawned workers and require '
+                '--gen-count N')
 
-    # Determine format and defaults.
-    if args.gen == 'instr':
-        fmt = RVB
-        batch_size = args.batch_size or 4096
-        n_inputs = args.n_inputs or 32
-    elif args.gen == 'seq':
-        fmt = RVS
-        batch_size = args.batch_size or 256
-        n_inputs = args.n_inputs or 4
-    else:
-        fmt = None
-        batch_size = args.batch_size or 4096
-        n_inputs = args.n_inputs or 32
+    fmt = RVT  # Single format; mux preserves it.
 
     out = binary_stdout()
     files = []
@@ -207,9 +212,7 @@ def main():
             has_explicit_weight = True
         f = open(path, 'rb')
         file_fmt = peek_format(f)
-        if fmt is None:
-            fmt = file_fmt
-        elif file_fmt.name != fmt.name:
+        if file_fmt.name != fmt.name:
             print(f'ERROR: {path}: format {file_fmt.name} != {fmt.name}',
                   file=sys.stderr)
             sys.exit(1)
@@ -217,30 +220,19 @@ def main():
         weights.append(weight)
         file_handles.append(f)
 
-    if args.gen and args.gen_count > 0:
-        if args.gen == 'instr':
-            script = str(Path(__file__).resolve().parent / 'gen_instr_batches.py')
-            base_cmd = [sys.executable, script,
-                        '--batch-size', str(batch_size),
-                        '--n-inputs', str(n_inputs)]
-            if args.config:
-                base_cmd += ['--config', args.config]
-        else:
-            script = str(Path(__file__).resolve().parent / 'gen_seq_batches.py')
-            base_cmd = [sys.executable, script,
-                        '--batch-size', str(batch_size),
-                        '--n-inputs', str(n_inputs),
-                        '--max-block-len', str(args.max_block_len)]
-        if args.verbose >= 2:
-            base_cmd.append('-v')
+    if args.gen_count > 0:
+        script = str(Path(__file__).resolve().parent / 'gen_batches.py')
+        base_cmd = [sys.executable, script] + gen_extra
 
         for i in range(args.gen_count):
-            cmd = base_cmd + ['--n-batches', str(args.n_batches),
-                              '--seed', str(args.seed + i)]
+            # --seed appended last so the per-worker offset overrides any
+            # --seed the caller passed after `--`.
+            cmd = base_cmd + ['--seed', str(args.seed + i)]
+            # Inherit stderr unconditionally — silent workers hide
+            # crashes (Python tracebacks land here), and that's exactly
+            # what you want to see if a worker dies mid-stream.
             proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE,
-                stderr=sys.stderr if args.verbose >= 2
-                else subprocess.DEVNULL)
+                cmd, stdout=subprocess.PIPE, stderr=sys.stderr)
             procs.append(proc)
             files.append(proc.stdout)
             weights.append(args.gen_weight)
@@ -260,11 +252,9 @@ def main():
         if n_file:
             parts.append(f'{n_file} file inputs')
         if n_gen:
-            parts.append(f'{n_gen} spawned {args.gen} workers')
+            parts.append(f'{n_gen} spawned gen_batches workers')
         print(f'Muxing {" + ".join(parts)}, mode={mode}, '
               f'format={fmt.name}', file=sys.stderr)
-
-    fmt.write_header(out)
 
     if mode == 'weighted':
         written = mux_weighted(files, weights, out, fmt,

@@ -1,33 +1,44 @@
-"""Training loops for the compressor.
+"""Training loops for the T1 encoder, T2 encoder, and decoder.
 
-- train_batches(): N×N pairwise MSE on single-instruction batches (step 1)
-- train_sequences(): fixed-window training on sequence batches (context experiments)
-- streaming_train(): shift-reduce compressor with REINFORCE gate training
-- train_t2(): T2 encoder training over chunked T1-emission sequences
+Three public training functions — train_encoder, train_t2_encoder, and
+train_decoder — each a batch loop the CLI shells in scripts/ drive.
+
+Shared helpers (used by trainers, eval, and the acceptance suite):
+  load_checkpoint           — load a torch.compile-aware state_dict.
+  encode_instrs             — tokenize + pad + encode an Instruction list.
+  prepare_decoder_targets   — build (input, target, padding) for CE.
+  binding_losses            — rename-equivariant register-binding losses,
+                              shared by the T1 and T2 encoder loops.
 """
 
+import itertools
+import queue
+import threading
 import time
 from datetime import timedelta
+from pathlib import Path
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from tokenizer import BOS, EOS, PAD, VOCAB_SIZE, encode_instruction
-from emulator import (
-    Instruction,
-    batch_execute, batch_parse_tokens, random_regs_gpu,
+from tokenizer.tokenizer import decode_instruction
+from datagen import (
+    padding_mask,
+    make_anchor_states, precompute_chunk,
+    N_REGS, MAX_INPUT_SLOTS, MAX_OUTPUT_SLOTS, AUX_CE_IGNORE,
 )
-from datagen.equivalences import MANIFEST, sample_binding, materialize
-from .model import T1Compressor, Decoder
+from emulator import Instruction
+from .model import T1Compressor, T2Compressor, Decoder
 
 
-# Fixed probe instructions for watching geometry during training.
-# Distances reported in each log line:
-#   aa:    ADD x5,x7,x7 vs ADD x5,x1,x2    (different-operand ADDs)
-#   canon: ADD x5,x7,x7 vs SLLI x5,x7,1    (double_is_shl1 canonical)
-#   ss:    SLLI x5,x7,1 vs SLLI x5,x3,2    (SLLI neighbor)
-#   comm:  ADD x5,x1,x2 vs ADD x5,x2,x1    (commutative swap — should collapse)
+# ===========================================================================
+# Probe instructions — fixed pairs whose distances we log during training
+# to watch the encoder's geometry develop in real time.
+# ===========================================================================
+
 _PROBE_INSTRS = [
     Instruction('ADD',  5, 7, 7),   # 0: ADD rs,rs (double canonical)
     Instruction('SLLI', 5, 7, 1),   # 1: SLLI rs,1 (shl1 canonical)
@@ -38,7 +49,6 @@ _PROBE_INSTRS = [
 
 
 def _probe_tensor(device):
-    """Tokenize + pad the fixed probe instructions for periodic eval."""
     encoded = [encode_instruction(i) for i in _PROBE_INSTRS]
     max_len = max(len(e) for e in encoded)
     tok = np.full((len(encoded), max_len), PAD, dtype=np.int64)
@@ -50,8 +60,37 @@ def _probe_tensor(device):
             torch.from_numpy(pad).to(device))
 
 
-def _encode_instrs(model, instrs, device):
-    """Tokenize + pad a list of Instructions and encode them."""
+def _probe_distances(encoder, probe_tok, probe_pad):
+    """Probe geometry. Distances are measured on the unit-normalized
+    full encoded vector."""
+    with torch.no_grad():
+        v = encoder.encode(probe_tok, probe_pad)
+        v = F.normalize(v, dim=-1)
+        return {
+            'aa':    float((v[0] - v[2]).norm()),
+            'canon': float((v[0] - v[1]).norm()),
+            'ss':    float((v[1] - v[3]).norm()),
+            'comm':  float((v[2] - v[4]).norm()),
+        }
+
+
+# ===========================================================================
+# Shared helpers
+# ===========================================================================
+
+def load_checkpoint(path, device):
+    """Load a state dict, stripping the torch.compile prefix.
+
+    `torch.compile` wraps modules so saved state dicts carry an
+    `_orig_mod.` prefix on every key. This helper handles both
+    compiled and uncompiled checkpoints transparently.
+    """
+    state = torch.load(path, map_location=device, weights_only=True)
+    return {k.removeprefix('_orig_mod.'): v for k, v in state.items()}
+
+
+def encode_instrs(model, instrs, device):
+    """Tokenize, pad, and encode a list of Instructions."""
     encoded = [encode_instruction(i) for i in instrs]
     max_len = max(len(e) for e in encoded)
     tok = np.full((len(encoded), max_len), PAD, dtype=np.int64)
@@ -59,458 +98,16 @@ def _encode_instrs(model, instrs, device):
     for i, e in enumerate(encoded):
         tok[i, :len(e)] = e
         pad[i, :len(e)] = False
-    tok_t = torch.from_numpy(tok).to(device)
-    pad_t = torch.from_numpy(pad).to(device)
-    return model.encode(tok_t, pad_t)
+    return model.encode(torch.from_numpy(tok).to(device),
+                        torch.from_numpy(pad).to(device))
 
 
-def equivalence_loss(model, device, rng):
-    """Per-class MSE on canonical *directional* pairwise distances, target=0.
-
-    Each call: for every manifest class with >=2 canonical templates,
-    sample a fresh binding, materialize, collect all instructions
-    across classes into a single padded batch, encode once, normalize
-    the resulting vectors to unit direction (T1 magnitude is a
-    separate validity signal — irrelevant for equivalence geometry),
-    then slice per-class to compute mean squared within-class
-    distance. Returns the mean across classes.
-    """
-    all_instrs = []
-    class_ranges = []  # list of (start, end) slices into the batch
-    start = 0
-    for klass in MANIFEST:
-        if len(klass.canonical) < 2:
-            continue
-        binding = sample_binding(klass, rng)
-        instrs = [materialize(t, binding) for t in klass.canonical]
-        all_instrs.extend(instrs)
-        class_ranges.append((start, start + len(instrs)))
-        start += len(instrs)
-
-    if not class_ranges:
-        return torch.tensor(0.0, device=device)
-
-    vecs = _encode_instrs(model, all_instrs, device)  # (N_total, d_out)
-    vecs = F.normalize(vecs, dim=-1)
-
-    losses = []
-    for s, e in class_ranges:
-        class_vecs = vecs[s:e]
-        N = class_vecs.shape[0]
-        idx = torch.triu_indices(N, N, offset=1, device=device)
-        dists = torch.cdist(class_vecs.unsqueeze(0),
-                            class_vecs.unsqueeze(0)).squeeze(0)
-        losses.append(dists[idx[0], idx[1]].square().mean())
-    return torch.stack(losses).mean()
-
-
-# ---------------------------------------------------------------------------
-# Execution distance metrics
-# ---------------------------------------------------------------------------
-
-def exec_distance_deltas(deltas, device):
-    """Pairwise execution distance from per-register deltas.
-    Used by sequence-based training (RVS).
-    """
-    d = deltas.to(device=device, dtype=torch.float32)
-    diff = (d.unsqueeze(1) - d.unsqueeze(0)).abs()
-    return diff.log1p_().mean(dim=(-1, -2))
-
-
-def _exec_distance_scalar_impl(dv, pv):
-    """Pairwise distance from scalar data_vals and pc_vals.
-
-    mean_s(log1p(log1p(|data_diff_s| + |pc_diff_s|)))
-
-    Nested log: first log1p compresses the int32 range (0..4e9) to
-    (0..22); second log1p compresses that to (0..3.14). The second
-    compression spreads the low end more uniformly, so near-equivalence
-    pairs (e.g., ADDI imm=0 vs imm=1, raw diff=1) get meaningfully
-    larger targets and thus more gradient pressure during training.
-    """
-    B, S = dv.shape
-    acc = torch.zeros(B, B, dtype=torch.float32, device=dv.device)
-    for s in range(S):
-        d = (dv[:, s].unsqueeze(1) - dv[:, s].unsqueeze(0)).abs()
-        p = (pv[:, s].unsqueeze(1) - pv[:, s].unsqueeze(0)).abs()
-        acc += torch.log1p(torch.log1p(d + p))
-    return acc / S
-
-
-_exec_distance_scalar_compiled = torch.compile(_exec_distance_scalar_impl)
-
-
-def exec_distance_scalar(data_vals, pc_vals, device):
-    """Pairwise execution distance from computed output values.
-    Used by single-instruction batch training (RVB).
-
-    data_vals: (B, n_inputs) int64 numpy array
-    pc_vals: (B, n_inputs) int64 numpy array
-    Returns: (B, B) float32 tensor
-    """
-    dv = torch.tensor(data_vals, dtype=torch.bfloat16, device=device)
-    pv = torch.tensor(pc_vals, dtype=torch.bfloat16, device=device)
-    return _exec_distance_scalar_compiled(dv, pv)
-
-
-# ---------------------------------------------------------------------------
-# Execution distance scaling
-# ---------------------------------------------------------------------------
-
-_EXEC_DIST_SCALE = 2.0 / 3.14  # nested-log range [0, ~3.14] → [0, ~2]
-
-
-# ---------------------------------------------------------------------------
-# N×N pairwise MSE training on single-instruction batches (step 1)
-# ---------------------------------------------------------------------------
-
-def train_batches(batch_iter, d_model=128, n_heads=4, n_layers=2,
-                  d_out=128, lr=3e-4, device='auto', n_steps=None,
-                  log_every=100, lr_min=1e-6, equiv_weight=0.0,
-                  equiv_seed=0, recon_weight=0.0, mag_weight=1.0,
-                  dec_d_model=128, dec_n_heads=4, dec_n_layers=2,
-                  k_samples=10, n_reward_inputs=4):
-    """Train the T1 encoder on single-instruction batches (RVB v2).
-
-    T1 lives in the unit ball (encoder no longer unit-normalizes).
-    Direction encodes semantics, magnitude encodes validity.
-
-    Loss composition:
-      - mag_loss:   MSE of ||T1|| against valid_mask (1 for valid
-                    single instruction, 0 for invalid window). All
-                    rows participate.
-      - mse_loss:   N×N MSE between *directional* T1 pairwise
-                    distances (using T1 / ||T1||) and scaled
-                    execution distances. Computed only over pairs
-                    where both rows are valid.
-      - dt_loss, dr_loss: destination classification CE on valid
-                    rows only (invalid rows have meaningless
-                    destinations).
-      - eq_loss:    equivalence-manifold loss on canonical tuples
-                    (always valid).
-      - recon_loss: decoder REINFORCE on valid rows only.
-
-    Returns (model, decoder, losses).
-    """
-    if device == 'auto':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    torch.set_float32_matmul_precision('high')
-
-    model = T1Compressor(VOCAB_SIZE, d_model, n_heads, n_layers, d_out)
-    model = model.to(device)
-
-    decoder = None
-    if recon_weight > 0:
-        decoder = Decoder(VOCAB_SIZE, dec_d_model, dec_n_heads,
-                          dec_n_layers, d_emb=d_out)
-        decoder = decoder.to(device)
-        all_params = list(model.parameters()) + list(decoder.parameters())
-    else:
-        all_params = list(model.parameters())
-
-    opt = torch.optim.Adam(all_params, lr=lr)
-    scheduler = None
-    if n_steps:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt, T_max=n_steps, eta_min=lr_min)
-
-    losses = []
-    step = 0
-    t0 = time.time()
-    probe_tok, probe_pad = _probe_tensor(device)
-    equiv_rng = np.random.default_rng(equiv_seed)
-    recon_baseline = 0.0
-
-    for batch in batch_iter:
-        tok = torch.from_numpy(batch.token_ids).to(device)
-        pad = torch.from_numpy(batch.padding_mask).to(device)
-        dt_targets = torch.from_numpy(batch.dest_types).to(device)
-        dr_targets = torch.from_numpy(batch.dest_regs).to(device)
-        valid_mask = torch.from_numpy(batch.valid_mask).to(device)
-
-        # Raw T1 in the unit ball; magnitude = validity, direction = semantics.
-        vecs = model.compiled_encode(tok, pad)  # (B, d_out)
-        vec_norms = vecs.norm(dim=-1)
-        vec_dirs = vecs / vec_norms.clamp(min=1e-8).unsqueeze(-1)
-
-        # Magnitude / validity loss: MSE of ||T1|| against a binary
-        # target. All rows participate.
-        mag_targets = valid_mask.float()
-        mag_loss = F.mse_loss(vec_norms, mag_targets)
-
-        # Destination classification — only meaningful on valid rows.
-        # Heads read direction (T1 / ||T1||), not raw T1: dest_type and
-        # dest_reg are properties of the instruction's identity, not of
-        # how confident we are in the window's validity. Reading raw
-        # T1 here would couple classifier scale to encoder magnitude,
-        # giving the heads a gradient incentive to inflate ||T1||
-        # during early training and producing magnitude-dependent
-        # behavior on streaming-mode inputs at inference time.
-        if valid_mask.any():
-            valid_idx = valid_mask.nonzero(as_tuple=True)[0]
-            dt_logits = model.dest_type_head(vec_dirs[valid_idx])
-            dr_logits = model.dest_reg_head(vec_dirs[valid_idx])
-            dt_loss = F.cross_entropy(dt_logits, dt_targets[valid_idx])
-            reg_mask = (dt_targets[valid_idx] == 0)
-            if reg_mask.any():
-                dr_loss = F.cross_entropy(
-                    dr_logits[reg_mask], dr_targets[valid_idx][reg_mask])
-            else:
-                dr_loss = torch.tensor(0.0, device=device)
-        else:
-            dt_loss = torch.tensor(0.0, device=device)
-            dr_loss = torch.tensor(0.0, device=device)
-
-        # Directional pair MSE: compute N×N over valid rows only.
-        # Using vec_dirs (unit-norm) so pair distances are purely
-        # angular — magnitude is already shaped by mag_loss.
-        if valid_mask.sum() >= 2:
-            valid_idx = valid_mask.nonzero(as_tuple=True)[0]
-            v_dirs = vec_dirs[valid_idx]
-            model_dists = torch.cdist(v_dirs.unsqueeze(0),
-                                      v_dirs.unsqueeze(0), p=2).squeeze(0)
-            # exec_distance_scalar operates on the full batch; slice down.
-            exec_dists = exec_distance_scalar(
-                batch.data_vals, batch.pc_vals, device)
-            exec_dists = exec_dists[valid_idx][:, valid_idx]
-
-            N = v_dirs.shape[0]
-            tri = torch.triu_indices(N, N, offset=1, device=device)
-            target = exec_dists[tri[0], tri[1]] * _EXEC_DIST_SCALE
-            mse_loss = (model_dists[tri[0], tri[1]] - target).square().mean()
-        else:
-            mse_loss = torch.tensor(0.0, device=device)
-            N = int(valid_mask.sum().item())
-
-        if equiv_weight > 0:
-            eq_loss = equivalence_loss(model, device, equiv_rng)
-        else:
-            eq_loss = torch.tensor(0.0, device=device)
-
-        if recon_weight > 0 and decoder is not None and valid_mask.any():
-            # Filter to valid rows — invalid windows aren't reconstructible.
-            valid_idx = valid_mask.nonzero(as_tuple=True)[0]
-            valid_tok = tok[valid_idx]
-            valid_pad = pad[valid_idx]
-            B_dec = valid_tok.shape[0]
-            token_lists = []
-            for b in range(B_dec):
-                mask_np = ~batch.padding_mask[valid_idx[b].item()]
-                token_lists.append(
-                    batch.token_ids[valid_idx[b].item()][mask_np].tolist())
-            dec_in, dec_tgt, dec_pad = _prepare_decoder_targets(
-                token_lists, device)
-
-            # Decoder forward — vecs NOT detached so REINFORCE
-            # gradient flows through decoder to encoder. Decoder reads
-            # raw T1 (not normalized direction) so cross-attention
-            # conditioning strength scales linearly with ||T1||.
-            # At inference: high-magnitude inputs produce confident,
-            # specific reconstructions; low-magnitude inputs produce
-            # high-entropy unconditioned-language-model output. No
-            # threshold needed for "invalid" handling — degradation
-            # is continuous and automatic.
-            dec_logits = decoder(vecs[valid_idx], dec_in, dec_pad)
-            non_pad_dec = ~dec_pad
-            orig_lengths = non_pad_dec.sum(dim=1)
-
-            dist = torch.distributions.Categorical(logits=dec_logits)
-
-            # K-sample REINFORCE with shaped execution reward.
-            reinforce_sum = torch.tensor(0.0, device=device)
-            total_reward = 0.0
-            total_equiv = 0
-
-            for _ in range(k_samples):
-                sampled = dist.sample()
-                lp = (dist.log_prob(sampled)
-                      * non_pad_dec.float()).sum(dim=1)
-
-                with torch.no_grad():
-                    o_op, o_rd, o_rs1, o_rs2, o_imm, o_v = \
-                        batch_parse_tokens(valid_tok, orig_lengths, device)
-                    d_op, d_rd, d_rs1, d_rs2, d_imm, d_v = \
-                        batch_parse_tokens(sampled, orig_lengths, device)
-                    both_v = o_v & d_v
-
-                    op_m = (o_op == d_op).float()
-                    rd_m = (o_rd == d_rd).float()
-                    dv_m = torch.zeros(B_dec, device=device)
-                    pc_m = torch.zeros(B_dec, device=device)
-
-                    for _ in range(n_reward_inputs):
-                        rgs = random_regs_gpu(B_dec, device=device)
-                        pcr = torch.randint(
-                            0, 256, (B_dec,),
-                            dtype=torch.int32, device=device) * 4
-                        o_dv, o_pc = batch_execute(
-                            o_op, o_rd, o_rs1, o_rs2, o_imm, rgs, pcr)
-                        d_dv, d_pc = batch_execute(
-                            d_op, d_rd, d_rs1, d_rs2, d_imm, rgs, pcr)
-                        dv_m += (o_dv == d_dv).float()
-                        pc_m += (o_pc == d_pc).float()
-
-                    rewards = torch.where(
-                        both_v,
-                        0.25 * op_m + 0.25 * rd_m
-                        + 0.25 * dv_m / n_reward_inputs
-                        + 0.25 * pc_m / n_reward_inputs,
-                        torch.zeros(B_dec, device=device))
-
-                    equiv = both_v & (dv_m == n_reward_inputs) \
-                                   & (pc_m == n_reward_inputs)
-
-                advantage = rewards - recon_baseline
-                adv_std = advantage.std() + 1e-8
-                advantage = (advantage - advantage.mean()) / adv_std
-                reinforce_sum = reinforce_sum \
-                    - (lp * advantage).mean()
-                total_reward += rewards.mean().item()
-                total_equiv += equiv.sum().item()
-
-            recon_loss = reinforce_sum / k_samples
-            recon_baseline = (0.99 * recon_baseline
-                              + 0.01 * total_reward / k_samples)
-            recon_acc = total_equiv / (B_dec * k_samples)
-        else:
-            recon_loss = torch.tensor(0.0, device=device)
-            dec_logits = None
-            recon_acc = 0.0
-
-        loss = (mag_weight * mag_loss
-                + mse_loss + dt_loss + dr_loss
-                + equiv_weight * eq_loss
-                + recon_weight * recon_loss)
-
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
-        if scheduler:
-            scheduler.step()
-
-        loss_val = loss.item()
-        losses.append(loss_val)
-        step += 1
-
-        if step % log_every == 0:
-            elapsed = time.time() - t0
-            ms_per = elapsed / step * 1000
-            current_lr = scheduler.get_last_lr()[0] if scheduler else lr
-            eta_str = ''
-            if n_steps:
-                eta_sec = int(max(0, n_steps - step) * ms_per / 1000)
-                eta_str = f'  eta {timedelta(seconds=eta_sec)}'
-            with torch.no_grad():
-                pv = model.encode(probe_tok, probe_pad)
-                pv_dir = pv / pv.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-            # Probe distances computed on normalized direction so
-            # they stay on the same scale as the training pair MSE.
-            d_add_add = (pv_dir[0] - pv_dir[2]).norm().item()
-            d_canon = (pv_dir[0] - pv_dir[1]).norm().item()
-            d_sll_sll = (pv_dir[1] - pv_dir[3]).norm().item()
-            d_comm = (pv_dir[2] - pv_dir[4]).norm().item()
-
-            # Magnitude stats across the last batch, split valid / invalid.
-            with torch.no_grad():
-                valid_mag_mean = (
-                    vec_norms[valid_mask].mean().item()
-                    if valid_mask.any() else float('nan'))
-                invalid_mag_mean = (
-                    vec_norms[~valid_mask].mean().item()
-                    if (~valid_mask).any() else float('nan'))
-                mag_max = vec_norms.max().item()
-
-            recon_str = ''
-            if dec_logits is not None:
-                recon_str = (f' rl {recon_loss.item():.3f}'
-                             f' eq {recon_acc:.0%}')
-            print(f'step {step:>6d}  '
-                  f'loss {loss_val:.4f} '
-                  f'(mag {mag_loss.item():.4f} '
-                  f'mse {mse_loss.item():.4f} '
-                  f'dt {dt_loss.item():.3f} '
-                  f'dr {dr_loss.item():.3f} '
-                  f'eq {eq_loss.item():.4f}'
-                  f'{recon_str})  '
-                  f'lr {current_lr:.1e}  {ms_per:.0f}ms/step  '
-                  f'N={N}{eta_str}  '
-                  f'||T1|| v={valid_mag_mean:.2f} '
-                  f'i={invalid_mag_mean:.2f} '
-                  f'max={mag_max:.2f}  '
-                  f'probe[aa={d_add_add:.3f} '
-                  f'canon={d_canon:.3f} '
-                  f'ss={d_sll_sll:.3f} '
-                  f'comm={d_comm:.3f}]')
-
-        if n_steps and step >= n_steps:
-            break
-
-    return model, decoder, losses
-
-
-# ---------------------------------------------------------------------------
-# Fixed-window training (context experiment)
-# ---------------------------------------------------------------------------
-
-def extract_windows(batch, window_size=1):
-    """Extract per-instruction training examples from a sequence batch."""
-    B = batch.token_ids.shape[0]
-    all_tokens = []
-    all_deltas = []
-
-    for b in range(B):
-        n = int(batch.n_instructions[b])
-        tok = batch.token_ids[b]
-        idx = batch.token_instr_idx[b]
-        mask = ~batch.padding_mask[b]
-
-        for i in range(window_size - 1, n):
-            start_instr = i - window_size + 1
-            sel = mask & (idx >= start_instr) & (idx <= i)
-            instr_tokens = tok[sel].tolist()
-            all_tokens.append([BOS] + instr_tokens + [EOS])
-            delta = (batch.per_instr_regs[b, i + 1, :, :]
-                     - batch.per_instr_regs[b, i, :, :])
-            all_deltas.append(delta)
-
-    if not all_tokens:
-        return None, None, None
-
-    max_len = max(len(t) for t in all_tokens)
-    N = len(all_tokens)
-    token_ids = np.full((N, max_len), PAD, dtype=np.int64)
-    padding_mask = np.ones((N, max_len), dtype=np.bool_)
-    for j, t in enumerate(all_tokens):
-        token_ids[j, :len(t)] = t
-        padding_mask[j, :len(t)] = False
-
-    deltas = np.stack(all_deltas, axis=0)
-    return token_ids, padding_mask, deltas
-
-
-def train_sequences(batch_iter, **kwargs):
-    """Placeholder for sequence-based training.
-
-    The original implementation (context experiments, Exp 19) used
-    fixed windows with per-register delta execution distance. It will
-    be replaced with streaming_train when T2 fine-tuning is built.
-    """
-    raise NotImplementedError(
-        'train_sequences is not implemented. Use train_batches for '
-        'encoder training (step 1) or streaming_train for gate training.')
-
-
-# ---------------------------------------------------------------------------
-# Decoder target preparation
-# ---------------------------------------------------------------------------
-
-def _prepare_decoder_targets(token_lists, device):
+def prepare_decoder_targets(token_lists, device):
     """Build decoder input/target tensors from lists of token IDs.
 
     Each token list gets wrapped: [BOS] + tokens + [EOS].
     Returns dec_input (shifted right), dec_target, dec_padding.
-    Returns None tuple if token_lists is empty.
+    Returns (None, None, None) if token_lists is empty.
     """
     if not token_lists:
         return None, None, None
@@ -533,809 +130,1354 @@ def _prepare_decoder_targets(token_lists, device):
             torch.from_numpy(dec_padding).to(device))
 
 
-@torch.no_grad()
-def autoregressive_sample(decoder, vecs, max_len, device):
-    """Sample token sequences autoregressively (no gradient).
+def decoder_targets_fixed(batch, max_dec_len):
+    """Fixed-shape (B, max_dec_len) teacher-forcing tensors over ALL rows —
+    the compile-able analog of prepare_decoder_targets (whose shape varies
+    with the valid-row count and per-batch max length, which would force a
+    CUDA-graph re-record every batch).
 
-    The decoder sees its OWN previous tokens at each position.
-    Returns sampled tokens only (BOS stripped) — log_probs are
-    computed separately in a single parallel forward pass to save
-    memory.
+    Valid rows: input=[BOS]+toks, target=toks+[EOS]. Invalid rows: target
+    all-PAD (CE ignore_index=PAD → they contribute nothing). Position 0 is
+    always BOS and never masked, so no row is fully-padded (an all-padding
+    row NaNs the decoder's attention softmax). max_dec_len must be >=
+    max token_len + 1; the caller derives it from the corpus-constant
+    batch.tokens width (max_tokens + 1)."""
+    B, max_tokens = batch.tokens.shape
+    valid = batch.valid
+    tl = batch.token_lens
+    dec_in = np.full((B, max_dec_len), PAD, dtype=np.int64)
+    dec_tgt = np.full((B, max_dec_len), PAD, dtype=np.int64)
+    dec_in[:, 0] = BOS
+    # input = [BOS] + toks (valid rows only; invalid rows stay [BOS, PAD…],
+    # fully masked below). target = toks + [EOS] for valid rows.
+    dec_in[valid, 1:1 + max_tokens] = batch.tokens[valid]
+    dec_tgt[valid, :max_tokens] = batch.tokens[valid]
+    rows = np.nonzero(valid)[0]
+    dec_tgt[rows, tl[rows]] = EOS              # EOS at each row's token_len
+    # padding mask: valid rows unmask token_len+1 positions ([BOS]+toks);
+    # invalid rows unmask only position 0 (BOS) so no row is fully padded.
+    lengths = np.where(valid, tl + 1, 1)
+    dec_pad = np.arange(max_dec_len)[None, :] >= lengths[:, None]
+    return dec_in, dec_tgt, dec_pad
+
+
+# ===========================================================================
+# train_encoder — magnitude-validity + rename-equivariant register binding
+# + value-prediction on RVT batches (the T2 loss set, single-instruction)
+# ===========================================================================
+
+def resolve_device(spec):
+    if spec == 'auto':
+        return 'cuda' if torch.cuda.is_available() else 'cpu'
+    return spec
+
+
+def _is_cuda(device):
+    return device == 'cuda' or getattr(device, 'type', None) == 'cuda'
+
+
+def _h2d(arr, device, dtype=None):
+    """Host->device copy for a batch array. On CUDA, route through pinned
+    memory + non_blocking so the 11 per-step copies don't each block the
+    CPU (they queue on the default stream and the CPU races ahead to launch
+    the compiled step) — this recovers most of the per-step H2D gap and
+    lifts GPU util ~81%->~92% with NO CUDA-graph hazard (the copy is on the
+    default stream, before/outside the captured region; unlike a side-stream
+    prefetcher, which collides with graph capture). dtype casts on the host
+    so the device sees the final dtype directly."""
+    t = torch.from_numpy(arr)
+    if dtype is not None:
+        t = t.to(dtype)
+    if _is_cuda(device):
+        return t.pin_memory().to(device, non_blocking=True)
+    return t.to(device)
+
+
+def _value_compress(x):
+    """Sign-preserving double-log1p compression. Maps int32 range
+    [-2^31, 2^31] roughly to [-3.0, 3.0] while preserving sign and
+    monotonicity. Matches the project's residual-compression
+    convention used by the canonical-output comparison."""
+    return torch.sign(x) * torch.log1p(torch.log1p(x.abs()))
+
+
+def value_predict_loss(vp_head, vecs, anchor_states,
+                       src_reg_0, src_reg_1, row_outputs,
+                       pair_valid, has_rd):
+    """MSE on the predicted rd-value-per-anchor.
+
+    The hypothesis: if the vector encodes operator-essence (the I/O
+    function of the instruction), then a head reading (vec, input
+    register values) — and *crucially* not register IDs — can predict
+    the output value. The head sees inputs as values only, so it has
+    to read "what operation" from the vector; there's no path to
+    identify which register the inputs came from.
+
+    Args:
+      vp_head:       nn.Module, (B*A, d+2) → (B*A, 1)
+      vecs:          (B, d) float
+      anchor_states: (n_anchors, 32) int32 — register-file snapshots
+      src_reg_0,1:   (B,) int64 — source-register IDs per row. 0 means
+                     "no source" (x0, which is hardwired to 0 — so the
+                     lookup naturally yields zero contribution).
+      row_outputs:   (B, n_anchors) float — target rd value per anchor.
+      pair_valid:    (B,) bool
+      has_rd:        (B,) bool
+
+    Returns scalar MSE on (pair_valid & has_rd) rows.
     """
-    B = vecs.shape[0]
-    generated = torch.full((B, 1), BOS, dtype=torch.long, device=device)
-    for _ in range(max_len):
-        pad_mask = torch.zeros(
-            B, generated.shape[1], dtype=torch.bool, device=device)
-        logits = decoder(vecs, generated, pad_mask)
-        next_token = torch.distributions.Categorical(
-            logits=logits[:, -1, :]).sample()
-        generated = torch.cat(
-            [generated, next_token.unsqueeze(1)], dim=1)
-    return generated[:, 1:]
+    device = vecs.device
+    B, d = vecs.shape
+    n_anchors = anchor_states.shape[0]
+
+    # Row mask as a multiplicative weight (not a boolean index / early
+    # return): keeps the op graph static-shape and host-sync-free, so the
+    # whole training step can be torch.compile'd / CUDA-graph captured. The
+    # masked-out rows still compute (their per-row loss is finite — pred and
+    # target are always finite) but contribute zero. clamp(min=1) makes the
+    # all-masked batch return 0.0, matching the old early-return.
+    mask = (pair_valid & has_rd).float()
+
+    # Lookup per-row input values: (n_anchors, B) → (B, n_anchors).
+    v_src0 = anchor_states[:, src_reg_0].T.float()
+    v_src1 = anchor_states[:, src_reg_1].T.float()
+    v_src0_c = _value_compress(v_src0)
+    v_src1_c = _value_compress(v_src1)
+
+    # Feature: per (row, anchor), [vec || v_src0 || v_src1].
+    vec_exp = vecs.unsqueeze(1).expand(-1, n_anchors, -1)
+    feat = torch.cat([
+        vec_exp,
+        v_src0_c.unsqueeze(-1),
+        v_src1_c.unsqueeze(-1),
+    ], dim=-1)    # (B, n_anchors, d + 2)
+
+    pred = vp_head(feat).squeeze(-1)    # (B, n_anchors)
+
+    target_raw = row_outputs.float()    # (B, n_anchors)
+    target_c = _value_compress(target_raw)
+
+    diff_sq = (pred - target_c) ** 2
+    per_row = diff_sq.mean(dim=-1)    # (B,)
+    return (per_row * mask).sum() / mask.sum().clamp(min=1)
 
 
-def compute_log_probs(decoder, vecs, sampled, orig_lengths, device):
-    """Compute log_probs for a sampled sequence in one parallel forward.
+def build_optim_sched(params, lr, n_steps, *, warmup_steps=0,
+                      lr_min=1e-6, device='cuda'):
+    """Adam (fused on cuda) + an optional-warmup→cosine LR schedule, shared
+    by all trainers. Returns (opt, scheduler); scheduler is None when
+    n_steps is falsy (LR held constant, e.g. unbounded streaming)."""
+    opt = torch.optim.Adam(params, lr=lr, fused=(device == 'cuda'))
+    if not n_steps:
+        return opt, None
+    cosine_steps = max(1, n_steps - warmup_steps)
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=cosine_steps, eta_min=lr_min)
+    if warmup_steps > 0:
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            opt, start_factor=1e-3, end_factor=1.0, total_iters=warmup_steps)
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            opt, schedulers=[warmup, cosine], milestones=[warmup_steps])
+    else:
+        scheduler = cosine
+    return opt, scheduler
 
-    Uses the sampled tokens as decoder input (shifted right with BOS).
-    The log_probs are conditioned on the sampled prefix, not ground
-    truth — teacher-forcing on the decoder's own output.
+
+def _current_lr(scheduler, lr):
+    return scheduler.get_last_lr()[0] if scheduler else lr
+
+
+class StepTimer:
+    """Wall-clock pacing for log lines. tick() returns (ms_per_step, eta_s)
+    for the current step given the total and the log cadence."""
+
+    def __init__(self):
+        self._t_last = time.time()
+
+    def tick(self, step, n_steps, log_every):
+        now = time.time()
+        ms_per_step = (now - self._t_last) / max(1, log_every) * 1000
+        self._t_last = now
+        eta = ((n_steps - step) * ms_per_step / 1000) if n_steps else 0
+        return ms_per_step, eta
+
+
+def capture_train_state(step, opt, scheduler):
+    """Snapshot optimizer moments + scheduler position + step + RNG for an
+    as-close-as-possible resume (the data stream from gen_batches is random,
+    so resume continues optimizer/schedule, not the exact byte stream).
+    Shared by all trainers; fires at log-boundary cadence, so the device->host
+    copies it triggers (state_dict / get_rng_state) are off the hot path."""
+    return {
+        'step': step,
+        'opt': opt.state_dict(),
+        'scheduler': scheduler.state_dict() if scheduler is not None else None,
+        'torch_rng': torch.get_rng_state(),
+        'cuda_rng': (torch.cuda.get_rng_state()
+                     if torch.cuda.is_available() else None),
+    }
+
+
+def restore_train_state(state, opt, scheduler):
+    """Inverse of capture_train_state: reload optimizer/scheduler/RNG and
+    return the step to resume from. Shared by all trainers."""
+    opt.load_state_dict(state['opt'])
+    if scheduler is not None and state.get('scheduler'):
+        scheduler.load_state_dict(state['scheduler'])
+    torch_rng = state.get('torch_rng')
+    if torch_rng is not None:
+        torch.set_rng_state(torch_rng.cpu() if hasattr(torch_rng, 'cpu')
+                            else torch_rng)
+    cuda_rng = state.get('cuda_rng')
+    if cuda_rng is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state(cuda_rng.cpu() if hasattr(cuda_rng, 'cpu')
+                                 else cuda_rng)
+    return int(state.get('step', 0))
+
+
+class TrainLog:
+    """Owns the training-loop log boundary, shared by all trainers.
+
+    The discipline it centralizes: keep loss values as GPU tensors every
+    step (no device->host sync), and ONLY at log boundaries materialize them
+    to floats, build + append the record, print, and invoke on_log. Each
+    float(tensor) drains the async CUDA pipeline; doing it every step
+    serializes CPU/GPU (a dominant cost on WSL2/GPU-PV) and would break any
+    CUDA-graph capture of the step. Concentrating every sync here keeps the
+    hot path async and gives one audited home for the invariant.
+
+    The logger is optimizer-agnostic: it never touches opt/scheduler. Resume
+    state is a separate concern (capture_train_state) — the loop hands this
+    logger an opaque dict via state_fn and the logger only forwards it to
+    on_log. Per-trainer differences are injected, not forked:
+      formatter(record, ms_per_step, eta, lr) -> str   (the human log line)
+      extra_fn() -> dict                                (probes / counts;
+                    called only at boundaries so its own GPU work/syncs are
+                    likewise off the hot path)
+    on_log is always called (model, losses, train_state) — train_state is
+    None for trainers that don't checkpoint resume state.
     """
-    B, T = sampled.shape
-    bos_col = torch.full((B, 1), BOS, dtype=torch.long, device=device)
-    dec_input = torch.cat([bos_col, sampled[:, :-1]], dim=1)
-    pad_mask = torch.zeros(B, T, dtype=torch.bool, device=device)
 
-    logits = decoder(vecs, dec_input, pad_mask)
-    dist = torch.distributions.Categorical(logits=logits)
-    log_probs = dist.log_prob(sampled)
+    def __init__(self, *, n_steps, log_every, lr, scheduler, formatter,
+                 on_log=None):
+        self.n_steps = n_steps
+        self.log_every = log_every
+        self.lr = lr
+        self.scheduler = scheduler
+        self.formatter = formatter
+        self.on_log = on_log
+        self.timer = StepTimer()
+        self.losses = []
 
-    pos_mask = (torch.arange(T, device=device).unsqueeze(0)
-                < orig_lengths.unsqueeze(1))
-    return (log_probs * pos_mask.float()).sum(dim=1)
+    def should_log(self, step):
+        return step % self.log_every == 0 or step == 1
 
-
-def gpu_reward(orig_tokens, sampled_tokens, orig_lengths,
-               sampled_lengths, device, n_inputs=4):
-    """Fully-GPU shaped execution-equivalence reward.
-
-    Decomposes the reward into per-field signals so the decoder
-    gets credit for partially-correct decodings:
-      0.25 × opcode match
-      0.25 × dest_reg match
-      0.25 × data_val match (fraction across n_inputs)
-      0.25 × pc match (fraction across n_inputs)
-
-    Returns (rewards, valid_mask, equiv_mask) as (B,) tensors.
-    """
-    o_op, o_rd, o_rs1, o_rs2, o_imm, o_valid = batch_parse_tokens(
-        orig_tokens, orig_lengths, device)
-    d_op, d_rd, d_rs1, d_rs2, d_imm, d_valid = batch_parse_tokens(
-        sampled_tokens, sampled_lengths, device)
-
-    both_valid = o_valid & d_valid
-    B = orig_tokens.shape[0]
-
-    op_match = (o_op == d_op).float()
-    rd_match = (o_rd == d_rd).float()
-
-    dv_match_count = torch.zeros(B, dtype=torch.float32, device=device)
-    pc_match_count = torch.zeros(B, dtype=torch.float32, device=device)
-
-    for _ in range(n_inputs):
-        regs = random_regs_gpu(B, device=device)
-        pc = torch.randint(0, 256, (B,), dtype=torch.int32,
-                           device=device) * 4
-        o_dv, o_pc = batch_execute(
-            o_op, o_rd, o_rs1, o_rs2, o_imm, regs, pc)
-        d_dv, d_pc = batch_execute(
-            d_op, d_rd, d_rs1, d_rs2, d_imm, regs, pc)
-        dv_match_count += (o_dv == d_dv).float()
-        pc_match_count += (o_pc == d_pc).float()
-
-    dv_match = dv_match_count / n_inputs
-    pc_match = pc_match_count / n_inputs
-
-    shaped_reward = (0.25 * op_match + 0.25 * rd_match
-                     + 0.25 * dv_match + 0.25 * pc_match)
-
-    rewards = torch.where(
-        both_valid, shaped_reward,
-        torch.zeros(B, dtype=torch.float32, device=device))
-
-    equiv_mask = (both_valid
-                  & (dv_match_count == n_inputs)
-                  & (pc_match_count == n_inputs))
-
-    return rewards, d_valid, equiv_mask
+    def log(self, step, loss_tensors, *, model=None, extra_fn=None,
+            state_fn=None):
+        """At a log boundary: materialize loss_tensors (dict of name->scalar
+        tensor) to floats, merge extra_fn(), record, print, on_log. Off
+        boundary: a no-op (NO sync). Returns the record dict or None."""
+        if not self.should_log(step):
+            return None
+        record = {'step': step}
+        record.update({k: float(v) for k, v in loss_tensors.items()})
+        if extra_fn is not None:
+            record.update(extra_fn())
+        ms_per_step, eta = self.timer.tick(step, self.n_steps, self.log_every)
+        lr_now = _current_lr(self.scheduler, self.lr)
+        print(self.formatter(record, ms_per_step, eta, lr_now))
+        self.losses.append(record)
+        if self.on_log is not None:
+            train_state = state_fn() if state_fn is not None else None
+            self.on_log(model, self.losses, train_state)
+        return record
 
 
-def load_checkpoint(path, device):
-    """Load a state dict, stripping the torch.compile prefix.
-
-    `torch.compile` wraps modules so saved state dicts carry an
-    `_orig_mod.` prefix on every key. This helper transparently
-    handles both compiled and uncompiled checkpoints so the result
-    loads into an uncompiled module.
-    """
-    state = torch.load(path, map_location=device, weights_only=True)
-    return {k.removeprefix('_orig_mod.'): v for k, v in state.items()}
-
-
-def _compute_emission_deltas(batch, emission_info, device):
-    """Compute cumulative register deltas for complete emissions."""
-    deltas = []
-    for info in emission_info:
-        b = info['batch_idx']
-        i_start = info['instr_start']
-        i_end = info['instr_end']
-        delta = (batch.per_instr_regs[b, i_end + 1, :, :]
-                 - batch.per_instr_regs[b, i_start, :, :])
-        deltas.append(torch.from_numpy(delta.astype(np.float32)))
-
-    if not deltas:
-        return torch.zeros(0, 1, 32, device=device)
-    return torch.stack(deltas).to(device)
+def _peek(it):
+    """Pull the first item so corpus-constant shapes/flags can be read, then
+    return (first, chained_iter) with the item put back. (first, iter) is
+    (None, it) for an empty stream. Lets trainers bake batch-derived constants
+    into the compiled graph without consuming the first batch."""
+    it = iter(it)
+    try:
+        first = next(it)
+    except StopIteration:
+        return None, it
+    return first, itertools.chain([first], it)
 
 
-# ---------------------------------------------------------------------------
-# Streaming compressor training with REINFORCE gate training
-# ---------------------------------------------------------------------------
+def run_train_loop(batch_source, *, model, opt, scheduler, log, device,
+                   prep_fn, fwd_loss_fn, extra_fn=None, clip=1.0,
+                   compile_step=True, capture_state=False, start_step=0):
+    """The shared compiled training loop for all trainers (T1/T2/decoder).
 
-def streaming_train(batch_iter, d_model=128, n_heads=4, n_layers=2,
-                    d_out=128, dec_d_model=128, dec_n_heads=4,
-                    dec_n_layers=2, lr=3e-4, device='auto',
-                    n_steps=None, log_every=100, lr_min=1e-6,
-                    pairwise_weight=1.0, reinforce_lr=1e-3,
-                    baseline_decay=0.99):
-    """Train shift-reduce compressor + decoder.
+    Owns the universal mechanics: process/device setup (TF32 matmul + disabling
+    the fused-attention fast path that the compiled step can't capture),
+    torch.compile (CUDA-graph, reduce-overhead) of the forward+loss+backward,
+    the per-step backward / grad-clip / opt / scheduler, and logging via `log`
+    (TrainLog) — including the log-boundary sync discipline and optional
+    resume-state capture. The two genuinely trainer-specific pieces are
+    injected:
 
-    The encoder (window encoder + GRU + projector) and decoder are
-    trained via normal backprop through reconstruction loss.
+      prep_fn(item) -> tuple of GPU inputs for fwd_loss_fn, or None to skip
+          the item (empty batch). Does the H2D copies (via _h2d) plus any
+          eager, dynamic-shape precompute that must stay OUTSIDE the captured
+          graph (e.g. T2's frozen-T1 per-instruction encode + chunk assembly,
+          whose instruction count varies per batch). Every tensor it returns
+          must be fixed-shape so the graph records once.
+      fwd_loss_fn(*inputs) -> (total, metrics, aux)
+          total:   scalar loss to backward.
+          metrics: dict[str, scalar tensor] logged at each boundary.
+          aux:     tensors a boundary-only extra_fn needs (or None).
+          The torch.compile target — keep it fixed-shape + host-sync-free.
+      extra_fn(item, aux) -> dict  boundary-only extra fields (probes, chunk
+          counts, decoder accuracy), or None.
 
-    The gates are trained via REINFORCE: at every iteration, the
-    decoder evaluates the T1 candidate against the current window
-    contents. The per-iteration reconstruction loss serves as the
-    reward signal (negated: lower loss = higher reward).
-
-    Returns (encoder, decoder, losses, gate_stats).
-    """
-    if device == 'auto':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    encoder = T1Compressor(
-        VOCAB_SIZE, d_model, n_heads, n_layers, d_out)
-    encoder = encoder.to(device)
-
-    decoder = Decoder(
-        VOCAB_SIZE, dec_d_model, dec_n_heads, dec_n_layers, d_emb=d_out)
-    decoder = decoder.to(device)
-
-    # Separate optimizers: normal backprop for encoder+decoder,
-    # REINFORCE for gates.
-    encoder_params = (
-        list(encoder.tok_emb.parameters())
-        + list(encoder.win_pos_emb.parameters())
-        + list(encoder.win_encoder.parameters())
-        + list(encoder.proj.parameters())
-        + list(encoder.gru.parameters()))
-    gate_params = (
-        list(encoder.accept_head.parameters())
-        + list(encoder.emit_head.parameters())
-        + list(encoder.evict_head.parameters()))
-
-    opt_main = torch.optim.Adam(
-        encoder_params + list(decoder.parameters()), lr=lr)
-    opt_gates = torch.optim.Adam(gate_params, lr=reinforce_lr)
-
-    scheduler = None
-    if n_steps:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt_main, T_max=n_steps, eta_min=lr_min)
-
-    # REINFORCE baseline (moving average of per-iteration loss).
-    baseline = 0.0
-
-    losses = []
-    gate_stats = []
-    step = 0
-    t0 = time.time()
-
-    for batch in batch_iter:
-        tok = torch.from_numpy(batch.token_ids).to(device)
-        pad = torch.from_numpy(batch.padding_mask).to(device)
-        idx = torch.from_numpy(batch.token_instr_idx).to(device)
-        n_instr = torch.from_numpy(batch.n_instructions).to(device)
-
-        B = tok.shape[0]
-
-        # --- Forward pass (shift-reduce loop) ---
-        (iter_t1s, iter_window_tokens,
-         iter_gate_log_probs, iter_gate_decisions,
-         iter_gate_logits,
-         iter_window_buf_t, iter_window_lens_t,
-         emission_info, emit_counts) = encoder(tok, pad, idx, n_instr)
-
-        n_iters = len(iter_t1s)
-        if n_iters == 0:
+    `model` is the trainable module (its parameters are grad-clipped). Returns
+    log.losses. start_step seeds the step counter (resume)."""
+    if _is_cuda(device):
+        # TF32 tensor cores for fp32 matmul (~2-4x, ~1 bit precision). Set
+        # here so every trainer gets it uniformly (it had drifted to only
+        # T2/decoder, leaving T1 on slow fp32 matmuls).
+        torch.set_float32_matmul_precision('high')
+    # Disable the fused attention fast path (_transformer_encoder_layer_fwd /
+    # nested-tensor) — not torch.compile-able; it shatters the captured graph.
+    # Global + numerically transparent; set once for all trainers.
+    torch.backends.mha.set_fastpath_enabled(False)
+    step_fn = (torch.compile(fwd_loss_fn, mode='reduce-overhead')
+               if compile_step else fwd_loss_fn)
+    step = start_step
+    for item in batch_source:
+        inputs = prep_fn(item)
+        if inputs is None:
             continue
-
-        # --- Per-iteration decoder evaluation (chunked + length-sorted) ---
-        # Flatten all (iter, batch_item) pairs with non-empty windows,
-        # sort by window length descending, process in chunks. Sorting
-        # keeps each chunk tightly padded; chunking keeps the decoder
-        # forward at a size the GPU can handle efficiently. A single
-        # unchunked forward with global-max padding turned out to be
-        # much slower than many small forwards.
-        flat_iter_idx = []
-        flat_batch_idx = []
-        flat_tokens = []
-        flat_win_sizes = []
-        for it in range(n_iters):
-            wt = iter_window_tokens[it]
-            for b in range(B):
-                if wt[b]:
-                    flat_iter_idx.append(it)
-                    flat_batch_idx.append(b)
-                    flat_tokens.append(wt[b])
-                    flat_win_sizes.append(len(wt[b]))
-
-        if not flat_tokens:
-            iter_recon_losses = [
-                torch.zeros(B, device=device) for _ in range(n_iters)]
-        else:
-            DECODER_CHUNK_SIZE = 1024
-            order = sorted(
-                range(len(flat_tokens)),
-                key=lambda i: -flat_win_sizes[i])
-
-            iter_idx_t = torch.tensor(
-                flat_iter_idx, dtype=torch.long, device=device)
-            batch_idx_t = torch.tensor(
-                flat_batch_idx, dtype=torch.long, device=device)
-            stacked_t1 = torch.stack(iter_t1s)  # (n_iters, B, d_out)
-
-            N = len(flat_tokens)
-            per_item_loss = torch.zeros(N, device=device)
-            for start in range(0, N, DECODER_CHUNK_SIZE):
-                chunk_flat_idx = order[start:start + DECODER_CHUNK_SIZE]
-                chunk_tokens = [flat_tokens[i] for i in chunk_flat_idx]
-                chunk_iter = torch.tensor(
-                    [flat_iter_idx[i] for i in chunk_flat_idx],
-                    dtype=torch.long, device=device)
-                chunk_batch = torch.tensor(
-                    [flat_batch_idx[i] for i in chunk_flat_idx],
-                    dtype=torch.long, device=device)
-                chunk_t1 = stacked_t1[chunk_iter, chunk_batch]
-
-                dec_in, dec_tgt, dec_pad = _prepare_decoder_targets(
-                    chunk_tokens, device)
-                logits = decoder(chunk_t1, dec_in, dec_pad)
-
-                pt = F.cross_entropy(
-                    logits.reshape(-1, VOCAB_SIZE),
-                    dec_tgt.reshape(-1),
-                    ignore_index=PAD, reduction='none')
-                pt = pt.reshape(len(chunk_tokens), -1)
-                non_pad_counts = (~dec_pad).sum(dim=1).clamp(min=1).float()
-                chunk_loss = pt.sum(dim=1) / non_pad_counts
-                ws = torch.tensor(
-                    [flat_win_sizes[i] for i in chunk_flat_idx],
-                    dtype=torch.float32, device=device)
-                chunk_loss = chunk_loss * ws
-
-                chunk_idx_tensor = torch.tensor(
-                    chunk_flat_idx, dtype=torch.long, device=device)
-                per_item_loss = per_item_loss.scatter(
-                    0, chunk_idx_tensor, chunk_loss)
-
-            flat_flat_idx = iter_idx_t * B + batch_idx_t
-            losses_flat = torch.zeros(
-                n_iters * B, device=device).scatter(
-                    0, flat_flat_idx, per_item_loss)
-            losses_matrix = losses_flat.view(n_iters, B)
-            iter_recon_losses = [losses_matrix[i] for i in range(n_iters)]
-
-        # --- Reconstruction loss for encoder+decoder (normal backprop) ---
-        # Average across all iterations and sequences.
-        all_recon = torch.stack(iter_recon_losses)  # (n_iters, B)
-        # Mask out done sequences (zero loss).
-        recon_mask = all_recon > 0
-        if recon_mask.any():
-            recon_loss = all_recon[recon_mask].mean()
-        else:
-            recon_loss = torch.tensor(0.0, device=device)
-
-        # --- Pairwise MSE loss (on actual emissions with complete instrs) ---
-        complete_info = [info for info in emission_info
-                         if info['has_complete']]
-
-        if len(complete_info) >= 2:
-            # Gather emission T1 vectors.
-            emission_vecs = []
-            for info in complete_info:
-                it = info['iteration']
-                b = info['batch_idx']
-                emission_vecs.append(iter_t1s[it][b])
-            emission_vecs = torch.stack(emission_vecs)
-
-            emission_deltas = _compute_emission_deltas(
-                batch, complete_info, device)
-            Nc = emission_vecs.shape[0]
-            model_dists = torch.cdist(
-                emission_vecs.unsqueeze(0),
-                emission_vecs.unsqueeze(0),
-                p=2).squeeze(0)
-            exec_dists = exec_distance_deltas(emission_deltas, device)
-            scale = 2.0 / max(exec_dists.max().item(), 1e-6)
-            exec_dists = exec_dists * min(scale, 4.0)
-            tri = torch.triu_indices(Nc, Nc, offset=1, device=device)
-            pairwise_loss = F.mse_loss(
-                model_dists[tri[0], tri[1]],
-                exec_dists[tri[0], tri[1]])
-        else:
-            pairwise_loss = torch.tensor(0.0, device=device)
-
-        # --- REINFORCE for gates ---
-        # Compute REINFORCE loss BEFORE main backward (shares graph).
-        with torch.no_grad():
-            iter_rewards = torch.stack(iter_recon_losses)
-            mean_reward = iter_rewards[iter_rewards > 0].mean().item() \
-                if (iter_rewards > 0).any() else 0.0
-            baseline = baseline_decay * baseline + (1 - baseline_decay) * mean_reward
-
-        reinforce_loss = torch.tensor(0.0, device=device)
-        n_terms = 0
-        for it in range(n_iters):
-            log_probs = iter_gate_log_probs[it]  # (B, 3)
-            rewards = iter_recon_losses[it].detach()  # (B,)
-            advantages = rewards - baseline
-
-            total_lp = log_probs.sum(dim=1)
-            active = rewards > 0
-            if active.any():
-                reinforce_loss = reinforce_loss + \
-                    (total_lp[active] * advantages[active]).mean()
-                n_terms += 1
-
-        if n_terms > 0:
-            reinforce_loss = reinforce_loss / n_terms
-
-        # --- Combined backward ---
-        main_loss = recon_loss + pairwise_weight * pairwise_loss
-        total_loss = main_loss + reinforce_loss
-        opt_main.zero_grad()
-        opt_gates.zero_grad()
-        total_loss.backward()
-        opt_main.step()
-        opt_gates.step()
-        if scheduler:
-            scheduler.step()
-
-        # --- Logging ---
-        recon_val = recon_loss.item()
-        pair_val = pairwise_loss.item()
-        loss_val = main_loss.item()
-        reinforce_val = reinforce_loss.item() if n_terms > 0 else 0.0
-
-        with torch.no_grad():
-            # Gate decision rates.
-            total_a = total_e = total_v = total_steps = 0
-            total_window = 0
-            for it in range(n_iters):
-                decs = iter_gate_decisions[it]  # (B, 3)
-                for b in range(B):
-                    wt = iter_window_tokens[it][b]
-                    if wt or (it == 0):  # active sequence
-                        total_a += decs[b, 0].item() > 0.5
-                        total_e += decs[b, 1].item() > 0.5
-                        total_v += decs[b, 2].item() > 0.5
-                        total_steps += 1
-                        total_window += len(wt)
-
-            accept_rate = total_a / max(total_steps, 1)
-            emit_rate = total_e / max(total_steps, 1)
-            evict_rate = total_v / max(total_steps, 1)
-            mean_emits = emit_counts.float().mean().item()
-            mean_instrs = n_instr.float().mean().item()
-            mean_window = total_window / max(total_steps, 1)
-            complete_frac = len(complete_info) / max(len(emission_info), 1)
-
-            # Reconstruction accuracy on actual emissions.
-            if emission_info:
-                all_tgt_toks = [info['target_tokens'] for info in emission_info]
-                dec_in, dec_tgt, dec_pad = _prepare_decoder_targets(
-                    all_tgt_toks, device)
-                if dec_in is not None:
-                    # Find emission T1 vectors.
-                    em_vecs = []
-                    for info in emission_info:
-                        em_vecs.append(
-                            iter_t1s[info['iteration']][info['batch_idx']])
-                    em_vecs = torch.stack(em_vecs)
-                    em_logits = decoder(em_vecs, dec_in, dec_pad)
-                    pred = em_logits.argmax(dim=-1)
-                    non_pad_dec = ~dec_pad
-                    correct = (pred == dec_tgt) & non_pad_dec
-                    recon_acc = correct.sum().item() / non_pad_dec.sum().item()
-                else:
-                    recon_acc = 0.0
-            else:
-                recon_acc = 0.0
-
-        losses.append({
-            'total': loss_val,
-            'recon': recon_val,
-            'pairwise': pair_val,
-            'reinforce': reinforce_val,
-            'mean_window': mean_window,
-        })
-        gs = {
-            'accept_rate': accept_rate,
-            'emit_rate': emit_rate,
-            'evict_rate': evict_rate,
-            'emits_per_seq': mean_emits,
-            'instrs_per_seq': mean_instrs,
-            'n_emissions': len(emission_info),
-            'complete_frac': complete_frac,
-            'recon_acc': recon_acc,
-            'iters_per_seq': n_iters,
-        }
-        gate_stats.append(gs)
-
-        step += 1
-
-        if step % log_every == 0:
-            elapsed = time.time() - t0
-            ms_per = elapsed / step * 1000
-            current_lr = scheduler.get_last_lr()[0] if scheduler else lr
-            eta_str = ''
-            if n_steps:
-                eta_sec = int(max(0, n_steps - step) * ms_per / 1000)
-                eta_str = f'  eta {timedelta(seconds=eta_sec)}'
-            print(f'step {step:>6d}  '
-                  f'loss {loss_val:.4f} '
-                  f'(recon {recon_val:.3f} pair {pair_val:.4f} '
-                  f'rl {reinforce_val:.3f})  '
-                  f'acc {recon_acc:.1%}  '
-                  f'lr {current_lr:.1e}  {ms_per:.0f}ms/step  '
-                  f'a/e/v={accept_rate:.0%}/{emit_rate:.0%}/'
-                  f'{evict_rate:.0%}  '
-                  f'{gs["emits_per_seq"]:.1f}/'
-                  f'{gs["instrs_per_seq"]:.1f}  '
-                  f'win {mean_window:.1f}  '
-                  f'ok {complete_frac:.0%}  '
-                  f'iters {n_iters}{eta_str}')
-
-        if n_steps and step >= n_steps:
-            break
-
-    return encoder, decoder, losses, gate_stats
-
-
-# ---------------------------------------------------------------------------
-# T2 training
-# ---------------------------------------------------------------------------
-
-def _full_pair_mse_per_register(reg_effect_out, v_reg_delta):
-    """Per-register pair-MSE loss without chunking.
-
-    Materializes the full (B_v, B_v, n_inputs, 32) tensor in one shot.
-    Used when memory permits; faster than the chunked version because
-    no checkpoint recompute and fewer kernel launches.
-
-    The exec_per_reg chain is computed under torch.no_grad() because
-    v_reg_delta is a constant (not a model output / not requires_grad).
-    Without explicit no_grad the autograd graph would retain the
-    intermediate (B, B, n_inputs, 32) tensors for backward — billions
-    of bytes that aren't needed.
-    """
-    B = reg_effect_out.shape[0]
-    if B < 2:
-        return (torch.zeros((), device=reg_effect_out.device),
-                torch.tensor(0, device=reg_effect_out.device))
-
-    with torch.no_grad():
-        delta_pair = v_reg_delta.unsqueeze(1) - v_reg_delta.unsqueeze(0)
-        exec_per_reg = torch.log1p(
-            torch.log1p(delta_pair.abs())).mean(dim=2)  # (B, B, 32)
-
-    model_per_reg = (reg_effect_out.unsqueeze(1)
-                     - reg_effect_out.unsqueeze(0)).abs()  # (B, B, 32)
-    per_pair = (model_per_reg - exec_per_reg).square().mean(dim=-1)  # (B, B)
-
-    # Upper-triangle mean.
-    i = torch.arange(B, device=reg_effect_out.device)
-    mask = i.unsqueeze(1) < i.unsqueeze(0)  # (B, B)
-    masked = per_pair * mask.to(per_pair.dtype)
-    n_pairs = mask.sum()
-    loss = masked.sum() / n_pairs.clamp(min=1).to(masked.dtype)
-    return loss, n_pairs
-
-
-def _chunked_pair_mse_per_register(reg_effect_out, v_reg_delta,
-                                    chunk_size: int = 128):
-    """Per-register pair-MSE loss, computed in chunks via checkpointing.
-
-    Mathematically identical to materializing the full
-    (B_v, B_v, n_inputs, 32) tensor and computing pair-MSE in one
-    shot. Memory-bounded: peak holds ~(chunk_size, B_v, ...) for
-    one slice at a time.
-
-    Implementation: torch.utils.checkpoint runs the per-slice
-    computation without storing intermediates during forward, then
-    re-runs it during backward to compute gradients. Trades ~2x
-    compute on the pair-MSE chain for an O(B²/chunk_size) memory
-    reduction. Pair-MSE isn't the training-loop's dominant compute
-    (T1 encode + T2 transformer dominate), so the wallclock
-    penalty is small.
-
-    Returns (scalar loss, total pair count).
-    """
-    from torch.utils.checkpoint import checkpoint as _checkpoint
-
-    B = reg_effect_out.shape[0]
-    if B < 2:
-        return (torch.zeros((), device=reg_effect_out.device),
-                torch.tensor(0, device=reg_effect_out.device))
-
-    def _slice_step(re_slice, rd_slice, re_full, rd_full, a_start: int, B: int):
-        # Pair distances for slice [a_start, a_start+C) × [0, B):
-        # delta_pair: (C, B, n_inputs, 32)
-        # Exec chain under no_grad — rd_* are constants, no backward
-        # path through them.
-        with torch.no_grad():
-            delta_pair = rd_slice.unsqueeze(1) - rd_full.unsqueeze(0)
-            exec_per_reg = torch.log1p(
-                torch.log1p(delta_pair.abs())).mean(dim=2)    # (C, B, 32)
-        model_per_reg = (re_slice.unsqueeze(1)
-                         - re_full.unsqueeze(0)).abs()        # (C, B, 32)
-        # Squared error, mean over the 32 register channels.
-        per_pair = (model_per_reg - exec_per_reg).square().mean(dim=-1)
-
-        # Upper-triangle mask: pair (a, b) where a < b. Within this
-        # slice, row i corresponds to a = a_start + i, col j is b.
-        # a_start and B are passed as Python ints so the arange calls
-        # don't force GPU->CPU syncs (use_reentrant=False checkpoint
-        # accepts non-tensor args).
-        C = re_slice.shape[0]
-        i = torch.arange(C, device=re_slice.device)
-        j = torch.arange(B, device=re_slice.device)
-        mask = (a_start + i.unsqueeze(1)) < j.unsqueeze(0)  # (C, B)
-
-        masked = per_pair * mask.to(per_pair.dtype)
-        return masked.sum(), mask.sum()
-
-    total_loss = torch.zeros((), device=reg_effect_out.device,
-                             dtype=reg_effect_out.dtype)
-    total_n = torch.zeros((), device=reg_effect_out.device,
-                          dtype=torch.long)
-
-    for a_start in range(0, B, chunk_size):
-        a_end = min(a_start + chunk_size, B)
-        re_slice = reg_effect_out[a_start:a_end]
-        rd_slice = v_reg_delta[a_start:a_end]
-        slice_sum, slice_n = _checkpoint(
-            _slice_step, re_slice, rd_slice,
-            reg_effect_out, v_reg_delta, a_start, B,
-            use_reentrant=False)
-        total_loss = total_loss + slice_sum
-        total_n = total_n + slice_n
-
-    loss = total_loss / total_n.clamp(min=1).to(total_loss.dtype)
-    return loss, total_n
-
-
-def train_t2(batch_iter, t1_encoder,
-             d_in: int = 64, d_model: int = 256,
-             n_heads: int = 4, n_layers: int = 2, d_out: int = 256,
-             max_chunk_len: int = 24,
-             target_valid_chunks_per_step: int = 1024,
-             pair_mse_chunk_size: int = 128,
-             lr: float = 3e-4, device: str = 'auto',
-             n_steps=None, log_every: int = 100, lr_min: float = 1e-6,
-             mag_weight: float = 1.0,
-             reg_effect_weight: float = 1.0,
-             modified_regs_weight: float = 1.0,
-             term_type_weight: float = 1.0):
-    """Train the T2 encoder over RVC chunked-T1-emission batches.
-
-    batch_iter yields RVC ChunkBatches (per-chunk per-instruction
-    token spans + chunk metadata). Boundary detection and invalidity
-    augmentation are upstream in the data pipeline (datagen/chunkgen.py
-    via scripts/chunk_t2.py); this loop only runs T1 encoder forward
-    and trains T2.
-
-    Pipeline per step:
-    1. Read RVC batches from batch_iter, run frozen T1 encoder on each
-       batch's per-instruction tokens to produce T2Batches of
-       emissions, accumulate until reaching
-       target_valid_chunks_per_step total chunks (valid + invalid
-       counted together; invalidity augmentation already done upstream).
-    2. Forward T2Compressor on chunk_emissions + chunk_lens.
-    3. Compute four losses:
-       - mag_loss: MSE of ||T2|| against valid_mask. All chunks.
-       - reg_effect_loss: per-register pairwise MSE on loglog'd
-         register-delta differences (chunked via gradient
-         checkpointing). Valid chunks only.
-       - modified_regs_loss: 32-D BCE on whether each register
-         was modified. Valid chunks only.
-       - term_type_loss: 5-class CE on terminator category.
-         Valid chunks only.
-    4. Sum, backprop, optimizer step.
-
-    The frozen T1 encoder stays in eval mode with parameters
-    non-trainable.
-
-    target_valid_chunks_per_step controls the T2 training batch
-    size; per-register pairwise MSE allocates O(B²·n_inputs·32)
-    memory bounded to a chunk via gradient checkpointing.
-
-    Returns (t2_model, losses).
-    """
-    # Local imports to avoid hardening the module-level cycle:
-    # compressor.t2_model and compressor.chunker both depend on
-    # things that train.py already imports.
-    from .t2_model import (
-        T2Compressor, N_REGS,
-        TERM_ALU, TERM_LOAD, TERM_STORE, TERM_BRANCH, TERM_JUMP,
-    )
-    from .chunker import (
-        encode_chunkbatch, concat_t2_batches,
-        TYPE_LOAD, TYPE_STORE, TYPE_BRANCH, TYPE_JUMP,
-        TYPE_CAPPED, TYPE_TAIL, TYPE_NON_TERMINATOR,
-    )
-
-    if device == 'auto':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    torch.set_float32_matmul_precision('high')
-
-    # Freeze T1 encoder.
-    t1_encoder.eval()
-    for p in t1_encoder.parameters():
-        p.requires_grad = False
-
-    t2 = T2Compressor(d_in=d_in, d_model=d_model, n_heads=n_heads,
-                     n_layers=n_layers, d_out=d_out,
-                     max_chunk_len=max_chunk_len).to(device)
-    opt = torch.optim.Adam(t2.parameters(), lr=lr)
-    scheduler = None
-    if n_steps:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt, T_max=n_steps, eta_min=lr_min)
-
-    # Lookup table from chunker TYPE_* codes to model TERM_* codes.
-    # Indexed by chunk_type's int value.
-    term_lut = torch.zeros(11, dtype=torch.long, device=device)
-    term_lut[TYPE_NON_TERMINATOR] = TERM_ALU
-    term_lut[TYPE_LOAD]   = TERM_LOAD
-    term_lut[TYPE_STORE]  = TERM_STORE
-    term_lut[TYPE_BRANCH] = TERM_BRANCH
-    term_lut[TYPE_JUMP]   = TERM_JUMP
-    term_lut[TYPE_CAPPED] = TERM_ALU
-    term_lut[TYPE_TAIL]   = TERM_ALU
-    # Invalid types (7-10) are filtered out before this is consulted.
-
-    losses = []
-    step = 0
-    t0 = time.time()
-    pending = []           # T2Batches awaiting accumulation
-    pending_n = 0          # total chunks (valid + invalid) in pending
-
-    for rvc_batch in batch_iter:
-        # 1: encode the RVC batch's per-instruction tokens through T1
-        # to produce a T2Batch of emissions; accumulate until we have
-        # enough for one training step. Augmentation already happened
-        # upstream in the data pipeline (scripts/chunk_t2.py).
-        t2_in = encode_chunkbatch(rvc_batch, t1_encoder, device=device)
-        if t2_in.chunk_emissions.shape[0] > 0:
-            pending.append(t2_in)
-            pending_n += t2_in.chunk_emissions.shape[0]
-        if pending_n < target_valid_chunks_per_step:
-            continue
-
-        # 2: concat accumulated batches and train one step.
-        t2_batch = concat_t2_batches(pending)
-        pending = []
-        pending_n = 0
-
-        if t2_batch.chunk_emissions.shape[0] == 0:
-            continue
-
-        # 3+4: forward T2 + loss computation under bf16 autocast.
-        # Memory-dominant tensors here are the (B_v, B_v, n_inputs, 32)
-        # pair-MSE intermediates; bf16 halves their footprint. Master
-        # weights and gradients remain fp32 via autocast's standard
-        # pattern. Mirrors T1's use of bf16 for exec_distance_scalar.
-        autocast_dtype = (torch.bfloat16
-                          if device.startswith('cuda') else torch.float32)
-        with torch.autocast(device_type=('cuda' if device.startswith('cuda')
-                                         else 'cpu'),
-                            dtype=autocast_dtype):
-            t2_vecs = t2.compiled_forward(
-                t2_batch.chunk_emissions, t2_batch.chunk_lens)
-            vec_norms = t2_vecs.norm(dim=-1)
-            vec_dirs = t2_vecs / vec_norms.clamp(min=1e-8).unsqueeze(-1)
-
-            # 4a: magnitude / validity loss (all rows).
-            mag_targets = t2_batch.valid_mask.to(t2_vecs.dtype)
-            mag_loss = F.mse_loss(vec_norms, mag_targets)
-
-            valid_mask = t2_batch.valid_mask
-            n_valid = int(valid_mask.sum().item())
-
-            if n_valid >= 2:
-                valid_idx = valid_mask.nonzero(as_tuple=True)[0]
-                v_dirs = vec_dirs[valid_idx]                # (B_v, d_out)
-                # Cast register deltas to bf16 explicitly: int32 -> bf16
-                # for the pair-MSE chain. Precision near zero matters
-                # (loglog'd output is in [0, ~3.14]), and bf16 has
-                # plenty of mantissa for that range. Large int deltas
-                # lose mantissa precision but the loglog flattens them.
-                v_reg_delta = t2_batch.reg_delta[valid_idx].to(autocast_dtype)
-                # (B_v, n_inputs, 32)
-
-                # 4b: per-register pairwise MSE.
-                # pair_mse_chunk_size <= 0 selects the unchunked path
-                # (no checkpoint, materializes full pair tensor — faster
-                # if it fits in memory). Positive value selects the
-                # checkpointed chunked path.
-                reg_effect_out = t2.reg_effect_head(v_dirs)     # (B_v, 32)
-                if pair_mse_chunk_size <= 0:
-                    reg_effect_loss, _ = _full_pair_mse_per_register(
-                        reg_effect_out, v_reg_delta)
-                else:
-                    reg_effect_loss, _ = _chunked_pair_mse_per_register(
-                        reg_effect_out, v_reg_delta,
-                        chunk_size=pair_mse_chunk_size)
-                N = v_dirs.shape[0]
-
-                # 4c: modified_regs BCE.
-                modified_target = (v_reg_delta != 0).any(dim=1).to(t2_vecs.dtype)
-                modified_logits = t2.modified_regs_head(v_dirs)
-                modified_regs_loss = F.binary_cross_entropy_with_logits(
-                    modified_logits, modified_target)
-
-                # 4d: terminator_type CE.
-                chunk_type = t2_batch.chunk_type[valid_idx].long()
-                term_target = term_lut[chunk_type]
-                term_logits = t2.terminator_type_head(v_dirs)
-                term_type_loss = F.cross_entropy(term_logits, term_target)
-            else:
-                reg_effect_loss = torch.tensor(0.0, device=device)
-                modified_regs_loss = torch.tensor(0.0, device=device)
-                term_type_loss = torch.tensor(0.0, device=device)
-                N = n_valid
-
-            loss = (mag_weight * mag_loss
-                    + reg_effect_weight * reg_effect_loss
-                    + modified_regs_weight * modified_regs_loss
-                    + term_type_weight * term_type_loss)
-
+        total, metrics, aux = step_fn(*inputs)
         opt.zero_grad(set_to_none=True)
-        loss.backward()
+        total.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
         opt.step()
         if scheduler:
             scheduler.step()
-
-        loss_val = loss.item()
-        losses.append(loss_val)
         step += 1
+        log.log(
+            step, metrics, model=model,
+            extra_fn=((lambda it=item, a=aux: extra_fn(it, a))
+                      if extra_fn is not None else None),
+            state_fn=((lambda s=step: capture_train_state(s, opt, scheduler))
+                      if capture_state else None))
+    return log.losses
 
-        if step % log_every == 0:
-            elapsed = time.time() - t0
-            ms_per = elapsed / step * 1000
-            current_lr = scheduler.get_last_lr()[0] if scheduler else lr
-            eta_str = ''
-            if n_steps:
-                eta_sec = int(max(0, n_steps - step) * ms_per / 1000)
-                eta_str = f'  eta {timedelta(seconds=eta_sec)}'
 
-            with torch.no_grad():
-                valid_mag_mean = (
-                    vec_norms[valid_mask].mean().item()
-                    if valid_mask.any() else float('nan'))
-                invalid_mag_mean = (
-                    vec_norms[~valid_mask].mean().item()
-                    if (~valid_mask).any() else float('nan'))
-                mag_max = vec_norms.max().item()
+def train_encoder(batch_iter, *,
+                  d_model=128, n_heads=4, n_layers=2, d_out=128,
+                  max_window=72,
+                  lr=3e-4, n_steps=None, log_every=100, lr_min=1e-6,
+                  valid_weight=0.1,
+                  live_in_weight=0.1, live_out_weight=0.1,
+                  pc_writes_weight=0.1,
+                  in_slot_weight=0.1, out_slot_weight=0.1,
+                  value_predict_weight=1.0,
+                  anchor_seed=0, n_anchor_states=8,
+                  device='auto', on_log=None, compile_step=True):
+    """Train a T1 encoder on RVT batches.
 
-            print(f'step {step:>6d}  '
-                  f'loss {loss_val:.4f} '
-                  f'(mag {mag_loss.item():.4f} '
-                  f'reg {reg_effect_loss.item():.4f} '
-                  f'mod {modified_regs_loss.item():.4f} '
-                  f'term {term_type_loss.item():.4f})  '
-                  f'lr {current_lr:.1e}  {ms_per:.0f}ms/step  '
-                  f'N_v={N}/{t2_batch.chunk_emissions.shape[0]}{eta_str}  '
-                  f'||T2|| v={valid_mag_mean:.2f} '
-                  f'i={invalid_mag_mean:.2f} '
-                  f'max={mag_max:.2f}')
+    T1 is the single-instruction special case of T2 and uses the same
+    rename-equivariant register-binding supervision (binding_losses):
+    live_in/out + pc_writes BCE, in/out-slot ListMLE, plus value
+    prediction. There is no equivalence-collapse loss — equivalence is
+    an emergent property of the consistent per-instruction targets, not a
+    separate objective that would fight register identity.
 
-        if n_steps and step >= n_steps:
-            break
+    valid_weight:        weight on (||v_c|| - (1 if valid else 0))**2.
+    live_in/out_weight:  BCE on the behavioral input/output register masks.
+    pc_writes_weight:    BCE on the explicit-PC-write flag.
+    in/out_slot_weight:  ListMLE on the input/output slot orderings.
+    value_predict_weight: MSE on per-anchor rd value prediction.
+    on_log:              optional callable(model, losses, train_state=None)
+                         called after each log point (uniform across
+                         trainers; the encoder passes no train_state).
+    compile_step:        torch.compile the forward+loss with CUDA graphs
+                         (mode='reduce-overhead'). The whole forward+loss+
+                         backward is captured as one graph (~9 launches vs
+                         ~485 eager), saturating the GPU (~99% vs ~50%) and
+                         ~2.5x faster. Requires the single-instruction T1
+                         regime (row_outputs present); the loss path is
+                         sync-free + static-shape, so it captures cleanly.
+                         Numerics differ slightly from eager (fusion / TF32
+                         reduction order) — set False for a bit-faithful
+                         eager run.
 
+    Returns (encoder, losses). losses[i] dict has keys: step, total,
+    valid, live_in, live_out, pc_writes, in_slot, out_slot, value_pred,
+    plus probe_* keys at each log point.
+    """
+    device = resolve_device(device)
+
+    encoder = T1Compressor(
+        VOCAB_SIZE, d_model, n_heads, n_layers, d_out,
+        max_window=max_window,
+    ).to(device)
+    opt, scheduler = build_optim_sched(
+        encoder.parameters(), lr, n_steps, lr_min=lr_min, device=device)
+
+    probe_tok, probe_pad = _probe_tensor(device)
+
+    # Anchor states for value-prediction loss. Reconstructed from
+    # anchor_seed + n_anchor_states must match what gen_batches used —
+    # otherwise row_outputs targets don't correspond to what executing
+    # an instruction on these states would produce. Only used when
+    # value_predict_weight > 0; built unconditionally because it's tiny.
+    anchor_np = make_anchor_states(n_anchor_states, anchor_seed)
+    anchor_states_t = torch.from_numpy(anchor_np).to(device)    # (A, 32) int32
+
+    def _fmt(r, ms, eta, lr_now):
+        return (
+            f'step {r["step"]:>5d}  loss {r["total"]:.4f} '
+            f'(val {r["valid"]:.4f}'
+            f' li {r["live_in"]:.3f} lo {r["live_out"]:.3f}'
+            f' pc {r["pc_writes"]:.3f}'
+            f' in {r["in_slot"]:.3f} out {r["out_slot"]:.3f}'
+            f' vp {r["value_pred"]:.4f})  '
+            f'lr {lr_now:.1e}  {ms:.0f}ms/step  '
+            f'eta {timedelta(seconds=int(eta))}  '
+            f'probes[aa={r["probe_aa"]:.3f} canon={r["probe_canon"]:.3f} '
+            f'ss={r["probe_ss"]:.3f} comm={r["probe_comm"]:.3f}]')
+
+    log = TrainLog(n_steps=n_steps, log_every=log_every, lr=lr,
+                   scheduler=scheduler, formatter=_fmt, on_log=on_log)
+
+    # value-prediction needs the single-instruction row_outputs payload;
+    # decide once from the first batch (the corpus rule is fixed for a run,
+    # so row_outputs presence is constant) — a Python constant baked into the
+    # compiled graph.
+    first_batch, batch_iter = _peek(batch_iter)
+    if first_batch is None:
+        return encoder, log.losses
+    vp_active = value_predict_weight > 0 and first_batch.row_outputs.shape[0] > 0
+
+    encoder.train()
+    _dummy = torch.zeros(1, device=device)
+
+    # The fixed-shape forward+loss captured as one CUDA graph (the input
+    # (B, max_tokens) is corpus-constant; in_k_eff/out_k_eff are Python ints
+    # and value_predict masks with a multiply, so it's host-sync-free).
+    def _fwd_loss(tok, pad, valid_f, li, lo, pc, ins, outs, ro, pv, hr,
+                  ike, oke):
+        vecs = encoder.encode(tok, pad)              # (B, d_out)
+        valid_loss = ((vecs.norm(dim=-1) - valid_f) ** 2).mean()
+        bl = binding_losses(
+            encoder, vecs, live_in_t=li, live_out_t=lo, pc_writes_t=pc,
+            in_slot_t=ins, out_slot_t=outs, in_k_eff=ike, out_k_eff=oke)
+        if vp_active:
+            vp = value_predict_loss(
+                encoder.vp_head, vecs, anchor_states_t,
+                ins[:, 0].clamp(min=0), ins[:, 1].clamp(min=0), ro, pv, hr)
+        else:
+            vp = vecs.new_zeros(())
+        total = (valid_weight * valid_loss
+                 + live_in_weight * bl['live_in']
+                 + live_out_weight * bl['live_out']
+                 + pc_writes_weight * bl['pc_writes']
+                 + in_slot_weight * bl['in_slot']
+                 + out_slot_weight * bl['out_slot']
+                 + value_predict_weight * vp)
+        metrics = {'total': total, 'valid': valid_loss,
+                   'live_in': bl['live_in'], 'live_out': bl['live_out'],
+                   'pc_writes': bl['pc_writes'], 'in_slot': bl['in_slot'],
+                   'out_slot': bl['out_slot'], 'value_pred': vp}
+        return total, metrics, None
+
+    def _prep(batch):
+        if vp_active:
+            ro = _h2d(batch.row_outputs, device)
+            pv = _h2d(batch.pair_valid, device)
+            hr = _h2d(batch.row_has_rd, device)
+        else:
+            ro = pv = hr = _dummy
+        return (_h2d(batch.tokens, device, dtype=torch.long),
+                _h2d(padding_mask(batch), device),
+                _h2d(batch.valid, device, dtype=torch.float32),
+                _h2d(batch.live_in_mask, device, dtype=torch.float32),
+                _h2d(batch.live_out_mask, device, dtype=torch.float32),
+                _h2d(batch.pc_writes, device, dtype=torch.float32),
+                _h2d(batch.in_slot_regs, device, dtype=torch.long),
+                _h2d(batch.out_slot_regs, device, dtype=torch.long),
+                ro, pv, hr,
+                _slot_k_eff(batch.in_slot_regs), _slot_k_eff(batch.out_slot_regs))
+
+    def _extra(batch, aux):
+        return {f'probe_{k}': v
+                for k, v in _probe_distances(encoder, probe_tok, probe_pad).items()}
+
+    losses = run_train_loop(
+        batch_iter, model=encoder, opt=opt, scheduler=scheduler, log=log,
+        device=device,
+        prep_fn=_prep, fwd_loss_fn=_fwd_loss, extra_fn=_extra,
+        compile_step=compile_step)
+    return encoder, losses
+
+
+# ===========================================================================
+# T2: per-chunk encoder over T1 emission vectors
+# ===========================================================================
+
+# Per-instruction max token count. Match datagen.batch.MAX_INSTR_TOKENS;
+# duplicated here only to avoid the cross-package import in a hot path.
+_MAX_INSTR_TOKENS = 9
+
+
+def _split_to_per_instruction(batch):
+    """From a Batch with instr_lens, build flat per-instruction token
+    arrays + a mapping back to (chunk, slot).
+
+    Returns:
+        instr_tokens: (N_instr_total, MAX_INSTR_TOKENS) int8 — padded
+                      with PAD past each instruction's actual length.
+                      Caller must .long() before nn.Embedding.
+        instr_pad:    (N_instr_total, MAX_INSTR_TOKENS) bool — True
+                      where padded.
+        chunk_idx:    (N_instr_total,) int64 — which row in the
+                      original batch each instruction came from.
+        slot_idx:     (N_instr_total,) int64 — which position-within-chunk.
+        n_per_chunk:  (B,) int32 — instructions in each chunk
+                      (0 for invalid rows).
+    """
+    B, max_n_instrs = batch.instr_lens.shape
+    n_per_chunk = (batch.instr_lens > 0).sum(axis=1).astype(np.int32)
+    total = int(n_per_chunk.sum())
+    if total == 0:
+        empty = np.zeros((0, _MAX_INSTR_TOKENS), dtype=np.int8)
+        return (
+            empty,
+            np.ones((0, _MAX_INSTR_TOKENS), dtype=bool),
+            np.zeros(0, dtype=np.int64),
+            np.zeros(0, dtype=np.int64),
+            n_per_chunk,
+        )
+
+    instr_tokens = np.full((total, _MAX_INSTR_TOKENS), PAD, dtype=np.int8)
+    instr_pad = np.ones((total, _MAX_INSTR_TOKENS), dtype=bool)
+    chunk_idx = np.empty(total, dtype=np.int64)
+    slot_idx = np.empty(total, dtype=np.int64)
+
+    out = 0
+    for c in range(B):
+        token_offset = 0
+        for j in range(max_n_instrs):
+            L = int(batch.instr_lens[c, j])
+            if L == 0:
+                continue
+            instr_tokens[out, :L] = batch.tokens[c, token_offset:token_offset + L]
+            instr_pad[out, :L] = False
+            chunk_idx[out] = c
+            slot_idx[out] = j
+            out += 1
+            token_offset += L
+    return instr_tokens, instr_pad, chunk_idx, slot_idx, n_per_chunk
+
+
+def _decode_chunk_instructions(batch, row_idx):
+    """Decode all instructions in chunk row_idx back to Instruction
+    objects. Returns the list, or None if any decode fails or the
+    chunk is empty/invalid. Caller masks via batch.valid."""
+    if not batch.valid[row_idx]:
+        return None
+    instr_lens = batch.instr_lens[row_idx]
+    tokens = batch.tokens[row_idx]
+    instrs = []
+    offset = 0
+    for j in range(len(instr_lens)):
+        L = int(instr_lens[j])
+        if L == 0:
+            continue
+        toks = tokens[offset:offset + L].tolist()
+        try:
+            instr, _ = decode_instruction(toks, 0)
+        except Exception:
+            return None
+        instrs.append(instr)
+        offset += L
+    return instrs if instrs else None
+
+
+def _assemble_chunk_seq(t1_vecs, split_outputs, n_chunks, max_n_instrs, device):
+    """Scatter per-instruction T1 vectors into padded per-chunk sequences
+    and build the key-padding mask. Shared by t2_chunk_forward and the
+    gradient-subspace diagnostic (which differ only in how they run the
+    T1/T2 encodes around it)."""
+    _, _, chunk_idx, slot_idx, n_per_chunk = split_outputs
+    chunk_t1 = torch.zeros(
+        n_chunks, max_n_instrs, t1_vecs.shape[-1], device=device)
+    chunk_t1[torch.from_numpy(chunk_idx).to(device),
+             torch.from_numpy(slot_idx).to(device)] = t1_vecs
+    n_per_chunk_t = torch.from_numpy(n_per_chunk).to(device)
+    chunk_pad = (torch.arange(max_n_instrs, device=device)[None, :]
+                 >= n_per_chunk_t[:, None])
+    # Unmask position 0: an all-padded row (invalid window) would NaN the
+    # attention softmax and 0*NaN the shared pool_query gradient.
+    chunk_pad[:, 0] = False
+    return chunk_t1, chunk_pad
+
+
+def t2_chunk_forward(t1, t2, split_outputs, n_chunks, max_n_instrs, device):
+    """Per-instruction T1 encode → per-chunk T1 sequence → T2 encode — the
+    forward shared by the T2 trainer and eval. T1 runs frozen (no_grad); T2
+    runs in the caller's grad context (the caller sets t2.train()/eval() and
+    wraps in torch.no_grad() as appropriate). split_outputs is the tuple from
+    _split_to_per_instruction. Returns t2_out (n_chunks, d_out), or None for
+    an empty batch."""
+    instr_tokens, instr_pad, *_ = split_outputs
+    if instr_tokens.shape[0] == 0:
+        return None
+    it = torch.from_numpy(instr_tokens).to(device).long()
+    ip = torch.from_numpy(instr_pad).to(device)
+    with torch.no_grad():
+        t1_vecs = t1.encode(it, ip)
+    chunk_t1, chunk_pad = _assemble_chunk_seq(
+        t1_vecs, split_outputs, n_chunks, max_n_instrs, device)
+    return t2.encode(chunk_t1, chunk_pad)
+
+
+def t2_value_predict_loss(t2, vecs, anchor_states_t,
+                          in_slot_regs_t, out_slot_regs_t,
+                          out_regs_t, mask_t, return_count=False):
+    """Per-anchor, per-out-slot value-prediction MSE for T2.
+
+    The head reads (vec, anchor input-slot values) and predicts
+    per-anchor per-slot output values. The supervision is "for slot k
+    bound to register r in this chunk, the value at slot k should be
+    register r's actual value after executing the chunk on this
+    anchor."
+
+    Args:
+      t2:               T2Compressor (uses t2.vp_head)
+      vecs:             (B, d) — T2 output vector
+      anchor_states_t:  (A, 32) int32 — register file per anchor (pre-exec)
+      in_slot_regs_t:   (B, MAX_INPUT_SLOTS) int64 — input slot register IDs
+                        (AUX_CE_IGNORE for unused slots)
+      out_slot_regs_t:  (B, MAX_OUTPUT_SLOTS) int64 — output slot register IDs
+                        (AUX_CE_IGNORE for unused slots)
+      out_regs_t:       (B, A, 32) int32 — register file per anchor AFTER
+                        executing each chunk
+      mask_t:           (B,) bool — rows to include (decoded successfully)
+
+    Returns scalar MSE over (row, output-slot, anchor) triplets where
+    out_slot_regs is not IGNORE.
+    """
+    n_anchors = anchor_states_t.shape[0]
+
+    # Build per-anchor input values: clamp IGNORE→0 (x0=0 in all anchors)
+    # for the lookup; x0's value is 0 by convention so unused slots
+    # contribute zero, which matches "no input" naturally.
+    in_lookup = in_slot_regs_t.clamp(min=0).long()    # (B, MAX_IN)
+    # anchor_states[:, in_lookup] -> (A, B, MAX_IN); permute to (B, A, MAX_IN)
+    in_vals = anchor_states_t[:, in_lookup].permute(1, 0, 2).float()
+
+    in_vals_c = _value_compress(in_vals)
+
+    # Feature: (B, A, d + MAX_IN)
+    vec_exp = vecs.unsqueeze(1).expand(-1, n_anchors, -1)
+    feat = torch.cat([vec_exp, in_vals_c], dim=-1)
+
+    # Predict: (B, A, MAX_OUT).
+    pred = t2.vp_head(feat)
+
+    # Target: target[b, a, k] = out_regs[b, a, out_slot_regs[b, k]].
+    # Clamp IGNORE→0 for lookup; mask out via out_slot_valid below.
+    out_lookup = out_slot_regs_t.clamp(min=0).long()    # (B, MAX_OUT)
+    out_lookup_expanded = out_lookup.unsqueeze(1).expand(-1, n_anchors, -1)
+    target = out_regs_t.gather(dim=-1, index=out_lookup_expanded).float()
+    target_c = _value_compress(target)
+
+    out_valid = (out_slot_regs_t != AUX_CE_IGNORE)    # (B, MAX_OUT)
+    pair_mask = out_valid & mask_t.unsqueeze(-1)        # (B, MAX_OUT)
+
+    diff_sq = (pred - target_c) ** 2                    # (B, A, MAX_OUT)
+    per_slot = diff_sq.mean(dim=1)                      # (B, MAX_OUT)
+    # Mask-multiply (not boolean index / early return) so the op stays
+    # static-shape and host-sync-free — capturable in the full-step graph.
+    # clamp(min=1) returns 0.0 for an all-masked batch, matching the old
+    # early-return.
+    pm = pair_mask.float()
+    mse = (per_slot * pm).sum() / pm.sum().clamp(min=1)
+    return (mse, int(pair_mask.sum())) if return_count else mse
+
+
+def _slot_k_eff(slot_regs_np):
+    """Host-side effective slot width: last column (across the batch) that
+    any row actually fills, +1. Computed from the numpy batch BEFORE the
+    H2D copy, so it costs no GPU sync — the ListMLE loop bound becomes a
+    plain Python int, keeping the training step graph-capturable (no
+    device->host sync, no data-dependent GPU control flow). Returns 0 when
+    no row fills any slot (all-IGNORE — invalid/mem-op batch)."""
+    nz = np.nonzero((slot_regs_np != AUX_CE_IGNORE).any(axis=0))[0]
+    return int(nz[-1]) + 1 if nz.size else 0
+
+
+def _listmle_loss(scores, slot_regs, K_max, active_f, k_eff=None):
+    """Plackett-Luce / ListMLE log-likelihood loss on per-register scores.
+
+    scores:    (B, n_regs) — predicted per-register scalar scores.
+    slot_regs: (B, K_max)  — GT slot ordering; AUX_CE_IGNORE for unfilled.
+    K_max:     length of slot_regs second dim.
+    active_f:  (B,) float — chunk validity mask.
+    k_eff:     optional host int — iterate only the first k_eff slot columns
+               (trailing all-IGNORE columns are a no-op on the loss, so this
+               is exact). Training loops pass it host-computed via
+               _slot_k_eff (sync-free). If None, it's derived on the GPU
+               here — correct but forces a host sync; fine for tests /
+               offline diagnostics, not the hot path.
+
+    For each chunk b and each filled slot k:
+        loss_k = -log softmax(scores_b \\ prev_chosen)[seq_b[k]]
+    where "\\ prev_chosen" means previously-chosen regs are masked to -inf
+    so they cannot be re-drawn. Per-chunk loss = sum_k loss_k / n_filled.
+    Final loss = mean over active chunks with at least one filled slot.
+
+    Properties:
+      - Direct per-position supervision (each slot is its own categorical
+        with the right answer at position k, identical structure to
+        per-slot CE).
+      - Distinctness baked in: the mask prevents the same reg from being
+        drawn twice.
+      - Info density ~K * log(n_regs) bits/chunk — same as per-slot CE,
+        much higher than pairwise ranking's K^2 margin signal.
+      - Decode (argsort) is unchanged.
+    """
+    B, N = scores.shape
+    device = scores.device
+    # Truncate to the last actually-filled slot column. A column where every
+    # row is AUX_CE_IGNORE has `valid` all-False, so it adds nothing to
+    # chunk_nll / n_filled / mask — iterating it is a no-op on the loss.
+    # K_max is the padded width (32 in / 16 out), but a single-instruction
+    # T1 chunk fills only ~2 in / 1 out, so iterating the full width launches
+    # ~10 tiny kernels per empty column and dominates the train step.
+    if k_eff is None:
+        nz = (slot_regs != AUX_CE_IGNORE).any(dim=0).nonzero()
+        k_eff = int(nz[-1].item()) + 1 if nz.numel() else 0
+    mask = torch.zeros_like(scores, dtype=torch.bool)
+    chunk_nll = torch.zeros(B, device=device)
+    n_filled = torch.zeros(B, device=device)
+    for k in range(k_eff):
+        target = slot_regs[:, k]
+        valid = (target != AUX_CE_IGNORE)
+        masked_scores = scores.masked_fill(mask, float('-inf'))
+        log_p = F.log_softmax(masked_scores, dim=-1)
+        safe_target = target.clamp(min=0)
+        step_nll = -log_p.gather(1, safe_target.unsqueeze(1)).squeeze(1)
+        # Use torch.where, NOT step_nll * valid.float(): when k exceeds
+        # the chunk's filled-slot count, safe_target collapses to 0 and
+        # log_p[0] may be -inf (if reg 0 has been masked at an earlier
+        # step), giving step_nll == +inf. Multiplying +inf * 0 yields
+        # nan; torch.where avoids touching step_nll on invalid rows.
+        chunk_nll = chunk_nll + torch.where(
+            valid, step_nll, torch.zeros_like(step_nll))
+        n_filled = n_filled + valid.float()
+        update = torch.zeros_like(mask).scatter(
+            1, safe_target.unsqueeze(1),
+            torch.ones_like(safe_target.unsqueeze(1), dtype=torch.bool))
+        mask = mask | (update & valid.unsqueeze(1))
+    chunk_loss = chunk_nll / n_filled.clamp(min=1)
+    chunk_has_slots = (n_filled > 0).float()
+    weight = active_f * chunk_has_slots
+    return (chunk_loss * weight).sum() / weight.sum().clamp(min=1)
+
+
+def binding_losses(model, vec, *, live_in_t, live_out_t, pc_writes_t,
+                   in_slot_t, out_slot_t, in_k_eff=None, out_k_eff=None):
+    """Rename-equivariant register-binding losses, shared by T1 and T2.
+
+    T1 is the n_instrs=1 special case of T2: both read these targets from
+    `precompute_chunk` and supervise the same heads on the normalized
+    binding direction. BCE on live_in/out masks + pc_writes; ListMLE
+    (Plackett-Luce) on the in/out slot orderings via per-register score
+    heads. Rows with all-zero masks (invalid / mem-op) are excluded.
+
+    Every target derives from one dataflow analysis, so these losses are
+    mutually consistent — no objective collapses what another must keep
+    distinct (this is what the old equivalence_loss vs src-register CE
+    could not jointly satisfy).
+
+    `model` must expose live_in_head / live_out_head / pc_writes_head /
+    in_score_head / out_score_head and n_regs / max_input_slots /
+    max_output_slots. Returns a dict of the five scalar losses plus
+    `active_f` (the per-row validity mask, for the caller's reuse).
+
+    in_k_eff / out_k_eff: optional host-computed effective slot widths
+    (see _slot_k_eff) forwarded to the ListMLE calls so the slot losses
+    iterate only filled columns without a GPU sync. Omit them and the
+    widths are derived on-device (a host sync — fine off the hot path).
+    """
+    any_in = live_in_t.any(dim=-1)
+    any_out = live_out_t.any(dim=-1)
+    active_f = (any_in | any_out).float()
+    n_active = active_f.sum().clamp(min=1)
+    n_regs = model.n_regs
+
+    binding_dir = F.normalize(vec, dim=-1)
+    li_logits = model.live_in_head(binding_dir)
+    lo_logits = model.live_out_head(binding_dir)
+    pc_logits = model.pc_writes_head(binding_dir).squeeze(-1)
+
+    li_per = F.binary_cross_entropy_with_logits(
+        li_logits, live_in_t, reduction='none')
+    li_loss = (li_per * active_f.unsqueeze(-1)).sum() / (n_active * n_regs)
+    lo_per = F.binary_cross_entropy_with_logits(
+        lo_logits, live_out_t, reduction='none')
+    lo_loss = (lo_per * active_f.unsqueeze(-1)).sum() / (n_active * n_regs)
+    pc_per = F.binary_cross_entropy_with_logits(
+        pc_logits, pc_writes_t, reduction='none')
+    pc_loss = (pc_per * active_f).sum() / n_active
+
+    in_scores = model.in_score_head(binding_dir)
+    out_scores = model.out_score_head(binding_dir)
+    in_slot_loss = _listmle_loss(
+        in_scores, in_slot_t, model.max_input_slots, active_f, k_eff=in_k_eff)
+    out_slot_loss = _listmle_loss(
+        out_scores, out_slot_t, model.max_output_slots, active_f, k_eff=out_k_eff)
+
+    return {
+        'live_in': li_loss, 'live_out': lo_loss, 'pc_writes': pc_loss,
+        'in_slot': in_slot_loss, 'out_slot': out_slot_loss,
+        'active_f': active_f,
+    }
+
+
+def _compute_chunk_out_regs(batch, anchor_states_np):
+    """Per row of the batch, run precompute_chunk to get the post-
+    execution full register file per anchor. Returns:
+      out_regs: (B, n_anchors, 32) int32
+      mask:     (B,) bool — True for rows we got valid out_regs from
+    Rows that fail (decode error, memory ops, etc.) get zero out_regs."""
+    B = batch.tokens.shape[0]
+    n_anchors = anchor_states_np.shape[0]
+    out = np.zeros((B, n_anchors, 32), dtype=np.int32)
+    mask = np.zeros(B, dtype=bool)
+    for b in range(B):
+        instrs = _decode_chunk_instructions(batch, b)
+        if instrs is None:
+            continue
+        try:
+            pre = precompute_chunk(instrs, anchor_states_np)
+        except NotImplementedError:
+            continue
+        except Exception:
+            continue
+        out[b] = pre.out_regs
+        mask[b] = True
+    return out, mask
+
+
+_GRAD_DIM_LOSSES = ['vp', 'in_slot', 'out_slot', 'live_in', 'live_out']
+
+
+def _pr_from_cov(C):
+    """Participation ratio (effective dimensionality) of a covariance/
+    second-moment matrix: (trace)^2 / ||.||_F^2 = (sum eig)^2 / sum eig^2."""
+    tr = torch.diagonal(C).sum()
+    fro2 = (C * C).sum().clamp(min=1e-30)
+    return float((tr * tr / fro2).item())
+
+
+def _cov_cosine(A, B):
+    """Matrix-cosine between two PSD matrices (0=orthogonal, 1=same)."""
+    inner = (A * B).sum()
+    na = torch.sqrt((A * A).sum())
+    nb = torch.sqrt((B * B).sum())
+    return float((inner / (na * nb).clamp(min=1e-30)).item())
+
+
+def _pr_and_overlaps(grads, center=True):
+    """grads: name -> (B, d) per-sample gradient on `pooled`.
+
+    Reports BOTH:
+      - uncentered second-moment C = g^T g: includes the mean (DC) gradient
+        direction the loss pushes every sample along. Dominated by that
+        common direction → small PR when gradients align.
+      - centered covariance Cc = (g-mean)^T (g-mean): the dimensionality of
+        how the gradient VARIES across samples (the common push removed),
+        the analog of mean-centered PCA on representations.
+
+    Returns dims = {name: {'unc': PR_uncentered, 'cen': PR_centered}} and
+    overlaps (matrix-cosine) computed on the chosen basis (centered by
+    default)."""
+    C = {n: g.t() @ g for n, g in grads.items()}
+    Cc = {n: (g - g.mean(0, keepdim=True)).t() @ (g - g.mean(0, keepdim=True))
+          for n, g in grads.items()}
+    dims = {n: {'unc': _pr_from_cov(C[n]), 'cen': _pr_from_cov(Cc[n])}
+            for n in grads}
+    basis = Cc if center else C
+    overlaps = {}
+    names = list(grads.keys())
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            a, b = names[i], names[j]
+            overlaps[f'{a}|{b}'] = _cov_cosine(basis[a], basis[b])
+    return dims, overlaps
+
+
+def loss_grad_dims(t2, t1, batch, anchor_states_t, device,
+                   out_regs_np=None, vp_mask_np=None):
+    """Per-loss gradient-subspace dims + overlaps on the shared `pooled`
+    vector (the score-heads + vp T2). Backprops each loss separately to
+    pooled and summarizes via _pr_and_overlaps. Dirties param .grad —
+    caller zeroes afterward. Pass precomputed out_regs to skip the anchor
+    execution when measuring a fixed batch repeatedly."""
+    split_outputs = _split_to_per_instruction(batch)
+    instr_tokens, instr_pad, *_ = split_outputs
+    if instr_tokens.shape[0] == 0:
+        return None, None
+    it = torch.from_numpy(instr_tokens).to(device).long()
+    ip = torch.from_numpy(instr_pad).to(device)
+    with torch.no_grad():
+        t1_vecs = t1.encode(it, ip)
+    B, max_n = batch.instr_lens.shape
+    chunk_t1, pad = _assemble_chunk_seq(
+        t1_vecs, split_outputs, B, max_n, device)
+    # return_pooled exposes the pre-projection vector that each loss term is
+    # backprop'd to below.
+    t2_out, pooled = t2.encode(chunk_t1, pad, return_pooled=True)
+    pooled.retain_grad()
+    binding_dir = F.normalize(t2_out, dim=-1)
+
+    in_slot_t = torch.from_numpy(
+        batch.in_slot_regs.astype(np.int64)).to(device)
+    out_slot_t = torch.from_numpy(
+        batch.out_slot_regs.astype(np.int64)).to(device)
+    live_in_t = torch.from_numpy(batch.live_in_mask).to(device).float()
+    live_out_t = torch.from_numpy(batch.live_out_mask).to(device).float()
+    active = (live_in_t.any(-1) | live_out_t.any(-1)).float()
+    n_active = active.sum().clamp(min=1)
+    nreg = t2.n_regs
+
+    if out_regs_np is None:
+        out_regs_np, vp_mask_np = _compute_chunk_out_regs(
+            batch, anchor_states_t.cpu().numpy())
+    out_regs_t = torch.from_numpy(out_regs_np).to(device)
+    vp_mask_t = torch.from_numpy(vp_mask_np).to(device)
+
+    losses = {
+        'vp': t2_value_predict_loss(
+            t2, t2_out, anchor_states_t, in_slot_t, out_slot_t,
+            out_regs_t, vp_mask_t),
+        'in_slot': _listmle_loss(
+            t2.in_score_head(binding_dir), in_slot_t,
+            t2.max_input_slots, active),
+        'out_slot': _listmle_loss(
+            t2.out_score_head(binding_dir), out_slot_t,
+            t2.max_output_slots, active),
+    }
+    li = F.binary_cross_entropy_with_logits(
+        t2.live_in_head(binding_dir), live_in_t, reduction='none')
+    losses['live_in'] = (li * active.unsqueeze(-1)).sum() / (n_active * nreg)
+    lo = F.binary_cross_entropy_with_logits(
+        t2.live_out_head(binding_dir), live_out_t, reduction='none')
+    losses['live_out'] = (lo * active.unsqueeze(-1)).sum() / (n_active * nreg)
+
+    grads = {}
+    for name in _GRAD_DIM_LOSSES:
+        if pooled.grad is not None:
+            pooled.grad = None
+        losses[name].backward(retain_graph=True)
+        grads[name] = pooled.grad.detach().clone()
+    return _pr_and_overlaps(grads)
+
+
+def _mp_worker_main(in_q, out_q, anchor_states_np, compute_out_regs):
+    """Worker-process entry point. Re-imports needed modules (we're under
+    spawn-context, so a fresh interpreter). Reads Batches from in_q,
+    runs CPU-side prep (split + per-chunk analysis loop), sends results on
+    out_q. EOF signaled by None.
+    """
+    # Imports must happen inside the worker (spawn context = fresh
+    # interpreter, doesn't inherit parent's already-loaded modules).
+    from compressor.train import (
+        _split_to_per_instruction, _compute_chunk_out_regs,
+    )
+    try:
+        while True:
+            batch = in_q.get()
+            if batch is None:
+                break
+            split = _split_to_per_instruction(batch)
+            if compute_out_regs:
+                out_regs_np, vp_mask_np = _compute_chunk_out_regs(
+                    batch, anchor_states_np)
+            else:
+                out_regs_np = vp_mask_np = None
+            out_q.put((batch, split, out_regs_np, vp_mask_np))
+    finally:
+        out_q.put(None)
+
+
+class TrainBatchPrefetcher:
+    """Multiprocessing prefetcher: spawn a worker *process* for CPU-side
+    prep so it runs in true parallel with the main loop's GPU work (no
+    GIL contention).
+
+    Architecture:
+      - Worker process (spawn context, fresh Python interpreter):
+          pulls Batches from input queue, runs _split_to_per_instruction
+          and _compute_chunk_out_regs, pushes results to output queue.
+      - Reader thread (in main process, daemon):
+          pulls Batches from batch_iter (the RVT stream), pushes to
+          input queue. Decoupling main loop from stdin read.
+      - Main loop: consumes prepped tuples from output queue.
+
+    Why processes instead of threads: the per-chunk loop inside
+    _compute_chunk_out_regs is pure-Python (decoding tokens, SSA
+    analysis, exception handling) and entirely GIL-bound.
+    Threading caused net regression (worker fought main for GIL).
+    Process boundary eliminates GIL contention entirely; cost is
+    pickling each batch across the queue (numpy arrays in dataclass,
+    ~1-2ms per batch).
+
+    Spawn context (not fork) avoids any CUDA-state contamination since
+    the worker is a fresh interpreter.
+    """
+
+    _EOF = None  # sentinel
+
+    def __init__(self, batch_iter, anchor_states_np, compute_out_regs,
+                 maxsize=4):
+        import multiprocessing as mp
+        ctx = mp.get_context('spawn')
+        self._in_q = ctx.Queue(maxsize=maxsize)
+        self._out_q = ctx.Queue(maxsize=maxsize)
+        self._worker = ctx.Process(
+            target=_mp_worker_main,
+            args=(self._in_q, self._out_q, anchor_states_np, compute_out_regs),
+            daemon=True,
+        )
+        self._worker.start()
+
+        # Reader thread feeds the worker's input queue from the batch
+        # iterator. Runs in the main process; minimal Python work
+        # (just reading from stdin and queue.put) so GIL contention
+        # with the main GPU loop is small.
+        self._reader_thread = threading.Thread(
+            target=self._read_loop, args=(batch_iter,), daemon=True)
+        self._reader_thread.start()
+
+    def _read_loop(self, batch_iter):
+        try:
+            for batch in batch_iter:
+                self._in_q.put(batch)
+        finally:
+            self._in_q.put(self._EOF)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = self._out_q.get()
+        if item is self._EOF:
+            self._worker.join(timeout=10)
+            raise StopIteration
+        return item
+
+
+def train_t2_encoder(batch_iter, t1_encoder, *,
+                     d_model=256, n_heads=4, n_layers=2, d_out=256,
+                     max_chunk_len=32,
+                     lr=3e-4, n_steps=None, log_every=100, lr_min=1e-6,
+                     warmup_steps=0,
+                     valid_weight=0.0,
+                     live_in_weight=0.1, live_out_weight=0.1,
+                     pc_writes_weight=0.1,
+                     in_slot_weight=0.1, out_slot_weight=0.1,
+                     value_predict_weight=0.0,
+                     value_predict_every=1,
+                     anchor_seed=0, n_anchor_states=8,
+                     t2_checkpoint=None,
+                     device='auto',
+                     on_log=None, compile_step=True):
+    """Train a T2 encoder on top of a frozen T1 encoder.
+
+    For each RVT batch:
+      1. Split flat chunk tokens into per-instruction segments via
+         batch.instr_lens.
+      2. Run frozen T1.encode on every instruction in the batch
+         (one big GPU call across all chunks).
+      3. Reshape T1 outputs back into per-chunk sequences with padding.
+      4. Run T2.encode over the sequences → one T2 vector per chunk.
+      5. Optional magnitude-validity loss (defaults off — corpora
+         generated without --inject-invalid have no negative class).
+      6. Aux register-identity supervision (BCE on live_in/out masks
+         and pc_writes; CE on slot-positional register predictions).
+
+    Aux heads project from F.normalize(t2_vecs) so register-identity
+    info is encoded into direction, not magnitude.
+
+    on_log: optional callable(model, losses, train_state) called after
+            each log point. Use it to checkpoint mid-run (train_state
+            carries optimizer/scheduler/RNG for --resume).
+
+    Returns (t2, losses).
+    """
+    device = resolve_device(device)
+    # TF32 + fused-attention-fastpath disable are handled in run_train_loop
+    # (shared across trainers).
+    t1_encoder.eval()
+    for p in t1_encoder.parameters():
+        p.requires_grad = False
+    t1_encoder = t1_encoder.to(device)
+
+    t2 = T2Compressor(
+        d_t1=t1_encoder.d_out, d_model=d_model, n_heads=n_heads,
+        n_layers=n_layers, d_out=d_out, max_chunk_len=max_chunk_len,
+    ).to(device)
+    # Track resumed training state (optimizer/scheduler/step/rng). When
+    # t2_checkpoint is a directory containing train_state.pt, we restore
+    # everything for a continue-from-where-we-left-off resume. When it's
+    # a .pt file, we only load model weights (legacy "polish" resume —
+    # Adam moments reset, schedule restarts).
+    resume_train_state = None
+    if t2_checkpoint is not None:
+        ckpt_path = Path(t2_checkpoint)
+        if ckpt_path.is_dir():
+            model_path = ckpt_path / 't2.pt'
+            train_state_path = ckpt_path / 'train_state.pt'
+            t2.load_state_dict(load_checkpoint(model_path, device),
+                               strict=False)
+            if train_state_path.exists():
+                resume_train_state = torch.load(
+                    train_state_path, map_location=device,
+                    weights_only=False)
+        else:
+            t2.load_state_dict(load_checkpoint(ckpt_path, device),
+                               strict=False)
+    opt, scheduler = build_optim_sched(
+        t2.parameters(), lr, n_steps, warmup_steps=warmup_steps,
+        lr_min=lr_min, device=device)
+
+    # Anchor states for value-prediction. Must match gen-time settings.
+    anchor_np = make_anchor_states(n_anchor_states, anchor_seed)
+    anchor_states_t = torch.from_numpy(anchor_np).to(device)
+
+    def _fmt(r, ms, eta, lr_now):
+        return (
+            f'step {r["step"]:>5d}  loss {r["total"]:.4f} '
+            f'(val {r["valid"]:.4f} '
+            f'li {r["live_in"]:.3f} lo {r["live_out"]:.3f} '
+            f'pc {r["pc_writes"]:.3f} '
+            f'is {r["in_slot"]:.3f} os {r["out_slot"]:.3f} '
+            f'vp {r["value_pred"]:.4f}) '
+            f'B={r["n_chunks"]} I={r["n_instrs"]}  '
+            f'lr {lr_now:.1e}  {ms:.0f}ms/step  '
+            f'eta {timedelta(seconds=int(eta))}')
+
+    log = TrainLog(n_steps=n_steps, log_every=log_every, lr=lr,
+                   scheduler=scheduler, formatter=_fmt, on_log=on_log)
+    step = 0
+
+    # Restore optimizer/scheduler/step/RNG from a previous checkpoint dir
+    # (set above in the t2_checkpoint handling block), so resume continues
+    # where the prior run left off.
+    if resume_train_state is not None:
+        step = restore_train_state(resume_train_state, opt, scheduler)
+        print(f'Resumed from step {step}')
+
+    # Trains until stdin EOF — pipeline upstream (cat / mux_batches /
+    # multinode_gen) controls total batch count. n_steps shapes the cosine
+    # scheduler and ETA display; if the pipeline runs longer the LR stays at
+    # lr_min, if shorter the schedule is truncated.
+    #
+    # Wrap batch_iter in a prefetcher so CPU-side prep (numpy splitting and
+    # the per-chunk loop for value-predict targets) overlaps
+    # with GPU work on the prior batch.
+    batch_source = TrainBatchPrefetcher(
+        batch_iter, anchor_np,
+        compute_out_regs=(value_predict_weight > 0))
+
+    # Peek the first item: batch shape (n_chunks, max_n_instrs) and vp/valid
+    # activity are corpus-constant, so bake them as Python constants into the
+    # compiled graph.
+    first, batch_source = _peek(batch_source)
+    if first is None:
+        return t2, log.losses
+    N_CHUNKS, MAX_NI = first[0].instr_lens.shape
+    d_t1 = t1_encoder.d_out
+    vp_active = value_predict_weight > 0
+    valid_active = valid_weight > 0
+
+    t2.train()
+    _dummy = torch.zeros(1, device=device)
+    _arange_ni = torch.arange(MAX_NI, device=device)[None, :]
+
+    # Compiled T2 forward+loss — FIXED-shape inputs (chunk_t1 is (N_CHUNKS,
+    # MAX_NI, d_t1), corpus-constant) so the graph records once. The frozen-T1
+    # per-instruction encode + chunk assembly stay EAGER in _prep: their input
+    # (total_instrs, ...) varies per batch, and feeding that to a CUDA graph
+    # re-records per size (we observed 51 — catastrophic). T1 (d128) eager is
+    # the cheap part; the T2 (d512) forward+loss+backward we capture is the bulk.
+    def _fwd_loss(chunk_t1, chunk_pad, li, lo, pc, in_slot, out_slot,
+                  out_regs, vp_mask, valid_f, ike, oke):
+        t2_out = t2.encode(chunk_t1, chunk_pad)
+        if valid_active:
+            valid_loss = ((t2_out.norm(dim=-1) - valid_f) ** 2).mean()
+        else:
+            valid_loss = t2_out.new_zeros(())
+        bl = binding_losses(
+            t2, t2_out, live_in_t=li, live_out_t=lo, pc_writes_t=pc,
+            in_slot_t=in_slot, out_slot_t=out_slot, in_k_eff=ike, out_k_eff=oke)
+        if vp_active:
+            vp = t2_value_predict_loss(
+                t2, t2_out, anchor_states_t, in_slot, out_slot, out_regs, vp_mask)
+        else:
+            vp = t2_out.new_zeros(())
+        total = (valid_weight * valid_loss
+                 + live_in_weight * bl['live_in']
+                 + live_out_weight * bl['live_out']
+                 + pc_writes_weight * bl['pc_writes']
+                 + in_slot_weight * bl['in_slot']
+                 + out_slot_weight * bl['out_slot']
+                 + value_predict_weight * vp)
+        metrics = {'total': total, 'valid': valid_loss,
+                   'live_in': bl['live_in'], 'live_out': bl['live_out'],
+                   'pc_writes': bl['pc_writes'], 'in_slot': bl['in_slot'],
+                   'out_slot': bl['out_slot'], 'value_pred': vp}
+        return total, metrics, None
+
+    def _prep(item):
+        batch, split_outputs, out_regs_np, vp_mask_np = item
+        instr_tokens, instr_pad, chunk_idx, slot_idx, n_per_chunk = split_outputs
+        if instr_tokens.shape[0] == 0:        # all-invalid batch
+            return None
+        # Eager (dynamic-shape) frozen-T1 encode + assemble → fixed chunk_t1.
+        it = _h2d(instr_tokens, device, dtype=torch.long)
+        ip = _h2d(instr_pad, device)
+        with torch.no_grad():
+            t1_vecs = t1_encoder.encode(it, ip)
+        ci = _h2d(chunk_idx, device, dtype=torch.long)
+        si = _h2d(slot_idx, device, dtype=torch.long)
+        npc = _h2d(n_per_chunk, device, dtype=torch.long)
+        chunk_t1 = torch.zeros(N_CHUNKS, MAX_NI, d_t1,
+                               device=device, dtype=t1_vecs.dtype)
+        chunk_t1[ci, si] = t1_vecs
+        chunk_pad = _arange_ni >= npc[:, None]
+        chunk_pad[:, 0] = False
+        valid_f = (_h2d(batch.valid, device, dtype=torch.float32)
+                   if valid_active else _dummy)
+        if vp_active:
+            out_regs_t = _h2d(out_regs_np, device)
+            vp_mask_t = _h2d(vp_mask_np, device)
+        else:
+            out_regs_t = vp_mask_t = _dummy
+        return (chunk_t1, chunk_pad,
+                _h2d(batch.live_in_mask, device, dtype=torch.float32),
+                _h2d(batch.live_out_mask, device, dtype=torch.float32),
+                _h2d(batch.pc_writes, device, dtype=torch.float32),
+                _h2d(batch.in_slot_regs, device, dtype=torch.long),
+                _h2d(batch.out_slot_regs, device, dtype=torch.long),
+                out_regs_t, vp_mask_t, valid_f,
+                _slot_k_eff(batch.in_slot_regs), _slot_k_eff(batch.out_slot_regs))
+
+    def _extra(item, aux):
+        n_per_chunk = item[1][4]
+        return {'n_chunks': N_CHUNKS, 'n_instrs': int(n_per_chunk.sum())}
+
+    losses = run_train_loop(
+        batch_source, model=t2, opt=opt, scheduler=scheduler, log=log,
+        device=device,
+        prep_fn=_prep, fwd_loss_fn=_fwd_loss, extra_fn=_extra,
+        compile_step=compile_step, capture_state=True, start_step=step)
     return t2, losses
 
+    return t2, log.losses
+
+
+def _decoder_accuracy(logits, dec_tgt, dec_pad):
+    """Per-token and per-instruction (whole-row exact-match) accuracy."""
+    with torch.no_grad():
+        pred = logits.argmax(dim=-1)
+        non_pad = ~dec_pad
+        tok_total = non_pad.sum().item()
+        tok_acc = (((pred == dec_tgt) & non_pad).sum().item() / tok_total
+                   if tok_total > 0 else 0.0)
+        B = dec_tgt.shape[0]
+        instr_correct = 0
+        for b in range(B):
+            n = non_pad[b].sum().item()
+            if n > 0 and (pred[b, :n] == dec_tgt[b, :n]).all():
+                instr_correct += 1
+        instr_acc = instr_correct / B if B > 0 else 0.0
+    return tok_acc, instr_acc
+
+
+def train_decoder(batch_iter, encoder, *, d_model, n_heads, n_layers,
+                  n_memory=1, lr=3e-4, n_steps=None, log_every=100,
+                  lr_min=1e-6, device='auto', on_log=None, compile_step=True):
+    """Train a decoder on a frozen encoder with teacher-forced CE.
+
+    Reconstructs each valid chunk's tokens from the frozen encoder's vector.
+    Processes ALL rows at a fixed shape (invalid rows get all-PAD targets,
+    ignored by CE) so the step is CUDA-graph-capturable like the encoders.
+    Returns (decoder, losses); losses[i] = {step, loss, tok_acc, instr_acc}.
+    """
+    device = resolve_device(device)
+    # TF32 + fused-attention-fastpath disable are handled in run_train_loop
+    # (shared across trainers). The decoder reconstructs straight from the
+    # batch each step (light prep), so it has no separate prefetcher.
+    encoder.eval()
+    for p in encoder.parameters():
+        p.requires_grad = False
+    encoder = encoder.to(device)
+
+    decoder = Decoder(
+        VOCAB_SIZE, d_model, n_heads, n_layers,
+        d_emb=encoder.d_out, n_memory_tokens=n_memory).to(device)
+    decoder.train()
+    opt, scheduler = build_optim_sched(
+        decoder.parameters(), lr, n_steps, lr_min=lr_min, device=device)
+
+    def _fmt(r, ms, eta, lr_now):
+        return (f'step {r["step"]:>5d}  loss {r["loss"]:.4f}  '
+                f'tok_acc {r["tok_acc"]:.1%}  instr_acc {r["instr_acc"]:.1%}  '
+                f'lr {lr_now:.1e}  {ms:.0f}ms/step  '
+                f'eta {timedelta(seconds=int(eta))}')
+
+    log = TrainLog(n_steps=n_steps, log_every=log_every, lr=lr,
+                   scheduler=scheduler, formatter=_fmt, on_log=on_log)
+
+    # max_dec_len from the corpus-constant token width (max_tokens + 1).
+    first, batch_iter = _peek(batch_iter)
+    if first is None:
+        return decoder, log.losses
+    max_dec_len = first.tokens.shape[1] + 1
+    autocast = _is_cuda(device)
+
+    def _fwd_loss(vecs, dec_in, dec_pad, dec_tgt):
+        if autocast:
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                logits = decoder(vecs, dec_in, dec_pad)
+                loss = F.cross_entropy(
+                    logits.reshape(-1, VOCAB_SIZE), dec_tgt.reshape(-1),
+                    ignore_index=PAD)
+        else:
+            logits = decoder(vecs, dec_in, dec_pad)
+            loss = F.cross_entropy(
+                logits.reshape(-1, VOCAB_SIZE), dec_tgt.reshape(-1),
+                ignore_index=PAD)
+        return loss, {'loss': loss}, (logits, dec_tgt, dec_pad)
+
+    def _prep(batch):
+        tok = _h2d(batch.tokens, device, dtype=torch.long)
+        pad = _h2d(padding_mask(batch), device)
+        with torch.no_grad():
+            vecs = encoder.encode(tok, pad)
+        di, dt, dp = decoder_targets_fixed(batch, max_dec_len)
+        return (vecs, _h2d(di, device, dtype=torch.long),
+                _h2d(dp, device), _h2d(dt, device, dtype=torch.long))
+
+    def _extra(batch, aux):
+        logits, dec_tgt, dec_pad = aux
+        tok_acc, instr_acc = _decoder_accuracy(logits, dec_tgt, dec_pad)
+        return {'tok_acc': tok_acc, 'instr_acc': instr_acc}
+
+    losses = run_train_loop(
+        batch_iter, model=decoder, opt=opt, scheduler=scheduler, log=log,
+        device=device,
+        prep_fn=_prep, fwd_loss_fn=_fwd_loss, extra_fn=_extra,
+        compile_step=compile_step)
+    return decoder, losses

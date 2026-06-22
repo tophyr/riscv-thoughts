@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Slice and inspect binary batch streams (RVS or RVB)."""
+"""Slice and inspect binary batch streams (RVT)."""
 
 import argparse
 import sys
@@ -7,23 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from scripts._batch_util import binary_stdout, detect_format
-
-
-def _read_one(f, fmt, lenient=False):
-    try:
-        data = fmt.read_bytes(f)
-    except EOFError as e:
-        if lenient:
-            return None, None
-        return None, str(e)
-    if data is None:
-        return None, None
-    try:
-        fmt.validate(data)
-    except ValueError as e:
-        return None, str(e)
-    return data, None
+from scripts._streamfmt import binary_stdout, detect_format, read_batch_or_error
 
 
 def do_info(f, fmt, lenient=False):
@@ -31,7 +15,7 @@ def do_info(f, fmt, lenient=False):
     total_items = 0
     last_B = None
     while True:
-        data, err = _read_one(f, fmt, lenient=lenient)
+        data, err = read_batch_or_error(fmt, f, lenient=lenient)
         if data is None and err is None:
             break
         if data is None:
@@ -54,14 +38,13 @@ def do_info(f, fmt, lenient=False):
 
 
 def do_slice(f, out, fmt, skip=0, count=None, lenient=False):
-    fmt.write_header(out)
     idx = 0
     written = 0
     try:
         while True:
             if count is not None and written >= count:
                 break
-            data, err = _read_one(f, fmt, lenient=lenient)
+            data, err = read_batch_or_error(fmt, f, lenient=lenient)
             if data is None and err is None:
                 break
             if data is None:
@@ -85,7 +68,7 @@ def do_tail(f, out, fmt, n, lenient=False):
     ring = deque(maxlen=n)
     total = 0
     while True:
-        data, err = _read_one(f, fmt, lenient=lenient)
+        data, err = read_batch_or_error(fmt, f, lenient=lenient)
         if data is None and err is None:
             break
         if data is None:
@@ -95,7 +78,6 @@ def do_tail(f, out, fmt, n, lenient=False):
             break
         ring.append(data)
         total += 1
-    fmt.write_header(out)
     try:
         for data in ring:
             out.write(data)

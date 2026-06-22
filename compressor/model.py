@@ -32,11 +32,14 @@ class T1Compressor(nn.Module):
     def __init__(self, vocab_size, d_model, n_heads, n_layers, d_out,
                  max_window=32, dropout=0.0,
                  max_iterations_per_token=4,
-                 n_dest_types=2, n_regs=32):
+                 n_regs=32, max_input_slots=32, max_output_slots=16):
         super().__init__()
         self.d_model = d_model
         self.d_out = d_out
         self.max_iters_per_token = max_iterations_per_token
+        self.n_regs = n_regs
+        self.max_input_slots = max_input_slots
+        self.max_output_slots = max_output_slots
         # Runtime cap on window size during streaming forward().
         # Defaults to the full pos-embedding table; callers can lower
         # it after loading a checkpoint to skip wasted compute on
@@ -48,17 +51,50 @@ class T1Compressor(nn.Module):
         win_layer = nn.TransformerEncoderLayer(
             d_model, n_heads, dim_feedforward=d_model * 4,
             dropout=dropout, batch_first=True)
-        self.win_encoder = nn.TransformerEncoder(win_layer, n_layers)
+        # enable_nested_tensor=False: the nested-tensor fast path isn't
+        # torch.compile-able and breaks the full-step CUDA graph — including
+        # when this frozen T1 encode runs inside the compiled T2 step. Dense
+        # path is numerically identical (padding-skip optimization only).
+        self.win_encoder = nn.TransformerEncoder(
+            win_layer, n_layers, enable_nested_tensor=False)
         self.proj = nn.Linear(d_model, d_out)
 
-        # Destination classification heads. Read from the T1 vector
-        # to force the encoder to carry destination info that the
-        # scalar exec_distance metric is blind to. T1 is no longer
-        # normalized (see design note on the ball vs sphere), so
-        # these heads see a vector whose magnitude reflects
-        # validity; training loops invoke them only on valid rows.
-        self.dest_type_head = nn.Linear(d_out, n_dest_types)
-        self.dest_reg_head = nn.Linear(d_out, n_regs)
+        # Register-binding heads — identical to T2Compressor's. T1 is the
+        # n_instrs=1 special case of T2, so it carries the same
+        # rename-equivariant binding supervision (live_in/out + pc_writes
+        # BCE, in/out-slot ListMLE via per-register score heads), read from
+        # the normalized binding direction. This replaces the old syntactic
+        # dest/src CE heads, whose targets conflicted with equivalence
+        # collapse (see train.binding_losses).
+        head_in = d_out
+        self.live_in_head = nn.Linear(head_in, n_regs)
+        self.live_out_head = nn.Linear(head_in, n_regs)
+        self.pc_writes_head = nn.Linear(head_in, 1)
+        _score_hidden = 512
+        self.in_score_head = nn.Sequential(
+            nn.Linear(head_in, _score_hidden), nn.ReLU(),
+            nn.Linear(_score_hidden, _score_hidden), nn.ReLU(),
+            nn.Linear(_score_hidden, n_regs))
+        self.out_score_head = nn.Sequential(
+            nn.Linear(head_in, _score_hidden), nn.ReLU(),
+            nn.Linear(_score_hidden, _score_hidden), nn.ReLU(),
+            nn.Linear(_score_hidden, n_regs))
+
+        # Value-prediction head (v1 experiment). Reads only the
+        # vector + input register values, never register IDs, and must
+        # predict the rd output value per anchor state. If the vector is
+        # actually operator-essence, this head can solve the I/O
+        # function for each opcode; if the vector lacks that information,
+        # the head can't recover it from the input values alone. Input
+        # per anchor: [vec (d_out), v_src0, v_src1] = d_out + 2
+        # features. Output: predicted (compressed) rd value at that
+        # anchor. Only used when value_predict_weight > 0 in train_-
+        # encoder; the head sits unused otherwise.
+        sh_in = d_out + 2
+        self.vp_head = nn.Sequential(
+            nn.Linear(sh_in, 128), nn.ReLU(),
+            nn.Linear(128, 128), nn.ReLU(),
+            nn.Linear(128, 1))
 
         self.gru = nn.GRUCell(d_out, d_model)
 
@@ -517,5 +553,136 @@ class Decoder(nn.Module):
         out = self.decoder(
             tgt, memory,
             tgt_mask=causal_mask,
-            tgt_key_padding_mask=target_padding_mask)
+            tgt_key_padding_mask=target_padding_mask,
+            tgt_is_causal=False)  # explicit (not None) → skips
+                                  # _detect_is_causal_mask's tensor->bool check
+                                  # (a graph break) while still applying the
+                                  # explicit causal mask. (True invokes a
+                                  # fast path that doesn't capture under compile.)
         return self.head(out)
+
+
+class T2Compressor(nn.Module):
+    """Encode a sequence of T1 emission vectors (one per source
+    instruction) into a single T2 vector per chunk.
+
+    Fixed-window only — no gates, no streaming. The whole chunk is
+    fed in at once, attention-pooled by a learned query, projected to
+    d_out. The pooled vector is supervised by per-row register-identity
+    aux targets (live-in/out masks, slot rankings) plus value
+    prediction — see train_t2_encoder.
+
+    Shape:
+      input:        t1_seq           (B, n_instrs, d_t1)
+                    padding_mask     (B, n_instrs) bool — True where padded
+      output:       t2_vec           (B, d_out)
+    """
+
+    def __init__(self, d_t1, d_model, n_heads, n_layers, d_out,
+                 max_chunk_len=32, dropout=0.0,
+                 n_regs=32, max_input_slots=32, max_output_slots=16):
+        super().__init__()
+        self.d_t1 = d_t1
+        self.d_model = d_model
+        self.d_out = d_out
+
+        self.max_chunk_len = max_chunk_len
+        self.n_regs = n_regs
+        self.max_input_slots = max_input_slots
+        self.max_output_slots = max_output_slots
+
+        # Shared input projection + transformer body + pooling.
+        self._build_shared_path(
+            d_t1, d_model, n_heads, n_layers, max_chunk_len, dropout)
+
+        # Single-query pool: one (B, d_model) vector per chunk.
+        self.pool_query = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.pool_attn = nn.MultiheadAttention(
+            d_model, n_heads, dropout=dropout, batch_first=True)
+        self.proj = nn.Linear(d_model, d_out)
+        # Aux heads project from the full d_out vector.
+        head_in = d_out
+        self.live_in_head = nn.Linear(head_in, n_regs)
+        self.live_out_head = nn.Linear(head_in, n_regs)
+        self.pc_writes_head = nn.Linear(head_in, 1)
+        # Per-register scalar score: one float per register. Decode
+        # ordering by sorting scores descending. Duplicates are impossible
+        # by construction (sort is a total order on floats). Loss:
+        # Plackett-Luce/ListMLE. MLP heads (not single Linear) so the
+        # score function has enough extractive capacity to read per-slot
+        # ordering info out of binding_dir into a scalar coordinate per
+        # register. Single-Linear bottlenecked out_slot accuracy in the
+        # prior experiment.
+        _score_hidden = 512
+        self.in_score_head = nn.Sequential(
+            nn.Linear(head_in, _score_hidden), nn.ReLU(),
+            nn.Linear(_score_hidden, _score_hidden), nn.ReLU(),
+            nn.Linear(_score_hidden, n_regs))
+        self.out_score_head = nn.Sequential(
+            nn.Linear(head_in, _score_hidden), nn.ReLU(),
+            nn.Linear(_score_hidden, _score_hidden), nn.ReLU(),
+            nn.Linear(_score_hidden, n_regs))
+
+        # Value-prediction head. Reads (vec, anchor input-slot
+        # values) and predicts per-anchor per-slot OUTPUT values. The
+        # head sees no register-identity info — to succeed, the vector must
+        # encode "what this chunk computes." Per-slot values must align
+        # with out_slot_regs (slot k bound to register r → predicted
+        # value at slot k must match register r's value).
+        #
+        # Sized generously for T2's task: 32 input slot values + 128-d
+        # vector → 16 output slots is genuinely complex (multi-instr
+        # symbolic execution). Previous 256×3 head plateaued at RMSE
+        # 1.23 in compressed space; 1024×5 gives ~30× more parameters
+        # to test whether head capacity was the bottleneck.
+        sh_in = d_out + max_input_slots
+        self.vp_head = nn.Sequential(
+            nn.Linear(sh_in, 1024), nn.ReLU(),
+            nn.Linear(1024, 1024), nn.ReLU(),
+            nn.Linear(1024, 1024), nn.ReLU(),
+            nn.Linear(1024, 1024), nn.ReLU(),
+            nn.Linear(1024, max_output_slots))
+
+    def _build_shared_path(self, d_t1, d_model, n_heads, n_layers,
+                           max_chunk_len, dropout):
+        """Build the shared input projection + pos-emb + transformer body."""
+        self.input_proj = nn.Linear(d_t1, d_model)
+        self.pos_emb = nn.Embedding(max_chunk_len, d_model)
+        layer = nn.TransformerEncoderLayer(
+            d_model, n_heads, dim_feedforward=d_model * 4,
+            dropout=dropout, batch_first=True)
+        # enable_nested_tensor=False: the nested-tensor fast path
+        # (_nested_tensor_from_mask_left_aligned) is not torch.compile-able
+        # and shatters the full-step CUDA graph (the variable chunk lengths
+        # here trigger it). It's only a padding-skip optimization — the dense
+        # path is numerically identical — so disabling it keeps the step
+        # capturable as one graph with no behavior change.
+        self.encoder = nn.TransformerEncoder(
+            layer, n_layers, enable_nested_tensor=False)
+
+    def encode(self, t1_seq, padding_mask, return_pooled=False):
+        """Encode a chunk's T1 vectors into the T2 output (B, d_out).
+
+        The pooled+projected vector is returned raw (open space, no
+        normalize): magnitude is a free degree of freedom and all heads
+        read the full vector.
+
+        return_pooled: also return the post-pool, pre-projection
+        (B, d_model) vector — the shared representation all output heads
+        read through `proj`. Used for per-loss gradient-subspace analysis.
+        """
+        B, N, _ = t1_seq.shape
+
+        x = self.input_proj(t1_seq)
+        positions = torch.arange(N, device=t1_seq.device).expand(B, N)
+        x = x + self.pos_emb(positions)
+        x = self.encoder(x, src_key_padding_mask=padding_mask)
+
+        q = self.pool_query.expand(B, -1, -1)
+        pooled, _ = self.pool_attn(
+            q, x, x, key_padding_mask=padding_mask)
+        pooled = pooled.squeeze(1)            # (B, d_model)
+        t2_out = self.proj(pooled)
+        if return_pooled:
+            return t2_out, pooled
+        return t2_out
