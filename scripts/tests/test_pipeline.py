@@ -73,7 +73,7 @@ def slice_info(data):
 
 def _first_header(data):
     """Unpack the first batch's RVT dimension header:
-    (B, max_tokens, max_n_instrs, RB, n_anchors)."""
+    (B, max_tokens, max_n_instrs, RB, n_anchors, OB)."""
     sys.path.insert(0, str(ROOT))
     from datagen import RVT_FORMAT
     off = RVT_FORMAT.batch_prefix_size
@@ -89,22 +89,25 @@ class TestGenBatches:
         assert 'Batches:      2' in info
 
     def test_row_outputs_mode_header(self):
-        """The `single` rule is the row-outputs T1 mode: the RVT header
-        carries RB == B (per-row value-prediction payload) and
-        n_anchors == --n-states, where multi-instruction rules ship
-        RB == 0 / n_anchors == 0. Pin that distinguishing property."""
+        """The `single` rule is the row-outputs T1 mode (RB == B, OB == 0);
+        a multi-instruction rule is the T2 mode that ships the out_regs
+        oracle (RB == 0, OB == B). Both carry n_anchors == --n-states."""
         out = gen(n_batches=1, batch_size=4, twins=0, n_states=4,
                   rule='single')
-        B, _, _, RB, n_anchors = _first_header(out)
+        B, _, _, RB, n_anchors, OB = _first_header(out)
         assert B == 4, (B, RB)
         assert RB == B, f'row-outputs mode must ship RB==B, got RB={RB} B={B}'
+        assert OB == 0, f'T1 row mode ships no out_regs, got OB={OB}'
         assert n_anchors == 4, n_anchors
 
-        # Contrast: a multi-instruction rule has no row-outputs payload.
+        # Contrast: a multi-instruction rule ships out_regs (OB==B), not the
+        # row-outputs payload (RB==0).
         multi = gen(n_batches=1, batch_size=4, twins=0, n_states=4,
                     rule='cap=2')
-        _, _, _, RB_m, n_anchors_m = _first_header(multi)
-        assert RB_m == 0 and n_anchors_m == 0, (RB_m, n_anchors_m)
+        B_m, _, _, RB_m, n_anchors_m, OB_m = _first_header(multi)
+        assert RB_m == 0, RB_m
+        assert OB_m == B_m, f'T2 mode must ship OB==B, got OB={OB_m} B={B_m}'
+        assert n_anchors_m == 4, n_anchors_m
 
 
 class TestGenRules:
@@ -466,8 +469,8 @@ class TestT2EvalTools:
 
 class TestStreamFmt:
     """_streamfmt header validation + format detection rejection paths.
-    The RVT header is 5 fields: (B, max_tokens, max_n_instrs, RB,
-    n_anchors)."""
+    The RVT header is 6 fields: (B, max_tokens, max_n_instrs, RB,
+    n_anchors, OB)."""
 
     @staticmethod
     def _prefix():
@@ -477,7 +480,7 @@ class TestStreamFmt:
             RVT_FORMAT.magic, RVT_FORMAT.version, RVT_FORMAT.dtype_chars)
 
     @staticmethod
-    def _batch_bytes(B, max_tokens, max_n_instrs, RB, n_anchors,
+    def _batch_bytes(B, max_tokens, max_n_instrs, RB, n_anchors, OB=0,
                      magic=None, version=None):
         sys.path.insert(0, str(ROOT))
         from datagen import RVT_FORMAT
@@ -486,7 +489,7 @@ class TestStreamFmt:
         prefix = RVT_FORMAT._prefix_struct.pack(
             m, v, RVT_FORMAT.dtype_chars)
         header = RVT_FORMAT.batch_header.pack(
-            B, max_tokens, max_n_instrs, RB, n_anchors)
+            B, max_tokens, max_n_instrs, RB, n_anchors, OB)
         return prefix + header
 
     def test_validate_rejects_out_of_bounds_header(self):
@@ -505,8 +508,8 @@ class TestStreamFmt:
     def test_validate_accepts_good_header(self):
         sys.path.insert(0, str(ROOT))
         from scripts._streamfmt import _validate_rvt
-        vals = _validate_rvt(self._batch_bytes(4, 32, 1, 4, 4))
-        assert vals == (4, 32, 1, 4, 4)
+        vals = _validate_rvt(self._batch_bytes(4, 32, 1, 4, 4, OB=4))
+        assert vals == (4, 32, 1, 4, 4, 4)
 
     def test_detect_format_unknown_magic(self):
         import io

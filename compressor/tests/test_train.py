@@ -19,11 +19,13 @@ from tokenizer import BOS, EOS, PAD, VOCAB_SIZE
 
 from compressor.model import T1Compressor, T2Compressor
 from compressor.train import (
+    _compute_chunk_out_regs,
     _listmle_loss,
     _value_compress,
     binding_losses,
     build_optim_sched,
     prepare_decoder_targets,
+    t2_pair_loss,
     t2_value_predict_loss,
     value_predict_loss,
 )
@@ -176,6 +178,65 @@ def test_t2_value_predict_loss_empty_masks_are_zero():
         fake, vecs, anchor, in_slot, all_ignore, out_regs,
         torch.tensor([True, True]))
     assert z2.item() == 0.0
+
+
+def test_t2_pair_loss_identical_behavior_targets_zero():
+    B, A = 2, 2
+    out_regs = torch.zeros(B, A, 32, dtype=torch.int32)
+    live_out = torch.zeros(B, 32); live_out[:, 5] = 1.0
+    valid = torch.tensor([True, True])
+    loss0 = t2_pair_loss(torch.tensor([[1., 0, 0, 0], [1., 0, 0, 0]]),
+                         out_regs, live_out, valid, scale=0.5, strides=(1,))
+    assert loss0.item() == pytest.approx(0.0, abs=1e-6)
+    loss1 = t2_pair_loss(torch.tensor([[1., 0, 0, 0], [0., 1, 0, 0]]),
+                         out_regs, live_out, valid, scale=0.5, strides=(1,))
+    assert loss1.item() == pytest.approx(1.0, abs=1e-6)
+
+
+def test_t2_pair_loss_different_behavior_pushes_apart():
+    B, A = 2, 2
+    out_regs = torch.zeros(B, A, 32, dtype=torch.int32); out_regs[1, :, 5] = 1000
+    live_out = torch.zeros(B, 32); live_out[:, 5] = 1.0
+    loss = t2_pair_loss(torch.tensor([[1., 0, 0, 0], [1., 0, 0, 0]]),
+                        out_regs, live_out, torch.tensor([True, True]),
+                        scale=0.5, strides=(1,))
+    target = 0.5 * math.log1p(math.log1p(1000.0))
+    assert loss.item() == pytest.approx(target ** 2, rel=1e-4)
+
+
+def test_t2_pair_loss_invalid_rows_excluded_and_differentiable():
+    z = t2_pair_loss(torch.eye(2, 4), torch.zeros(2, 2, 32, dtype=torch.int32),
+                     torch.ones(2, 32), torch.tensor([False, False]),
+                     scale=0.5, strides=(1,))
+    assert z.item() == 0.0
+    vecs = torch.randn(8, 16, requires_grad=True)
+    loss = t2_pair_loss(vecs, torch.randint(-5000, 5000, (8, 4, 32), dtype=torch.int32),
+                        (torch.rand(8, 32) > 0.5).float(), torch.ones(8, dtype=torch.bool),
+                        scale=0.5)
+    loss.backward()
+    assert loss.dim() == 0 and torch.isfinite(vecs.grad).all()
+
+
+def test_gen_shipped_out_regs_matches_recompute():
+    """The out_regs the gen workers ship in the RVT batch must be bit-
+    identical to what the trainer would recompute single-threaded (the
+    gen-side shipping is a perf move, not a semantic change)."""
+    from datagen.batch import collect_into_batches, generate_chunks
+    from datagen.compare import make_anchor_states
+    from datagen.generate import either, until_branch, length_cap
+
+    anchors = make_anchor_states(8, 0)
+    rng = np.random.default_rng(0)
+    chunks = generate_chunks(either(until_branch(), length_cap(4)), rng,
+                             eq_rate=0.05)
+    batch = next(collect_into_batches(
+        chunks, batch_size=64, twins=3, anchor_states=anchors, rng=rng,
+        max_chunk_len=4))
+
+    assert batch.out_regs.shape[0] == batch.tokens.shape[0]   # OB == B (T2)
+    ref_out, ref_valid = _compute_chunk_out_regs(batch, anchors)
+    assert np.array_equal(batch.out_regs, ref_out)
+    assert np.array_equal(batch.out_regs_valid, ref_valid)
 
 
 # ===========================================================================

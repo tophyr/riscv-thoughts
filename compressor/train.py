@@ -803,6 +803,47 @@ def t2_value_predict_loss(t2, vecs, anchor_states_t,
     return (mse, int(pair_mask.sum())) if return_count else mse
 
 
+T2_PAIR_STRIDES = (1, 2, 3, 5, 8, 13, 21, 34)
+
+
+def t2_pair_loss(vecs, out_regs_t, live_out_t, valid_t, *,
+                 scale, strides=T2_PAIR_STRIDES, return_count=False):
+    """Oracle behavioral pairwise loss (rename-SENSITIVE). Matches cosine
+    distance between chunk vectors to a behavioral distance from their
+    post-execution register files: identical behaviors collapse, different
+    behaviors separate in proportion. Pairs formed statically by rolling the
+    batch by each stride (compile-safe). Distance averaged over registers
+    either chunk writes (live_out union) so it isn't diluted by untouched
+    registers.
+
+      vecs:        (B, d) raw T2 vectors (normalized internally).
+      out_regs_t:  (B, A, 32) int — post-exec register file per anchor.
+      live_out_t:  (B, 32) float — which registers each chunk writes.
+      valid_t:     (B,) — rows with valid out_regs (others excluded).
+      scale:       maps behavioral distance (loglog, ~[0,3]) to a target
+                   cosine distance ([0,2])."""
+    v = F.normalize(vecs, dim=-1)
+    orl = out_regs_t.long()
+    lo_b = live_out_t.bool()
+    valid_f = valid_t.float()
+    num = vecs.new_zeros(())
+    den = vecs.new_zeros(())
+    for s in strides:
+        vb = torch.roll(v, -s, 0)
+        dv = 1.0 - (v * vb).sum(-1)                            # (B,) cos dist
+        diff = (orl - torch.roll(orl, -s, 0)).abs().float()   # (B, A, 32)
+        c = torch.log1p(torch.log1p(diff))                    # loglog magnitude
+        touched = (lo_b | torch.roll(lo_b, -s, 0)).float()    # (B, 32)
+        per_anchor = ((c * touched.unsqueeze(1)).sum(-1)
+                      / touched.sum(-1, keepdim=True).clamp(min=1))   # (B, A)
+        target = (scale * per_anchor.mean(1)).clamp(max=2.0)  # (B,)
+        pm = valid_f * torch.roll(valid_f, -s, 0)
+        num = num + ((dv - target) ** 2 * pm).sum()
+        den = den + pm.sum()
+    mse = num / den.clamp(min=1)
+    return (mse, int(den)) if return_count else mse
+
+
 def _slot_k_eff(slot_regs_np):
     """Host-side effective slot width: last column (across the batch) that
     any row actually fills, +1. Computed from the numpy batch BEFORE the
@@ -1016,13 +1057,11 @@ def _pr_and_overlaps(grads, center=True):
     return dims, overlaps
 
 
-def loss_grad_dims(t2, t1, batch, anchor_states_t, device,
-                   out_regs_np=None, vp_mask_np=None):
+def loss_grad_dims(t2, t1, batch, anchor_states_t, device):
     """Per-loss gradient-subspace dims + overlaps on the shared `pooled`
     vector (the score-heads + vp T2). Backprops each loss separately to
     pooled and summarizes via _pr_and_overlaps. Dirties param .grad —
-    caller zeroes afterward. Pass precomputed out_regs to skip the anchor
-    execution when measuring a fixed batch repeatedly."""
+    caller zeroes afterward."""
     split_outputs = _split_to_per_instruction(batch)
     instr_tokens, instr_pad, *_ = split_outputs
     if instr_tokens.shape[0] == 0:
@@ -1050,11 +1089,8 @@ def loss_grad_dims(t2, t1, batch, anchor_states_t, device,
     n_active = active.sum().clamp(min=1)
     nreg = t2.n_regs
 
-    if out_regs_np is None:
-        out_regs_np, vp_mask_np = _compute_chunk_out_regs(
-            batch, anchor_states_t.cpu().numpy())
-    out_regs_t = torch.from_numpy(out_regs_np).to(device)
-    vp_mask_t = torch.from_numpy(vp_mask_np).to(device)
+    out_regs_t = torch.from_numpy(batch.out_regs).to(device)
+    vp_mask_t = torch.from_numpy(batch.out_regs_valid).to(device)
 
     losses = {
         'vp': t2_value_predict_loss(
@@ -1083,29 +1119,21 @@ def loss_grad_dims(t2, t1, batch, anchor_states_t, device,
     return _pr_and_overlaps(grads)
 
 
-def _mp_worker_main(in_q, out_q, anchor_states_np, compute_out_regs):
+def _mp_worker_main(in_q, out_q):
     """Worker-process entry point. Re-imports needed modules (we're under
     spawn-context, so a fresh interpreter). Reads Batches from in_q,
-    runs CPU-side prep (split + per-chunk analysis loop), sends results on
+    runs CPU-side prep (_split_to_per_instruction), sends results on
     out_q. EOF signaled by None.
     """
     # Imports must happen inside the worker (spawn context = fresh
     # interpreter, doesn't inherit parent's already-loaded modules).
-    from compressor.train import (
-        _split_to_per_instruction, _compute_chunk_out_regs,
-    )
+    from compressor.train import _split_to_per_instruction
     try:
         while True:
             batch = in_q.get()
             if batch is None:
                 break
-            split = _split_to_per_instruction(batch)
-            if compute_out_regs:
-                out_regs_np, vp_mask_np = _compute_chunk_out_regs(
-                    batch, anchor_states_np)
-            else:
-                out_regs_np = vp_mask_np = None
-            out_q.put((batch, split, out_regs_np, vp_mask_np))
+            out_q.put((batch, _split_to_per_instruction(batch)))
     finally:
         out_q.put(None)
 
@@ -1117,20 +1145,18 @@ class TrainBatchPrefetcher:
 
     Architecture:
       - Worker process (spawn context, fresh Python interpreter):
-          pulls Batches from input queue, runs _split_to_per_instruction
-          and _compute_chunk_out_regs, pushes results to output queue.
+          pulls Batches from input queue, runs _split_to_per_instruction,
+          pushes results to the output queue.
       - Reader thread (in main process, daemon):
           pulls Batches from batch_iter (the RVT stream), pushes to
           input queue. Decoupling main loop from stdin read.
       - Main loop: consumes prepped tuples from output queue.
 
-    Why processes instead of threads: the per-chunk loop inside
-    _compute_chunk_out_regs is pure-Python (decoding tokens, SSA
-    analysis, exception handling) and entirely GIL-bound.
-    Threading caused net regression (worker fought main for GIL).
-    Process boundary eliminates GIL contention entirely; cost is
-    pickling each batch across the queue (numpy arrays in dataclass,
-    ~1-2ms per batch).
+    Why processes instead of threads: _split_to_per_instruction is
+    pure-Python numpy reshaping and entirely GIL-bound. Threading caused
+    net regression (worker fought main for GIL). Process boundary
+    eliminates GIL contention entirely; cost is pickling each batch across
+    the queue (numpy arrays in dataclass, ~1-2ms per batch).
 
     Spawn context (not fork) avoids any CUDA-state contamination since
     the worker is a fresh interpreter.
@@ -1138,15 +1164,14 @@ class TrainBatchPrefetcher:
 
     _EOF = None  # sentinel
 
-    def __init__(self, batch_iter, anchor_states_np, compute_out_regs,
-                 maxsize=4):
+    def __init__(self, batch_iter, maxsize=4):
         import multiprocessing as mp
         ctx = mp.get_context('spawn')
         self._in_q = ctx.Queue(maxsize=maxsize)
         self._out_q = ctx.Queue(maxsize=maxsize)
         self._worker = ctx.Process(
             target=_mp_worker_main,
-            args=(self._in_q, self._out_q, anchor_states_np, compute_out_regs),
+            args=(self._in_q, self._out_q),
             daemon=True,
         )
         self._worker.start()
@@ -1188,6 +1213,7 @@ def train_t2_encoder(batch_iter, t1_encoder, *,
                      in_slot_weight=0.1, out_slot_weight=0.1,
                      value_predict_weight=0.0,
                      value_predict_every=1,
+                     pair_weight=0.0, pair_scale=0.5,
                      anchor_seed=0, n_anchor_states=8,
                      t2_checkpoint=None,
                      device='auto',
@@ -1262,7 +1288,7 @@ def train_t2_encoder(batch_iter, t1_encoder, *,
             f'li {r["live_in"]:.3f} lo {r["live_out"]:.3f} '
             f'pc {r["pc_writes"]:.3f} '
             f'is {r["in_slot"]:.3f} os {r["out_slot"]:.3f} '
-            f'vp {r["value_pred"]:.4f}) '
+            f'vp {r["value_pred"]:.4f} pair {r["pair"]:.4f}) '
             f'B={r["n_chunks"]} I={r["n_instrs"]}  '
             f'lr {lr_now:.1e}  {ms:.0f}ms/step  '
             f'eta {timedelta(seconds=int(eta))}')
@@ -1286,9 +1312,7 @@ def train_t2_encoder(batch_iter, t1_encoder, *,
     # Wrap batch_iter in a prefetcher so CPU-side prep (numpy splitting and
     # the per-chunk loop for value-predict targets) overlaps
     # with GPU work on the prior batch.
-    batch_source = TrainBatchPrefetcher(
-        batch_iter, anchor_np,
-        compute_out_regs=(value_predict_weight > 0))
+    batch_source = TrainBatchPrefetcher(batch_iter)
 
     # Peek the first item: batch shape (n_chunks, max_n_instrs) and vp/valid
     # activity are corpus-constant, so bake them as Python constants into the
@@ -1299,6 +1323,8 @@ def train_t2_encoder(batch_iter, t1_encoder, *,
     N_CHUNKS, MAX_NI = first[0].instr_lens.shape
     d_t1 = t1_encoder.d_out
     vp_active = value_predict_weight > 0
+    pair_active = pair_weight > 0
+    out_regs_active = vp_active or pair_active
     valid_active = valid_weight > 0
 
     t2.train()
@@ -1326,21 +1352,26 @@ def train_t2_encoder(batch_iter, t1_encoder, *,
                 t2, t2_out, anchor_states_t, in_slot, out_slot, out_regs, vp_mask)
         else:
             vp = t2_out.new_zeros(())
+        if pair_active:
+            pair = t2_pair_loss(t2_out, out_regs, lo, vp_mask, scale=pair_scale)
+        else:
+            pair = t2_out.new_zeros(())
         total = (valid_weight * valid_loss
                  + live_in_weight * bl['live_in']
                  + live_out_weight * bl['live_out']
                  + pc_writes_weight * bl['pc_writes']
                  + in_slot_weight * bl['in_slot']
                  + out_slot_weight * bl['out_slot']
-                 + value_predict_weight * vp)
+                 + value_predict_weight * vp
+                 + pair_weight * pair)
         metrics = {'total': total, 'valid': valid_loss,
                    'live_in': bl['live_in'], 'live_out': bl['live_out'],
                    'pc_writes': bl['pc_writes'], 'in_slot': bl['in_slot'],
-                   'out_slot': bl['out_slot'], 'value_pred': vp}
+                   'out_slot': bl['out_slot'], 'value_pred': vp, 'pair': pair}
         return total, metrics, None
 
     def _prep(item):
-        batch, split_outputs, out_regs_np, vp_mask_np = item
+        batch, split_outputs = item
         instr_tokens, instr_pad, chunk_idx, slot_idx, n_per_chunk = split_outputs
         if instr_tokens.shape[0] == 0:        # all-invalid batch
             return None
@@ -1359,9 +1390,9 @@ def train_t2_encoder(batch_iter, t1_encoder, *,
         chunk_pad[:, 0] = False
         valid_f = (_h2d(batch.valid, device, dtype=torch.float32)
                    if valid_active else _dummy)
-        if vp_active:
-            out_regs_t = _h2d(out_regs_np, device)
-            vp_mask_t = _h2d(vp_mask_np, device)
+        if out_regs_active:
+            out_regs_t = _h2d(batch.out_regs, device)
+            vp_mask_t = _h2d(batch.out_regs_valid, device)
         else:
             out_regs_t = vp_mask_t = _dummy
         return (chunk_t1, chunk_pad,

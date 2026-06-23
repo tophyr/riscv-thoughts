@@ -250,16 +250,25 @@ class Batch:
     pc_writes:      np.ndarray   # (B,) bool — pc_explicit flag
     in_slot_regs:   np.ndarray   # (B, MAX_INPUT_SLOTS) int8 — reg or AUX_CE_IGNORE
     out_slot_regs:  np.ndarray   # (B, MAX_OUTPUT_SLOTS) int8
+    # Full post-execution register file per anchor — the value-prediction
+    # oracle target. Computed in the (parallel) gen workers from the same
+    # Precomputed as the binding aux, so the trainer reads it instead of
+    # recomputing single-threaded. OB = B when shipped (T2 twin mode), 0
+    # otherwise; out_regs_valid marks decodable non-mem rows.
+    out_regs:       np.ndarray   # (OB, n_anchors, N_REGS) int32
+    out_regs_valid: np.ndarray   # (OB,) bool
 
 
 RVT_FORMAT = BinaryFormat(
-    magic=b'RVT\x00', version=6,
-    header_fields=['B', 'max_tokens', 'max_n_instrs', 'RB', 'n_anchors'],
+    magic=b'RVT\x00', version=7,
+    header_fields=['B', 'max_tokens', 'max_n_instrs', 'RB', 'n_anchors', 'OB'],
     body_fields=[
         BodyField('tokens', np.dtype(np.int8), ('B', 'max_tokens')),
         BodyField('token_lens', np.dtype(np.int32), ('B',)),
         BodyField('valid', np.dtype(np.bool_), ('B',)),
         BodyField('instr_lens', np.dtype(np.int32), ('B', 'max_n_instrs')),
+        BodyField('out_regs', np.dtype(np.int32), ('OB', 'n_anchors', N_REGS)),
+        BodyField('out_regs_valid', np.dtype(np.bool_), ('OB',)),
         BodyField('row_outputs', np.dtype(np.float32), ('RB', 'n_anchors')),
         BodyField('row_has_rd', np.dtype(np.bool_), ('RB',)),
         BodyField('pair_valid', np.dtype(np.bool_), ('RB',)),
@@ -331,9 +340,26 @@ def _aux_from_precomputeds(precomputeds):
     return aux
 
 
+def _out_regs_from_precomputeds(precomputeds, n_anchors):
+    """Full post-execution register file per anchor for each row, from the
+    already-computed Precomputeds. None rows (invalid / mem-op) → zeros with
+    valid=False. Same result the trainer would recompute single-threaded;
+    computing it here ships it from the (parallel) gen workers instead."""
+    n = len(precomputeds)
+    out = np.zeros((n, n_anchors, N_REGS), dtype=np.int32)
+    valid = np.zeros(n, dtype=bool)
+    for i, pre in enumerate(precomputeds):
+        if pre is None:
+            continue
+        out[i] = pre.out_regs
+        valid[i] = True
+    return out, valid
+
+
 def pack_batch(chunks, *,
                target_B, target_max_tokens,
                target_max_n_instrs,
+               out_regs=None, out_regs_valid=None,
                row_outputs_payload=None,
                aux_payload=None):
     """Build a Batch from chunks, optionally with a row-outputs payload.
@@ -405,9 +431,19 @@ def pack_batch(chunks, *,
             for j, instr in enumerate(c.instructions):
                 instr_lens[i, j] = len(encode_instruction(instr))
 
+    # Shared anchor count across the per-anchor payloads (out_regs in T2
+    # mode, row_outputs in T1 mode). Even an EMPTY payload carries n_anchors
+    # in its anchor dim so the header derives the same value from either.
+    if out_regs is not None:
+        n_anchors = int(out_regs.shape[1])
+    elif row_outputs_payload is not None:
+        n_anchors = int(row_outputs_payload.row_outputs.shape[1])
+    else:
+        n_anchors = 0
+
     if row_outputs_payload is None:
-        # No row-outputs payload: the row-* fields are empty.
-        row_outputs_arr = np.zeros((0, 0), dtype=np.float32)
+        # No row-outputs payload: RB = 0 (carry n_anchors).
+        row_outputs_arr = np.zeros((0, n_anchors), dtype=np.float32)
         has_rd_arr = np.zeros((0,), dtype=bool)
         pair_valid_arr = np.zeros((0,), dtype=bool)
     else:
@@ -418,8 +454,6 @@ def pack_batch(chunks, *,
                 f'row_outputs_payload.row_outputs first dim '
                 f'({p.row_outputs.shape[0]}) must equal '
                 f'actual_B ({actual_B})')
-        n_anchors = p.row_outputs.shape[1]
-
         row_outputs_arr = np.zeros((B, n_anchors), dtype=np.float32)
         row_outputs_arr[:actual_B] = p.row_outputs.astype(
             np.float32, copy=False)
@@ -429,6 +463,21 @@ def pack_batch(chunks, *,
 
         pair_valid_arr = np.zeros((B,), dtype=bool)
         pair_valid_arr[:actual_B] = p.pair_valid
+
+    # out_regs payload (OB = B in T2 mode, 0 otherwise). Empty carries
+    # n_anchors so the header is consistent with row_outputs.
+    if out_regs is None:
+        out_regs_arr = np.zeros((0, n_anchors, N_REGS), dtype=np.int32)
+        out_regs_valid_arr = np.zeros((0,), dtype=bool)
+    else:
+        if out_regs.shape[0] != actual_B:
+            raise ValueError(
+                f'out_regs first dim ({out_regs.shape[0]}) must equal '
+                f'actual_B ({actual_B})')
+        out_regs_arr = np.zeros((B, n_anchors, N_REGS), dtype=np.int32)
+        out_regs_arr[:actual_B] = out_regs
+        out_regs_valid_arr = np.zeros((B,), dtype=bool)
+        out_regs_valid_arr[:actual_B] = out_regs_valid
 
     aux = aux_payload if aux_payload is not None else _empty_aux(actual_B)
     if aux.live_in_mask.shape[0] != actual_B:
@@ -448,6 +497,8 @@ def pack_batch(chunks, *,
 
     return Batch(tokens=tokens, token_lens=token_lens, valid=valid,
                  instr_lens=instr_lens,
+                 out_regs=out_regs_arr,
+                 out_regs_valid=out_regs_valid_arr,
                  row_outputs=row_outputs_arr,
                  row_has_rd=has_rd_arr,
                  pair_valid=pair_valid_arr,
@@ -503,8 +554,10 @@ def build_twins(chunks, twins, anchor_states, rng):
     Memory-op chunks keep no twins (their Precomputed is unavailable in
     V1 scope) and contribute an empty aux row.
 
-    Returns (chunks_out, aux) where chunks_out extends `chunks` with the
-    new twins and aux is the parallel AuxPayload.
+    Returns (chunks_out, aux, out_regs, out_regs_valid) where chunks_out
+    extends `chunks` with the new twins, aux is the parallel AuxPayload, and
+    out_regs/out_regs_valid are the per-row post-exec register file (the
+    value-prediction oracle target, shipped from the gen workers).
     """
     # Filter out memory-op chunks at the source list — twins inherit
     # their parent's filtering.
@@ -540,8 +593,10 @@ def build_twins(chunks, twins, anchor_states, rng):
         for ch, hp in zip(chunks_out, has_pre)
     ]
     aux = _aux_from_precomputeds(aux_pre)
+    out_regs, out_regs_valid = _out_regs_from_precomputeds(
+        aux_pre, anchor_states.shape[0])
 
-    return chunks_out, aux
+    return chunks_out, aux, out_regs, out_regs_valid
 
 
 def build_row_outputs(chunks, twins, anchor_states, rng):
@@ -709,7 +764,7 @@ def collect_into_batches(chunks_iter, *, batch_size, twins,
                     row_outputs_payload=payload,
                     aux_payload=aux)
             else:
-                chunks_out, aux = build_twins(
+                chunks_out, aux, out_regs, out_regs_valid = build_twins(
                     mixed, twins=twins,
                     anchor_states=anchor_states, rng=rng)
                 yield pack_batch(
@@ -717,4 +772,6 @@ def collect_into_batches(chunks_iter, *, batch_size, twins,
                     target_B=target_B,
                     target_max_tokens=target_max_tokens,
                     target_max_n_instrs=target_max_n_instrs,
+                    out_regs=out_regs,
+                    out_regs_valid=out_regs_valid,
                     aux_payload=aux)

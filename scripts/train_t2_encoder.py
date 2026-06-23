@@ -71,6 +71,13 @@ def main():
                         '(default 1 = every step). Amortizes the '
                         'Python-side per-row precompute_chunk loop '
                         'that dominates per-step cost otherwise.')
+    p.add_argument('--pair-weight', type=float, default=1.0,
+                   help='Oracle behavioral pairwise loss (rename-sensitive): '
+                        'match chunk-vector cosine distance to a behavioral '
+                        'distance from their out_regs. 0 = off.')
+    p.add_argument('--pair-scale', type=float, default=0.5,
+                   help='Maps behavioral distance (loglog ~[0,3]) to target '
+                        'cosine distance ([0,2]).')
     p.add_argument('--anchor-seed', type=int, default=0,
                    help='Anchor-states seed (must match gen_batches).')
     p.add_argument('--n-anchor-states', type=int, default=8,
@@ -109,6 +116,8 @@ def main():
         out_slot_weight=args.out_slot_weight,
         value_predict_weight=args.value_predict_weight,
         value_predict_every=args.value_predict_every,
+        pair_weight=args.pair_weight,
+        pair_scale=args.pair_scale,
         anchor_seed=args.anchor_seed,
         n_anchor_states=args.n_anchor_states,
         t2_checkpoint=args.resume,

@@ -400,7 +400,7 @@ def test_build_twins_builds_twin_clusters():
         _instrs_to_chunk([Instruction('XOR', 3, 1, 1)]),
         _instrs_to_chunk([Instruction('OR', 4, 1, 2)]),
     ]
-    out, _aux = build_twins(
+    out, _aux, _or, _orv = build_twins(
         chunks, twins=2, anchor_states=anchors, rng=rng)
     # Each source plus its 2 twins forms a cluster of 3 → 3*3 rows.
     assert len(out) == 3 * 3
@@ -417,7 +417,7 @@ def test_build_twins_aux_content_and_none_rows():
         _make_invalid_chunk([5, 6, 7]),                    # invalid → None row
         _instrs_to_chunk([Instruction('LW', 9, 0, 3)]),    # mem-op → None row
     ]
-    out, aux = build_twins(chunks, twins=0, anchor_states=anchors, rng=rng)
+    out, aux, _or, _orv = build_twins(chunks, twins=0, anchor_states=anchors, rng=rng)
     assert len(out) == 3  # twins=0 → no growth
 
     # Row 0: ADD x5,x1,x2.
@@ -488,7 +488,7 @@ def test_build_twins_drops_memory_op_chunks():
         _instrs_to_chunk([Instruction('ADD', 2, 3, 4)]),
         _instrs_to_chunk([Instruction('SUB', 5, 6, 7)]),
     ]
-    out, _aux = build_twins(
+    out, _aux, _or, _orv = build_twins(
         chunks, twins=1, anchor_states=anchors, rng=rng)
     # The mem-op chunk gets no twins.
     # 1 mem-op + 2 sources × 2 cluster_size = 1 + 4 = 5.
