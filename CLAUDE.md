@@ -97,6 +97,16 @@ was needed "for distance comparability" — also wrong; distances are
 self-contained per pair. Always grep for callers before defending a
 value.
 
+## Data generation pipeline
+
+Nearly every task in this project touches datagen, so the pipeline guide
+is imported in full below. It carries the silent-corruption invariants
+(anchor-seed match, fixed batch shape, raw-vs-canonical anchors) and the
+orphan-worker remediation — apply them when editing `datagen/`, the
+`scripts/` stream tools, the RVT format, or the multinode generators.
+
+@datagen/SKILL.md
+
 ## Anchored memory
 
 These prior-session memory files apply without requiring reload.
