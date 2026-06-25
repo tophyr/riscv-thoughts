@@ -1,13 +1,11 @@
 """Smoke tests for compressor.eval diagnostic functions.
 
-These run each diagnostic against an untrained model on a small fixture.
-They verify:
-  - Each function executes end-to-end without crashing.
-  - The returned dict has the documented keys/shapes.
-
-They do NOT assert on metric values: an untrained encoder won't satisfy
-the Step 1 / Step 2 acceptance thresholds. Acceptance assertions belong
-in test_acceptance.py with --encoder/--decoder fixtures.
+Runs each diagnostic against an untrained model on a small fixture, verifying
+it executes end-to-end and returns the documented keys/shapes (no metric-value
+assertions — an untrained model means nothing about the numbers). The
+equivariant measures (equivariance_error / tag_invariance / binding accuracy /
+gvn_collapse) are exercised end-to-end by scripts/tests/test_pipeline.py via
+the scripts/eval.py CLI.
 """
 
 import numpy as np
@@ -15,24 +13,18 @@ import pytest
 import torch
 
 from compressor.model import T1Compressor, Decoder
-from compressor.eval import (
-    equivalence_collapse,
-    validity_separation, decoder_accuracy,
-)
-from datagen.batch import (
-    Chunk, RVT_FORMAT, generate_chunks, collect_into_batches,
-    _make_valid_chunk,
-)
+from compressor.eval import decoder_accuracy
+from datagen.batch import generate_chunks, collect_into_batches
 from datagen.compare import make_anchor_states
-from datagen.generate import single, random_instruction
+from datagen.generate import single
 from tokenizer import VOCAB_SIZE
 
 
 @pytest.fixture
 def encoder():
     torch.manual_seed(0)
-    return T1Compressor(VOCAB_SIZE, d_model=32, n_heads=2, n_layers=1,
-                        d_out=32, max_window=72)
+    return T1Compressor(vocab_size=VOCAB_SIZE, d_model=32, n_heads=2,
+                        n_layers=1, max_window=72, d_out=32, d_event=16)
 
 
 @pytest.fixture
@@ -49,33 +41,9 @@ def batches():
         generate_chunks(single(), rng),
         batch_size=8, twins=1,
         anchor_states=anchors, rng=rng,
-        max_chunk_len=1,
-        row_outputs_mode=True,   # live T1 path (row-outputs value-prediction)
+        max_chunk_len=1,         # single-instr T1 corpus (canonical out_regs)
     )
     return [next(gen) for _ in range(2)]
-
-
-def test_equivalence_collapse(encoder):
-    out = equivalence_collapse(encoder, device='cpu', n_samples=2, seed=0)
-    assert 'classes' in out
-    assert 'mean_ratio' in out
-    has_ratio = any(c['ratio'] is not None for c in out['classes'].values())
-    assert has_ratio
-
-
-def test_validity_separation(encoder):
-    out = validity_separation(
-        encoder, device='cpu', n_per_class=20, max_window=32, seed=0,
-        batch_size=20)
-    assert set(out) == {'class_stats', 'magnitude_acc',
-                        'majority_baseline', 'magnitude_threshold'}
-    assert set(out['class_stats']) == {
-        'valid', 'partial', 'spanning', 'multi', 'bogus'}
-    for stats in out['class_stats'].values():
-        assert stats['n'] == 20
-        assert stats['norm_mean'] >= 0
-    assert 0.0 <= out['magnitude_acc'] <= 1.0
-    assert 0.5 <= out['majority_baseline'] <= 1.0
 
 
 def test_decoder_accuracy(encoder, decoder, batches):

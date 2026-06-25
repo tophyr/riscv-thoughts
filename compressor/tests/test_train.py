@@ -11,7 +11,6 @@ head so the *target side* of the loss is exercised deterministically.
 import math
 
 import numpy as np
-import pytest
 import torch
 
 from datagen import AUX_CE_IGNORE, MAX_INPUT_SLOTS, MAX_OUTPUT_SLOTS
@@ -25,9 +24,7 @@ from compressor.train import (
     binding_losses,
     build_optim_sched,
     prepare_decoder_targets,
-    t2_pair_loss,
     t2_value_predict_loss,
-    value_predict_loss,
 )
 
 
@@ -49,76 +46,55 @@ class _ConstHead(torch.nn.Module):
 
 
 # ===========================================================================
-# value_predict_loss
+# t2_value_predict_loss (the one canonical vp loss, shared by T1 and T2)
 # ===========================================================================
 
-def test_value_predict_loss_matches_hand_computed_mse():
-    """Per-row MSE with a zero-prediction head equals mean over anchors
-    of compressed-target squared; only (pair_valid & has_rd) rows count."""
-    B, d, A = 3, 4, 2
+class _CaptureHead(torch.nn.Module):
+    """Records the last feature tensor it was called with, returns zeros —
+    lets a test read exactly what values the vp loss fed the head."""
+
+    def __init__(self, out_dim):
+        super().__init__()
+        self.out_dim = out_dim
+        self.last = None
+
+    def forward(self, x):
+        self.last = x.detach().clone()
+        return torch.zeros((*x.shape[:-1], self.out_dim))
+
+
+def test_t2_value_predict_loss_feeds_canonical_inputs_not_raw():
+    """The head is fed the CANONICAL input value anchor[:, k+1] for
+    filled input slot k — NOT the raw value at the slot's actual register
+    (the old bug). Unfilled slots feed 0."""
+    B, d, A = 1, 4, 2
     vecs = torch.zeros(B, d)
-    anchor_states = torch.zeros(A, 32, dtype=torch.int32)
-    src0 = torch.zeros(B, dtype=torch.int64)
-    src1 = torch.zeros(B, dtype=torch.int64)
-    row_outputs = torch.tensor([[3.0, 5.0], [7.0, 7.0], [100.0, 200.0]])
-    pair_valid = torch.tensor([True, True, False])
-    has_rd = torch.tensor([True, False, True])
-    # mask = pair_valid & has_rd = [True, False, False] -> only row 0.
+    # Distinct value per (anchor, position): pos p, anchor a -> 10*p + a.
+    anchor = torch.zeros(A, 32, dtype=torch.int32)
+    for p in range(32):
+        for a in range(A):
+            anchor[a, p] = 10 * p + a
+    in_slot = torch.full((B, MAX_INPUT_SLOTS), AUX_CE_IGNORE, dtype=torch.int64)
+    # Slot 0 filled, bound to actual reg 7 (canonical position is 1, not 7).
+    in_slot[0, 0] = 7
+    out_slot = torch.full((B, MAX_OUTPUT_SLOTS), AUX_CE_IGNORE, dtype=torch.int64)
+    out_regs = torch.zeros(B, A, 32, dtype=torch.int32)
 
-    loss = value_predict_loss(
-        _ConstHead(1, 0.0), vecs, anchor_states, src0, src1,
-        row_outputs, pair_valid, has_rd)
+    head = _CaptureHead(MAX_OUTPUT_SLOTS)
+    fake = type('T2', (), {'vp_head': head})()
+    t2_value_predict_loss(
+        fake, vecs, anchor, in_slot, out_slot, out_regs,
+        torch.tensor([True]))
 
-    tc = _value_compress(row_outputs)
-    expected = (tc[0] ** 2).mean()   # row 0, pred=0
-    assert math.isclose(loss.item(), expected.item(), rel_tol=1e-6)
+    in_vals = head.last[..., d:]                       # (B, A, MAX_IN)
+    # Slot 0 fed canonical position 1 (= anchor[:, 1]), per anchor.
+    canon1 = _value_compress(anchor[:, 1].float())     # (A,)
+    raw7 = _value_compress(anchor[:, 7].float())
+    assert torch.allclose(in_vals[0, :, 0], canon1, atol=1e-5)
+    assert not torch.allclose(in_vals[0, :, 0], raw7)  # NOT the raw register
+    # Unfilled slots feed 0.
+    assert torch.allclose(in_vals[0, :, 1:], torch.zeros_like(in_vals[0, :, 1:]))
 
-
-def test_value_predict_loss_masked_rows_excluded():
-    """Changing a masked-out row's target must NOT change the loss; only
-    the single (valid & has_rd) row drives the mean."""
-    B, d, A = 3, 4, 2
-    vecs = torch.zeros(B, d)
-    anchor_states = torch.zeros(A, 32, dtype=torch.int32)
-    src0 = torch.zeros(B, dtype=torch.int64)
-    src1 = torch.zeros(B, dtype=torch.int64)
-    pair_valid = torch.tensor([True, True, False])
-    has_rd = torch.tensor([True, False, True])
-
-    base = torch.tensor([[3.0, 5.0], [7.0, 7.0], [100.0, 200.0]])
-    perturbed = base.clone()
-    perturbed[1] = 999.0       # masked (has_rd False)
-    perturbed[2] = -42.0       # masked (pair_valid False)
-
-    l_base = value_predict_loss(
-        _ConstHead(1), vecs, anchor_states, src0, src1, base,
-        pair_valid, has_rd)
-    l_pert = value_predict_loss(
-        _ConstHead(1), vecs, anchor_states, src0, src1, perturbed,
-        pair_valid, has_rd)
-    assert math.isclose(l_base.item(), l_pert.item(), rel_tol=1e-7)
-
-
-def test_value_predict_loss_empty_mask_is_zero():
-    """No (pair_valid & has_rd) rows -> exactly 0.0, no grad."""
-    B, d, A = 2, 4, 2
-    vecs = torch.zeros(B, d)
-    anchor_states = torch.zeros(A, 32, dtype=torch.int32)
-    src0 = torch.zeros(B, dtype=torch.int64)
-    src1 = torch.zeros(B, dtype=torch.int64)
-    row_outputs = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
-    pair_valid = torch.tensor([False, True])
-    has_rd = torch.tensor([True, False])    # AND is all-False
-
-    loss = value_predict_loss(
-        _ConstHead(1), vecs, anchor_states, src0, src1, row_outputs,
-        pair_valid, has_rd)
-    assert loss.item() == 0.0
-
-
-# ===========================================================================
-# t2_value_predict_loss
-# ===========================================================================
 
 def test_t2_value_predict_loss_gather_and_mask():
     """out_slot_regs gather picks the right register column of out_regs;
@@ -180,43 +156,6 @@ def test_t2_value_predict_loss_empty_masks_are_zero():
     assert z2.item() == 0.0
 
 
-def test_t2_pair_loss_identical_behavior_targets_zero():
-    B, A = 2, 2
-    out_regs = torch.zeros(B, A, 32, dtype=torch.int32)
-    live_out = torch.zeros(B, 32); live_out[:, 5] = 1.0
-    valid = torch.tensor([True, True])
-    loss0 = t2_pair_loss(torch.tensor([[1., 0, 0, 0], [1., 0, 0, 0]]),
-                         out_regs, live_out, valid, scale=0.5, strides=(1,))
-    assert loss0.item() == pytest.approx(0.0, abs=1e-6)
-    loss1 = t2_pair_loss(torch.tensor([[1., 0, 0, 0], [0., 1, 0, 0]]),
-                         out_regs, live_out, valid, scale=0.5, strides=(1,))
-    assert loss1.item() == pytest.approx(1.0, abs=1e-6)
-
-
-def test_t2_pair_loss_different_behavior_pushes_apart():
-    B, A = 2, 2
-    out_regs = torch.zeros(B, A, 32, dtype=torch.int32); out_regs[1, :, 5] = 1000
-    live_out = torch.zeros(B, 32); live_out[:, 5] = 1.0
-    loss = t2_pair_loss(torch.tensor([[1., 0, 0, 0], [1., 0, 0, 0]]),
-                        out_regs, live_out, torch.tensor([True, True]),
-                        scale=0.5, strides=(1,))
-    target = 0.5 * math.log1p(math.log1p(1000.0))
-    assert loss.item() == pytest.approx(target ** 2, rel=1e-4)
-
-
-def test_t2_pair_loss_invalid_rows_excluded_and_differentiable():
-    z = t2_pair_loss(torch.eye(2, 4), torch.zeros(2, 2, 32, dtype=torch.int32),
-                     torch.ones(2, 32), torch.tensor([False, False]),
-                     scale=0.5, strides=(1,))
-    assert z.item() == 0.0
-    vecs = torch.randn(8, 16, requires_grad=True)
-    loss = t2_pair_loss(vecs, torch.randint(-5000, 5000, (8, 4, 32), dtype=torch.int32),
-                        (torch.rand(8, 32) > 0.5).float(), torch.ones(8, dtype=torch.bool),
-                        scale=0.5)
-    loss.backward()
-    assert loss.dim() == 0 and torch.isfinite(vecs.grad).all()
-
-
 def test_gen_shipped_out_regs_matches_recompute():
     """The out_regs the gen workers ship in the RVT batch must be bit-
     identical to what the trainer would recompute single-threaded (the
@@ -237,6 +176,44 @@ def test_gen_shipped_out_regs_matches_recompute():
     ref_out, ref_valid = _compute_chunk_out_regs(batch, anchors)
     assert np.array_equal(batch.out_regs, ref_out)
     assert np.array_equal(batch.out_regs_valid, ref_valid)
+
+
+# ===========================================================================
+# _t1_predicted_wiring (tier-recursion routing)
+# ===========================================================================
+
+def test_t1_predicted_wiring_from_binding_scores():
+    """T2 derives (in0,in1,out) from T1's predicted binding: out = top
+    out_score; in0/in1 = top-2 in_score in read order; operand count gated by
+    predicted live_in/live_out; absent operands route to x0."""
+    from compressor.train import _t1_predicted_wiring
+    n_regs, N, NEG = 8, 3, -50.0
+    # instr0: reads 3 (first) then 5 (second), writes 7.
+    # instr1: reads 2, writes 4.   instr2: reads nothing, writes 6 (LUI-like).
+    in_s = torch.full((N, n_regs), NEG)
+    in_s[0, 3] = 10.0; in_s[0, 5] = 5.0; in_s[1, 2] = 10.0
+    out_s = torch.full((N, n_regs), NEG)
+    out_s[0, 7] = 10.0; out_s[1, 4] = 10.0; out_s[2, 6] = 10.0
+    live_in = torch.full((N, n_regs), -10.0)
+    live_in[0, 3] = 10.0; live_in[0, 5] = 10.0; live_in[1, 2] = 10.0
+    live_out = torch.full((N, n_regs), -10.0)
+    live_out[0, 7] = 10.0; live_out[1, 4] = 10.0; live_out[2, 6] = 10.0
+
+    class _Stub:
+        n_regs = 8
+        def in_score_head(self, T):   return in_s.unsqueeze(-1)
+        def out_score_head(self, T):  return out_s.unsqueeze(-1)
+        def live_in_head(self, T):    return live_in.unsqueeze(-1)
+        def live_out_head(self, T):   return live_out.unsqueeze(-1)
+
+    in0, in1, out = _t1_predicted_wiring(_Stub(), torch.zeros(N, n_regs, 4))
+    assert in0.tolist() == [3, 2, 0]     # first operand / single / none
+    assert in1.tolist() == [5, 0, 0]     # second operand / none / none
+    assert out.tolist() == [7, 4, 6]
+    # x0 never selected even if it scored highest.
+    in_s[2, 0] = 100.0; live_in[2, 0] = 10.0
+    i0b, _, _ = _t1_predicted_wiring(_Stub(), torch.zeros(N, n_regs, 4))
+    assert i0b[2].item() == 0            # x0 masked out of contention -> absent
 
 
 # ===========================================================================
@@ -291,7 +268,9 @@ def test_listmle_loss_zero_filled_rows_stay_finite():
 
 class _StubBindingModel:
     """Binding heads return caller-fixed logits/scores, so binding_losses
-    can be driven to a known value independent of learned weights."""
+    can be driven to a known value independent of learned weights. The
+    per-slot heads return (B, n_regs, 1) (binding_losses squeezes the last
+    dim); pc_writes reads essence and returns (B, 1)."""
 
     def __init__(self, *, n_regs, li, lo, pc, in_s, out_s,
                  max_input_slots, max_output_slots):
@@ -301,11 +280,11 @@ class _StubBindingModel:
         self._li, self._lo, self._pc = li, lo, pc
         self._in, self._out = in_s, out_s
 
-    def live_in_head(self, x):    return self._li
-    def live_out_head(self, x):   return self._lo
-    def pc_writes_head(self, x):  return self._pc
-    def in_score_head(self, x):   return self._in
-    def out_score_head(self, x):  return self._out
+    def live_in_head(self, T):    return self._li.unsqueeze(-1)
+    def live_out_head(self, T):   return self._lo.unsqueeze(-1)
+    def pc_writes_head(self, e):  return self._pc
+    def in_score_head(self, T):   return self._in.unsqueeze(-1)
+    def out_score_head(self, T):  return self._out.unsqueeze(-1)
 
 
 def test_binding_losses_jointly_satisfiable():
@@ -333,7 +312,8 @@ def test_binding_losses_jointly_satisfiable():
         n_regs=n_regs, li=li, lo=lo, pc=pc_logit, in_s=in_s, out_s=out_s,
         max_input_slots=4, max_output_slots=4)
     out = binding_losses(
-        model, torch.randn(1, 16), live_in_t=live_in, live_out_t=live_out,
+        model, torch.randn(1, n_regs, 4), torch.randn(1, 4),
+        live_in_t=live_in, live_out_t=live_out,
         pc_writes_t=pc, in_slot_t=in_slot, out_slot_t=out_slot)
     for k in ('live_in', 'live_out', 'pc_writes', 'in_slot', 'out_slot'):
         assert float(out[k]) < 1e-3, (k, float(out[k]))
@@ -352,29 +332,44 @@ def test_binding_losses_excludes_all_zero_mask_rows():
         n_regs=n_regs, li=z, lo=z, pc=torch.zeros(2, 1), in_s=z, out_s=z,
         max_input_slots=4, max_output_slots=4)
     out = binding_losses(
-        model, torch.randn(2, 16), live_in_t=live_in, live_out_t=live_out,
+        model, torch.randn(2, n_regs, 4), torch.randn(2, 4),
+        live_in_t=live_in, live_out_t=live_out,
         pc_writes_t=pc, in_slot_t=in_slot, out_slot_t=out_slot)
     assert out['active_f'].tolist() == [1.0, 0.0]
 
 
 def test_t1_compressor_uses_t2_binding_heads():
-    """T1 carries T2's binding heads (and not the removed syntactic CE
-    heads), so the shared binding_losses runs on a real T1 vector."""
-    enc = T1Compressor(VOCAB_SIZE, d_model=32, n_heads=2, n_layers=1, d_out=16)
+    """T1 carries the per-slot binding heads (and not the removed syntactic
+    CE heads), so the shared binding_losses runs on a real (T, essence)."""
+    from emulator import Instruction
+    from tokenizer import encode_instruction
+    from compressor.model import instruction_wiring
+
+    enc = T1Compressor(vocab_size=VOCAB_SIZE, d_model=32, n_heads=2,
+                       n_layers=1, max_window=32, d_out=16, d_event=16)
     for h in ('live_in_head', 'live_out_head', 'pc_writes_head',
               'in_score_head', 'out_score_head'):
         assert hasattr(enc, h), h
     for gone in ('dest_type_head', 'dest_reg_head', 'src_reg_head_0'):
         assert not hasattr(enc, gone), gone
+
+    instr = Instruction('ADD', 5, 1, 2)               # reads 1,2 writes 5
+    toks = encode_instruction(instr)
+    tok = torch.tensor([toks]); pad = torch.zeros(1, len(toks), dtype=torch.bool)
+    i0, i1, o = instruction_wiring(instr)
+    tags = torch.randn(1, enc.n_regs); tags[:, 0] = 0.0
+    T, ess = enc.encode_state(
+        tok, pad, torch.tensor([i0]), torch.tensor([i1]), torch.tensor([o]), tags)
+
     n = enc.n_regs
-    live_in = torch.zeros(1, n); live_in[0, 1] = 1.0
+    live_in = torch.zeros(1, n); live_in[0, [1, 2]] = 1.0
     live_out = torch.zeros(1, n); live_out[0, 5] = 1.0
     in_slot = torch.full((1, enc.max_input_slots), AUX_CE_IGNORE, dtype=torch.long)
-    in_slot[0, 0] = 1
+    in_slot[0, 0], in_slot[0, 1] = 1, 2
     out_slot = torch.full((1, enc.max_output_slots), AUX_CE_IGNORE, dtype=torch.long)
     out_slot[0, 0] = 5
     out = binding_losses(
-        enc, torch.randn(1, 16), live_in_t=live_in, live_out_t=live_out,
+        enc, T, ess, live_in_t=live_in, live_out_t=live_out,
         pc_writes_t=torch.zeros(1), in_slot_t=in_slot, out_slot_t=out_slot)
     for k in ('live_in', 'live_out', 'pc_writes', 'in_slot', 'out_slot'):
         assert math.isfinite(float(out[k]))
@@ -460,30 +455,23 @@ def test_prepare_decoder_targets_empty():
 # ===========================================================================
 
 def test_t2compressor_forward_shape_and_padding_contract():
-    """Output shape (B, d_out); return_pooled gives (B, d_model). With
-    position 0 unmasked (the contract _assemble_chunk_seq guarantees) an
-    otherwise-all-padded row does NOT NaN. Pinning the boundary: raw
-    encode WITH a fully-padded row DOES NaN — protection lives in the
-    caller (train.py:645), not in encode."""
+    """The equivariant T2 runs the register-state machine over a chunk of
+    frozen-T1 essences threaded by per-instruction wiring. encode_state ->
+    (T (B,n_regs,d_out+d_event), essence (B,d_out)); padded steps (active=0)
+    are no-ops, so a chunk shorter than N does not NaN."""
     torch.manual_seed(0)
-    t2 = T2Compressor(d_t1=8, d_model=16, n_heads=2, n_layers=1,
-                      d_out=12, max_chunk_len=4)
-    B, N = 3, 4
-    seq = torch.randn(B, N, 8)
+    t2 = T2Compressor(d_t1=8, d_out=12, d_event=16)
+    B, N, R = 3, 4, t2.n_regs
+    seq = torch.randn(B, N, 8)                       # per-instr T1 essences
+    in0 = torch.randint(1, R, (B, N)); in1 = torch.randint(1, R, (B, N))
+    out = torch.randint(1, R, (B, N))
+    # row 2 is a 1-instruction chunk (rest padded -> active=0, no-op).
+    active = torch.ones(B, N); active[2, 1:] = 0.0
+    tags = torch.randn(B, R)
 
-    # Realistic mask: row 2 fully padded EXCEPT position 0 (as
-    # _assemble_chunk_seq forces). No NaN.
-    pad = torch.zeros(B, N, dtype=torch.bool)
-    pad[2, :] = True
-    pad[:, 0] = False
-    out, pooled = t2.encode(seq, pad, return_pooled=True)
-    assert out.shape == (B, 12)
-    assert pooled.shape == (B, 16)
-    assert not torch.isnan(out).any()
-
-    # Contract boundary: a truly all-padded row (position 0 masked too)
-    # DOES NaN — the model relies on the caller unmasking position 0.
-    pad_all = torch.zeros(B, N, dtype=torch.bool)
-    pad_all[2, :] = True
-    out_bad = t2.encode(seq, pad_all)
-    assert torch.isnan(out_bad[2]).any()
+    T, essence = t2.encode_state(seq, in0, in1, out, active, tags)
+    assert T.shape == (B, R, 12 + 16)
+    assert essence.shape == (B, 12)
+    assert not torch.isnan(T).any() and not torch.isnan(essence).any()
+    # encode() returns just the essence.
+    assert torch.allclose(t2.encode(seq, in0, in1, out, active, tags), essence)

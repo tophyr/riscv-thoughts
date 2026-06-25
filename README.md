@@ -49,44 +49,65 @@ See [RISCV_DESIGN.md](RISCV_DESIGN.md) for the testbed design.
 
 ## Current Status
 
-**Unified loss set — T1 is the single-instruction special case of T2.**
-Both train on one shared behavioral loss set (`compressor.train.binding_losses`):
-magnitude-as-validity (soft `(‖v‖−is_valid)²`), `live_in`/`live_out` (regs
-read/written), `pc_writes`, `in_slot`/`out_slot` (read/write ORDER via
-ListMLE score heads), and `value_predict` (predict output register values
-from inputs on sampled anchor states). **Equivalence is emergent** — there
-is no equivalence loss; equivalent instructions/chunks collapse from the
-behavioral targets alone. Earlier per-register pair-MSE, syntactic
-dest/src CE, explicit equivalence-collapse, and `rename_equiv` are
-removed; the `behavioral_distance` (GVN/Hungarian) machinery is a dormant
-offline oracle.
+**Rename-equivariant T1/T2 — one Compressor, validated as a real tier
+recursion.** The encoder is a register-indexed state machine (one
+`Compressor` class, `compressor/model.py`): it seeds 32 register slots with
+per-chunk anonymous tags, then per instruction reads operand slots → applies
+a shared op-cell → writes the destination slot, and emits the final
+register-indexed state. Because the only register-indexed input is the
+anonymous tag and reads/writes are pure one-hot ops, a register rename
+**permutes the slots exactly** — equivariance is by construction, not trained.
+Essence (operator axis) is a permutation-invariant pool over the register
+axis; binding is the per-slot remainder. T1 is literally T2 with `seq_len=1`:
+the only tier-specific piece is the content provider — T1 embeds an
+instruction's opcode+immediate tokens (registers stripped to wiring); T2 is
+fed a **frozen T1's per-instruction essence** (the tier contract — never a
+re-embedded opcode). See RISCV_DESIGN.md for the theory.
 
-**T1 encoder/decoder — validated.** T1 in the unit ball (magnitude =
-validity, direction = semantics): ~99.8% magnitude-threshold validity
-accuracy; equivalence classes collapse without an equivalence loss.
-CE-trained decoder on a frozen encoder reaches 95%+ training tok_acc;
-generalization ceiling ~72% held-out, set by encoder geometry, with ~23%
-of held-out decodings execution-equivalent to the original.
+**Shared loss set; equivalence is emergent.** Both tiers train on the same
+behavioral losses (`compressor.train.binding_losses`): magnitude-as-validity
+(soft `(‖v‖−is_valid)²`), `live_in`/`live_out`, `pc_writes`,
+`in_slot`/`out_slot` (read/write ORDER via ListMLE score heads), and a
+canonical `value_predict` (predict canonical output-register values from
+canonical input values on sampled anchor states). There is **no equivalence
+loss** — equivalent chunks collapse from the behavioral targets alone.
 
-**T2 compressor — converged, single open-space d=512 vector.** A merged
-512-d vector (no shape/binding split) learns the binding losses cleanly
-(cap=4: in_slot/out_slot ~99%, dup 0). A 2M-step convergence run
-(`runs/t2_d512_cap4_2M`, vp 2.15→0.18) established the **central open
-finding**: value-prediction does **not** induce an operator/effect axis.
-Holding register binding fixed, flipping the computed function barely
-moves the vector (cosine gap ~0.01) while changing the binding moves it
-~0.18 — binding dominates the geometry ~16×, and more vp training shrank
-the gap rather than growing it. The vector also uses only ~13 of 512
-effective dimensions, so **capacity is not the bottleneck — the objective
-is.** The indicated fix is an oracle `out_regs` pairwise loss
-(rename-sensitive behavioral distance) that forces behavioral separation.
-See EXPERIMENT_LOG.md Phase 12.
+**T1 — validated** (`runs/t1_equiv_d128_canonvp_250k`, d128/n4/l2/d_out64,
+250k, `--rule single`): equivariance `0.00e+00` (exact, on the trained
+model), tag-invariance `1.0000`; binding live_in 99.9% / live_out 100% / pc
+100% / in_slot 100% / out_slot 100% / dup 0. Magnitude carries validity,
+direction carries semantics (open space — train *toward* the unit surface
+with the soft loss, never `F.normalize` onto it).
 
-**Infrastructure.** Full-step `torch.compile` (CUDA graphs) + pinned H2D
-saturate the GPU at ~95% for T1, T2, and the decoder; the compiled
-train step is shared via `run_train_loop`. Streaming pipeline:
+**T2 — tier recursion validated** (`runs/t2_equiv_d512_cap4_2M_principled`,
+d_out=512, `branch+cap=4`, 2M, routing off T1's *predicted* binding). T2
+derives each instruction's wiring from the frozen T1's own binding
+predictions (`argmax`/top-k of its in/out-slot scores), **not** decoded
+tokens — so the run actually tests the claim the whole hierarchy rests on:
+*is T1's emitted representation sufficient for the next tier?* Held-out:
+live_in 99.7% / live_out 100% / pc 98.4% / in_slot 91.5% / out_slot 99.9% /
+dup 0 (in_slot's 91.5% vs 93.8% on ground-truth token wiring is the honest
+cost of routing off *predicted*, imperfect binding). Equivariance composes
+exactly over a chunk (`0.00e+00`).
+
+**The headline is GVN behavioral collapse, not value-prediction.** Essence
+distance split by pair type: rename-twins `0.008` (structural — free from the
+equivariant architecture), **behavioral-non-rename (commutativity) `0.024`**
+(TRAINED value-numbering — collapses ~28× vs distinct), distinct `0.659`. The
+non-rename collapse is the real result: the register-state machine performs
+global value numbering, and not merely the free rename-twin collapse. `vp` is
+a **diagnostic probe** sitting at an intrinsic floor (regressing wrapped /
+bitwise ops from log-compressed scalar operands is hard for any MLP) — do not
+read its absolute value as the objective; GVN collapse is the property that
+matters.
+
+**Infrastructure.** The frozen-T1 encode + predicted-binding routing + T2
+state machine + losses fold into ONE compiled CUDA-graph step at a
+fixed-padded instruction count (verified bit-identical to the ragged path):
+**T2 at 8–9 ms/step / 95–97% GPU util**. Streaming pipeline:
 `mux_batches (N× gen_batches) | batch_slice | train_t2_encoder` — CPU
-generates/analyzes chunks, the trainer only does forward/backward.
+generates/analyzes chunks, the trainer only does forward/backward. RVT wire
+format is **v8** (5-field header; the retired raw row-outputs path is gone).
 
 **GPU batch emulator.** All RV32I opcodes executable in parallel via
 `torch.where`, ~1.7ms for B=4096.
@@ -112,9 +133,10 @@ emulator/       RV32I emulator + GPU batch emulator (all opcodes via
                 torch.where)
 tokenizer/      Structural tokenizer
 datagen/        RVT batch format + chunk analysis: SSA, anchor
-                execution, behavioral binding targets, equivalence
-                manifest. behavioral_distance (GVN) is a dormant oracle.
-compressor/     T1/T2 encoders, decoder, shared training loop (train.py)
+                execution, canonical out_regs oracle, behavioral binding
+                targets, equivalence manifest.
+compressor/     Equivariant Compressor (T1/T2), decoder, shared training
+                loop (train.py), held-out eval (eval.py)
 scripts/        Training and evaluation entry points
 ```
 
@@ -139,7 +161,7 @@ python scripts/mux_batches.py --gen-count 8 --mode fifo --seed 0 -- \
     --n-states 8 --anchor-seed 0 --config configs/instr_t2.json \
   | python scripts/batch_slice.py --count 2000000 \
   | python scripts/train_t2_encoder.py --t1-model runs/t1_run/encoder.pt \
-    --d-model 512 --n-heads 4 --n-layers 4 --d-out 512 --max-chunk-len 32 \
+    --d-out 512 --d-event 16 --route binding \
     --n-steps 2000000 --anchor-seed 0 --n-anchor-states 8 --out-dir t2_run
 
 # Train a decoder on a frozen encoder

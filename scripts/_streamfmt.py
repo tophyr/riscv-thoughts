@@ -39,14 +39,12 @@ def _validate_rvt(data):
     off = RVT_FORMAT.batch_prefix_size  # skip magic+version+dtype prefix
     vals = RVT_FORMAT.batch_header.unpack(
         data[off:off + RVT_FORMAT.batch_header.size])
-    # Header fields: B, max_tokens, max_n_instrs, RB, n_anchors, OB. RB is 0
-    # except in the row-outputs T1 mode (RB=B); OB is B in the T2 twin mode
-    # (out_regs shipped) and 0 otherwise.
-    B, max_tokens, max_n_instrs, RB, n_anchors, OB = vals
+    # Header fields: B, max_tokens, max_n_instrs, n_anchors, OB. OB is B when
+    # the out_regs oracle is shipped (every rule does now) and 0 otherwise.
+    B, max_tokens, max_n_instrs, n_anchors, OB = vals
     if not (0 < B <= _MAX_B
             and 0 < max_tokens <= _MAX_TOKENS
             and 0 < max_n_instrs <= _MAX_TOKENS
-            and 0 <= RB <= _MAX_B
             and 0 <= n_anchors <= 256
             and 0 <= OB <= _MAX_B):
         raise ValueError(f'Invalid RVT header: {vals}')

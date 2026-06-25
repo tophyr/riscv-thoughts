@@ -33,13 +33,10 @@ def main():
                    help='Path to T1 encoder.pt. Companion hparams.json '
                         'in the same dir is read automatically.')
 
-    p.add_argument('--d-model', type=int, default=512)
-    p.add_argument('--n-heads', type=int, default=4)
-    p.add_argument('--n-layers', type=int, default=4)
-    p.add_argument('--d-out', type=int, default=512)
-    p.add_argument('--max-chunk-len', type=int, default=32,
-                   help='Position-embedding table size for the T2 sequence '
-                        '(max instructions per chunk).')
+    p.add_argument('--d-out', type=int, default=512,
+                   help='T2 register-state width (d_value).')
+    p.add_argument('--d-event', type=int, default=16,
+                   help='Per-slot event-channel width (read/write trace).')
 
     add_common_train_args(p, lr=1e-4)
     p.add_argument('--warmup-steps', type=int, default=10000,
@@ -66,23 +63,17 @@ def main():
                         'Reconstructs '
                         'anchor_states from --anchor-seed and '
                         '--n-anchor-states — must match gen_batches.')
-    p.add_argument('--value-predict-every', type=int, default=1,
-                   help='Run value-prediction loss every Nth step '
-                        '(default 1 = every step). Amortizes the '
-                        'Python-side per-row precompute_chunk loop '
-                        'that dominates per-step cost otherwise.')
-    p.add_argument('--pair-weight', type=float, default=1.0,
-                   help='Oracle behavioral pairwise loss (rename-sensitive): '
-                        'match chunk-vector cosine distance to a behavioral '
-                        'distance from their out_regs. 0 = off.')
-    p.add_argument('--pair-scale', type=float, default=0.5,
-                   help='Maps behavioral distance (loglog ~[0,3]) to target '
-                        'cosine distance ([0,2]).')
     p.add_argument('--anchor-seed', type=int, default=0,
                    help='Anchor-states seed (must match gen_batches).')
     p.add_argument('--n-anchor-states', type=int, default=8,
                    help='Anchor states count (must match gen_batches).')
 
+    p.add_argument('--route', choices=('binding', 'tokens'), default='binding',
+                   help="How T2 gets per-instruction wiring. 'binding' "
+                        "(default): from the frozen T1's PREDICTED "
+                        'binding — the real tier-recursion test. '
+                        "'tokens': decoded-token wiring (diagnostic A/B, not "
+                        'a valid recursion result).')
     p.add_argument('--resume', type=str, default=None,
                    help='Path to a t2.pt checkpoint to resume from. '
                         'Loads weights into a freshly-built T2 (model '
@@ -103,9 +94,7 @@ def main():
 
     t2, losses = train_t2_encoder(
         reader, t1,
-        d_model=args.d_model, n_heads=args.n_heads, n_layers=args.n_layers,
-        d_out=args.d_out,
-        max_chunk_len=args.max_chunk_len,
+        d_out=args.d_out, d_event=args.d_event,
         lr=args.lr, n_steps=args.n_steps, log_every=args.log_every,
         warmup_steps=args.warmup_steps,
         valid_weight=args.valid_weight,
@@ -115,12 +104,10 @@ def main():
         in_slot_weight=args.in_slot_weight,
         out_slot_weight=args.out_slot_weight,
         value_predict_weight=args.value_predict_weight,
-        value_predict_every=args.value_predict_every,
-        pair_weight=args.pair_weight,
-        pair_scale=args.pair_scale,
         anchor_seed=args.anchor_seed,
         n_anchor_states=args.n_anchor_states,
         t2_checkpoint=args.resume,
+        t2_route=args.route,
         device=device,
         on_log=save,
         compile_step=not args.no_compile,

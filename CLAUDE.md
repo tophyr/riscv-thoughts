@@ -123,3 +123,5 @@ connection is what makes the lesson land:
   don't echo
 - `feedback_commit_at_boundaries.md` — wait for natural commit points
 - `feedback_no_storytime_comments.md` — comments state WHY, briefly
+- `feedback_confirm_gpu_saturation.md` — never leave a long run at low
+  util; fix the throughput bottleneck first, don't defer it

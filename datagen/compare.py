@@ -1,21 +1,14 @@
 """SSA analysis + canonical-baseline execution over RV32I chunks.
 
 Owns the Precomputed/AuxPayload schema (SSA + DCE + anchor execution +
-input-sensitivity magnitudes) and the single-instruction row-outputs
-value-prediction target (`precompute_row_outputs`).
-
-The GVN bijection oracle (`behavioral_distance` /
-`behavioral_distance_cached`) lives in `datagen.behavioral_oracle` — it
-is not used in training or corpus generation. It reuses the SSA +
-evaluator primitives defined here.
+input-sensitivity magnitudes) — the canonical out_regs / binding targets
+consumed by training (`precompute_chunk`).
 
 Shared infrastructure:
   - SSA construction (to_ssa) — converts an instruction list into a
     dataflow DAG with INPUT leaves for live-in registers, anchored
     leaves for PC and memory state, and op nodes for each instruction.
   - DCE (live_nodes) — backward reachability from outputs.
-  - Partial bijection enumeration (partial_bijections) — yields
-    candidate input mappings for the distance search.
   - SSA-numpy evaluator (_eval_ssa_numpy) — evaluates an SSA graph on
     N anchor states using vectorized numpy ops. ~10× faster than per-
     state Python emulator dispatch and bit-equal for chunker-respecting
@@ -26,7 +19,6 @@ V1 scope: ALU R/I-type, LUI, AUIPC, B-type, JAL, JALR. Memory ops
 """
 
 from dataclasses import dataclass, field
-from itertools import combinations, permutations
 
 import numpy as np
 
@@ -82,23 +74,13 @@ _SHIFT_MASK = np.int32(0x1f)
 # so that "no observable effect on any output" reliably filters out.
 BEHAVIORAL_RELEVANCE_THRESHOLD = 1e-9
 
-# Cap on the bijection search size. The number of partial bijections
-# is P(max(|a|, |b|), min(|a|, |b|)) — factorial in the smaller set.
-# 8! = 40320 is fast and bounded; above that the distance oracle falls
-# back to the empty bijection (no input symmetry discovery; distance is
-# an upper bound for those pathological chunks).
-MAX_BIJECTION_SIZE = 8
-
 N_REGS = 32
 
-# Canonical anchor-position list for register input sourcing during
-# SSA evaluation. A row's behavioral inputs are sourced from these
-# positions instead of from the row's actual register positions, so
-# the residual and magnitudes don't leak the row's register names.
-# All 31 non-x0 register slots are usable. Position 0 stays reserved
-# for x0 (always reads zero); pairs whose unaligned input count exceeds
-# 31 raise CanonPositionOverflow so the caller can skip rather than
-# silently aliasing positions.
+# Canonical anchor-position list for register input sourcing during SSA
+# evaluation. A chunk's behavioral inputs (in syntactic first-read order) are
+# sourced from these positions instead of from the row's actual register
+# positions, so out_regs / magnitudes don't leak register names — the
+# rename-invariant canonical baseline. Position 0 stays reserved for x0.
 _CANON_POSITIONS = list(range(1, N_REGS))
 
 # Per-row aux target shapes. T2's slot-positional CE heads supervise
@@ -109,13 +91,6 @@ _CANON_POSITIONS = list(range(1, N_REGS))
 MAX_INPUT_SLOTS = 32
 MAX_OUTPUT_SLOTS = 16
 AUX_CE_IGNORE = -100
-
-
-class CanonPositionOverflow(Exception):
-    """Raised when a pair's combined unaligned input count exceeds
-    the 31 available canonical positions (positions 1..31; position 0
-    is reserved for x0). Pairs that overflow can't be evaluated under
-    the GVN-invariant canonical metric and should be skipped."""
 
 
 class UnsupportedOpError(ValueError):
@@ -338,37 +313,13 @@ def _split_outputs(g):
 
 
 # ---------------------------------------------------------------------------
-# Partial bijection enumeration — used by behavioral_distance
-# (datagen.behavioral_oracle)
-# ---------------------------------------------------------------------------
-
-def partial_bijections(set_a, set_b):
-    """Yield all partial bijections of size k = min(|a|, |b|) as
-    paired ordered tuples (a_subset, b_subset) where a_subset[i] is
-    matched to b_subset[i]."""
-    a = tuple(set_a)
-    b = tuple(set_b)
-    k = min(len(a), len(b))
-    if k == 0:
-        yield (), ()
-        return
-    if len(a) <= len(b):
-        for chosen in combinations(b, k):
-            for perm in permutations(chosen):
-                yield a, perm
-    else:
-        for chosen in combinations(a, k):
-            for perm in permutations(chosen):
-                yield perm, b
-
-
-# ---------------------------------------------------------------------------
 # Anchor states + SSA-numpy evaluator
 # ---------------------------------------------------------------------------
 
 def make_anchor_states(n_states, seed):
-    """Generate shared anchor states for distance computation. Two
-    chunks compared via behavioral_distance must use the same anchor states."""
+    """Generate the shared anchor states (random register files) used as
+    test inputs for value-prediction / canonical execution. gen and trainer
+    must reconstruct the same states from matching (n_states, seed)."""
     rng = np.random.default_rng(seed)
     anchor_states = rng.integers(
         np.iinfo(np.int32).min, np.iinfo(np.int32).max,
@@ -394,38 +345,6 @@ def _canonical_state(anchor_states, inputs, canon_positions):
     return state
 
 
-def _pair_canon_positions(inputs_a, inputs_b, a_keys, b_keys):
-    """Assign canonical positions for a pair under bijection σ
-    (a_keys[i] ↔ b_keys[i]). Matched inputs share canon positions
-    0..m-1; a's unaligned inputs use m..k_a-1; b's unaligned inputs
-    use k_a..k_a+k_b-m-1. Returns two lists in the syntactic input
-    order of inputs_a and inputs_b. Raises CanonPositionOverflow if
-    the combined position count exceeds the 31 available slots."""
-    m = len(a_keys)
-    a_to_pos = {a_keys[i]: _CANON_POSITIONS[i] for i in range(m)}
-    b_to_pos = {b_keys[i]: _CANON_POSITIONS[i] for i in range(m)}
-    next_pos = m
-    n_avail = len(_CANON_POSITIONS)
-    for r in inputs_a:
-        if r not in a_to_pos:
-            if next_pos >= n_avail:
-                raise CanonPositionOverflow(
-                    f'pair needs >{n_avail} canon positions '
-                    f'(|a|={len(inputs_a)} |b|={len(inputs_b)} m={m})')
-            a_to_pos[r] = _CANON_POSITIONS[next_pos]
-            next_pos += 1
-    for r in inputs_b:
-        if r not in b_to_pos:
-            if next_pos >= n_avail:
-                raise CanonPositionOverflow(
-                    f'pair needs >{n_avail} canon positions '
-                    f'(|a|={len(inputs_a)} |b|={len(inputs_b)} m={m})')
-            b_to_pos[r] = _CANON_POSITIONS[next_pos]
-            next_pos += 1
-    return ([a_to_pos[r] for r in inputs_a],
-            [b_to_pos[r] for r in inputs_b])
-
-
 def _eval_ssa_numpy(ssa, chunk_len, anchor_states, live=None):
     """Evaluate an SSA graph on N input states using numpy ops.
 
@@ -436,8 +355,7 @@ def _eval_ssa_numpy(ssa, chunk_len, anchor_states, live=None):
     For chunker-respecting chunks (only the last instruction may be
     control flow), bit-equal to the Python emulator. For chunks with
     intra-chunk control flow the semantics differ (SSA evaluates every
-    node regardless of runtime PC dispatch) — behavioral_distance's contract
-    excludes those cases.
+    node regardless of runtime PC dispatch).
     """
     n_states = anchor_states.shape[0]
     values = {}
@@ -673,7 +591,7 @@ def precompute_chunk(chunk, anchor_states):
     """
     if _has_memory_ops(chunk):
         raise NotImplementedError(
-            'behavioral_distance V1 does not support memory ops (LOAD/STORE)')
+            'precompute_chunk V1 does not support memory ops (LOAD/STORE)')
 
     ssa = to_ssa(chunk)
     live = live_nodes(ssa)
@@ -742,51 +660,3 @@ def precompute_chunk(chunk, anchor_states):
     )
 
 
-# ---------------------------------------------------------------------------
-# Row-outputs path (single-instruction T1)
-# ---------------------------------------------------------------------------
-#
-# For single-instruction T1 chunks, `precompute_row_outputs` runs the SSA
-# on the RAW anchor states and ships the destination register's value per
-# anchor — the value-prediction supervision target.
-
-@dataclass
-class RowOutputs:
-    """Per-row T1 value-prediction target: the destination register's value
-    under each anchor state. n_anchors = anchor_states.shape[0]."""
-    rd_values: np.ndarray     # (n_anchors,) float64 — rd value per anchor
-    has_rd: bool              # does this row write a non-x0 register?
-
-
-def precompute_row_outputs(instr, anchor_states, *, pre=None):
-    """Per-row value-prediction target for a single instruction: the value
-    written to its destination register under each anchor state.
-
-    The value comes from executing the instruction on the RAW anchor states
-    (reading its actual source registers) — NOT `pre.out_regs`, which is the
-    rename-invariant canonical baseline (inputs relocated to canonical
-    positions) used by the distance oracle. value_predict_loss feeds the head
-    the actual source registers' anchor values, so the label must match real
-    execution.
-
-    Pass `pre` to skip the internal precompute_chunk call when the caller
-    already has it (avoids duplicate SSA work in build pipelines that also
-    extract aux targets from the same Precomputed).
-
-    Raises NotImplementedError on memory ops (V1 distance scope).
-    """
-    chunk = [instr]
-    if pre is None:
-        pre = precompute_chunk(chunk, anchor_states)
-
-    n_anchors = anchor_states.shape[0]
-    has_rd = bool(pre.reg_outs)
-    rd = pre.reg_outs[0] if has_rd else None
-
-    if rd is not None:
-        out_regs, _ = _eval_ssa_numpy(pre.ssa, len(chunk), anchor_states, pre.live)
-        rd_values = out_regs[:, rd].astype(np.float64)
-    else:
-        rd_values = np.zeros(n_anchors, dtype=np.float64)
-
-    return RowOutputs(rd_values=rd_values, has_rd=has_rd)

@@ -42,6 +42,13 @@ _REG_OFFSET = _OPCODE_OFFSET + len(_OPCODES)
 # Hex digit tokens: H0 .. HF
 _HEX_OFFSET = _REG_OFFSET + 32
 
+# Public register-token id range [REG_TOKEN_LO, REG_TOKEN_HI). The
+# equivariant encoder strips register identity from its content stream
+# (registers enter as wiring, not as content embeddings), so it detects
+# register tokens by id.
+REG_TOKEN_LO = _REG_OFFSET
+REG_TOKEN_HI = _HEX_OFFSET
+
 VOCAB_SIZE = _HEX_OFFSET + 16
 
 # Build string representations for the full vocabulary.

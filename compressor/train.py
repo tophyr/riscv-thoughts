@@ -31,47 +31,9 @@ from datagen import (
     N_REGS, MAX_INPUT_SLOTS, MAX_OUTPUT_SLOTS, AUX_CE_IGNORE,
 )
 from emulator import Instruction
-from .model import T1Compressor, T2Compressor, Decoder
-
-
-# ===========================================================================
-# Probe instructions — fixed pairs whose distances we log during training
-# to watch the encoder's geometry develop in real time.
-# ===========================================================================
-
-_PROBE_INSTRS = [
-    Instruction('ADD',  5, 7, 7),   # 0: ADD rs,rs (double canonical)
-    Instruction('SLLI', 5, 7, 1),   # 1: SLLI rs,1 (shl1 canonical)
-    Instruction('ADD',  5, 1, 2),   # 2: random ADD
-    Instruction('SLLI', 5, 3, 2),   # 3: SLLI neighbor
-    Instruction('ADD',  5, 2, 1),   # 4: commutative swap of #2
-]
-
-
-def _probe_tensor(device):
-    encoded = [encode_instruction(i) for i in _PROBE_INSTRS]
-    max_len = max(len(e) for e in encoded)
-    tok = np.full((len(encoded), max_len), PAD, dtype=np.int64)
-    pad = np.ones((len(encoded), max_len), dtype=np.bool_)
-    for i, e in enumerate(encoded):
-        tok[i, :len(e)] = e
-        pad[i, :len(e)] = False
-    return (torch.from_numpy(tok).to(device),
-            torch.from_numpy(pad).to(device))
-
-
-def _probe_distances(encoder, probe_tok, probe_pad):
-    """Probe geometry. Distances are measured on the unit-normalized
-    full encoded vector."""
-    with torch.no_grad():
-        v = encoder.encode(probe_tok, probe_pad)
-        v = F.normalize(v, dim=-1)
-        return {
-            'aa':    float((v[0] - v[2]).norm()),
-            'canon': float((v[0] - v[1]).norm()),
-            'ss':    float((v[1] - v[3]).norm()),
-            'comm':  float((v[2] - v[4]).norm()),
-        }
+from .model import (
+    Compressor, T1Compressor, T2Compressor, Decoder, instruction_wiring,
+    X0_SLOT)
 
 
 # ===========================================================================
@@ -89,17 +51,73 @@ def load_checkpoint(path, device):
     return {k.removeprefix('_orig_mod.'): v for k, v in state.items()}
 
 
-def encode_instrs(model, instrs, device):
-    """Tokenize, pad, and encode a list of Instructions."""
+# Token front-end submodule prefixes (live in TokenEmbedder); everything else
+# in a T1 checkpoint (core + heads) lives in the Compressor.
+_T1_EMBEDDER_KEYS = ('tok_emb.', 'win_pos_emb.', 'content_encoder.')
+
+
+def _split_t1_state(state):
+    """Map a T1 state_dict to the T1Compressor layout (`embedder.*` +
+    `compressor.*`). Old flat checkpoints (pre-`TokenEmbedder` split) keyed the
+    front-end + core + heads at the top level; route the embedder submodules to
+    `embedder.` and the rest to `compressor.`. Already-split checkpoints (any
+    key starts with `embedder.`/`compressor.`) pass through unchanged."""
+    if any(k.startswith(('embedder.', 'compressor.')) for k in state):
+        return state
+    out = {}
+    for k, v in state.items():
+        pre = 'embedder.' if k.startswith(_T1_EMBEDDER_KEYS) else 'compressor.'
+        out[pre + k] = v
+    return out
+
+
+def _wiring_from_token_lists(token_lists):
+    """Per token sequence, the GP wiring (in0, in1, out) for the state
+    machine. Undecodable windows (partial / bogus) get (0, 0, 0). Three
+    (N,) int64 arrays."""
+    n = len(token_lists)
+    in0 = np.zeros(n, dtype=np.int64)
+    in1 = np.zeros(n, dtype=np.int64)
+    out = np.zeros(n, dtype=np.int64)
+    for i, toks in enumerate(token_lists):
+        try:
+            instr, _ = decode_instruction(list(toks), 0)
+        except Exception:
+            continue
+        in0[i], in1[i], out[i] = instruction_wiring(instr)
+    # decode_instruction doesn't validate token classes, so a malformed
+    # window can yield out-of-range register ids — clamp those to x0 (no-op).
+    for a in (in0, in1, out):
+        a[(a < 0) | (a >= N_REGS)] = 0
+    return in0, in1, out
+
+
+def encode_instrs(model, instrs, device, tags=None):
+    """Tokenize, pad, and encode a list of Instructions to their essence
+    vectors. Registers enter as wiring (instruction_wiring); a SHARED per-
+    register tag (broadcast across the instrs) is used by default so the
+    essence comparison isolates the operator signal (equivalence / probe
+    geometry), matching how a trained model becomes tag-invariant."""
     encoded = [encode_instruction(i) for i in instrs]
     max_len = max(len(e) for e in encoded)
-    tok = np.full((len(encoded), max_len), PAD, dtype=np.int64)
-    pad = np.ones((len(encoded), max_len), dtype=np.bool_)
+    n = len(encoded)
+    tok = np.full((n, max_len), PAD, dtype=np.int64)
+    pad = np.ones((n, max_len), dtype=np.bool_)
     for i, e in enumerate(encoded):
         tok[i, :len(e)] = e
         pad[i, :len(e)] = False
-    return model.encode(torch.from_numpy(tok).to(device),
-                        torch.from_numpy(pad).to(device))
+    wiring = np.array([instruction_wiring(i) for i in instrs], dtype=np.int64)
+    if tags is None:
+        shared = np.random.standard_normal(model.n_regs).astype(np.float32)
+        shared[0] = 0.0
+        tags = np.broadcast_to(shared, (n, model.n_regs)).copy()
+    return model.encode(
+        torch.from_numpy(tok).to(device),
+        torch.from_numpy(pad).to(device),
+        torch.from_numpy(wiring[:, 0]).to(device),
+        torch.from_numpy(wiring[:, 1]).to(device),
+        torch.from_numpy(wiring[:, 2]).to(device),
+        torch.as_tensor(tags, dtype=torch.float32, device=device))
 
 
 def prepare_decoder_targets(token_lists, device):
@@ -199,67 +217,6 @@ def _value_compress(x):
     monotonicity. Matches the project's residual-compression
     convention used by the canonical-output comparison."""
     return torch.sign(x) * torch.log1p(torch.log1p(x.abs()))
-
-
-def value_predict_loss(vp_head, vecs, anchor_states,
-                       src_reg_0, src_reg_1, row_outputs,
-                       pair_valid, has_rd):
-    """MSE on the predicted rd-value-per-anchor.
-
-    The hypothesis: if the vector encodes operator-essence (the I/O
-    function of the instruction), then a head reading (vec, input
-    register values) — and *crucially* not register IDs — can predict
-    the output value. The head sees inputs as values only, so it has
-    to read "what operation" from the vector; there's no path to
-    identify which register the inputs came from.
-
-    Args:
-      vp_head:       nn.Module, (B*A, d+2) → (B*A, 1)
-      vecs:          (B, d) float
-      anchor_states: (n_anchors, 32) int32 — register-file snapshots
-      src_reg_0,1:   (B,) int64 — source-register IDs per row. 0 means
-                     "no source" (x0, which is hardwired to 0 — so the
-                     lookup naturally yields zero contribution).
-      row_outputs:   (B, n_anchors) float — target rd value per anchor.
-      pair_valid:    (B,) bool
-      has_rd:        (B,) bool
-
-    Returns scalar MSE on (pair_valid & has_rd) rows.
-    """
-    device = vecs.device
-    B, d = vecs.shape
-    n_anchors = anchor_states.shape[0]
-
-    # Row mask as a multiplicative weight (not a boolean index / early
-    # return): keeps the op graph static-shape and host-sync-free, so the
-    # whole training step can be torch.compile'd / CUDA-graph captured. The
-    # masked-out rows still compute (their per-row loss is finite — pred and
-    # target are always finite) but contribute zero. clamp(min=1) makes the
-    # all-masked batch return 0.0, matching the old early-return.
-    mask = (pair_valid & has_rd).float()
-
-    # Lookup per-row input values: (n_anchors, B) → (B, n_anchors).
-    v_src0 = anchor_states[:, src_reg_0].T.float()
-    v_src1 = anchor_states[:, src_reg_1].T.float()
-    v_src0_c = _value_compress(v_src0)
-    v_src1_c = _value_compress(v_src1)
-
-    # Feature: per (row, anchor), [vec || v_src0 || v_src1].
-    vec_exp = vecs.unsqueeze(1).expand(-1, n_anchors, -1)
-    feat = torch.cat([
-        vec_exp,
-        v_src0_c.unsqueeze(-1),
-        v_src1_c.unsqueeze(-1),
-    ], dim=-1)    # (B, n_anchors, d + 2)
-
-    pred = vp_head(feat).squeeze(-1)    # (B, n_anchors)
-
-    target_raw = row_outputs.float()    # (B, n_anchors)
-    target_c = _value_compress(target_raw)
-
-    diff_sq = (pred - target_c) ** 2
-    per_row = diff_sq.mean(dim=-1)    # (B,)
-    return (per_row * mask).sum() / mask.sum().clamp(min=1)
 
 
 def build_optim_sched(params, lr, n_steps, *, warmup_steps=0,
@@ -468,6 +425,224 @@ def run_train_loop(batch_source, *, model, opt, scheduler, log, device,
     return log.losses
 
 
+def _t1_wiring(batch):
+    """Per single-instruction row, the GP wiring (in0, in1, out) the state
+    machine routes on, decoded from the row's tokens. Invalid / undecodable
+    rows get (0, 0, 0) (x0, masked by the behavioral targets anyway). CPU-
+    side (no RVT-format change); returns three (B,) int64 arrays."""
+    B = batch.tokens.shape[0]
+    in0 = np.zeros(B, dtype=np.int64)
+    in1 = np.zeros(B, dtype=np.int64)
+    out = np.zeros(B, dtype=np.int64)
+    for b in range(B):
+        if not batch.valid[b]:
+            continue
+        L = int(batch.token_lens[b])
+        try:
+            instr, _ = decode_instruction(batch.tokens[b, :L].tolist(), 0)
+        except Exception:
+            continue
+        in0[b], in1[b], out[b] = instruction_wiring(instr)
+    return in0, in1, out
+
+
+def train_compressor(batch_iter, *, ingest, lower_encoder=None,
+                     d_out=128, d_event=16,
+                     d_model=128, n_heads=4, n_layers=2, max_window=72,
+                     route='binding',
+                     lr=3e-4, n_steps=None, log_every=100, lr_min=1e-6,
+                     warmup_steps=0,
+                     valid_weight=0.1, live_in_weight=0.1, live_out_weight=0.1,
+                     pc_writes_weight=0.1, in_slot_weight=0.1,
+                     out_slot_weight=0.1, value_predict_weight=1.0,
+                     anchor_seed=0, n_anchor_states=8,
+                     resume=None, device='auto', on_log=None,
+                     compile_step=True):
+    """The ONE trainer for the equivariant Compressor — T1 and T2 run the SAME
+    execution path. The only tier-specific piece is the content
+    provider (`_content` below): ingest='tokens' (T1) embeds opcode+immediate
+    tokens with the model itself (gradients flow into the front-end);
+    ingest='vectors' (T2) runs a FROZEN lower-tier Compressor per instruction
+    and routes T2's wiring off its PREDICTED binding (route='binding')
+    rather than decoded tokens. Everything else is shared: the dense-grid prep
+    (`_dense_chunk_grid`), the binding + canonical value-prediction + magnitude
+    losses, the single compiled CUDA-graph step (frozen-T1 encode + routing +
+    core + losses folded in), the prefetcher, and the logging.
+
+    Returns (model, losses). loss records: step, total, valid, live_in,
+    live_out, pc_writes, in_slot, out_slot, value_pred, pair, n_chunks,
+    n_instrs.
+    """
+    device = resolve_device(device)
+    # `model` is the trained+saved+grad-clipped entity; `comp` is the Compressor
+    # whose heads/core the losses + routing read. For T2 they're the same; for
+    # T1, model = TokenEmbedder + Compressor and comp = model.compressor.
+    if ingest == 'vectors':
+        lower_encoder.eval()
+        for p in lower_encoder.parameters():
+            p.requires_grad = False
+        lower_encoder = lower_encoder.to(device)
+        comp = Compressor(
+            d_content=lower_encoder.d_out, d_out=d_out, d_event=d_event)
+        model = comp.to(device)
+        model_file = 't2.pt'
+    else:
+        model = T1Compressor(
+            vocab_size=VOCAB_SIZE, d_model=d_model, n_heads=n_heads,
+            n_layers=n_layers, max_window=max_window, d_out=d_out,
+            d_event=d_event).to(device)
+        comp = model.compressor
+        model_file = 'encoder.pt'
+    route_binding = (route == 'binding')
+
+    # Optional resume: a run-dir (model + train_state.pt) continues
+    # optimizer/schedule/step/RNG; a bare .pt loads weights only. T1 state is
+    # split-remapped (old flat -> embedder./compressor.) if needed.
+    resume_train_state = None
+    if resume is not None:
+        ckpt_path = Path(resume)
+        weights_path = ckpt_path / model_file if ckpt_path.is_dir() else ckpt_path
+        state = load_checkpoint(weights_path, device)
+        if ingest == 'tokens':
+            state = _split_t1_state(state)
+        model.load_state_dict(state, strict=False)
+        if ckpt_path.is_dir():
+            ts = ckpt_path / 'train_state.pt'
+            if ts.exists():
+                resume_train_state = torch.load(
+                    ts, map_location=device, weights_only=False)
+
+    opt, scheduler = build_optim_sched(
+        model.parameters(), lr, n_steps, warmup_steps=warmup_steps,
+        lr_min=lr_min, device=device)
+    anchor_states_t = torch.from_numpy(
+        make_anchor_states(n_anchor_states, anchor_seed)).to(device)
+
+    def _fmt(r, ms, eta, lr_now):
+        return (
+            f'step {r["step"]:>5d}  loss {r["total"]:.4f} '
+            f'(val {r["valid"]:.4f} li {r["live_in"]:.3f} lo {r["live_out"]:.3f} '
+            f'pc {r["pc_writes"]:.3f} is {r["in_slot"]:.3f} os {r["out_slot"]:.3f} '
+            f'vp {r["value_pred"]:.4f}) '
+            f'B={r["n_chunks"]} I={r["n_instrs"]}  '
+            f'lr {lr_now:.1e}  {ms:.0f}ms/step  '
+            f'eta {timedelta(seconds=int(eta))}')
+
+    log = TrainLog(n_steps=n_steps, log_every=log_every, lr=lr,
+                   scheduler=scheduler, formatter=_fmt, on_log=on_log)
+    step = 0
+    if resume_train_state is not None:
+        step = restore_train_state(resume_train_state, opt, scheduler)
+        print(f'Resumed from step {step}')
+
+    # Prefetcher overlaps CPU-side split with GPU work — shared by both tiers.
+    batch_source = TrainBatchPrefetcher(batch_iter)
+    first, batch_source = _peek(batch_source)
+    if first is None:
+        return model, log.losses
+    N_CHUNKS, MAX_NI = first[0].instr_lens.shape
+    # CONSTANT ListMLE loop bounds (corpus-constant, so the compiled step never
+    # recompiles on a varying slot width). A K-instr chunk reads <=2K regs,
+    # writes <=K; iterating extra all-IGNORE columns is a no-op on the loss.
+    IN_K = min(2 * MAX_NI, MAX_INPUT_SLOTS)
+    OUT_K = min(MAX_NI, MAX_OUTPUT_SLOTS)
+    vp_active = value_predict_weight > 0
+    out_regs_active = vp_active
+    valid_active = valid_weight > 0
+    model.train()
+    _dummy = torch.zeros(1, device=device)
+
+    def _content(tok, pad, w0, w1, wo, active, t1_tags):
+        """Tier front-end (the one tier-specific path): a (B, MNI) dense
+        token grid -> (content_seq (B,MNI,d_content), in0,in1,out (B,MNI)).
+        tokens: embed with the trained model (grad flows). vectors: frozen
+        lower-tier encode + predicted-binding routing (no grad)."""
+        B, MNI = active.shape
+        flat = B * MNI
+        Ltok = tok.shape[-1]
+        if ingest == 'tokens':
+            content = model.embedder(
+                tok.reshape(flat, Ltok), pad.reshape(flat, Ltok)).reshape(B, MNI, -1)
+            return content, w0, w1, wo
+        with torch.no_grad():
+            T1s, ess = lower_encoder.encode_state(
+                tok.reshape(flat, Ltok), pad.reshape(flat, Ltok),
+                w0.reshape(flat), w1.reshape(flat), wo.reshape(flat), t1_tags)
+            if route_binding:
+                r0, r1, ro = _t1_predicted_wiring(lower_encoder, T1s)
+            else:
+                r0, r1, ro = w0.reshape(flat), w1.reshape(flat), wo.reshape(flat)
+        return (ess.reshape(B, MNI, -1),
+                r0.reshape(B, MNI), r1.reshape(B, MNI), ro.reshape(B, MNI))
+
+    # ONE compiled CUDA-graph step (the one-graph fold): front-end + core + losses, all
+    # at a fixed-padded instruction count (B*MNI). Host-sync-free, static-shape.
+    def _fwd_loss(tok, pad, w0, w1, wo, active, t1_tags, t2_tags,
+                  li, lo, pc, in_slot, out_slot, out_regs, vp_mask, valid_f,
+                  ike, oke):
+        content_seq, c0, c1, co = _content(tok, pad, w0, w1, wo, active, t1_tags)
+        T, essence = comp.encode_state(content_seq, c0, c1, co, active, t2_tags)
+        valid_loss = (((essence.norm(dim=-1) - valid_f) ** 2).mean()
+                      if valid_active else essence.new_zeros(()))
+        bl = binding_losses(
+            comp, T, essence, live_in_t=li, live_out_t=lo, pc_writes_t=pc,
+            in_slot_t=in_slot, out_slot_t=out_slot, in_k_eff=ike, out_k_eff=oke)
+        vp = (t2_value_predict_loss(
+                  comp, essence, anchor_states_t, in_slot, out_slot,
+                  out_regs, vp_mask)
+              if vp_active else essence.new_zeros(()))
+        total = (valid_weight * valid_loss
+                 + live_in_weight * bl['live_in']
+                 + live_out_weight * bl['live_out']
+                 + pc_writes_weight * bl['pc_writes']
+                 + in_slot_weight * bl['in_slot']
+                 + out_slot_weight * bl['out_slot']
+                 + value_predict_weight * vp)
+        metrics = {'total': total, 'valid': valid_loss,
+                   'live_in': bl['live_in'], 'live_out': bl['live_out'],
+                   'pc_writes': bl['pc_writes'], 'in_slot': bl['in_slot'],
+                   'out_slot': bl['out_slot'], 'value_pred': vp}
+        return total, metrics, None
+
+    def _prep(item):
+        batch, split_outputs = item
+        if split_outputs[0].shape[0] == 0:        # all-invalid batch
+            return None
+        tok, pad, gi0, gi1, go, active = _dense_chunk_grid(
+            split_outputs, N_CHUNKS, MAX_NI)
+        t1_tags = torch.randn(N_CHUNKS * MAX_NI, model.n_regs, device=device)
+        t2_tags = torch.randn(N_CHUNKS, model.n_regs, device=device)
+        valid_f = (_h2d(batch.valid, device, dtype=torch.float32)
+                   if valid_active else _dummy)
+        if out_regs_active:
+            out_regs_t = _h2d(batch.out_regs, device)
+            vp_mask_t = _h2d(batch.out_regs_valid, device)
+        else:
+            out_regs_t = vp_mask_t = _dummy
+        return (_h2d(tok, device, dtype=torch.long), _h2d(pad, device),
+                _h2d(gi0, device, dtype=torch.long),
+                _h2d(gi1, device, dtype=torch.long),
+                _h2d(go, device, dtype=torch.long),
+                _h2d(active, device, dtype=torch.float32),
+                t1_tags, t2_tags,
+                _h2d(batch.live_in_mask, device, dtype=torch.float32),
+                _h2d(batch.live_out_mask, device, dtype=torch.float32),
+                _h2d(batch.pc_writes, device, dtype=torch.float32),
+                _h2d(batch.in_slot_regs, device, dtype=torch.long),
+                _h2d(batch.out_slot_regs, device, dtype=torch.long),
+                out_regs_t, vp_mask_t, valid_f, IN_K, OUT_K)
+
+    def _extra(item, aux):
+        n_per_chunk = item[1][4]
+        return {'n_chunks': N_CHUNKS, 'n_instrs': int(n_per_chunk.sum())}
+
+    losses = run_train_loop(
+        batch_source, model=model, opt=opt, scheduler=scheduler, log=log,
+        device=device, prep_fn=_prep, fwd_loss_fn=_fwd_loss, extra_fn=_extra,
+        compile_step=compile_step, capture_state=True, start_step=step)
+    return model, losses
+
+
 def train_encoder(batch_iter, *,
                   d_model=128, n_heads=4, n_layers=2, d_out=128,
                   max_window=72,
@@ -500,9 +675,8 @@ def train_encoder(batch_iter, *,
                          (mode='reduce-overhead'). The whole forward+loss+
                          backward is captured as one graph (~9 launches vs
                          ~485 eager), saturating the GPU (~99% vs ~50%) and
-                         ~2.5x faster. Requires the single-instruction T1
-                         regime (row_outputs present); the loss path is
-                         sync-free + static-shape, so it captures cleanly.
+                         ~2.5x faster. The loss path is sync-free +
+                         static-shape, so it captures cleanly.
                          Numerics differ slightly from eager (fusion / TF32
                          reduction order) — set False for a bit-faithful
                          eager run.
@@ -511,110 +685,16 @@ def train_encoder(batch_iter, *,
     valid, live_in, live_out, pc_writes, in_slot, out_slot, value_pred,
     plus probe_* keys at each log point.
     """
-    device = resolve_device(device)
-
-    encoder = T1Compressor(
-        VOCAB_SIZE, d_model, n_heads, n_layers, d_out,
-        max_window=max_window,
-    ).to(device)
-    opt, scheduler = build_optim_sched(
-        encoder.parameters(), lr, n_steps, lr_min=lr_min, device=device)
-
-    probe_tok, probe_pad = _probe_tensor(device)
-
-    # Anchor states for value-prediction loss. Reconstructed from
-    # anchor_seed + n_anchor_states must match what gen_batches used —
-    # otherwise row_outputs targets don't correspond to what executing
-    # an instruction on these states would produce. Only used when
-    # value_predict_weight > 0; built unconditionally because it's tiny.
-    anchor_np = make_anchor_states(n_anchor_states, anchor_seed)
-    anchor_states_t = torch.from_numpy(anchor_np).to(device)    # (A, 32) int32
-
-    def _fmt(r, ms, eta, lr_now):
-        return (
-            f'step {r["step"]:>5d}  loss {r["total"]:.4f} '
-            f'(val {r["valid"]:.4f}'
-            f' li {r["live_in"]:.3f} lo {r["live_out"]:.3f}'
-            f' pc {r["pc_writes"]:.3f}'
-            f' in {r["in_slot"]:.3f} out {r["out_slot"]:.3f}'
-            f' vp {r["value_pred"]:.4f})  '
-            f'lr {lr_now:.1e}  {ms:.0f}ms/step  '
-            f'eta {timedelta(seconds=int(eta))}  '
-            f'probes[aa={r["probe_aa"]:.3f} canon={r["probe_canon"]:.3f} '
-            f'ss={r["probe_ss"]:.3f} comm={r["probe_comm"]:.3f}]')
-
-    log = TrainLog(n_steps=n_steps, log_every=log_every, lr=lr,
-                   scheduler=scheduler, formatter=_fmt, on_log=on_log)
-
-    # value-prediction needs the single-instruction row_outputs payload;
-    # decide once from the first batch (the corpus rule is fixed for a run,
-    # so row_outputs presence is constant) — a Python constant baked into the
-    # compiled graph.
-    first_batch, batch_iter = _peek(batch_iter)
-    if first_batch is None:
-        return encoder, log.losses
-    vp_active = value_predict_weight > 0 and first_batch.row_outputs.shape[0] > 0
-
-    encoder.train()
-    _dummy = torch.zeros(1, device=device)
-
-    # The fixed-shape forward+loss captured as one CUDA graph (the input
-    # (B, max_tokens) is corpus-constant; in_k_eff/out_k_eff are Python ints
-    # and value_predict masks with a multiply, so it's host-sync-free).
-    def _fwd_loss(tok, pad, valid_f, li, lo, pc, ins, outs, ro, pv, hr,
-                  ike, oke):
-        vecs = encoder.encode(tok, pad)              # (B, d_out)
-        valid_loss = ((vecs.norm(dim=-1) - valid_f) ** 2).mean()
-        bl = binding_losses(
-            encoder, vecs, live_in_t=li, live_out_t=lo, pc_writes_t=pc,
-            in_slot_t=ins, out_slot_t=outs, in_k_eff=ike, out_k_eff=oke)
-        if vp_active:
-            vp = value_predict_loss(
-                encoder.vp_head, vecs, anchor_states_t,
-                ins[:, 0].clamp(min=0), ins[:, 1].clamp(min=0), ro, pv, hr)
-        else:
-            vp = vecs.new_zeros(())
-        total = (valid_weight * valid_loss
-                 + live_in_weight * bl['live_in']
-                 + live_out_weight * bl['live_out']
-                 + pc_writes_weight * bl['pc_writes']
-                 + in_slot_weight * bl['in_slot']
-                 + out_slot_weight * bl['out_slot']
-                 + value_predict_weight * vp)
-        metrics = {'total': total, 'valid': valid_loss,
-                   'live_in': bl['live_in'], 'live_out': bl['live_out'],
-                   'pc_writes': bl['pc_writes'], 'in_slot': bl['in_slot'],
-                   'out_slot': bl['out_slot'], 'value_pred': vp}
-        return total, metrics, None
-
-    def _prep(batch):
-        if vp_active:
-            ro = _h2d(batch.row_outputs, device)
-            pv = _h2d(batch.pair_valid, device)
-            hr = _h2d(batch.row_has_rd, device)
-        else:
-            ro = pv = hr = _dummy
-        return (_h2d(batch.tokens, device, dtype=torch.long),
-                _h2d(padding_mask(batch), device),
-                _h2d(batch.valid, device, dtype=torch.float32),
-                _h2d(batch.live_in_mask, device, dtype=torch.float32),
-                _h2d(batch.live_out_mask, device, dtype=torch.float32),
-                _h2d(batch.pc_writes, device, dtype=torch.float32),
-                _h2d(batch.in_slot_regs, device, dtype=torch.long),
-                _h2d(batch.out_slot_regs, device, dtype=torch.long),
-                ro, pv, hr,
-                _slot_k_eff(batch.in_slot_regs), _slot_k_eff(batch.out_slot_regs))
-
-    def _extra(batch, aux):
-        return {f'probe_{k}': v
-                for k, v in _probe_distances(encoder, probe_tok, probe_pad).items()}
-
-    losses = run_train_loop(
-        batch_iter, model=encoder, opt=opt, scheduler=scheduler, log=log,
-        device=device,
-        prep_fn=_prep, fwd_loss_fn=_fwd_loss, extra_fn=_extra,
-        compile_step=compile_step)
-    return encoder, losses
+    return train_compressor(
+        batch_iter, ingest='tokens', d_out=d_out, d_model=d_model,
+        n_heads=n_heads, n_layers=n_layers, max_window=max_window,
+        lr=lr, n_steps=n_steps, log_every=log_every, lr_min=lr_min,
+        valid_weight=valid_weight, live_in_weight=live_in_weight,
+        live_out_weight=live_out_weight, pc_writes_weight=pc_writes_weight,
+        in_slot_weight=in_slot_weight, out_slot_weight=out_slot_weight,
+        value_predict_weight=value_predict_weight,
+        anchor_seed=anchor_seed, n_anchor_states=n_anchor_states,
+        device=device, on_log=on_log, compile_step=compile_step)
 
 
 # ===========================================================================
@@ -641,24 +721,26 @@ def _split_to_per_instruction(batch):
         slot_idx:     (N_instr_total,) int64 — which position-within-chunk.
         n_per_chunk:  (B,) int32 — instructions in each chunk
                       (0 for invalid rows).
+        instr_in0/in1/out: (N_instr_total,) int64 — per-instruction GP
+                      wiring for the state machine (x0=0). Decoded here so
+                      it rides through the prefetcher with the token split.
     """
     B, max_n_instrs = batch.instr_lens.shape
     n_per_chunk = (batch.instr_lens > 0).sum(axis=1).astype(np.int32)
     total = int(n_per_chunk.sum())
     if total == 0:
         empty = np.zeros((0, _MAX_INSTR_TOKENS), dtype=np.int8)
-        return (
-            empty,
-            np.ones((0, _MAX_INSTR_TOKENS), dtype=bool),
-            np.zeros(0, dtype=np.int64),
-            np.zeros(0, dtype=np.int64),
-            n_per_chunk,
-        )
+        z = np.zeros(0, dtype=np.int64)
+        return (empty, np.ones((0, _MAX_INSTR_TOKENS), dtype=bool),
+                z, z, n_per_chunk, z.copy(), z.copy(), z.copy())
 
     instr_tokens = np.full((total, _MAX_INSTR_TOKENS), PAD, dtype=np.int8)
     instr_pad = np.ones((total, _MAX_INSTR_TOKENS), dtype=bool)
     chunk_idx = np.empty(total, dtype=np.int64)
     slot_idx = np.empty(total, dtype=np.int64)
+    instr_in0 = np.zeros(total, dtype=np.int64)
+    instr_in1 = np.zeros(total, dtype=np.int64)
+    instr_out = np.zeros(total, dtype=np.int64)
 
     out = 0
     for c in range(B):
@@ -667,13 +749,24 @@ def _split_to_per_instruction(batch):
             L = int(batch.instr_lens[c, j])
             if L == 0:
                 continue
-            instr_tokens[out, :L] = batch.tokens[c, token_offset:token_offset + L]
+            toks = batch.tokens[c, token_offset:token_offset + L]
+            instr_tokens[out, :L] = toks
             instr_pad[out, :L] = False
             chunk_idx[out] = c
             slot_idx[out] = j
+            try:
+                instr, _ = decode_instruction(toks.tolist(), 0)
+                instr_in0[out], instr_in1[out], instr_out[out] = \
+                    instruction_wiring(instr)
+            except Exception:
+                pass    # leave (0,0,0); undecodable rows route to x0
             out += 1
             token_offset += L
-    return instr_tokens, instr_pad, chunk_idx, slot_idx, n_per_chunk
+    # sanitize out-of-range reg ids (garbage windows) -> x0.
+    for a in (instr_in0, instr_in1, instr_out):
+        a[(a < 0) | (a >= N_REGS)] = 0
+    return (instr_tokens, instr_pad, chunk_idx, slot_idx, n_per_chunk,
+            instr_in0, instr_in1, instr_out)
 
 
 def _decode_chunk_instructions(batch, row_idx):
@@ -700,61 +793,178 @@ def _decode_chunk_instructions(batch, row_idx):
     return instrs if instrs else None
 
 
-def _assemble_chunk_seq(t1_vecs, split_outputs, n_chunks, max_n_instrs, device):
-    """Scatter per-instruction T1 vectors into padded per-chunk sequences
-    and build the key-padding mask. Shared by t2_chunk_forward and the
-    gradient-subspace diagnostic (which differ only in how they run the
-    T1/T2 encodes around it)."""
-    _, _, chunk_idx, slot_idx, n_per_chunk = split_outputs
-    chunk_t1 = torch.zeros(
-        n_chunks, max_n_instrs, t1_vecs.shape[-1], device=device)
-    chunk_t1[torch.from_numpy(chunk_idx).to(device),
-             torch.from_numpy(slot_idx).to(device)] = t1_vecs
-    n_per_chunk_t = torch.from_numpy(n_per_chunk).to(device)
-    chunk_pad = (torch.arange(max_n_instrs, device=device)[None, :]
-                 >= n_per_chunk_t[:, None])
-    # Unmask position 0: an all-padded row (invalid window) would NaN the
-    # attention softmax and 0*NaN the shared pool_query gradient.
-    chunk_pad[:, 0] = False
-    return chunk_t1, chunk_pad
+@torch.no_grad()
+def _t1_predicted_wiring(t1, T):
+    """Per instruction, derive the GP wiring (in0, in1, out) for T2 from the
+    FROZEN T1's own binding PREDICTIONS — never decoded tokens. This is the
+    tier-recursion routing: T2 consumes only T1's emitted output
+    (essence + binding), so the experiment actually tests "is T1's emission
+    sufficient for the next tier?". With token wiring (the old diagnostic path) T2
+    would score identically given a useless T1, so it tested nothing.
+
+      out      = argmax out_score over predicted-written regs (gated by
+                 predicted live_out count; absent => x0).
+      in0, in1 = top-2 in_score over predicted-read regs in read order
+                 (gated by predicted live_in count; absent => x0).
+
+    T1's binding heads are behavioral (magnitude-filtered live sets), so this
+    routes the behaviorally-relevant operands — exactly what T2's own binding
+    targets supervise, and what value-numbering needs (a non-behavioral read
+    can't change the output, so dropping it is correct).
+
+    Equivariance is preserved EXACTLY: in_score/out_score/live heads are
+    equivariant per-slot readouts of T, so an argmax/topk over the register
+    axis permutes with a rename and the counts are rename-invariant — the
+    derived wiring permutes with π, keeping T2 exactly equivariant.
+
+    T: (N, n_regs, d_slot) frozen-T1 per-instruction state. Returns three
+    (N,) long slot-index tensors. x0 (=0) stands for an absent operand."""
+    n_regs = t1.n_regs
+    device = T.device
+    in_scores = t1.in_score_head(T).squeeze(-1)             # (N, n_regs)
+    out_scores = t1.out_score_head(T).squeeze(-1)
+    live_in = torch.sigmoid(t1.live_in_head(T).squeeze(-1))
+    live_out = torch.sigmoid(t1.live_out_head(T).squeeze(-1))
+    # x0 is never a GP operand/output — take it out of contention.
+    not_x0 = torch.ones(n_regs, device=device)
+    not_x0[X0_SLOT] = 0.0
+    neg = torch.finfo(in_scores.dtype).min
+    in_s = in_scores.masked_fill(not_x0 == 0, neg)
+    out_s = out_scores.masked_fill(not_x0 == 0, neg)
+    n_in = ((live_in > 0.5) * not_x0).sum(-1)               # (N,)
+    n_out = ((live_out > 0.5) * not_x0).sum(-1)
+    top2 = in_s.topk(2, dim=-1).indices                     # (N, 2): in0 then in1
+    out_top = out_s.argmax(dim=-1)                          # (N,)
+    z = torch.zeros_like(out_top)
+    in0 = torch.where(n_in >= 1, top2[:, 0], z)
+    in1 = torch.where(n_in >= 2, top2[:, 1], z)
+    out = torch.where(n_out >= 1, out_top, z)
+    return in0, in1, out
 
 
-def t2_chunk_forward(t1, t2, split_outputs, n_chunks, max_n_instrs, device):
-    """Per-instruction T1 encode → per-chunk T1 sequence → T2 encode — the
-    forward shared by the T2 trainer and eval. T1 runs frozen (no_grad); T2
-    runs in the caller's grad context (the caller sets t2.train()/eval() and
-    wraps in torch.no_grad() as appropriate). split_outputs is the tuple from
-    _split_to_per_instruction. Returns t2_out (n_chunks, d_out), or None for
-    an empty batch."""
-    instr_tokens, instr_pad, *_ = split_outputs
-    if instr_tokens.shape[0] == 0:
-        return None
+def _dense_chunk_grid(split_outputs, n_chunks, max_n_instrs):
+    """Scatter the ragged per-instruction split into a FIXED-shape
+    (n_chunks, max_n_instrs, ...) dense grid, so the frozen-T1 encode +
+    predicted-binding routing can run INSIDE the single compiled CUDA-graph step
+    instead of as eager, variable-shape, per-step CPU dispatch (the throughput fold).
+
+    Padding slots (a chunk's missing instructions) are PAD-filled with
+    active=0. T1 still encodes them, but they scatter to inactive T2 slots
+    where the core's write/event are gated to zero — so every ACTIVE slot is
+    bit-identical to the ragged path; only discarded padding work is added.
+
+    Returns numpy: tokens (B, MNI, 9) int64, pad (B, MNI, 9) bool,
+    in0/in1/out (B, MNI) int64 (token-decoded wiring; feeds T1 ingestion),
+    active (B, MNI) float32."""
+    (instr_tokens, instr_pad, chunk_idx, slot_idx, n_per_chunk,
+     in0, in1, out) = split_outputs
+    B, MNI = n_chunks, max_n_instrs
+    tok = np.full((B, MNI, _MAX_INSTR_TOKENS), PAD, dtype=np.int64)
+    pad = np.ones((B, MNI, _MAX_INSTR_TOKENS), dtype=bool)
+    g0 = np.zeros((B, MNI), dtype=np.int64)
+    g1 = np.zeros((B, MNI), dtype=np.int64)
+    go = np.zeros((B, MNI), dtype=np.int64)
+    ci, si = chunk_idx, slot_idx
+    tok[ci, si] = instr_tokens.astype(np.int64)
+    pad[ci, si] = instr_pad
+    g0[ci, si] = in0
+    g1[ci, si] = in1
+    go[ci, si] = out
+    active = (np.arange(MNI)[None, :] < n_per_chunk[:, None]).astype(np.float32)
+    return tok, pad, g0, g1, go, active
+
+
+def _t2_assemble(t1, split_outputs, n_chunks, max_n_instrs, device,
+                 t1_encode=None, route='binding'):
+    """Eager (dynamic-shape) frozen-T1 encode + scatter into fixed per-chunk
+    tensors for the T2 state machine. Returns:
+      chunk_t1   (n_chunks, max_n_instrs, d_t1)  — per-instr T1 essence (content)
+      chunk_in0/in1/out (n_chunks, max_n_instrs) long — per-instr wiring
+      chunk_active (n_chunks, max_n_instrs) float — 1 where an instr sits
+    Frozen-T1 essence is tag-invariant, so any in-distribution tag gives the
+    same content — we use a fresh random tag here purely to stay in
+    distribution. Padded slots route to x0 with active=0 (no-op in the core).
+
+    route: 'binding' (default) derives T2's per-instruction wiring from
+    T1's PREDICTED binding (_t1_predicted_wiring) — the tier-recursion path.
+    'tokens' uses the token-decoded wiring carried in split_outputs (the old
+    diagnostic path) — kept ONLY as a diagnostic A/B, not a valid recursion result.
+    Either way the wiring fed to T1 itself is token-derived (T1 ingesting its
+    own instruction); only what flows to T2 changes.
+
+    t1_encode: optional compiled `t1.encode_state` (the register-state machine
+    has many small ops; eager per-step launch of them over ~all-chunk
+    instructions was the T2 trainer's CPU bottleneck — the trainer passes a
+    compiled, dynamic-shape version so they fuse). Must return (T, essence)."""
+    (instr_tokens, instr_pad, chunk_idx, slot_idx, n_per_chunk,
+     in0, in1, out) = split_outputs
+    enc = t1_encode if t1_encode is not None else t1.encode_state
     it = torch.from_numpy(instr_tokens).to(device).long()
     ip = torch.from_numpy(instr_pad).to(device)
+    t1_in0 = torch.from_numpy(in0).to(device)
+    t1_in1 = torch.from_numpy(in1).to(device)
+    t1_out = torch.from_numpy(out).to(device)
+    t1_tags = torch.randn(it.shape[0], t1.n_regs, device=device)
     with torch.no_grad():
-        t1_vecs = t1.encode(it, ip)
-    chunk_t1, chunk_pad = _assemble_chunk_seq(
-        t1_vecs, split_outputs, n_chunks, max_n_instrs, device)
-    return t2.encode(chunk_t1, chunk_pad)
+        # T1 runs on its OWN token-derived wiring (ingestion); it emits state
+        # T and essence.
+        T1_state, t1_ess = enc(it, ip, t1_in0, t1_in1, t1_out, t1_tags)
+    if route == 'binding':
+        r_in0, r_in1, r_out = _t1_predicted_wiring(t1, T1_state)
+    else:                                    # 'tokens' diagnostic
+        r_in0, r_in1, r_out = t1_in0, t1_in1, t1_out
+    ci = torch.from_numpy(chunk_idx).to(device)
+    si = torch.from_numpy(slot_idx).to(device)
+    chunk_t1 = torch.zeros(n_chunks, max_n_instrs, t1_ess.shape[-1], device=device)
+    chunk_t1[ci, si] = t1_ess
+    chunk_in0 = torch.zeros(n_chunks, max_n_instrs, dtype=torch.long, device=device)
+    chunk_in1 = torch.zeros(n_chunks, max_n_instrs, dtype=torch.long, device=device)
+    chunk_out = torch.zeros(n_chunks, max_n_instrs, dtype=torch.long, device=device)
+    chunk_in0[ci, si] = r_in0
+    chunk_in1[ci, si] = r_in1
+    chunk_out[ci, si] = r_out
+    npc = torch.from_numpy(n_per_chunk).to(device)
+    chunk_active = (torch.arange(max_n_instrs, device=device)[None, :]
+                    < npc[:, None]).float()
+    return chunk_t1, chunk_in0, chunk_in1, chunk_out, chunk_active
+
+
+def t2_chunk_forward(t1, t2, split_outputs, n_chunks, max_n_instrs, device,
+                     t2_tags=None, route='binding'):
+    """Frozen-T1 per-instruction essence → T2 register-state machine over the
+    chunk → essence. The whole forward, for eval / non-compiled callers (the
+    trainer splits the eager assemble from the compiled core). Returns the
+    chunk essence (n_chunks, d_out), or None for an empty batch."""
+    if split_outputs[0].shape[0] == 0:
+        return None
+    chunk_t1, in0, in1, out, active = _t2_assemble(
+        t1, split_outputs, n_chunks, max_n_instrs, device, route=route)
+    if t2_tags is None:
+        t2_tags = torch.randn(n_chunks, t2.n_regs, device=device)
+    return t2.encode(chunk_t1, in0, in1, out, active, t2_tags)
 
 
 def t2_value_predict_loss(t2, vecs, anchor_states_t,
                           in_slot_regs_t, out_slot_regs_t,
                           out_regs_t, mask_t, return_count=False):
-    """Per-anchor, per-out-slot value-prediction MSE for T2.
+    """Per-anchor, per-out-slot value-prediction MSE (canonical).
 
-    The head reads (vec, anchor input-slot values) and predicts
-    per-anchor per-slot output values. The supervision is "for slot k
-    bound to register r in this chunk, the value at slot k should be
-    register r's actual value after executing the chunk on this
-    anchor."
+    The head reads (vec, CANONICAL input-slot values) and predicts per-anchor
+    per-slot output values. Both the inputs fed and the target read are in the
+    canonical frame: input slot k is fed anchor[:, k+1] (the canonical position
+    precompute_chunk sourced the k-th input from) and the target is out_regs
+    (the canonical post-execution register file). So the task is "given the
+    canonical input values, predict the canonical output values" — a
+    self-consistent, register-name-free I/O function the essence must encode.
 
     Args:
       t2:               T2Compressor (uses t2.vp_head)
       vecs:             (B, d) — T2 output vector
       anchor_states_t:  (A, 32) int32 — register file per anchor (pre-exec)
-      in_slot_regs_t:   (B, MAX_INPUT_SLOTS) int64 — input slot register IDs
-                        (AUX_CE_IGNORE for unused slots)
+      in_slot_regs_t:   (B, MAX_INPUT_SLOTS) int64 — input slot register IDs;
+                        used ONLY as a fill mask (which slots carry an input).
+                        The values fed are canonical (anchor[:, k+1]), not the
+                        actual registers' values.
       out_slot_regs_t:  (B, MAX_OUTPUT_SLOTS) int64 — output slot register IDs
                         (AUX_CE_IGNORE for unused slots)
       out_regs_t:       (B, A, 32) int32 — register file per anchor AFTER
@@ -765,13 +975,29 @@ def t2_value_predict_loss(t2, vecs, anchor_states_t,
     out_slot_regs is not IGNORE.
     """
     n_anchors = anchor_states_t.shape[0]
+    max_in = in_slot_regs_t.shape[1]
 
-    # Build per-anchor input values: clamp IGNORE→0 (x0=0 in all anchors)
-    # for the lookup; x0's value is 0 by convention so unused slots
-    # contribute zero, which matches "no input" naturally.
-    in_lookup = in_slot_regs_t.clamp(min=0).long()    # (B, MAX_IN)
-    # anchor_states[:, in_lookup] -> (A, B, MAX_IN); permute to (B, A, MAX_IN)
-    in_vals = anchor_states_t[:, in_lookup].permute(1, 0, 2).float()
+    # CANONICAL input values. `out_regs` is the canonical baseline:
+    # precompute_chunk relocates the chunk's i-th first-read input to canonical
+    # position i+1 (_canonical_state) and executes there, so out_regs depends
+    # only on operand STRUCTURE, not register names. The vp head must therefore
+    # see the canonical-position values anchor[:, k+1] for input slot k — NOT
+    # the raw value at the slot's actual register (the old bug, which fed
+    # anchor[:, in_slot_regs] and asked the head to predict f(canon inputs) from
+    # raw inputs = uncorrelated numbers). Canonical also leaks no register
+    # identity into vp, which is the right choice for an equivariant encoder.
+    # Unfilled slots (AUX_CE_IGNORE) feed 0 = "no input".
+    # (Caveat: canonical positions are assigned to all live syntactic inputs,
+    # while in_slot_regs lists only the behavioral subset; the two coincide for
+    # T1 and ~all T2 chunks, diverging only for degenerate ops with a live-but-
+    # value-irrelevant input, e.g. ANDI _,_,0 — rare, accepted.)
+    device = anchor_states_t.device
+    canon_pos = torch.arange(1, max_in + 1, device=device).clamp(max=N_REGS - 1)
+    in_filled = (in_slot_regs_t != AUX_CE_IGNORE).float()       # (B, max_in)
+    # (A, max_in) canonical values, broadcast over rows, zeroed at unfilled
+    # slots -> (B, A, max_in).
+    in_vals = (anchor_states_t[:, canon_pos].float().unsqueeze(0)
+               * in_filled.unsqueeze(1))
 
     in_vals_c = _value_compress(in_vals)
 
@@ -801,47 +1027,6 @@ def t2_value_predict_loss(t2, vecs, anchor_states_t,
     pm = pair_mask.float()
     mse = (per_slot * pm).sum() / pm.sum().clamp(min=1)
     return (mse, int(pair_mask.sum())) if return_count else mse
-
-
-T2_PAIR_STRIDES = (1, 2, 3, 5, 8, 13, 21, 34)
-
-
-def t2_pair_loss(vecs, out_regs_t, live_out_t, valid_t, *,
-                 scale, strides=T2_PAIR_STRIDES, return_count=False):
-    """Oracle behavioral pairwise loss (rename-SENSITIVE). Matches cosine
-    distance between chunk vectors to a behavioral distance from their
-    post-execution register files: identical behaviors collapse, different
-    behaviors separate in proportion. Pairs formed statically by rolling the
-    batch by each stride (compile-safe). Distance averaged over registers
-    either chunk writes (live_out union) so it isn't diluted by untouched
-    registers.
-
-      vecs:        (B, d) raw T2 vectors (normalized internally).
-      out_regs_t:  (B, A, 32) int — post-exec register file per anchor.
-      live_out_t:  (B, 32) float — which registers each chunk writes.
-      valid_t:     (B,) — rows with valid out_regs (others excluded).
-      scale:       maps behavioral distance (loglog, ~[0,3]) to a target
-                   cosine distance ([0,2])."""
-    v = F.normalize(vecs, dim=-1)
-    orl = out_regs_t.long()
-    lo_b = live_out_t.bool()
-    valid_f = valid_t.float()
-    num = vecs.new_zeros(())
-    den = vecs.new_zeros(())
-    for s in strides:
-        vb = torch.roll(v, -s, 0)
-        dv = 1.0 - (v * vb).sum(-1)                            # (B,) cos dist
-        diff = (orl - torch.roll(orl, -s, 0)).abs().float()   # (B, A, 32)
-        c = torch.log1p(torch.log1p(diff))                    # loglog magnitude
-        touched = (lo_b | torch.roll(lo_b, -s, 0)).float()    # (B, 32)
-        per_anchor = ((c * touched.unsqueeze(1)).sum(-1)
-                      / touched.sum(-1, keepdim=True).clamp(min=1))   # (B, A)
-        target = (scale * per_anchor.mean(1)).clamp(max=2.0)  # (B,)
-        pm = valid_f * torch.roll(valid_f, -s, 0)
-        num = num + ((dv - target) ** 2 * pm).sum()
-        den = den + pm.sum()
-    mse = num / den.clamp(min=1)
-    return (mse, int(den)) if return_count else mse
 
 
 def _slot_k_eff(slot_regs_np):
@@ -924,15 +1109,18 @@ def _listmle_loss(scores, slot_regs, K_max, active_f, k_eff=None):
     return (chunk_loss * weight).sum() / weight.sum().clamp(min=1)
 
 
-def binding_losses(model, vec, *, live_in_t, live_out_t, pc_writes_t,
+def binding_losses(model, T, essence, *, live_in_t, live_out_t, pc_writes_t,
                    in_slot_t, out_slot_t, in_k_eff=None, out_k_eff=None):
     """Rename-equivariant register-binding losses, shared by T1 and T2.
 
-    T1 is the n_instrs=1 special case of T2: both read these targets from
-    `precompute_chunk` and supervise the same heads on the normalized
-    binding direction. BCE on live_in/out masks + pc_writes; ListMLE
-    (Plackett-Luce) on the in/out slot orderings via per-register score
-    heads. Rows with all-zero masks (invalid / mem-op) are excluded.
+    T1 is the n_instrs=1 special case of T2: both emit one register-indexed
+    state `T` (B, n_regs, d_slot) plus a rename-invariant `essence`. The
+    binding heads are per-slot readouts of `T` — `head(T) -> (B, n_regs, 1)`
+    — so a register rename permutes the scores identically (equivariant by
+    construction, duplicate-free). `pc_writes` reads `essence` (PC effects
+    are opcode-determined, rename-invariant). BCE on live_in/out + pc_writes;
+    ListMLE (Plackett-Luce) on the in/out slot orderings. Rows with all-zero
+    masks (invalid / mem-op) are excluded.
 
     Every target derives from one dataflow analysis, so these losses are
     mutually consistent — no objective collapses what another must keep
@@ -955,10 +1143,9 @@ def binding_losses(model, vec, *, live_in_t, live_out_t, pc_writes_t,
     n_active = active_f.sum().clamp(min=1)
     n_regs = model.n_regs
 
-    binding_dir = F.normalize(vec, dim=-1)
-    li_logits = model.live_in_head(binding_dir)
-    lo_logits = model.live_out_head(binding_dir)
-    pc_logits = model.pc_writes_head(binding_dir).squeeze(-1)
+    li_logits = model.live_in_head(T).squeeze(-1)        # (B, n_regs)
+    lo_logits = model.live_out_head(T).squeeze(-1)
+    pc_logits = model.pc_writes_head(essence).squeeze(-1)
 
     li_per = F.binary_cross_entropy_with_logits(
         li_logits, live_in_t, reduction='none')
@@ -970,8 +1157,8 @@ def binding_losses(model, vec, *, live_in_t, live_out_t, pc_writes_t,
         pc_logits, pc_writes_t, reduction='none')
     pc_loss = (pc_per * active_f).sum() / n_active
 
-    in_scores = model.in_score_head(binding_dir)
-    out_scores = model.out_score_head(binding_dir)
+    in_scores = model.in_score_head(T).squeeze(-1)       # (B, n_regs)
+    out_scores = model.out_score_head(T).squeeze(-1)
     in_slot_loss = _listmle_loss(
         in_scores, in_slot_t, model.max_input_slots, active_f, k_eff=in_k_eff)
     out_slot_loss = _listmle_loss(
@@ -1007,116 +1194,6 @@ def _compute_chunk_out_regs(batch, anchor_states_np):
         out[b] = pre.out_regs
         mask[b] = True
     return out, mask
-
-
-_GRAD_DIM_LOSSES = ['vp', 'in_slot', 'out_slot', 'live_in', 'live_out']
-
-
-def _pr_from_cov(C):
-    """Participation ratio (effective dimensionality) of a covariance/
-    second-moment matrix: (trace)^2 / ||.||_F^2 = (sum eig)^2 / sum eig^2."""
-    tr = torch.diagonal(C).sum()
-    fro2 = (C * C).sum().clamp(min=1e-30)
-    return float((tr * tr / fro2).item())
-
-
-def _cov_cosine(A, B):
-    """Matrix-cosine between two PSD matrices (0=orthogonal, 1=same)."""
-    inner = (A * B).sum()
-    na = torch.sqrt((A * A).sum())
-    nb = torch.sqrt((B * B).sum())
-    return float((inner / (na * nb).clamp(min=1e-30)).item())
-
-
-def _pr_and_overlaps(grads, center=True):
-    """grads: name -> (B, d) per-sample gradient on `pooled`.
-
-    Reports BOTH:
-      - uncentered second-moment C = g^T g: includes the mean (DC) gradient
-        direction the loss pushes every sample along. Dominated by that
-        common direction → small PR when gradients align.
-      - centered covariance Cc = (g-mean)^T (g-mean): the dimensionality of
-        how the gradient VARIES across samples (the common push removed),
-        the analog of mean-centered PCA on representations.
-
-    Returns dims = {name: {'unc': PR_uncentered, 'cen': PR_centered}} and
-    overlaps (matrix-cosine) computed on the chosen basis (centered by
-    default)."""
-    C = {n: g.t() @ g for n, g in grads.items()}
-    Cc = {n: (g - g.mean(0, keepdim=True)).t() @ (g - g.mean(0, keepdim=True))
-          for n, g in grads.items()}
-    dims = {n: {'unc': _pr_from_cov(C[n]), 'cen': _pr_from_cov(Cc[n])}
-            for n in grads}
-    basis = Cc if center else C
-    overlaps = {}
-    names = list(grads.keys())
-    for i in range(len(names)):
-        for j in range(i + 1, len(names)):
-            a, b = names[i], names[j]
-            overlaps[f'{a}|{b}'] = _cov_cosine(basis[a], basis[b])
-    return dims, overlaps
-
-
-def loss_grad_dims(t2, t1, batch, anchor_states_t, device):
-    """Per-loss gradient-subspace dims + overlaps on the shared `pooled`
-    vector (the score-heads + vp T2). Backprops each loss separately to
-    pooled and summarizes via _pr_and_overlaps. Dirties param .grad —
-    caller zeroes afterward."""
-    split_outputs = _split_to_per_instruction(batch)
-    instr_tokens, instr_pad, *_ = split_outputs
-    if instr_tokens.shape[0] == 0:
-        return None, None
-    it = torch.from_numpy(instr_tokens).to(device).long()
-    ip = torch.from_numpy(instr_pad).to(device)
-    with torch.no_grad():
-        t1_vecs = t1.encode(it, ip)
-    B, max_n = batch.instr_lens.shape
-    chunk_t1, pad = _assemble_chunk_seq(
-        t1_vecs, split_outputs, B, max_n, device)
-    # return_pooled exposes the pre-projection vector that each loss term is
-    # backprop'd to below.
-    t2_out, pooled = t2.encode(chunk_t1, pad, return_pooled=True)
-    pooled.retain_grad()
-    binding_dir = F.normalize(t2_out, dim=-1)
-
-    in_slot_t = torch.from_numpy(
-        batch.in_slot_regs.astype(np.int64)).to(device)
-    out_slot_t = torch.from_numpy(
-        batch.out_slot_regs.astype(np.int64)).to(device)
-    live_in_t = torch.from_numpy(batch.live_in_mask).to(device).float()
-    live_out_t = torch.from_numpy(batch.live_out_mask).to(device).float()
-    active = (live_in_t.any(-1) | live_out_t.any(-1)).float()
-    n_active = active.sum().clamp(min=1)
-    nreg = t2.n_regs
-
-    out_regs_t = torch.from_numpy(batch.out_regs).to(device)
-    vp_mask_t = torch.from_numpy(batch.out_regs_valid).to(device)
-
-    losses = {
-        'vp': t2_value_predict_loss(
-            t2, t2_out, anchor_states_t, in_slot_t, out_slot_t,
-            out_regs_t, vp_mask_t),
-        'in_slot': _listmle_loss(
-            t2.in_score_head(binding_dir), in_slot_t,
-            t2.max_input_slots, active),
-        'out_slot': _listmle_loss(
-            t2.out_score_head(binding_dir), out_slot_t,
-            t2.max_output_slots, active),
-    }
-    li = F.binary_cross_entropy_with_logits(
-        t2.live_in_head(binding_dir), live_in_t, reduction='none')
-    losses['live_in'] = (li * active.unsqueeze(-1)).sum() / (n_active * nreg)
-    lo = F.binary_cross_entropy_with_logits(
-        t2.live_out_head(binding_dir), live_out_t, reduction='none')
-    losses['live_out'] = (lo * active.unsqueeze(-1)).sum() / (n_active * nreg)
-
-    grads = {}
-    for name in _GRAD_DIM_LOSSES:
-        if pooled.grad is not None:
-            pooled.grad = None
-        losses[name].backward(retain_graph=True)
-        grads[name] = pooled.grad.detach().clone()
-    return _pr_and_overlaps(grads)
 
 
 def _mp_worker_main(in_q, out_q):
@@ -1203,8 +1280,7 @@ class TrainBatchPrefetcher:
 
 
 def train_t2_encoder(batch_iter, t1_encoder, *,
-                     d_model=256, n_heads=4, n_layers=2, d_out=256,
-                     max_chunk_len=32,
+                     d_out=256, d_event=16,
                      lr=3e-4, n_steps=None, log_every=100, lr_min=1e-6,
                      warmup_steps=0,
                      valid_weight=0.0,
@@ -1212,210 +1288,25 @@ def train_t2_encoder(batch_iter, t1_encoder, *,
                      pc_writes_weight=0.1,
                      in_slot_weight=0.1, out_slot_weight=0.1,
                      value_predict_weight=0.0,
-                     value_predict_every=1,
-                     pair_weight=0.0, pair_scale=0.5,
                      anchor_seed=0, n_anchor_states=8,
-                     t2_checkpoint=None,
+                     t2_checkpoint=None, t2_route='binding',
                      device='auto',
                      on_log=None, compile_step=True):
-    """Train a T2 encoder on top of a frozen T1 encoder.
-
-    For each RVT batch:
-      1. Split flat chunk tokens into per-instruction segments via
-         batch.instr_lens.
-      2. Run frozen T1.encode on every instruction in the batch
-         (one big GPU call across all chunks).
-      3. Reshape T1 outputs back into per-chunk sequences with padding.
-      4. Run T2.encode over the sequences → one T2 vector per chunk.
-      5. Optional magnitude-validity loss (defaults off — corpora
-         generated without --inject-invalid have no negative class).
-      6. Aux register-identity supervision (BCE on live_in/out masks
-         and pc_writes; CE on slot-positional register predictions).
-
-    Aux heads project from F.normalize(t2_vecs) so register-identity
-    info is encoded into direction, not magnitude.
-
-    on_log: optional callable(model, losses, train_state) called after
-            each log point. Use it to checkpoint mid-run (train_state
-            carries optimizer/scheduler/RNG for --resume).
-
-    Returns (t2, losses).
-    """
-    device = resolve_device(device)
-    # TF32 + fused-attention-fastpath disable are handled in run_train_loop
-    # (shared across trainers).
-    t1_encoder.eval()
-    for p in t1_encoder.parameters():
-        p.requires_grad = False
-    t1_encoder = t1_encoder.to(device)
-
-    t2 = T2Compressor(
-        d_t1=t1_encoder.d_out, d_model=d_model, n_heads=n_heads,
-        n_layers=n_layers, d_out=d_out, max_chunk_len=max_chunk_len,
-    ).to(device)
-    # Track resumed training state (optimizer/scheduler/step/rng). When
-    # t2_checkpoint is a directory containing train_state.pt, we restore
-    # everything for a continue-from-where-we-left-off resume. When it's
-    # a .pt file, we only load model weights (legacy "polish" resume —
-    # Adam moments reset, schedule restarts).
-    resume_train_state = None
-    if t2_checkpoint is not None:
-        ckpt_path = Path(t2_checkpoint)
-        if ckpt_path.is_dir():
-            model_path = ckpt_path / 't2.pt'
-            train_state_path = ckpt_path / 'train_state.pt'
-            t2.load_state_dict(load_checkpoint(model_path, device),
-                               strict=False)
-            if train_state_path.exists():
-                resume_train_state = torch.load(
-                    train_state_path, map_location=device,
-                    weights_only=False)
-        else:
-            t2.load_state_dict(load_checkpoint(ckpt_path, device),
-                               strict=False)
-    opt, scheduler = build_optim_sched(
-        t2.parameters(), lr, n_steps, warmup_steps=warmup_steps,
-        lr_min=lr_min, device=device)
-
-    # Anchor states for value-prediction. Must match gen-time settings.
-    anchor_np = make_anchor_states(n_anchor_states, anchor_seed)
-    anchor_states_t = torch.from_numpy(anchor_np).to(device)
-
-    def _fmt(r, ms, eta, lr_now):
-        return (
-            f'step {r["step"]:>5d}  loss {r["total"]:.4f} '
-            f'(val {r["valid"]:.4f} '
-            f'li {r["live_in"]:.3f} lo {r["live_out"]:.3f} '
-            f'pc {r["pc_writes"]:.3f} '
-            f'is {r["in_slot"]:.3f} os {r["out_slot"]:.3f} '
-            f'vp {r["value_pred"]:.4f} pair {r["pair"]:.4f}) '
-            f'B={r["n_chunks"]} I={r["n_instrs"]}  '
-            f'lr {lr_now:.1e}  {ms:.0f}ms/step  '
-            f'eta {timedelta(seconds=int(eta))}')
-
-    log = TrainLog(n_steps=n_steps, log_every=log_every, lr=lr,
-                   scheduler=scheduler, formatter=_fmt, on_log=on_log)
-    step = 0
-
-    # Restore optimizer/scheduler/step/RNG from a previous checkpoint dir
-    # (set above in the t2_checkpoint handling block), so resume continues
-    # where the prior run left off.
-    if resume_train_state is not None:
-        step = restore_train_state(resume_train_state, opt, scheduler)
-        print(f'Resumed from step {step}')
-
-    # Trains until stdin EOF — pipeline upstream (cat / mux_batches /
-    # multinode_gen) controls total batch count. n_steps shapes the cosine
-    # scheduler and ETA display; if the pipeline runs longer the LR stays at
-    # lr_min, if shorter the schedule is truncated.
-    #
-    # Wrap batch_iter in a prefetcher so CPU-side prep (numpy splitting and
-    # the per-chunk loop for value-predict targets) overlaps
-    # with GPU work on the prior batch.
-    batch_source = TrainBatchPrefetcher(batch_iter)
-
-    # Peek the first item: batch shape (n_chunks, max_n_instrs) and vp/valid
-    # activity are corpus-constant, so bake them as Python constants into the
-    # compiled graph.
-    first, batch_source = _peek(batch_source)
-    if first is None:
-        return t2, log.losses
-    N_CHUNKS, MAX_NI = first[0].instr_lens.shape
-    d_t1 = t1_encoder.d_out
-    vp_active = value_predict_weight > 0
-    pair_active = pair_weight > 0
-    out_regs_active = vp_active or pair_active
-    valid_active = valid_weight > 0
-
-    t2.train()
-    _dummy = torch.zeros(1, device=device)
-    _arange_ni = torch.arange(MAX_NI, device=device)[None, :]
-
-    # Compiled T2 forward+loss — FIXED-shape inputs (chunk_t1 is (N_CHUNKS,
-    # MAX_NI, d_t1), corpus-constant) so the graph records once. The frozen-T1
-    # per-instruction encode + chunk assembly stay EAGER in _prep: their input
-    # (total_instrs, ...) varies per batch, and feeding that to a CUDA graph
-    # re-records per size (we observed 51 — catastrophic). T1 (d128) eager is
-    # the cheap part; the T2 (d512) forward+loss+backward we capture is the bulk.
-    def _fwd_loss(chunk_t1, chunk_pad, li, lo, pc, in_slot, out_slot,
-                  out_regs, vp_mask, valid_f, ike, oke):
-        t2_out = t2.encode(chunk_t1, chunk_pad)
-        if valid_active:
-            valid_loss = ((t2_out.norm(dim=-1) - valid_f) ** 2).mean()
-        else:
-            valid_loss = t2_out.new_zeros(())
-        bl = binding_losses(
-            t2, t2_out, live_in_t=li, live_out_t=lo, pc_writes_t=pc,
-            in_slot_t=in_slot, out_slot_t=out_slot, in_k_eff=ike, out_k_eff=oke)
-        if vp_active:
-            vp = t2_value_predict_loss(
-                t2, t2_out, anchor_states_t, in_slot, out_slot, out_regs, vp_mask)
-        else:
-            vp = t2_out.new_zeros(())
-        if pair_active:
-            pair = t2_pair_loss(t2_out, out_regs, lo, vp_mask, scale=pair_scale)
-        else:
-            pair = t2_out.new_zeros(())
-        total = (valid_weight * valid_loss
-                 + live_in_weight * bl['live_in']
-                 + live_out_weight * bl['live_out']
-                 + pc_writes_weight * bl['pc_writes']
-                 + in_slot_weight * bl['in_slot']
-                 + out_slot_weight * bl['out_slot']
-                 + value_predict_weight * vp
-                 + pair_weight * pair)
-        metrics = {'total': total, 'valid': valid_loss,
-                   'live_in': bl['live_in'], 'live_out': bl['live_out'],
-                   'pc_writes': bl['pc_writes'], 'in_slot': bl['in_slot'],
-                   'out_slot': bl['out_slot'], 'value_pred': vp, 'pair': pair}
-        return total, metrics, None
-
-    def _prep(item):
-        batch, split_outputs = item
-        instr_tokens, instr_pad, chunk_idx, slot_idx, n_per_chunk = split_outputs
-        if instr_tokens.shape[0] == 0:        # all-invalid batch
-            return None
-        # Eager (dynamic-shape) frozen-T1 encode + assemble → fixed chunk_t1.
-        it = _h2d(instr_tokens, device, dtype=torch.long)
-        ip = _h2d(instr_pad, device)
-        with torch.no_grad():
-            t1_vecs = t1_encoder.encode(it, ip)
-        ci = _h2d(chunk_idx, device, dtype=torch.long)
-        si = _h2d(slot_idx, device, dtype=torch.long)
-        npc = _h2d(n_per_chunk, device, dtype=torch.long)
-        chunk_t1 = torch.zeros(N_CHUNKS, MAX_NI, d_t1,
-                               device=device, dtype=t1_vecs.dtype)
-        chunk_t1[ci, si] = t1_vecs
-        chunk_pad = _arange_ni >= npc[:, None]
-        chunk_pad[:, 0] = False
-        valid_f = (_h2d(batch.valid, device, dtype=torch.float32)
-                   if valid_active else _dummy)
-        if out_regs_active:
-            out_regs_t = _h2d(batch.out_regs, device)
-            vp_mask_t = _h2d(batch.out_regs_valid, device)
-        else:
-            out_regs_t = vp_mask_t = _dummy
-        return (chunk_t1, chunk_pad,
-                _h2d(batch.live_in_mask, device, dtype=torch.float32),
-                _h2d(batch.live_out_mask, device, dtype=torch.float32),
-                _h2d(batch.pc_writes, device, dtype=torch.float32),
-                _h2d(batch.in_slot_regs, device, dtype=torch.long),
-                _h2d(batch.out_slot_regs, device, dtype=torch.long),
-                out_regs_t, vp_mask_t, valid_f,
-                _slot_k_eff(batch.in_slot_regs), _slot_k_eff(batch.out_slot_regs))
-
-    def _extra(item, aux):
-        n_per_chunk = item[1][4]
-        return {'n_chunks': N_CHUNKS, 'n_instrs': int(n_per_chunk.sum())}
-
-    losses = run_train_loop(
-        batch_source, model=t2, opt=opt, scheduler=scheduler, log=log,
-        device=device,
-        prep_fn=_prep, fwd_loss_fn=_fwd_loss, extra_fn=_extra,
-        compile_step=compile_step, capture_state=True, start_step=step)
-    return t2, losses
-
-    return t2, log.losses
+    """T2 preset over `train_compressor` — frozen-T1 vector front-end, wiring
+    routed off T1's predicted binding (t2_route). Same execution path
+    as T1; only the content provider + hparams differ."""
+    return train_compressor(
+        batch_iter, ingest='vectors', lower_encoder=t1_encoder,
+        d_out=d_out, d_event=d_event, route=t2_route,
+        lr=lr, n_steps=n_steps, log_every=log_every, lr_min=lr_min,
+        warmup_steps=warmup_steps,
+        valid_weight=valid_weight, live_in_weight=live_in_weight,
+        live_out_weight=live_out_weight, pc_writes_weight=pc_writes_weight,
+        in_slot_weight=in_slot_weight, out_slot_weight=out_slot_weight,
+        value_predict_weight=value_predict_weight,
+        anchor_seed=anchor_seed,
+        n_anchor_states=n_anchor_states, resume=t2_checkpoint,
+        device=device, on_log=on_log, compile_step=compile_step)
 
 
 def _decoder_accuracy(logits, dec_tgt, dec_pad):

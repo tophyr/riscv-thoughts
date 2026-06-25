@@ -217,37 +217,183 @@ same decoder architecture that lowers T1→T0 should lower T2→T1. The
 only difference at the T0 boundary is that the output must discretize
 into a finite token vocabulary.
 
-### Joint encoder-compressor (T0→T1)
+### Encoder design
 
-Train the encoder and compressor jointly, end-to-end. The compressor's
-loss (execution equivalence + distance preservation) directly optimizes
-the encoder to produce representations useful for semantic compression.
+The encoder is the **rename-equivariant register-state machine** described in
+the next section — one shared core for every tier, trained end-to-end with the
+behavioral loss set, no separate token-transformer + pooling stage. Output
+dimensionality follows the information content: a single T1 instruction is
+bounded (opcode ~6 bits, up to 3 registers ~5 bits each, immediate ~12 bits ≈
+~30 bits), so T1's `d_out` is small (64); T2 carries multi-instruction binding
+plus essence and needs more (512). Err toward too small rather than too large —
+overcomplete spaces enable shortcut solutions (see TRANSFERABLE_LESSONS.md
+lesson 6).
 
-The encoder is a small transformer that processes an instruction's
-tokens and produces contextual representations. The compressor pools
-these into a single T1 vector. Both are trained together.
+---
 
-Size: small. RV32I vocabulary is ~90 tokens. Single instructions are
-4-7 tokens. A 2-4 layer transformer with d_model=128-256 should be
-sufficient for T0→T1. Trainable on a 4090 in minutes.
+## Rename-Equivariant Compressor
 
-### Compressor pooling
+The settled design. It is the architecture validated in EXPERIMENT_LOG.md
+Phase 14; this section is the durable rationale for *why* it is shaped the
+way it is.
 
-Takes the encoder's token representations and produces a single
-compressed point. Architecture candidates:
+### The nuisance variable is register naming
 
-- **Cross-attention pooling**: a single learned query slot attends
-  over the token representations. Start here.
-- **Mean pooling + projection**: simpler baseline. Mean of token
-  representations projected to output space.
+A tier T_n maps a unit of computation to a vector whose geometry encodes what
+the computation *does*, so behaviorally-equivalent programs land in the same
+place and the *operator* is the macro organizer of the space. For RISC-V
+chunks the nuisance variable is **register naming**: `add r5,r3,r4` and
+`add r9,r1,r2` compute the same function with different labels. The
+representation must treat the *operation* as the essence and the *register
+binding* (which physical register plays which role) as a secondary,
+recoverable coordinate — not the other way around.
 
-Output dimensionality: start small (32-128). For T0→T1, the
-information content of a single instruction is bounded — opcode
-(~6 bits), up to 3 registers (~5 bits each), and an immediate
-(~12 bits). The effective information is ~30 bits, so d_out in the
-range of 32-64 should be sufficient. Err on the side of too small
-rather than too large — overcomplete spaces enable shortcut solutions
-(see TRANSFERABLE_LESSONS.md §6).
+### The symmetry, and why a rename cannot be a vector addition
+
+A register rename is a permutation π ∈ S₃₂ acting on register names. We want
+the encoder to be **equivariant**: `enc(π·C) = ρ(π)·enc(C)` for a
+representation ρ that is a group homomorphism (`ρ(π∘σ) = ρ(π)·ρ(σ)`). The
+operator-essence part should be **invariant** (an add is an add); the binding
+part should **transform predictably** with π (king − man + woman ≈ queen, but
+for register roles).
+
+A rename **cannot** be modeled as adding a per-rename vector. If
+`ρ(π) = "add v_π"`, the homomorphism law forces `v_{π∘σ} = v_π + v_σ`. For
+any transposition t, `t∘t = identity` ⇒ `0 = v_id = 2·v_t` ⇒ `v_t = 0`, and
+since transpositions generate S₃₂, **every** v_π = 0. `(ℝ^d, +)` is
+torsion-free, but permutations are built from finite-order elements; a
+homomorphism into it kills all torsion → kills everything. This is not a
+training difficulty — it is a theorem, and it was confirmed empirically: an
+additive "consistent displacement" objective gave held-out-π displacement
+consistency at the random baseline (`R ≈ 0.09`; EXPERIMENT_LOG.md Phase 13).
+
+The right structure is an **orthogonal / permutation representation**:
+`ρ(π) = R_π`, a permutation matrix acting on **register-indexed**
+coordinates. O(d) is full of finite-order elements (a swap needs `R² = I`, a
+3-cycle `R³ = I` — both exist), so the torsion problem vanishes; it is
+norm-preserving (renames must not change validity, which rides on magnitude);
+it is exact and identical across all inputs; and it never enumerates the 32!
+permutations (a homomorphism is fixed by where it sends ~31 generators).
+
+### The essence/binding split is emergent, not imposed
+
+Do not hand-partition the vector into "these dims = operator, those =
+binding." Once S₃₂ acts on a register-indexed space, the space decomposes
+canonically into isotypic components: the **invariant** (symmetric) subspace
+and its equivariant complement. Operator-essence = the rename-invariant
+(symmetric) component — *what* the model routes there is learned; *that* it
+exists is forced by the symmetry. Binding = the equivariant per-register
+deviations that π permutes. The one structural commitment is that the
+representation carries a **register axis** (the entities the symmetry
+permutes) — categorically like a GNN's node axis or a CNN's spatial axis.
+Exact by-construction equivariance *requires* it; you cannot make an
+unstructured flat vector equivariant by construction.
+
+### SSA makes the split structural
+
+The chunk's SSA dataflow DAG already isolates register identity. A physical
+register name appears in exactly two places — the **input leaves** (live-in
+registers) and the **output bindings** (which register holds each final
+value); everything in between references operands by SSA id, the
+rename-invariant canonical form. So a rename touches *only the boundary*; the
+interior is bit-identical. The invariant essence (interior computation) and
+the equivariant binding (boundary register-assignment) are SSA's own
+structure, surfaced — not a split we invent.
+
+### The register-state machine
+
+Realize the encoder as a register-indexed state machine over the dataflow:
+
+- State `S ∈ ℝ^{n_regs × d}` — the running essence bound to each register.
+- Seed live-in registers with **distinct, anonymous leaf tags** (below).
+- For each instruction in order: **read** the operand slots' states, apply a
+  shared **op-cell** to produce the result essence, **write** it to the
+  destination slot (functional, SSA-style — one-hot read/write, no in-place
+  scatter, so the step captures cleanly into a compiled CUDA graph).
+- Chunk representation = the final state `S`. Essence = a
+  permutation-invariant **attention pool** over the register axis (not a plain
+  mean, which would drag in the random leaf-tags of untouched slots); binding
+  = the per-slot structure, read back by the binding heads.
+
+This is equivariant by construction: renaming registers permutes which slots
+are read and written, so `S` permutes and the symmetric-pool essence is
+invariant — *exactly*, with no training. Equivariance is exact precisely
+because there are **no per-register learned parameters**: the only
+register-indexed input is the anonymous tag, and reads/writes are pure one-hot
+tensor ops.
+
+Two channel groups per slot, both equivariant: **value channels** (set on
+write, preserved on read — the dataflow state the op-cell threads, which makes
+multi-hop value-numbering correct) and **event channels** (accumulate
+read/write events with order timestamps, so `live_in`/`in_slot`/`out_slot`
+are recoverable from the emitted object; a pure value-state records only
+writes). The read pulse is content-dependent, so a behaviorally-irrelevant
+read (`AND rs1,x0`) is distinguishable from a relevant one.
+
+**Distinct anonymous leaf tags (subtle but essential).** Inputs must be
+*distinguishable* (so `add r2,r3` ≠ `add r2,r2`) but carry *no intrinsic
+identity* — a per-register learned embedding `f(r)` would have to be constant
+to be equivariant, destroying distinctness. Resolution = the random-node-
+feature trick: give each live-in register a random tag, sampled per chunk,
+that permutes with π. The network learns to use tags only as "these two
+inputs differ," not "this is register 5"; structurally-identical inputs
+collapse, distinct ones stay apart.
+
+### The tier contract — never re-embed tokens
+
+**T_{n+1} consumes only the output of T_n, never raw tokens.** Every tier
+emits an `(essence, binding)` object: an essence vector (rename-invariant,
+"what this unit computes") and binding references (which registers, in which
+roles, as equivariant indices into the register axis).
+
+- **T1** (one instruction): the state machine with `seq_len=1`, its per-step
+  content the embedded **opcode + immediate tokens** (registers stripped to
+  wiring). Essence = the operation; binding = the register filling each role.
+- **T2** (chunk): the *same* machine over K steps, its per-step content the
+  **frozen T1 essence** for that instruction — *not* a re-embedded opcode. The
+  op-cell takes `[T1_essence_i, operand_states]`; the wiring (which registers
+  each instruction reads/writes) comes from **T1's predicted binding**, so the
+  experiment genuinely tests whether T1's emission is sufficient for the next
+  tier. If a tier re-derives its inputs from raw instructions, it has bypassed
+  the tier below and the hierarchy is broken. ("T1 essence ≈ a function of
+  opcode" does **not** license "so T2 can embed opcodes itself.")
+
+T1 is therefore literally T2 with `seq_len=1`: the only legitimate difference
+between the tiers is the ingestion front-end and the hparams.
+
+### GVN: the invariant essence is the value-number
+
+The rename-invariant essence *is* a value-number — two computations producing
+the same value get the same essence; different values stay apart.
+Rename-equivalence collapses **structurally** (free, from the equivariant
+core). Other behavioral equivalences — commutative operand swaps (`a+b==b+a`),
+reordering of independent instructions, dead code, algebraic identities — are
+*not* structural and are **trained in** by the behavioral targets (the
+canonical `out_regs` value-prediction supervises the rename-invariant I/O
+function, so equivalent chunks receive identical targets). Distinct behaviors
+must stay apart — the essence is behavioral, not a syntactic hash.
+
+### Open problems (additive over the equivariance skeleton)
+
+These are real work, each additive over a stable "register-indexed state; the
+32 GP registers are the permutable slots" skeleton:
+
+- **PC / branches.** PC is currently read from the invariant essence
+  (`pc_writes`), with `n_regs = 32` (GP only). The clean extension is a
+  non-renameable PC slot (renaming permutes only the 32 GP slots).
+- **Memory (loads/stores).** Modelled as another non-renameable slot;
+  structurally clean, but whether the essence can capture value-dependent
+  memory dataflow / aliasing is genuinely unproven — the real expressiveness
+  risk. Currently out of scope (`precompute_chunk` raises on memory ops).
+- **Immediates.** Rename-invariant content; enrich T1's essence, orthogonal
+  to equivariance. Low risk.
+- **Validity / parse.** The equivariant intake needs a *valid parse*, so
+  validity moves from a learned magnitude toward a parse-level gate. How an
+  equivariant T1 integrates with the streaming shift-reduce parser (which
+  proposes possibly-invalid windows) is unresolved.
+- **Capacity.** The permutation realization is an exact faithful
+  representation of S_n, so non-abelianness is handled — but whether a given
+  `d` has room for rich binding + essence is empirical.
 
 ---
 
@@ -256,7 +402,7 @@ rather than too large — overcomplete spaces enable shortcut solutions
 ### Loss terms
 
 **Evolved through extensive experimentation** (see EXPERIMENT_LOG.md, esp.
-Phases 9–12). The settled approach is one **behavioral loss set shared by
+Phases 9–14). The settled approach is one **behavioral loss set shared by
 T1 and T2** (`compressor.train.binding_losses`) — T1 is the
 single-instruction special case. No pairwise distance-matching, no explicit
 equivalence loss, no syntactic CE heads: equivalence is **emergent**.
@@ -266,32 +412,45 @@ valid thought (one complete instruction at T1; a well-formed chunk at T2),
 →0 otherwise. Vectors live in open space (no `F.normalize` on the output);
 magnitude carries validity, direction carries semantics. A *hard*
 normalize onto the unit sphere breaks `out_slot` — train TOWARD the
-surface with this soft loss, don't project ONTO it (Phase 12).
+surface with this soft loss, don't project ONTO it.
 
-**Behavioral binding losses** (read the normalized direction):
+**Behavioral binding losses** (the binding heads read the equivariant
+per-slot state `T`, one score per register slot; `pc_writes` reads the
+invariant essence):
 - `live_in` / `live_out`: BCE on which registers are read / written.
 - `pc_writes`: BCE on whether the chunk writes PC.
 - `in_slot` / `out_slot`: read/write ORDER, as ListMLE (Plackett–Luce)
   over per-register scalar score heads (argsort to decode; duplicate-free).
 
 **Value-prediction (`value_predict`).** Per-anchor, per-output-slot MSE:
-from `(vector, input-slot values)` predict each output register's value,
-on a fixed set of sampled anchor input states. This is the function/effect
-signal. It is a competent per-chunk *reconstructor* but, being per-chunk,
-does **not** by itself cluster behaviorally-equivalent chunks (Phase 12) —
-the indicated fix is an oracle `out_regs` pairwise loss.
+from `(essence, canonical input-slot values)` predict each output register's
+**canonical** value (the `out_regs` baseline — inputs relocated to canonical
+first-read positions, so the target depends only on operand structure, not
+register names), on a fixed set of sampled anchor input states. Feeding the
+head canonical inputs to match the canonical target is load-bearing: the
+earlier bug fed *raw* register values against a *canonical* target, making
+the task mathematically inconsistent. vp is a **diagnostic probe** of whether
+the essence carries the operator's I/O function — it sits at an intrinsic
+floor (regressing wrapped/bitwise ops from log-compressed scalars is hard for
+any MLP) and its absolute value is not the objective. The operator-clustering
+that the flat encoder could never get from vp comes instead **for free from
+the equivariant core** (rename-invariant essence = the value-number) plus the
+canonical vp target collapsing the non-structural equivalences.
 
 **Emergent equivalence.** With the behavioral targets alone, provably
-equivalent instructions/chunks collapse without any equivalence loss
-(e.g. `ADD x,y,y` ≡ `SLLI x,y,1` land nearly coincident). The
-`behavioral_distance` (GVN / Hungarian-bijection) oracle that earlier
-phases trained against is retained only as a dormant offline check.
+equivalent instructions/chunks collapse without any equivalence loss:
+rename-twins collapse *structurally* (the equivariant core), and non-rename
+behavioral equivalents (commutativity, reorder, dead code) collapse from the
+canonical vp target. Measured as GVN collapse split by pair type
+(EXPERIMENT_LOG.md Phase 14). A design constraint this surfaces: a
+rename-*invariant* behavioral target (e.g. a GVN-bijection distance) is the
+WRONG objective here — it would weld apart the binding distinctions the
+equivariant representation deliberately keeps recoverable.
 
-**What didn't work (removed):** Pearson/ranking losses (collapse or no
-separation), per-register pair-MSE (`reg_effect_loss` — noisy, never
-converged, undiscriminating on operands), explicit equivalence-collapse
-loss, syntactic dest/src CE heads, `rename_equiv` (wrong-sign for the
-equivariance goal), and unit-sphere normalization. See EXPERIMENT_LOG.md.
+Dead-end objectives explored on the way here (collapse losses, pairwise
+distance-matching, additive king−queen equivariance, unit-sphere
+normalization, syntactic CE heads) are recorded in EXPERIMENT_LOG.md; the
+behavioral loss set above superseded them all.
 
 ### Training data volume
 

@@ -23,8 +23,6 @@ Types:
             valid instruction; that label noise is tolerated.
 """
 
-import numpy as np
-
 from tokenizer import encode_instruction, VOCAB_SIZE, PAD, BOS, EOS, NEG
 from .generate import random_instruction
 

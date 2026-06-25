@@ -73,7 +73,7 @@ def slice_info(data):
 
 def _first_header(data):
     """Unpack the first batch's RVT dimension header:
-    (B, max_tokens, max_n_instrs, RB, n_anchors, OB)."""
+    (B, max_tokens, max_n_instrs, n_anchors, OB)."""
     sys.path.insert(0, str(ROOT))
     from datagen import RVT_FORMAT
     off = RVT_FORMAT.batch_prefix_size
@@ -88,24 +88,21 @@ class TestGenBatches:
         assert 'Format:       rvt' in info
         assert 'Batches:      2' in info
 
-    def test_row_outputs_mode_header(self):
-        """The `single` rule is the row-outputs T1 mode (RB == B, OB == 0);
-        a multi-instruction rule is the T2 mode that ships the out_regs
-        oracle (RB == 0, OB == B). Both carry n_anchors == --n-states."""
+    def test_out_regs_mode_header(self):
+        """Every rule — single (T1) and multi-instruction (T2) — ships the
+        unified CANONICAL out_regs oracle (OB == B). Both carry
+        n_anchors == --n-states."""
         out = gen(n_batches=1, batch_size=4, twins=0, n_states=4,
                   rule='single')
-        B, _, _, RB, n_anchors, OB = _first_header(out)
-        assert B == 4, (B, RB)
-        assert RB == B, f'row-outputs mode must ship RB==B, got RB={RB} B={B}'
-        assert OB == 0, f'T1 row mode ships no out_regs, got OB={OB}'
+        B, _, _, n_anchors, OB = _first_header(out)
+        assert B == 4, B
+        assert OB == B, f'single must ship OB==B (canonical), got OB={OB} B={B}'
         assert n_anchors == 4, n_anchors
 
-        # Contrast: a multi-instruction rule ships out_regs (OB==B), not the
-        # row-outputs payload (RB==0).
+        # A multi-instruction rule ships the same out_regs payload.
         multi = gen(n_batches=1, batch_size=4, twins=0, n_states=4,
                     rule='cap=2')
-        B_m, _, _, RB_m, n_anchors_m, OB_m = _first_header(multi)
-        assert RB_m == 0, RB_m
+        B_m, _, _, n_anchors_m, OB_m = _first_header(multi)
         assert OB_m == B_m, f'T2 mode must ship OB==B, got OB={OB_m} B={B_m}'
         assert n_anchors_m == 4, n_anchors_m
 
@@ -371,8 +368,8 @@ class TestBenchThroughput:
 
 def _train_t1(tmp, name='t1'):
     """Produce a tiny 1-step T1 encoder checkpoint under tmp/<name>.
-    Returns the encoder.pt path. cap=2 corpus → RB=0, so the value-
-    prediction path is skipped (matches --n-anchor-states 4 anyway)."""
+    Returns the encoder.pt path. --n-anchor-states 4 matches the corpus's
+    --n-states 4 (canonical vp runs on the shipped out_regs)."""
     run_dir = str(Path(tmp) / name)
     data = gen(n_batches=2, batch_size=8, rule='cap=2', twins=1, n_states=4)
     out, err, rc = run([
@@ -397,8 +394,7 @@ def _train_t2(tmp, t1_enc, name='t2'):
     out, err, rc = run([
         PYTHON, 'scripts/train_t2_encoder.py', '--t1-model', str(t1_enc),
         '--n-steps', '1', '--log-every', '1', '--out-dir', run_dir,
-        '--d-model', '32', '--n-heads', '2', '--n-layers', '1',
-        '--d-out', '32', '--max-chunk-len', '8',
+        '--d-out', '32', '--d-event', '16',
         '--n-anchor-states', '4', '--warmup-steps', '0', '--no-compile'],
         stdin=data, timeout=180)
     assert rc == 0, f'T2 train failed: {err}'
@@ -408,7 +404,9 @@ def _train_t2(tmp, t1_enc, name='t2'):
 
 class TestTraining:
     def test_encoder_train_smoke(self):
-        """gen_batches | train_encoder smoke (single step)."""
+        """gen_batches | train_encoder smoke (single step). T1 now runs the
+        unified canonical vp on out_regs (present for every rule), so
+        --n-anchor-states must match gen's --n-states (4) per invariant 1."""
         data = gen(n_batches=2, batch_size=8)
         with tempfile.TemporaryDirectory() as tmp:
             out, err, rc = run([
@@ -416,7 +414,8 @@ class TestTraining:
                 '--n-steps', '1', '--log-every', '1',
                 '--out-dir', tmp,
                 '--d-model', '32', '--n-heads', '2', '--n-layers', '1',
-                '--d-out', '32', '--max-window', '32', '--no-compile'],
+                '--d-out', '32', '--max-window', '32', '--n-anchor-states', '4',
+                '--no-compile'],
                 stdin=data, timeout=120)
         assert rc == 0, f'encoder training failed: {err}'
 
@@ -430,47 +429,44 @@ class TestTraining:
             assert (t2_dir / 't2.pt').exists()
 
 
-class TestT2EvalTools:
-    """eval_t2 + measure_loss_dims pull many compressor.train internals
-    that drift. Guard import + --help, then run end-to-end on a 1-step T2
-    checkpoint + tiny corpus."""
+class TestEval:
+    """scripts/eval.py pulls many compressor internals that drift. Guard
+    import + --help, then run end-to-end (T1 + T2, binding routing) on a
+    1-step checkpoint + tiny corpus."""
 
-    def test_eval_t2_help(self):
-        _, err, rc = run([PYTHON, 'scripts/eval_t2.py', '--help'])
+    def test_eval_help(self):
+        _, err, rc = run([PYTHON, 'scripts/eval.py', '--help'])
         assert rc == 0, err
 
-    def test_measure_loss_dims_help(self):
-        _, err, rc = run([PYTHON, 'scripts/measure_loss_dims.py', '--help'])
-        assert rc == 0, err
-
-    def test_eval_t2_and_loss_dims_run(self):
+    def test_eval_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             t1_enc = _train_t1(tmp)
             t2_dir = _train_t2(tmp, t1_enc)
-            corpus = Path(tmp) / 'corpus.rvt'
-            corpus.write_bytes(gen(n_batches=2, batch_size=8,
-                                   rule='branch+cap=8', twins=1, n_states=4,
-                                   seed=99))
+            t1_corpus = Path(tmp) / 't1.rvt'      # single-instruction (T1)
+            t1_corpus.write_bytes(gen(n_batches=2, batch_size=8, rule='single',
+                                      twins=1, n_states=4, seed=98))
+            t2_corpus = Path(tmp) / 't2.rvt'      # multi-instruction (T2)
+            t2_corpus.write_bytes(gen(n_batches=2, batch_size=8,
+                                      rule='branch+cap=8', twins=1, n_states=4,
+                                      seed=99))
 
-            _, err, rc = run([
-                PYTHON, 'scripts/eval_t2.py', str(t2_dir),
-                '--t1-model', str(t1_enc), '--corpus', str(corpus),
-                '--max-batches', '2', '--n-anchor-states', '4',
-                '--device', 'cpu'], timeout=180)
-            assert rc == 0, f'eval_t2 failed: {err}'
-
-            _, err, rc = run([
-                PYTHON, 'scripts/measure_loss_dims.py', str(t2_dir),
-                '--t1-model', str(t1_enc), '--corpus', str(corpus),
-                '--n-batches', '2', '--n-anchor-states', '4',
-                '--device', 'cpu'], timeout=180)
-            assert rc == 0, f'measure_loss_dims failed: {err}'
+            out, err, rc = run([
+                PYTHON, 'scripts/eval.py',
+                '--t1-model', str(t1_enc), '--t2', str(t2_dir),
+                '--t1-corpus', str(t1_corpus), '--t2-corpus', str(t2_corpus),
+                '--max-batches', '2', '--route', 'binding',
+                '--gvn-pairs', '8', '--gvn-chunk-len', '3',
+                '--device', 'cpu'], timeout=300)
+            assert rc == 0, f'eval failed: {err}'
+            # Equivariance is exact by construction even on a 1-step model.
+            text = out.decode() if isinstance(out, bytes) else out
+            assert 'state_max_err=' in text, text
+            assert 'GVN collapse' in text, text
 
 
 class TestStreamFmt:
     """_streamfmt header validation + format detection rejection paths.
-    The RVT header is 6 fields: (B, max_tokens, max_n_instrs, RB,
-    n_anchors, OB)."""
+    The RVT header is 5 fields: (B, max_tokens, max_n_instrs, n_anchors, OB)."""
 
     @staticmethod
     def _prefix():
@@ -480,7 +476,7 @@ class TestStreamFmt:
             RVT_FORMAT.magic, RVT_FORMAT.version, RVT_FORMAT.dtype_chars)
 
     @staticmethod
-    def _batch_bytes(B, max_tokens, max_n_instrs, RB, n_anchors, OB=0,
+    def _batch_bytes(B, max_tokens, max_n_instrs, n_anchors, OB=0,
                      magic=None, version=None):
         sys.path.insert(0, str(ROOT))
         from datagen import RVT_FORMAT
@@ -489,7 +485,7 @@ class TestStreamFmt:
         prefix = RVT_FORMAT._prefix_struct.pack(
             m, v, RVT_FORMAT.dtype_chars)
         header = RVT_FORMAT.batch_header.pack(
-            B, max_tokens, max_n_instrs, RB, n_anchors, OB)
+            B, max_tokens, max_n_instrs, n_anchors, OB)
         return prefix + header
 
     def test_validate_rejects_out_of_bounds_header(self):
@@ -497,25 +493,25 @@ class TestStreamFmt:
         from scripts._streamfmt import _validate_rvt, _MAX_B
         # B == 0 (must be > 0).
         with pytest.raises(ValueError, match='Invalid RVT header'):
-            _validate_rvt(self._batch_bytes(0, 32, 1, 4, 4))
+            _validate_rvt(self._batch_bytes(0, 32, 1, 4))
         # B > _MAX_B.
         with pytest.raises(ValueError, match='Invalid RVT header'):
-            _validate_rvt(self._batch_bytes(_MAX_B + 1, 32, 1, 4, 4))
+            _validate_rvt(self._batch_bytes(_MAX_B + 1, 32, 1, 4))
         # n_anchors > 256.
         with pytest.raises(ValueError, match='Invalid RVT header'):
-            _validate_rvt(self._batch_bytes(4, 32, 1, 4, 300))
+            _validate_rvt(self._batch_bytes(4, 32, 1, 300))
 
     def test_validate_accepts_good_header(self):
         sys.path.insert(0, str(ROOT))
         from scripts._streamfmt import _validate_rvt
-        vals = _validate_rvt(self._batch_bytes(4, 32, 1, 4, 4, OB=4))
-        assert vals == (4, 32, 1, 4, 4, 4)
+        vals = _validate_rvt(self._batch_bytes(4, 32, 1, 4, OB=4))
+        assert vals == (4, 32, 1, 4, 4)
 
     def test_detect_format_unknown_magic(self):
         import io
         sys.path.insert(0, str(ROOT))
         from scripts._streamfmt import detect_format
-        buf = b'XYZ\x00' + self._batch_bytes(4, 32, 1, 4, 4)[4:]
+        buf = b'XYZ\x00' + self._batch_bytes(4, 32, 1, 4)[4:]
         f = io.BufferedReader(io.BytesIO(buf))
         with pytest.raises(ValueError, match='Unknown format'):
             detect_format(f)

@@ -8,17 +8,16 @@ import pytest
 
 from emulator import Instruction
 from datagen.batch import (
-    Chunk, Batch, RVT_FORMAT, BinaryFormat, BodyField,
+    Chunk, Batch, RVT_FORMAT, BinaryFormat,
     pack_batch, padding_mask,
-    generate_chunks, collect_into_batches, build_twins,
-    build_row_outputs, RowOutputsPayload, AuxPayload,
+    generate_chunks, collect_into_batches, build_twins, AuxPayload,
     _make_valid_chunk, _make_invalid_chunk,
 )
 from datagen.compare import (
-    make_anchor_states, precompute_chunk, precompute_row_outputs,
+    make_anchor_states,
     AUX_CE_IGNORE, N_REGS,
 )
-from datagen.generate import length_cap, single, until_branch
+from datagen.generate import length_cap, single
 from tokenizer.tokenizer import MAX_INSTR_TOKENS
 
 
@@ -50,8 +49,6 @@ def test_pack_basic():
     assert batch.tokens.shape[0] == 2
     assert batch.token_lens[0] > batch.token_lens[1]
     assert batch.valid.tolist() == [True, True]
-    # No row-outputs payload supplied → row-* fields empty.
-    assert batch.row_outputs.shape[0] == 0
 
 
 def test_pack_rejects_empty():
@@ -163,18 +160,18 @@ def test_reader_concatenates():
     assert len(list(RVT_FORMAT.reader(buf, Batch))) == 2
 
 
-def test_no_row_outputs_round_trip():
-    """RB=0 case: pack a batch with no row-outputs payload and verify it
-    serializes (the row-* fields are empty)."""
+def test_round_trip_preserves_fields():
+    """A packed batch survives write -> read with its fields intact (OB=0
+    when no out_regs payload is supplied)."""
     chunks = [_instrs_to_chunk([Instruction('ADD', 1, 2, 3)])]
     b = _pack(chunks)
     buf = io.BytesIO()
     RVT_FORMAT.write_batch(buf, b)
     buf.seek(0)
     got = RVT_FORMAT.read_batch(buf, Batch)
-    assert got.row_outputs.shape == (0, 0)
-    assert got.row_has_rd.shape == (0,)
-    assert got.pair_valid.shape == (0,)
+    assert np.array_equal(got.tokens, b.tokens)
+    assert got.valid.tolist() == b.valid.tolist()
+    assert got.out_regs.shape[0] == 0          # OB=0, no oracle supplied
 
 
 def test_bad_magic_raises():
@@ -307,75 +304,6 @@ def test_pack_rejects_aux_first_dim_mismatch():
                    target_max_n_instrs=4, aux_payload=bad_aux)
 
 
-def test_pack_rejects_row_outputs_first_dim_mismatch():
-    chunks = [_instrs_to_chunk([Instruction('ADD', 1, 2, 3)])]
-    bad_payload = RowOutputsPayload(
-        row_outputs=np.zeros((2, 4), dtype=np.float64),  # 2 rows, 1 chunk
-        has_rd=np.zeros((2,), dtype=bool),
-        pair_valid=np.zeros((2,), dtype=bool),
-    )
-    with pytest.raises(ValueError, match='row_outputs'):
-        pack_batch(chunks, target_B=2,
-                   target_max_tokens=4 * MAX_INSTR_TOKENS,
-                   target_max_n_instrs=4,
-                   row_outputs_payload=bad_payload)
-
-
-# ---------------------------------------------------------------------------
-# pack_batch row-outputs branch — real RowOutputsPayload via build_row_outputs
-# ---------------------------------------------------------------------------
-
-def test_pack_row_outputs_branch_populates_fields():
-    anchors = make_anchor_states(4, seed=0)
-    rng = np.random.default_rng(0)
-    # One ALU source (writes x5) + one x0-write NOP (no rd).
-    chunks = [
-        _instrs_to_chunk([Instruction('ADD', 5, 1, 2)]),
-        _instrs_to_chunk([Instruction('ADD', 0, 1, 2)]),
-    ]
-    chunks_out, payload, aux = build_row_outputs(
-        chunks, twins=0, anchor_states=anchors, rng=rng)
-    target_B = len(chunks_out) + 2  # leave padding rows
-    batch = pack_batch(
-        chunks_out, target_B=target_B,
-        target_max_tokens=MAX_INSTR_TOKENS,
-        target_max_n_instrs=1,
-        row_outputs_payload=payload, aux_payload=aux)
-
-    # RB == B (row-outputs mode pads to target_B).
-    assert batch.row_outputs.shape == (target_B, 4)
-    assert batch.row_has_rd.shape == (target_B,)
-    assert batch.pair_valid.shape == (target_B,)
-    # First two rows are real single-instr ALU → pair_valid True; the
-    # ADD x5 writes a real reg (has_rd), the ADD x0 does not.
-    assert batch.pair_valid[0] and batch.pair_valid[1]
-    assert batch.row_has_rd[0] and not batch.row_has_rd[1]
-    # Padding rows past actual_B: pair_valid False.
-    assert not batch.pair_valid[len(chunks_out):].any()
-
-
-def test_pack_row_outputs_masks_invalid_rows():
-    anchors = make_anchor_states(4, seed=0)
-    rng = np.random.default_rng(0)
-    chunks = [
-        _instrs_to_chunk([Instruction('ADD', 5, 1, 2)]),
-        _make_invalid_chunk([5, 6, 7]),         # invalid window → not meaningful
-        _instrs_to_chunk([Instruction('LW', 5, 0, 1)]),  # mem-op → not meaningful
-    ]
-    chunks_out, payload, aux = build_row_outputs(
-        chunks, twins=0, anchor_states=anchors, rng=rng)
-    batch = pack_batch(
-        chunks_out, target_B=len(chunks_out),
-        target_max_tokens=MAX_INSTR_TOKENS,
-        target_max_n_instrs=1,
-        row_outputs_payload=payload, aux_payload=aux)
-    # Only the first row is a behaviorally-meaningful single ALU instr.
-    assert batch.pair_valid.tolist() == [True, False, False]
-    # The masked rows carry a zero row-outputs vector.
-    assert (batch.row_outputs[1] == 0).all()
-    assert (batch.row_outputs[2] == 0).all()
-
-
 def test_recognized_by_streamfmt():
     from scripts._streamfmt import detect_format, RVT
     b = _sample_batch()
@@ -438,48 +366,6 @@ def test_build_twins_aux_content_and_none_rows():
         assert (aux.out_slot_regs[r] == AUX_CE_IGNORE).all()
 
 
-def test_build_row_outputs_pair_valid_and_zero_rows():
-    """build_row_outputs marks single-ALU rows pair_valid and zero-fills /
-    masks mem-op and multi-instruction rows (which get no value target)."""
-    anchors = make_anchor_states(4, seed=0)
-    rng = np.random.default_rng(0)
-    chunks = [
-        _instrs_to_chunk([Instruction('ADD', 5, 1, 2)]),         # single ALU
-        _instrs_to_chunk([Instruction('LW', 6, 0, 3)]),          # mem-op
-        _instrs_to_chunk([Instruction('ADD', 7, 1, 2),
-                          Instruction('SUB', 8, 7, 1)]),         # multi-instr
-    ]
-    out, payload, aux = build_row_outputs(
-        chunks, twins=0, anchor_states=anchors, rng=rng)
-    assert len(out) == 3
-    assert payload.pair_valid[0] and payload.has_rd[0]
-    # Rows 1 (mem-op) and 2 (multi-instr): zero row, pair_valid False.
-    assert not payload.pair_valid[1]
-    assert not payload.pair_valid[2]
-    assert (payload.row_outputs[1] == 0).all()
-    assert (payload.row_outputs[2] == 0).all()
-
-
-def test_build_row_outputs_live_label_matches_emulator():
-    """build_row_outputs ships, per row, the destination register's value
-    under each anchor — the LIVE T1 value-prediction target. Use an
-    instruction whose inputs are NOT already at the canonical slots (x5,x9)
-    so a regression to the canonical-baseline bug would be visible (ADD
-    x5,x1,x2 would pass by coincidence)."""
-    from emulator import run, make_ctx
-    anchors = make_anchor_states(4, seed=3)
-    rng = np.random.default_rng(0)
-    instr = Instruction('ADD', 7, 5, 9)
-    out, payload, aux = build_row_outputs(
-        [_instrs_to_chunk([instr])], twins=0,
-        anchor_states=anchors, rng=rng)
-    ctx = make_ctx()
-    for i in range(4):
-        st, _, _ = run([instr], regs=anchors[i].copy(), pc=0,
-                       _ctx=ctx, max_steps=1)
-        assert int(payload.row_outputs[0, i]) == int(st.regs[7])
-
-
 def test_build_twins_drops_memory_op_chunks():
     rng = np.random.default_rng(0)
     anchors = make_anchor_states(4, seed=0)
@@ -540,26 +426,26 @@ def test_fixed_shape_with_twins_and_invalids():
     assert saw_invalid_window, 'invalid_rate>0 yielded no invalid windows'
 
 
-def test_fixed_shape_row_outputs_mode():
+def test_fixed_shape_single_rule_out_regs():
+    """The `single` rule (T1) ships canonical out_regs (OB==B, RB==0) like
+    every other rule (the T1/T2 unification), at a fixed batch shape."""
     rng = np.random.default_rng(1)
     anchors = make_anchor_states(4, seed=0)
     gen = collect_into_batches(
         generate_chunks(single(), rng),
         batch_size=8, twins=1,
         anchor_states=anchors, rng=rng,
-        max_chunk_len=1, row_outputs_mode=True)
+        max_chunk_len=1)
     batches = _drain(gen, 5)
 
     shape0 = batches[0].tokens.shape
     ilen0 = batches[0].instr_lens.shape
-    ro0 = batches[0].row_outputs.shape
+    or0 = batches[0].out_regs.shape
     for b in batches:
         assert b.tokens.shape == shape0
         assert b.instr_lens.shape == ilen0
-        assert b.row_outputs.shape == ro0
-        # row_outputs_mode populates the row-* payload (RB == B, not 0).
-        assert b.row_outputs.shape[0] == b.tokens.shape[0]
-
-    # row_outputs_mode actually populated meaningful rows.
-    assert any(b.pair_valid.any() for b in batches)
-    assert any(b.row_has_rd.any() for b in batches)
+        assert b.out_regs.shape == or0
+        # canonical out_regs mode: OB == B.
+        assert b.out_regs.shape[0] == b.tokens.shape[0]
+    # out_regs carries meaningful rows.
+    assert any(b.out_regs_valid.any() for b in batches)

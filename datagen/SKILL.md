@@ -76,7 +76,7 @@ python scripts/mux_batches.py --gen-count 8 --mode fifo --seed 0 -- \
     --n-states 8 --anchor-seed 0 --config configs/instr_t2.json \
   | python scripts/batch_slice.py --count 2000000 \
   | python scripts/train_t2_encoder.py --t1-model runs/t1_run/encoder.pt \
-    --d-model 512 --n-heads 4 --n-layers 4 --d-out 512 --max-chunk-len 32 \
+    --d-out 512 --d-event 16 --route binding \
     --n-steps 2000000 --anchor-seed 0 --n-anchor-states 8 --out-dir t2_run
 ```
 Note: with `--gen-count 8` and per-worker `--n-batches 2000000`, the pool can
@@ -107,26 +107,29 @@ batch count upstream with `batch_slice --count N` or the generator's `-n`.
    This is why a `--rule` with no cap is REJECTED (see Rule grammar). Don't add a
    code path that emits a differently-shaped batch mid-run.
 
-3. **`single` rule ⇒ row-outputs mode; multi-instr rule ⇒ T2 out_regs mode.**
-   `gen_batches.py:179` keys this off `args.rule == 'single'`. In the RVT header:
-   - row-outputs (T1): `RB == B`, `OB == 0` (ships per-row rd value per anchor)
-   - T2 twin mode:      `RB == 0`, `OB == B` (ships full out_regs register file)
-   Both carry `n_anchors == --n-states`. (`scripts/tests/test_pipeline.py:91`.)
+3. **EVERY rule ships the CANONICAL out_regs oracle (`OB == B`).**
+   `single` (T1) and multi-instruction (T2) rules both go through `build_twins`
+   and ship the full canonical `out_regs` register file (`OB == B`, carrying
+   `n_anchors == --n-states`). There is no per-rule payload split — both tiers
+   feed one canonical value-prediction target.
+   (`scripts/tests/test_pipeline.py::test_out_regs_mode_header`.)
 
-4. **row_outputs uses RAW anchors; out_regs uses CANONICAL anchors. Do not
-   conflate.** `precompute_row_outputs` (`datagen/compare.py:761`) executes on the
-   raw anchor states reading the instruction's actual source registers — because
-   value_predict feeds the head the actual registers' anchor values, so the label
-   must match real execution. `Precomputed.out_regs` is the rename-invariant
-   canonical baseline (inputs relocated to canonical positions) used by the
-   dormant distance oracle. These are different tensors with different semantics.
+4. **value_predict is CANONICAL for both tiers.** `out_regs` is the
+   rename-invariant canonical baseline: `precompute_chunk` relocates the chunk's
+   i-th first-read input to canonical position i+1 (`_canonical_state`) and
+   executes there, so `out_regs[:, r]` depends only on operand structure. The vp
+   loss (`t2_value_predict_loss`, used by BOTH T1 and T2) therefore feeds the head
+   the canonical-position values `anchor[:, k+1]` for input slot k — never the raw
+   value at the slot's actual register. Feeding raw input values against the
+   canonical target is mathematically inconsistent — the head must see canonical
+   inputs to match the canonical output.
 
 5. **x0 is fixed under relabeling.** `random_perm`/`relabel` require `perm[0]==0`
    (`datagen/generate.py:279,293`). x0 is hardwired zero, not a register.
 
-6. **Memory-op chunks get no twins and no aux (V1 scope).** `build_twins` /
-   `build_row_outputs` drop chunks containing LOAD/STORE from twin+aux
-   construction (`datagen/batch.py:525,564`) because their `Precomputed` is
+6. **Memory-op chunks get no twins and no aux (V1 scope).** `build_twins`
+   drops chunks containing LOAD/STORE from twin+aux construction because their
+   `Precomputed` is
    unavailable — `precompute_chunk` raises NotImplementedError on memory ops
    (`datagen/compare.py:674`). The chunk's tokens are still shipped (so the
    encoder sees them for magnitude/validity), but its aux row is zero-mask /
@@ -135,7 +138,8 @@ batch count upstream with `batch_slice --count N` or the generator's `-n`.
 ## gen_batches.py reference
 
 `--rule` grammar (`scripts/gen_batches.py:67`, rules in `datagen/generate.py:628`):
-- `single` — one instruction per chunk → row-outputs/T1 mode. `max_len=1`.
+- `single` — one instruction per chunk (T1). `max_len=1`. Ships canonical
+  out_regs like every other rule (the T1/T2 unification).
 - `cap=N` — fixed length N.
 - `branch+cap=N` — terminate at a branch OR length N.
 - `transform+cap=N` — terminate at a memory-op / branch / jump OR length N.
@@ -184,18 +188,19 @@ permission system — prefer the explicit pgrep→kill form. Do this on the remo
 
 ## RVT binary format (datagen/batch.py)
 
-- **Version 7.** `RVT_FORMAT` at `datagen/batch.py:262`. A version bump is a hard
-  break — readers reject mismatched versions and tell you to regenerate.
+- **Version 8.** `RVT_FORMAT` in `datagen/batch.py`. A version bump is a hard
+  break — readers reject mismatched versions and tell you to regenerate (older
+  streams won't read).
 - **No stream header — every batch is self-describing** (4-byte magic `RVT\x00` +
-  1-byte version + dtype signature, then a 6-uint32 dimension header, then the
+  1-byte version + dtype signature, then a 5-uint32 dimension header, then the
   body). This is the load-bearing property: **RVT streams concatenate with `cat`.**
   - Combine corpora: `cat a.rvt b.rvt > both.rvt`
   - **Second epoch = `cat corpus.rvt corpus.rvt | trainer`.** There is no built-in
     repeat; epochs are shell-level `cat`.
-- Header fields: `B, max_tokens, max_n_instrs, RB, n_anchors, OB`. `RB`/`OB` are
-  the row-outputs / out_regs row counts (0 when that payload is absent) — see
-  invariant 3. Body field list + dtypes are in the `BodyField(...)` block at
-  `datagen/batch.py:265`; header validation bounds in `scripts/_streamfmt.py:38`.
+- Header fields: `B, max_tokens, max_n_instrs, n_anchors, OB`. `OB` is the
+  out_regs row count (`B` when the oracle is shipped — always, now — else 0).
+  Body field list + dtypes are in the `BodyField(...)` block in
+  `datagen/batch.py`; header validation bounds in `scripts/_streamfmt.py`.
 - Per-instruction segmentation is NOT preserved on the wire — relabeling/aux
   happen at generation time while the `list[Instruction]` is still in hand.
 
@@ -267,8 +272,9 @@ cat corpus.rvt | python scripts/bench_throughput.py --log-every-sec 5
 - `MAX_INSTR_TOKENS = 9`, `VOCAB_SIZE = 89` (`tokenizer/tokenizer.py`).
 - A chunk's token budget: `target_max_tokens = max_chunk_len * 9`
   (`datagen/batch.py:742`), widened to fit `--max-invalid-window` if larger.
-- Trainer position-embedding tables must cover this: T1 `--max-window` (default 72
-  = 8×9), T2 `--max-chunk-len` (default 32, the *instruction* count → ×9 tokens).
+- T1's TokenEmbedder needs `--max-window` (default 72 = 8×9) to cover this. T2's
+  equivariant core has no position table — it unrolls to each batch's actual
+  instruction count, so there is no T2 chunk-length flag.
 - N_REGS=32, MAX_INPUT_SLOTS=32, MAX_OUTPUT_SLOTS=16, AUX_CE_IGNORE=-100
   (`datagen/compare.py:92,109-111`). PC_REG=32, MEM_REG=33 are pseudo-slots.
 
@@ -292,6 +298,3 @@ cat corpus.rvt | python scripts/bench_throughput.py --log-every-sec 5
 - Measured throughput numbers — they drift with machine/arch; measure with
   `bench_throughput.py` rather than quoting a remembered figure
   (CLAUDE.md: no speculative numbers).
-- The `behavioral_distance` GVN/Hungarian oracle (`datagen/behavioral_oracle.py`)
-  is DORMANT — not on the generation or training path. It's a ground-truth
-  reference only.

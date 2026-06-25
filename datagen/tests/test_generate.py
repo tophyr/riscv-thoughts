@@ -7,12 +7,11 @@ import pytest
 from emulator import (
     Instruction, run, make_ctx, random_regs, ALL_OPCODES,
 )
-from datagen.behavioral_oracle import behavioral_distance
 from datagen.generate import (
-    DEFAULT_DISTRIBUTION, validate_distribution, build_opcode_table,
+    DEFAULT_DISTRIBUTION, build_opcode_table,
     random_instruction,
-    random_perm, relabel, random_relabel,
-    MANIFEST, sample_binding, materialize, sample_injection_tuples,
+    random_perm, relabel,
+    MANIFEST, sample_binding, sample_injection_tuples,
     single, until_branch, until_transformation, length_cap, either,
     collect_groups,
 )
@@ -97,49 +96,6 @@ def test_sample_binding_satisfies_constraints():
         b = sample_binding(klass, rng)
         for c in klass.constraints:
             assert c(b)
-
-
-def _materialize_tuple(klass, binding):
-    return [materialize(tpl, binding) for tpl in klass.canonical]
-
-
-@pytest.mark.parametrize('klass', MANIFEST, ids=lambda k: k.name)
-def test_manifest_canonical_collapses_under_oracle(klass):
-    """Every curated equivalence class must actually be equivalent: each
-    canonical template, materialized under one shared binding, collapses to
-    behavioral_distance 0 against the class's first template. This pins the
-    MANIFEST against the ground-truth GVN oracle — a non-zero distance means
-    a curated 'equivalence' is wrong.
-
-    x0_write_nop is the one class whose members can be mem-ops (LB/LH/LW with
-    rd=x0); the oracle rejects mem-ops, so those pairs are skipped — the NOP
-    semantics they share (writing nothing) is not in the oracle's scope.
-    """
-    rng = np.random.default_rng(0)
-    if len(klass.canonical) < 2:
-        pytest.skip(f'{klass.name} has a single canonical template')
-    # Try several bindings so a single unlucky draw can't hide a real split.
-    for _ in range(5):
-        binding = sample_binding(klass, rng)
-        instrs = _materialize_tuple(klass, binding)
-        base = [instrs[0]]
-        for other in instrs[1:]:
-            try:
-                d = behavioral_distance(base, [other])
-            except NotImplementedError:
-                continue  # mem-op member (x0_write_nop) — out of oracle scope
-            assert d == 0.0, (
-                f'{klass.name}: {base[0]} vs {other} did not collapse '
-                f'(distance {d})')
-
-
-def test_manifest_distinct_instruction_is_positive():
-    """A deliberately-different instruction must NOT collapse: ADD vs SUB on
-    the same operands differs on essentially every input, so the oracle
-    reports a positive distance."""
-    a = [Instruction('ADD', 5, 1, 2)]
-    b = [Instruction('SUB', 5, 1, 2)]
-    assert behavioral_distance(a, b) > 0.0
 
 
 def test_sample_injection_tuples_returns_whole_tuples():

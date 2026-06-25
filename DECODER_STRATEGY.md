@@ -75,31 +75,18 @@ distance landscape is smooth enough to navigate by gradient. If it
 fails, the geometry is the problem, not the search method, and no
 learned decoder will do better.
 
-### Preliminary Results (Experiment 18)
+### Preliminary Results
 
-Implemented and tested on the Exp 16 T0→T1 model (S^127, MSE loss,
-Spearman 0.730). Key findings:
+The gradient-decoder PoC was validated on an early T0→T1 model
+(EXPERIMENT_LOG.md Phase 5). The durable lessons: search recovers the original
+or an execution-equivalent instruction wherever the T1 geometry is smooth (it
+discovered commutative equivalents by navigation) and fails wherever the
+geometry is poor — so a decoding failure indicts the encoder geometry, not the
+search method. Discrete snapping to the nearest token sequence adds distance
+because the vocabulary is sparse in the continuous output space.
 
-- **Search works where the geometry is good.** ADD x5,x3,x7 decoded
-  to its commutative equivalent ADD x5,x7,x3 -- the decoder
-  discovered execution equivalence by navigating the T1 space.
-  SLLI x5,x3,1 recovered exactly.
-
-- **Search fails where the geometry is bad.** SUB-self (always zero)
-  decoded to a branch instruction (false cluster). BEQ couldn't be
-  decoded at all. The T1 space's known problems (SLT/BEQ cluster,
-  rough branch geometry) directly cause decoder failures.
-
-- **Discrete snapping adds distance.** Successful decodes land at
-  distance 0.4-0.8 from the target even when the continuous optimum
-  is very close. The discrete token vocabulary is sparse in the
-  T1 output space (the sphere in the Phase 1 experiments, the
-  unit ball under the post-Exp 33 magnitude-as-validity framing).
-
-These results validate the proposer+verifier framework: the
-compressor IS usable as a scoring function for search, and search
-DOES find execution-equivalent instructions in the regions where
-the compressor learned smooth geometry.
+These validate the proposer+verifier framework. The decoder must still be
+re-validated against the current equivariant T1's geometry (TODO.md).
 
 ---
 
@@ -223,9 +210,9 @@ thought space that are never visited don't waste decoder capacity.
 The decoder strategy is orthogonal to the compressor architecture.
 It works the same way whether the compressor is:
 
-- The current single-instruction T1 model
-- A variable-length sequence model
-- The streaming compressor with learned gates
+- The current equivariant T1/T2 register-state-machine encoder
+- Any future tier (T3+) on the same core
+- The deferred streaming segmenter with learned gates
 
 At every level: the compressor produces a vector, the decoder inverts
 it. The compressor is the oracle, the decoder is the proposer. The

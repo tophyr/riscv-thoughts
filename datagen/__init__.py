@@ -37,9 +37,3 @@ from .invalidity import (
     gen_partial, gen_spanning, gen_multi, gen_bogus,
     generate_invalid, build_type_table, DEFAULT_TYPE_WEIGHTS,
 )
-
-# Dormant offline GVN oracle — not on the training/generation path; kept
-# as a ground-truth reference for operator-equivalence validation.
-from .behavioral_oracle import (
-    behavioral_distance, behavioral_distance_cached,
-)

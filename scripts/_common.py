@@ -16,7 +16,7 @@ from pathlib import Path
 import torch
 
 from compressor.model import T1Compressor, T2Compressor
-from compressor.train import load_checkpoint, resolve_device
+from compressor.train import load_checkpoint, resolve_device, _split_t1_state
 from tokenizer import VOCAB_SIZE
 
 
@@ -67,23 +67,24 @@ def open_run_dir(args, model_name, *, suffix=''):
 # ---------------------------------------------------------------------------
 
 def load_frozen_encoder(model_path, device):
-    """Build a T1Compressor from the encoder's companion hparams.json
-    (next to model_path), strict-load the checkpoint, eval(), freeze
-    parameters.
+    """Build a T1Compressor (TokenEmbedder + Compressor) from the encoder's
+    companion hparams.json (next to model_path), load the checkpoint (old flat
+    state dicts are split-remapped to embedder./compressor.), eval(), freeze.
 
-    model_path: path to encoder.pt; its sibling hparams.json supplies the
-                arch (d_model, n_heads, n_layers, d_out, max_window).
+    model_path: path to encoder.pt; its sibling hparams.json supplies the arch
+                (d_model, n_heads, n_layers, d_out, max_window, d_event).
     """
     hp = json.loads((Path(model_path).parent / 'hparams.json').read_text())
     encoder = T1Compressor(
-        VOCAB_SIZE,
+        vocab_size=VOCAB_SIZE,
         d_model=hp.get('d_model', 128),
         n_heads=hp.get('n_heads', 4),
         n_layers=hp.get('n_layers', 2),
-        d_out=hp.get('d_out', 64),
         max_window=hp.get('max_window', 32),
+        d_out=hp.get('d_out', 64),
+        d_event=hp.get('d_event', 16),
     ).to(device)
-    encoder.load_state_dict(load_checkpoint(model_path, device))
+    encoder.load_state_dict(_split_t1_state(load_checkpoint(model_path, device)))
     encoder.eval()
     for p in encoder.parameters():
         p.requires_grad = False
@@ -91,16 +92,12 @@ def load_frozen_encoder(model_path, device):
 
 
 def load_t2(t2_dir, t1, device):
-    """Build a T2Compressor from t2_dir/hparams.json, strict-load t2.pt,
-    eval(). Returns (t2, hparams). NOT gradient-frozen — callers needing
-    grads (measure_loss_dims) backprop through it; eval-only callers wrap
-    in torch.no_grad()."""
+    """Build a T2Compressor (a Compressor fed t1's essence) from
+    t2_dir/hparams.json, load t2.pt, eval(). Returns (t2, hparams)."""
     t2_dir = Path(t2_dir)
     hp = json.loads((t2_dir / 'hparams.json').read_text())
     t2 = T2Compressor(
-        d_t1=t1.d_out, d_model=hp['d_model'], n_heads=hp['n_heads'],
-        n_layers=hp['n_layers'], d_out=hp['d_out'],
-        max_chunk_len=hp['max_chunk_len'],
+        d_t1=t1.d_out, d_out=hp['d_out'], d_event=hp.get('d_event', 16),
     ).to(device)
     t2.load_state_dict(load_checkpoint(t2_dir / 't2.pt', device))
     t2.eval()

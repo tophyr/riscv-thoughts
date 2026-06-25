@@ -9,10 +9,10 @@ targets. Losses see different views of the same batch:
   - Validity magnitude:
         for c in chunks:
             loss += (||encode(c.tokens)|| - (1.0 if c.valid else 0.0)) ** 2
-  - Value prediction (T1 single-instr): predict the destination register's
-    value per anchor from the vector + input values (row_outputs targets).
+  - Value prediction: predict each output slot's canonical value per anchor
+    from the vector + canonical input values (the out_regs oracle target).
   - Register-identity aux + value prediction read the per-row aux targets
-    (live_in/out masks, slot regs).
+    (live_in/out masks, slot regs, out_regs).
 
 Storage shape: encoder consumes flat (B, max_tokens) tokens with a
 padding mask, so the binary format stores tokens flatly. Per-instruction
@@ -25,14 +25,12 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from emulator import Instruction
 from tokenizer import PAD, encode_instruction
-from tokenizer.tokenizer import MAX_INSTR_TOKENS, decode_instruction
+from tokenizer.tokenizer import MAX_INSTR_TOKENS
 
 from .compare import (
     AUX_CE_IGNORE, MAX_INPUT_SLOTS, MAX_OUTPUT_SLOTS, N_REGS,
-    make_anchor_states, precompute_chunk,
-    precompute_row_outputs,
+    precompute_chunk,
 )
 from .generate import (
     collect_groups, random_instruction, random_relabel,
@@ -224,24 +222,13 @@ class Batch:
     """Serialized batch: flat tokens + validity + per-instruction
     segmentation + supervision payloads.
 
-    Row-outputs payload (single-instruction T1 chunks): sized RB = B in
-    that mode, RB = 0 otherwise. row_outputs holds the destination
-    register's value per anchor (value-prediction target); pair_valid
-    masks which rows are behaviorally-meaningful (False for invalid
-    windows and mem-op rows), row_has_rd which rows write a non-x0
-    register. The training mask is pair_valid & row_has_rd.
-
-    All other arrays sized for B chunks; instr_lens sized for
-    max_n_instrs columns (0 past actual count, 0 for invalid).
+    All arrays sized for B chunks; instr_lens sized for max_n_instrs
+    columns (0 past actual count, 0 for invalid).
     """
     tokens:         np.ndarray   # (B, max_tokens) int8
     token_lens:     np.ndarray   # (B,) int32
     valid:          np.ndarray   # (B,) bool — complete instruction window
     instr_lens:     np.ndarray   # (B, max_n_instrs) int32
-    # Row-outputs mode payload (RB=B if active, RB=0 otherwise):
-    row_outputs:    np.ndarray   # (RB, n_anchors) float32 — rd value per anchor
-    row_has_rd:     np.ndarray   # (RB,) bool
-    pair_valid:     np.ndarray   # (RB,) bool — meaningful row_outputs
     # T2 aux register-identity targets — always sized B; rows without a
     # valid Precomputed (invalid windows, mem-op chunks) get zero
     # masks and AUX_CE_IGNORE in the slot arrays.
@@ -260,8 +247,8 @@ class Batch:
 
 
 RVT_FORMAT = BinaryFormat(
-    magic=b'RVT\x00', version=7,
-    header_fields=['B', 'max_tokens', 'max_n_instrs', 'RB', 'n_anchors', 'OB'],
+    magic=b'RVT\x00', version=8,
+    header_fields=['B', 'max_tokens', 'max_n_instrs', 'n_anchors', 'OB'],
     body_fields=[
         BodyField('tokens', np.dtype(np.int8), ('B', 'max_tokens')),
         BodyField('token_lens', np.dtype(np.int32), ('B',)),
@@ -269,9 +256,6 @@ RVT_FORMAT = BinaryFormat(
         BodyField('instr_lens', np.dtype(np.int32), ('B', 'max_n_instrs')),
         BodyField('out_regs', np.dtype(np.int32), ('OB', 'n_anchors', N_REGS)),
         BodyField('out_regs_valid', np.dtype(np.bool_), ('OB',)),
-        BodyField('row_outputs', np.dtype(np.float32), ('RB', 'n_anchors')),
-        BodyField('row_has_rd', np.dtype(np.bool_), ('RB',)),
-        BodyField('pair_valid', np.dtype(np.bool_), ('RB',)),
         BodyField('live_in_mask', np.dtype(np.bool_), ('B', N_REGS)),
         BodyField('live_out_mask', np.dtype(np.bool_), ('B', N_REGS)),
         BodyField('pc_writes', np.dtype(np.bool_), ('B',)),
@@ -286,16 +270,6 @@ RVT_FORMAT = BinaryFormat(
 # ===========================================================================
 # Pack / unpack
 # ===========================================================================
-
-@dataclass
-class RowOutputsPayload:
-    """Per-row arrays produced by build_row_outputs and consumed by
-    pack_batch when in row-outputs mode. All sized for actual rows
-    (length-actual_B); pack_batch pads to target_B."""
-    row_outputs: np.ndarray     # (actual_B, n_anchors) float — rd value per anchor
-    has_rd: np.ndarray          # (actual_B,) bool
-    pair_valid: np.ndarray      # (actual_B,) bool
-
 
 @dataclass
 class AuxPayload:
@@ -360,9 +334,8 @@ def pack_batch(chunks, *,
                target_B, target_max_tokens,
                target_max_n_instrs,
                out_regs=None, out_regs_valid=None,
-               row_outputs_payload=None,
                aux_payload=None):
-    """Build a Batch from chunks, optionally with a row-outputs payload.
+    """Build a Batch from chunks with the canonical out_regs oracle.
 
     chunks:    list[Chunk]
 
@@ -374,11 +347,6 @@ def pack_batch(chunks, *,
                from the chunking rule's length cap. Padding rows have
                valid=False, token_lens=0, instr_lens=0 — naturally zero
                loss, no special handling needed in training.
-
-    row_outputs_payload:
-        Optional RowOutputsPayload. When supplied, the row-* fields
-        are populated (RB = target_B). When None, RB = 0 and the
-        row-* body fields are empty.
 
     aux_payload:
         Optional AuxPayload of T2 register-identity targets. When
@@ -431,41 +399,10 @@ def pack_batch(chunks, *,
             for j, instr in enumerate(c.instructions):
                 instr_lens[i, j] = len(encode_instruction(instr))
 
-    # Shared anchor count across the per-anchor payloads (out_regs in T2
-    # mode, row_outputs in T1 mode). Even an EMPTY payload carries n_anchors
-    # in its anchor dim so the header derives the same value from either.
-    if out_regs is not None:
-        n_anchors = int(out_regs.shape[1])
-    elif row_outputs_payload is not None:
-        n_anchors = int(row_outputs_payload.row_outputs.shape[1])
-    else:
-        n_anchors = 0
+    # Anchor count comes from the out_regs payload (every rule ships it now).
+    n_anchors = int(out_regs.shape[1]) if out_regs is not None else 0
 
-    if row_outputs_payload is None:
-        # No row-outputs payload: RB = 0 (carry n_anchors).
-        row_outputs_arr = np.zeros((0, n_anchors), dtype=np.float32)
-        has_rd_arr = np.zeros((0,), dtype=bool)
-        pair_valid_arr = np.zeros((0,), dtype=bool)
-    else:
-        # row-outputs mode: RB = B; pad payload's actual_B to B.
-        p = row_outputs_payload
-        if p.row_outputs.shape[0] != actual_B:
-            raise ValueError(
-                f'row_outputs_payload.row_outputs first dim '
-                f'({p.row_outputs.shape[0]}) must equal '
-                f'actual_B ({actual_B})')
-        row_outputs_arr = np.zeros((B, n_anchors), dtype=np.float32)
-        row_outputs_arr[:actual_B] = p.row_outputs.astype(
-            np.float32, copy=False)
-
-        has_rd_arr = np.zeros((B,), dtype=bool)
-        has_rd_arr[:actual_B] = p.has_rd
-
-        pair_valid_arr = np.zeros((B,), dtype=bool)
-        pair_valid_arr[:actual_B] = p.pair_valid
-
-    # out_regs payload (OB = B in T2 mode, 0 otherwise). Empty carries
-    # n_anchors so the header is consistent with row_outputs.
+    # out_regs payload (OB = B in T2 mode, 0 otherwise).
     if out_regs is None:
         out_regs_arr = np.zeros((0, n_anchors, N_REGS), dtype=np.int32)
         out_regs_valid_arr = np.zeros((0,), dtype=bool)
@@ -499,9 +436,6 @@ def pack_batch(chunks, *,
                  instr_lens=instr_lens,
                  out_regs=out_regs_arr,
                  out_regs_valid=out_regs_valid_arr,
-                 row_outputs=row_outputs_arr,
-                 row_has_rd=has_rd_arr,
-                 pair_valid=pair_valid_arr,
                  live_in_mask=live_in_arr,
                  live_out_mask=live_out_arr,
                  pc_writes=pc_writes_arr,
@@ -599,70 +533,6 @@ def build_twins(chunks, twins, anchor_states, rng):
     return chunks_out, aux, out_regs, out_regs_valid
 
 
-def build_row_outputs(chunks, twins, anchor_states, rng):
-    """Add `twins` relabeled copies of each valid non-mem-op single-
-    instruction source chunk and compute the per-row value-prediction
-    target (the destination register's value per anchor) for every row.
-
-    Like `build_twins`, but additionally produces the row-outputs
-    payload consumed as value-prediction supervision at training time.
-
-    All chunks must be single-instruction (or invalid windows). Memory
-    ops are kept in the chunks list (so the encoder still sees their
-    tokens for magnitude-validity training) but their row_outputs is
-    zero and pair_valid is False — the value-prediction loss skips them.
-
-    Returns (chunks_out, payload, aux) where chunks_out extends
-    `chunks` with twin rows, payload is a RowOutputsPayload sized for
-    chunks_out, and aux is the parallel AuxPayload of T2 register-
-    identity targets.
-    """
-    chunks_out = []
-    rows = []
-    pres = []   # parallel to chunks_out; None for invalid/mem-op rows
-
-    n_anchors = anchor_states.shape[0]
-    zero_row_outputs = np.zeros((n_anchors,), dtype=np.float64)
-    empty_row = (zero_row_outputs, False, False)
-
-    def _process(ch):
-        if (not ch.valid
-                or ch.instructions is None
-                or len(ch.instructions) != 1
-                or _has_mem_ops(ch.instructions)):
-            return empty_row, None
-        instr = ch.instructions[0]
-        pre = precompute_chunk(ch.instructions, anchor_states)
-        ro = precompute_row_outputs(instr, anchor_states, pre=pre)
-        return ((ro.rd_values, ro.has_rd, True), pre)
-
-    for ch in chunks:
-        chunks_out.append(ch)
-        row, pre = _process(ch)
-        rows.append(row)
-        pres.append(pre)
-
-        if pre is None:
-            # Invalid / mem-op / multi-instr: no twins.
-            continue
-
-        for _ in range(twins):
-            twin_instrs = random_relabel(ch.instructions, rng)
-            twin_chunk = _make_valid_chunk(twin_instrs)
-            chunks_out.append(twin_chunk)
-            twin_row, twin_pre = _process(twin_chunk)
-            rows.append(twin_row)
-            pres.append(twin_pre)
-
-    payload = RowOutputsPayload(
-        row_outputs=np.stack([r[0] for r in rows]),
-        has_rd=np.array([r[1] for r in rows], dtype=bool),
-        pair_valid=np.array([r[2] for r in rows], dtype=bool),
-    )
-    aux = _aux_from_precomputeds(pres)
-    return chunks_out, payload, aux
-
-
 # ===========================================================================
 # Top-level: instruction stream → Batch stream
 # ===========================================================================
@@ -698,8 +568,7 @@ def collect_into_batches(chunks_iter, *, batch_size, twins,
                          anchor_states, rng,
                          invalid_rate=0.0, invalid_provider=None,
                          max_invalid_window=None,
-                         max_chunk_len,
-                         row_outputs_mode=False):
+                         max_chunk_len):
     """Consume a Chunk stream, build Batches of `batch_size` rows.
 
     invalid_rate>0 mixes invalid windows in at the given fraction of
@@ -710,6 +579,9 @@ def collect_into_batches(chunks_iter, *, batch_size, twins,
     invalid rows + `batch_size - n_invalid` valid source slots; twins
     are added on top of the valid-source slots, growing the batch.
 
+    Every rule (single → T1, multi-instr → T2) ships the canonical out_regs
+    oracle via build_twins (the T1/T2 unification).
+
     max_chunk_len: maximum number of instructions per chunk under the
                    chunking rule (the rule's length cap; 1 for 'single').
                    Required: every emitted batch has identical shape — B,
@@ -718,12 +590,6 @@ def collect_into_batches(chunks_iter, *, batch_size, twins,
                    caching allocator from fragmenting over a long training
                    run with stochastically-varying batch shapes (a real
                    OOM trigger we hit at ~step 500 of t1_cosine_full).
-
-    row_outputs_mode: if True, switch to the single-instruction T1 row-
-                   outputs path — the destination register's value per
-                   anchor is computed and shipped as the value-prediction
-                   target. Requires single-instruction chunks
-                   (e.g. --rule single).
     """
     if invalid_rate > 0 and invalid_provider is None:
         raise ValueError('invalid_rate > 0 requires invalid_provider')
@@ -752,26 +618,14 @@ def collect_into_batches(chunks_iter, *, batch_size, twins,
             invalids = [_make_invalid_chunk(invalid_provider())
                         for _ in range(n_invalid)]
             mixed = valid_sources + invalids
-            if row_outputs_mode:
-                chunks_out, payload, aux = build_row_outputs(
-                    mixed, twins=twins,
-                    anchor_states=anchor_states, rng=rng)
-                yield pack_batch(
-                    chunks_out,
-                    target_B=target_B,
-                    target_max_tokens=target_max_tokens,
-                    target_max_n_instrs=target_max_n_instrs,
-                    row_outputs_payload=payload,
-                    aux_payload=aux)
-            else:
-                chunks_out, aux, out_regs, out_regs_valid = build_twins(
-                    mixed, twins=twins,
-                    anchor_states=anchor_states, rng=rng)
-                yield pack_batch(
-                    chunks_out,
-                    target_B=target_B,
-                    target_max_tokens=target_max_tokens,
-                    target_max_n_instrs=target_max_n_instrs,
-                    out_regs=out_regs,
-                    out_regs_valid=out_regs_valid,
-                    aux_payload=aux)
+            chunks_out, aux, out_regs, out_regs_valid = build_twins(
+                mixed, twins=twins,
+                anchor_states=anchor_states, rng=rng)
+            yield pack_batch(
+                chunks_out,
+                target_B=target_B,
+                target_max_tokens=target_max_tokens,
+                target_max_n_instrs=target_max_n_instrs,
+                out_regs=out_regs,
+                out_regs_valid=out_regs_valid,
+                aux_payload=aux)

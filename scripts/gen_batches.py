@@ -173,11 +173,9 @@ def main():
         eq_min_per_class=eq_min_per_class,
         eq_boost=eq_boost,
     )
-    # Single-instruction rule → row-outputs mode (per-row canonical
-    # outputs shipped, training forms (B,B) target distance on-GPU).
-    # Multi-instruction rules keep the per-pair CPU distance path.
-    row_outputs_mode = (args.rule.strip() == 'single')
-
+    # All rules — including `single` — ship the CANONICAL out_regs oracle
+    # (OB==B). T1 and T2 now share one canonical value-prediction target
+    # (the T1/T2 unification); the raw row-outputs path is retired.
     batches_iter = collect_into_batches(
         chunks_iter,
         batch_size=args.batch_size,
@@ -186,7 +184,6 @@ def main():
         invalid_rate=inv_rate, invalid_provider=invalid_provider,
         max_invalid_window=args.max_invalid_window,
         max_chunk_len=max_chunk_len,
-        row_outputs_mode=row_outputs_mode,
     )
 
     out = binary_stdout()
