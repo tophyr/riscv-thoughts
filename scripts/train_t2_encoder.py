@@ -7,10 +7,9 @@ pools the resulting sequence into a single chunk vector. Supervision is
 value-prediction and aux register-identity heads.
 
 Usage:
-    gen_batches.py --rule 'branch+cap=8' --twins 3 \\
-        --batch-size 256 -n 5000 -v > corpus.rvt
-    cat corpus.rvt |
-        train_t2_encoder.py --t1-model runs/t1_good/encoder.pt
+    python -m datagen --rule 'branch+cap=8' --twins 3 --batch-size 256 \\
+        --count 5000 \\
+        | train_t2_encoder.py --t1-model runs/t1_good/encoder.pt
 """
 
 import argparse
@@ -62,11 +61,11 @@ def main():
                         'on shape (chunk I/O function supervision). '
                         'Reconstructs '
                         'anchor_states from --anchor-seed and '
-                        '--n-anchor-states — must match gen_batches.')
+                        '--n-anchor-states — must match datagen.')
     p.add_argument('--anchor-seed', type=int, default=0,
-                   help='Anchor-states seed (must match gen_batches).')
+                   help='Anchor-states seed (must match datagen).')
     p.add_argument('--n-anchor-states', type=int, default=8,
-                   help='Anchor states count (must match gen_batches).')
+                   help='Anchor states count (must match datagen).')
 
     p.add_argument('--route', choices=('binding', 'tokens'), default='binding',
                    help="How T2 gets per-instruction wiring. 'binding' "

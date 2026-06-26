@@ -2,23 +2,25 @@
 
 # Cluster-style RVT corpus generator.
 #
-# Combines a remote 96-worker gen_batches pool (over a compressed netcat
-# link) with a local 8-worker pool. Each worker generates
-# BATCHES_PER_WORKER batches, then exits; the script ends when all
-# workers have drained. Pipe stdout to a file (or to a downstream
-# consumer like train_*).
+# Combines a remote datagen pool (over a netcat link) with a local
+# datagen pool. Both generate infinitely; the local side bounds the
+# joined stream to TOTAL_BATCHES with --count. When that count is reached,
+# BrokenPipe cascades local→nc→remote and every worker (pdeathsig-armed)
+# is reaped. Pipe stdout to a file (or to a downstream consumer like
+# train_*).
 #
-# Generation knobs are applied identically to both mux_batches
+# Generation knobs are applied identically to both datagen
 # invocations so local and remote workers produce the same shape of
-# data. Worker counts (96 odin, 8 local) are tuned to the specific
-# machines and stay hardcoded.
+# data. Worker counts (48 odin, 8 local) are tuned to the specific
+# machines and stay hardcoded; they set the gen mix ratio, not the total
+# (which --count fixes).
 #
 # This is a personal aid for Chris Sarbora's setup; treat it as an
 # example pattern rather than a turnkey tool.
 #
 # Usage:
-#   multinode_gen.sh BATCHES_PER_WORKER > /tmp/corpus.rvt
-#   multinode_gen.sh 2500              # → 104 * 2500 = 260,000 batches
+#   multinode_gen.sh TOTAL_BATCHES > /tmp/corpus.rvt
+#   multinode_gen.sh 260000            # → exactly 260,000 batches
 #
 # Override generation knobs via env vars:
 #   BATCH_SIZE      (default 128)
@@ -35,7 +37,7 @@
 set -euo pipefail
 
 PYTHON=.venv/bin/python
-BATCHES_PER_WORKER=$1
+TOTAL=$1
 BATCH_SIZE=${BATCH_SIZE:-128}
 TWINS=${TWINS:-3}
 N_STATES=${N_STATES:-8}
@@ -68,18 +70,18 @@ cleanup() {
 trap cleanup EXIT
 
 # Ship Python sources over the ssh pipe as a compressed tar stream. We
-# only need the datagen side of the pipeline (mux_batches + the
-# gen_batches workers it spawns), which pulls in datagen/, emulator/,
-# tokenizer/, and the JSON configs. Total payload is well under 100KB.
+# only need the datagen side of the pipeline (datagen + the worker
+# processes it forks), which pulls in datagen/, emulator/, tokenizer/,
+# and the JSON configs. Total payload is well under 100KB.
 echo "Shipping sources to ${REMOTE}:${REMOTE_DIR}" >&2
 tar -czf - --exclude='__pycache__' --exclude='*.pyc' --exclude='tests' \
     datagen emulator tokenizer scripts configs \
   | ssh ${REMOTE} "tar -xzf - -C ${REMOTE_DIR}" \
   || { echo "ERROR: failed to ship sources" >&2; exit 1; }
 
-# Spawn remote 96-worker pool. Each worker is a gen_batches.py with
-# matching knobs; mux interleaves their output and lz4-compresses it
-# over netcat to us.
+# Spawn the remote 48-worker pool. datagen forks the workers and
+# interleaves their output over netcat to us. Generation is infinite;
+# the local --count bound (below) drives shutdown.
 EXTRA_ARGS="--inject-invalid ${INJECT_INVALID}"
 if [ -n "${INJECT_EQUIV}" ]; then
   EXTRA_ARGS="${EXTRA_ARGS} --inject-equiv ${INJECT_EQUIV}"
@@ -88,11 +90,9 @@ fi
 ssh ${REMOTE} "bash ${REMOTE_DIR}/scripts/multinode_remote.sh \
     ${REMOTE_DIR} ${REMOTE_PYTHON} \
     --gen-count 48 \
-    -- \
     --rule ${RULE} \
     --batch-size ${BATCH_SIZE} \
     --twins ${TWINS} --n-states ${N_STATES} \
-    --n-batches ${BATCHES_PER_WORKER} \
     --config ${CONFIG} \
     ${EXTRA_ARGS}" &
 SSH_PID=$!
@@ -101,16 +101,16 @@ SSH_PID=$!
 sleep 5
 kill -0 $SSH_PID 2>/dev/null || { echo "ERROR: remote process died" >&2; exit 1; }
 
-# Local mux: 8 local workers plus the remote netcat stream as an
-# additional input. mux exits on its own once all inputs (8 workers +
-# remote stream) have closed, so total batches = 104 * BATCHES_PER_WORKER.
-${PYTHON} scripts/mux_batches.py \
+# Local pool: 8 local workers plus the remote netcat stream as an extra
+# mux input. --count TOTAL bounds the joined stream and, on reaching it,
+# reaps the local pool and (via BrokenPipe over nc) the remote pool.
+# </dev/null: mux only the explicit <(nc …) input, never an inherited stdin.
+${PYTHON} -m datagen \
     --gen-count 8 \
     <(nc odin 6464 -d) \
-    -- \
     --rule ${RULE} \
     --batch-size ${BATCH_SIZE} \
     --twins ${TWINS} --n-states ${N_STATES} \
-    --n-batches ${BATCHES_PER_WORKER} \
     --config ${CONFIG} \
-    ${EXTRA_ARGS}
+    --count ${TOTAL} \
+    ${EXTRA_ARGS} </dev/null

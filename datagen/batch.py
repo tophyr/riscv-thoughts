@@ -59,26 +59,33 @@ class BinaryFormat:
     cat corpus.rvt corpus.rvt for a second epoch).
 
     Per batch:
-      prefix: 4-byte magic + 1-byte version + N dtype chars
+      prefix: 4-byte magic + N dtype chars
       header: one uint32 per symbolic dimension
       body:   the body fields as contiguous raw arrays
     """
 
-    def __init__(self, magic, version, header_fields, body_fields):
+    def __init__(self, magic, header_fields, body_fields, header_bounds=None):
         if len(magic) != 4:
             raise ValueError('magic must be exactly 4 bytes')
         self.magic = magic
-        self.version = version
         self.header_fields = list(header_fields)
         self.body_fields = list(body_fields)
+        # Per-field (lo, hi) sanity bounds on the dimension header, checked on
+        # every read (see _check_header_bounds). Structural validation: a torn
+        # or corrupt stream can present a syntactically-valid header with insane
+        # dims, and we must reject it before trusting it to size a read.
+        self.header_bounds = dict(header_bounds or {})
         self._header_struct = struct.Struct('<' + 'I' * len(header_fields))
         self._dtype_chars = b''.join(
             f.dtype.char.encode() for f in body_fields)
-        # Per-batch self-describing prefix: magic + version + dtype
-        # signature. There is no stream header — every batch carries this,
-        # which is what lets RVT streams concatenate/repeat with `cat`.
+        # Per-batch self-describing prefix: magic + dtype signature. There is
+        # no stream header — every batch carries this, which is what lets RVT
+        # streams concatenate/repeat with `cat`. No version field: the format
+        # is singular and global; any change to it is immediate everywhere, so
+        # there is no compatibility to negotiate. The dtype signature still
+        # rejects a schema-mismatched stream (a body-field change shifts it).
         self._prefix_struct = struct.Struct(
-            f'<4sB{len(self._dtype_chars)}s')
+            f'<4s{len(self._dtype_chars)}s')
 
     @property
     def name(self):
@@ -90,8 +97,8 @@ class BinaryFormat:
 
     @property
     def batch_prefix_size(self):
-        """Bytes of the self-describing prefix (magic+version+dtype) that
-        precede each batch's dimension header."""
+        """Bytes of the self-describing prefix (magic+dtype) that precede each
+        batch's dimension header."""
         return self._prefix_struct.size
 
     @property
@@ -123,28 +130,56 @@ class BinaryFormat:
         return header
 
     def _read_prefix(self, f):
-        """Read + validate one batch's self-describing prefix (magic,
-        version, dtype). Returns the prefix bytes, or None at clean EOF."""
+        """Read + validate one batch's self-describing prefix (magic, dtype).
+        Returns the prefix bytes, or None at clean EOF."""
         buf = f.read(self._prefix_struct.size)
         if len(buf) == 0:
             return None
         if len(buf) < self._prefix_struct.size:
             raise EOFError(f'Truncated batch prefix ({len(buf)} bytes)')
-        magic, version, dtype_chars = self._prefix_struct.unpack(buf)
+        magic, dtype_chars = self._prefix_struct.unpack(buf)
         if magic != self.magic:
             raise ValueError(
                 f'Bad magic: {magic!r} (expected {self.magic!r})')
-        if version != self.version:
-            raise ValueError(
-                f'Unsupported {self.name} version: {version}')
         if dtype_chars != self._dtype_chars:
             raise ValueError(f'Dtype mismatch: {dtype_chars!r}')
         return buf
 
+    def _check_header_bounds(self, header_values):
+        """Reject a structurally-invalid dimension header before we trust it to
+        size a read. A field whose value falls outside its declared (lo, hi)
+        bound means the stream is torn/corrupt, not a different version."""
+        for name, val in zip(self.header_fields, header_values):
+            bounds = self.header_bounds.get(name)
+            if bounds is None:
+                continue
+            lo, hi = bounds
+            if not (lo <= val <= hi):
+                dims = dict(zip(self.header_fields, header_values))
+                raise ValueError(
+                    f'Invalid {self.name} header: {name}={val} outside '
+                    f'[{lo}, {hi}] ({dims})')
+
+    def peek_magic(self, f):
+        """Confirm the stream starts with this format's magic WITHOUT consuming
+        it (the batch is read whole afterward). Raises ValueError otherwise.
+        Requires a buffered/peekable stream."""
+        n = len(self.magic)
+        buf = b''
+        while len(buf) < n:
+            prev = len(buf)
+            buf = f.peek(n)
+            if len(buf) <= prev:
+                raise ValueError(
+                    f'Truncated stream: {len(buf)} bytes before magic')
+        magic = bytes(buf[:n])
+        if magic != self.magic:
+            raise ValueError(
+                f'Bad magic: {magic!r} (expected {self.magic!r})')
+
     def write_batch(self, f, batch):
         header = self._extract_header(batch)
-        f.write(self._prefix_struct.pack(
-            self.magic, self.version, self._dtype_chars))
+        f.write(self._prefix_struct.pack(self.magic, self._dtype_chars))
         f.write(self._header_struct.pack(
             *[header[n] for n in self.header_fields]))
         for fld in self.body_fields:
@@ -157,8 +192,9 @@ class BinaryFormat:
         if len(header_buf) < self._header_struct.size:
             raise EOFError(
                 f'Truncated batch header ({len(header_buf)} bytes)')
-        header = dict(zip(self.header_fields,
-                          self._header_struct.unpack(header_buf)))
+        header_vals = self._header_struct.unpack(header_buf)
+        self._check_header_bounds(header_vals)
+        header = dict(zip(self.header_fields, header_vals))
         kwargs = {}
         for fld in self.body_fields:
             shape = self._shape(fld, header)
@@ -181,6 +217,7 @@ class BinaryFormat:
             raise EOFError(
                 f'Truncated batch header ({len(header_buf)} bytes)')
         header_vals = self._header_struct.unpack(header_buf)
+        self._check_header_bounds(header_vals)
         body_size = self.body_size(*header_vals)
         body = f.read(body_size) if body_size > 0 else b''
         if body_size > 0 and len(body) < body_size:
@@ -247,7 +284,7 @@ class Batch:
 
 
 RVT_FORMAT = BinaryFormat(
-    magic=b'RVT\x00', version=8,
+    magic=b'RVT\x00',
     header_fields=['B', 'max_tokens', 'max_n_instrs', 'n_anchors', 'OB'],
     body_fields=[
         BodyField('tokens', np.dtype(np.int8), ('B', 'max_tokens')),
@@ -264,6 +301,15 @@ RVT_FORMAT = BinaryFormat(
         BodyField('out_slot_regs', np.dtype(np.int8),
                   ('B', MAX_OUTPUT_SLOTS)),
     ],
+    # Sanity bounds on the dimension header — reject a torn/corrupt stream
+    # whose dims are garbage before sizing a read off them.
+    header_bounds={
+        'B': (1, 1_000_000),
+        'max_tokens': (1, 100_000),
+        'max_n_instrs': (1, 100_000),
+        'n_anchors': (0, 256),
+        'OB': (0, 1_000_000),
+    },
 )
 
 

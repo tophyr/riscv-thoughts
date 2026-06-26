@@ -261,7 +261,7 @@ class StepTimer:
 
 def capture_train_state(step, opt, scheduler):
     """Snapshot optimizer moments + scheduler position + step + RNG for an
-    as-close-as-possible resume (the data stream from gen_batches is random,
+    as-close-as-possible resume (the data stream from datagen is random,
     so resume continues optimizer/schedule, not the exact byte stream).
     Shared by all trainers; fires at log-boundary cadence, so the device->host
     copies it triggers (state_dict / get_rng_state) are off the hot path."""

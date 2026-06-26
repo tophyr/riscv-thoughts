@@ -1,6 +1,6 @@
 """Integration tests for the batch pipeline scripts.
 
-Runs gen_batches, batch_slice, and mux_batches via subprocess.
+Runs `python -m datagen` and the trainers via subprocess.
 All tools share the single RVT format.
 """
 
@@ -19,56 +19,64 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 PYTHON = sys.executable
 
 
-def _gen_worker_pids():
-    """PIDs of live gen_batches.py worker processes, by /proc cmdline
-    scan (psutil-free). Used by the orphan-cleanup test.
+def _children_of(pid):
+    """Direct child PIDs of `pid`. datagen forks its workers, so they
+    share the parent's argv and can't be told apart by a cmdline scan;
+    identify them by parentage instead (pgrep -P)."""
+    try:
+        r = subprocess.run(['pgrep', '-P', str(pid)],
+                           capture_output=True, text=True)
+    except FileNotFoundError:
+        return set()
+    return {int(x) for x in r.stdout.split()}
 
-    Matches only processes RUNNING gen_batches.py as a script — i.e. an
-    argv element whose basename is exactly 'gen_batches.py'. A plain
-    substring scan would also match shell wrappers and helper processes
-    that merely mention the path in their command line (e.g. the pytest
-    launcher), which would make the orphan check spuriously fire.
-    """
-    pids = set()
-    for d in glob.glob('/proc/[0-9]*'):
-        try:
-            with open(os.path.join(d, 'cmdline'), 'rb') as f:
-                cmdline = f.read()
-        except OSError:
-            continue  # process exited between glob and open
-        argv = cmdline.split(b'\x00')
-        if any(os.path.basename(a) == b'gen_batches.py' for a in argv):
-            pids.add(int(os.path.basename(d)))
-    return pids
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
 
 
 def run(cmd, stdin=None, timeout=60):
-    result = subprocess.run(
-        cmd, input=stdin, capture_output=True, timeout=timeout,
-        cwd=str(ROOT))
+    kwargs = dict(capture_output=True, timeout=timeout, cwd=str(ROOT))
+    if stdin is None:
+        # datagen auto-muxes a piped/redirected stdin; give it /dev/null
+        # (a char device, skipped) so an inherited pipe under some test
+        # runner can't perturb generation-only runs.
+        kwargs['stdin'] = subprocess.DEVNULL
+    else:
+        kwargs['input'] = stdin
+    result = subprocess.run(cmd, **kwargs)
     return result.stdout, result.stderr.decode(), result.returncode
 
 
 def gen(n_batches=2, batch_size=8, twins=1, n_states=4,
         rule='cap=2', seed=42):
+    """A bounded RVT fixture: a single-worker datagen pool capped to exactly
+    n_batches via --count. One worker keeps the bytes deterministic under
+    `seed`."""
     out, err, rc = run([
-        PYTHON, 'scripts/gen_batches.py',
-        '-n', str(n_batches),
-        '--batch-size', str(batch_size),
-        '--rule', rule,
-        '--twins', str(twins),
-        '--n-states', str(n_states),
-        '--seed', str(seed)])
-    assert rc == 0, f'gen_batches failed: {err}'
+        PYTHON, '-m', 'datagen', '--gen-count', '1', '--count', str(n_batches),
+        '--batch-size', str(batch_size), '--rule', rule,
+        '--twins', str(twins), '--n-states', str(n_states),
+        '--seed', str(seed)], timeout=120)
+    assert rc == 0, f'datagen failed: {err}'
     assert len(out) > 0
     return out
 
 
-def slice_info(data):
-    _, err, rc = run([PYTHON, 'scripts/batch_slice.py', '--info'],
-                     stdin=data)
-    assert rc == 0, f'batch_slice --info failed: {err}'
-    return err
+def _count_batches(data):
+    """Count batches in an RVT blob, in-process (replaces the deleted
+    `batch_slice --info`). A clean parse also confirms the bytes are valid
+    RVT — the reader raises otherwise."""
+    import io
+    sys.path.insert(0, str(ROOT))
+    from datagen import RVT_FORMAT, Batch
+    return sum(1 for _ in RVT_FORMAT.reader(io.BytesIO(data), Batch))
 
 
 def _first_header(data):
@@ -84,9 +92,7 @@ def _first_header(data):
 class TestGenBatches:
     def test_emits_valid_rvt(self):
         data = gen()
-        info = slice_info(data)
-        assert 'Format:       rvt' in info
-        assert 'Batches:      2' in info
+        assert _count_batches(data) == 2
 
     def test_out_regs_mode_header(self):
         """Every rule — single (T1) and multi-instruction (T2) — ships the
@@ -108,7 +114,7 @@ class TestGenBatches:
 
 
 class TestGenRules:
-    """gen_batches --rule parsing: capped composite rules emit valid RVT
+    """datagen --rule parsing: capped composite rules emit valid RVT
     respecting the length cap; unbounded / unknown rules fail clearly."""
 
     @pytest.mark.parametrize('component,cap', [('branch', 3),
@@ -119,8 +125,7 @@ class TestGenRules:
         # chunks hit the cap.
         data = gen(n_batches=3, batch_size=16, twins=0, n_states=4,
                    rule=rule, seed=7)
-        info = slice_info(data)
-        assert 'Format:       rvt' in info, info
+        assert _count_batches(data) == 3
         # Every chunk's instruction count is bounded by the cap. Read the
         # per-row instr_lens column counts back out of the stream.
         sys.path.insert(0, str(ROOT))
@@ -137,10 +142,11 @@ class TestGenRules:
 
     def test_bare_branch_rejected(self):
         """A bare terminator (no length cap) can build an unbounded chunk;
-        gen_batches must reject it eagerly with a clear message, not crash
-        downstream with an opaque None-arithmetic error."""
+        datagen must reject it eagerly in the parent (before forking
+        workers), with a clear message and non-zero exit — not a traceback
+        deep inside a worker."""
         out, err, rc = run([
-            PYTHON, 'scripts/gen_batches.py', '-n', '1', '--batch-size', '4',
+            PYTHON, '-m', 'datagen', '--batch-size', '4',
             '--rule', 'branch', '--twins', '0', '--n-states', '4'])
         assert rc != 0, 'bare branch must fail'
         assert 'unbounded' in err.lower() and 'cap' in err.lower(), err
@@ -148,62 +154,63 @@ class TestGenRules:
 
     def test_unknown_component_rejected(self):
         out, err, rc = run([
-            PYTHON, 'scripts/gen_batches.py', '-n', '1', '--batch-size', '4',
+            PYTHON, '-m', 'datagen', '--batch-size', '4',
             '--rule', 'frobnicate', '--twins', '0', '--n-states', '4'])
         assert rc != 0, 'unknown rule component must fail'
         assert 'Unknown rule component' in err and 'frobnicate' in err, err
         assert len(out) == 0
 
 
-class TestBatchSlice:
-    def test_count(self):
-        data = gen(n_batches=5)
-        out, err, rc = run(
-            [PYTHON, 'scripts/batch_slice.py', '--count', '2'],
-            stdin=data)
-        assert rc == 0
-        assert 'Batches:      2' in slice_info(out)
+class TestCount:
+    """`--count N` (folded in from the retired batch_slice): emit exactly N
+    batches total across the pool, then stop and reap."""
 
-    def test_skip(self):
-        data = gen(n_batches=5)
-        out, _, rc = run(
-            [PYTHON, 'scripts/batch_slice.py', '--skip', '3'],
-            stdin=data)
-        assert rc == 0
-        assert 'Batches:      2' in slice_info(out)
+    def test_count_caps_pool_output(self):
+        out, err, rc = run([
+            PYTHON, '-m', 'datagen', '--gen-count', '4', '--count', '10',
+            '--batch-size', '8', '--rule', 'cap=2', '--twins', '1',
+            '--n-states', '4'], timeout=120)
+        assert rc == 0, err
+        assert _count_batches(out) == 10
 
-    def test_tail(self):
-        with tempfile.NamedTemporaryFile(suffix='.rvt') as f:
-            f.write(gen(n_batches=5))
-            f.flush()
-            out, _, rc = run([
-                PYTHON, 'scripts/batch_slice.py', '--tail', '2', f.name])
-            assert rc == 0
-            assert 'Batches:      2' in slice_info(out)
+    def test_count_on_pure_mux(self):
+        """--count also bounds a pure-mux (--gen-count 0) pass over inputs —
+        the old `batch_slice --count` on a stream."""
+        with tempfile.NamedTemporaryFile(suffix='.rvt') as f1, \
+             tempfile.NamedTemporaryFile(suffix='.rvt') as f2:
+            f1.write(gen(n_batches=3, seed=1))
+            f1.flush()
+            f2.write(gen(n_batches=3, seed=2))
+            f2.flush()
+            out, err, rc = run([
+                PYTHON, '-m', 'datagen', '--gen-count', '0', '--count', '4',
+                f1.name, f2.name])
+            assert rc == 0, err
+            assert _count_batches(out) == 4
 
 
 class TestMuxBatches:
     def test_file_inputs(self):
+        """Pure mux (--gen-count 0) of two file inputs, conserving total."""
         with tempfile.NamedTemporaryFile(suffix='.rvt') as f1, \
              tempfile.NamedTemporaryFile(suffix='.rvt') as f2:
             f1.write(gen(n_batches=2, seed=1))
             f1.flush()
             f2.write(gen(n_batches=3, seed=2))
             f2.flush()
-            out, err, rc = run([PYTHON, 'scripts/mux_batches.py',
-                                f1.name, f2.name])
+            out, err, rc = run([PYTHON, '-m', 'datagen',
+                                '--gen-count', '0', f1.name, f2.name])
             assert rc == 0, err
-            assert 'Batches:      5' in slice_info(out)
+            assert _count_batches(out) == 5
 
     def test_spawned_workers(self):
+        """Two generation workers, bounded to 4 batches by --count."""
         out, err, rc = run([
-            PYTHON, 'scripts/mux_batches.py',
-            '--gen-count', '2', '--',
-            '--n-batches', '2', '--batch-size', '8', '--rule', 'cap=2',
-            '--twins', '1', '--n-states', '4'],
-            timeout=120)
-        assert rc == 0, f'mux spawned failed: {err}'
-        assert 'Batches:      4' in slice_info(out)
+            PYTHON, '-m', 'datagen', '--gen-count', '2', '--count', '4',
+            '--batch-size', '8', '--rule', 'cap=2', '--twins', '1',
+            '--n-states', '4'], timeout=120)
+        assert rc == 0, err
+        assert _count_batches(out) == 4
 
     def test_round_robin_unequal(self):
         """round-robin over two file inputs of UNEQUAL length: it
@@ -216,10 +223,10 @@ class TestMuxBatches:
             f2.write(gen(n_batches=3, seed=2))
             f2.flush()
             out, err, rc = run([
-                PYTHON, 'scripts/mux_batches.py', '--mode', 'round-robin',
-                f1.name, f2.name])
+                PYTHON, '-m', 'datagen', '--gen-count', '0',
+                '--mode', 'round-robin', f1.name, f2.name])
             assert rc == 0, err
-            assert 'Batches:      5' in slice_info(out)
+            assert _count_batches(out) == 5
 
     def test_weighted_mode(self):
         """weighted mode honors per-input weights (W:path syntax) and
@@ -234,136 +241,190 @@ class TestMuxBatches:
             f2.write(gen(n_batches=4, seed=2))
             f2.flush()
             out, err, rc = run([
-                PYTHON, 'scripts/mux_batches.py', '--mode', 'weighted',
-                '1:' + f1.name, '5:' + f2.name])
+                PYTHON, '-m', 'datagen', '--gen-count', '0',
+                '--mode', 'weighted', '1:' + f1.name, '5:' + f2.name])
             assert rc == 0, err
-            assert 'Batches:      6' in slice_info(out)
+            assert _count_batches(out) == 6
 
             # `W:path` with a non-1.0 weight auto-selects weighted mode
             # even without --mode.
             out2, err2, rc2 = run([
-                PYTHON, 'scripts/mux_batches.py',
+                PYTHON, '-m', 'datagen', '--gen-count', '0',
                 '1:' + f1.name, '5:' + f2.name])
             assert rc2 == 0, err2
-            assert 'Batches:      6' in slice_info(out2)
+            assert _count_batches(out2) == 6
 
-    def test_no_orphan_workers_after_exit(self):
-        """The project's recurring hazard: gen_batches workers spawned by
-        mux via subprocess.Popen must NOT survive mux's exit. Spawn 2
-        long-running workers, force mux to exit while they're still
-        producing (a downstream consumer closes the pipe after a few
-        batches), then assert no gen_batches child PID survives.
-
-        psutil is not a hard dep — scan /proc for the worker cmdlines.
-        """
-        before = _gen_worker_pids()
-        # Long -n so the workers keep producing indefinitely; THIS test
-        # owns the read end of mux's pipe, so it controls precisely when
-        # the pipe closes. No early-finishing downstream consumer races
-        # the PID poll: we block until we positively observe the workers,
-        # and only THEN close our read end to trigger mux's BrokenPipe
-        # cleanup path. That makes "workers were observed" deterministic.
-        mux = subprocess.Popen([
-            PYTHON, 'scripts/mux_batches.py', '--gen-count', '2', '--',
-            '--n-batches', '100000', '--batch-size', '64',
-            '--rule', 'branch+cap=8', '--twins', '3', '--n-states', '8'],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd=str(ROOT))
-        spawned = set()
+    def test_no_orphan_workers_after_kill(self):
+        """The project's #1 recurring hazard, now OS-enforced. datagen
+        forks generation workers that arm PR_SET_PDEATHSIG, so a `kill -9`
+        of the parent (no clean shutdown, no reaping code runs) takes the
+        whole pool with it. Start a pool, observe its worker children,
+        SIGKILL the parent, assert no worker survives — identifying workers
+        by parentage (fork children share the parent's argv)."""
+        proc = subprocess.Popen([
+            PYTHON, '-m', 'datagen', '--gen-count', '4',
+            '--rule', 'branch+cap=8', '--batch-size', '64',
+            '--twins', '3', '--n-states', '8'],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, cwd=str(ROOT))
+        workers = set()
         try:
-            # Block until both workers are observed alive (or time out).
-            # We deliberately do NOT drain mux.stdout here — letting the
-            # pipe buffer fill keeps the workers running/visible.
             deadline = time.time() + 30
             while time.time() < deadline:
-                spawned |= (_gen_worker_pids() - before)
-                if len(spawned) >= 2:
+                workers = _children_of(proc.pid)
+                if len(workers) >= 4:
                     break
-                assert mux.poll() is None, (
-                    f'mux exited early rc={mux.returncode} before workers '
-                    f'were observed')
+                assert proc.poll() is None, (
+                    f'parent exited early rc={proc.returncode}')
                 time.sleep(0.1)
-            assert len(spawned) >= 2, (
-                f'expected 2 gen_batches workers, observed {sorted(spawned)}')
+            assert len(workers) >= 4, (
+                f'expected 4 workers, observed {sorted(workers)}')
 
-            # Close our read end → mux's writes hit BrokenPipeError; it
-            # drains its loop and reaps (terminate+wait) every worker.
-            mux.stdout.close()
-            mux.wait(timeout=60)
-            assert mux.returncode == 0, f'mux rc {mux.returncode}'
+            # kill -9 the parent: NO clean shutdown path runs. Only
+            # pdeathsig can save us here.
+            proc.send_signal(signal.SIGKILL)
+            proc.wait(timeout=10)
 
-            # Every spawned worker must be reaped — no orphan survives.
             deadline = time.time() + 15
-            survivors = _gen_worker_pids() & spawned
+            survivors = {w for w in workers if _alive(w)}
             while time.time() < deadline and survivors:
                 time.sleep(0.2)
-                survivors = _gen_worker_pids() & spawned
+                survivors = {w for w in workers if _alive(w)}
             assert not survivors, (
-                f'orphan gen_batches workers survived mux exit: '
+                f'orphan workers survived kill -9 of parent: '
                 f'{sorted(survivors)}')
         finally:
-            # Defensive: never let this test itself leak workers.
-            for pid in (_gen_worker_pids() & spawned):
+            for w in workers:
                 try:
-                    os.kill(pid, signal.SIGKILL)
+                    os.kill(w, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-            if mux.poll() is None:
-                mux.kill()
-                mux.wait(timeout=10)
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
 
 
-class TestBenchThroughput:
+class TestThroughput:
+    """`-v` throughput reporting (folded in from the retired bench tool):
+    windowed batch/s + MB/s lines and a final summary, on a --count run."""
+
     def test_final_summary(self):
-        """Pipe N batches; expect `Final: N batches` on stderr."""
-        data = gen(n_batches=4)
-        _, err, rc = run([PYTHON, 'scripts/bench_throughput.py',
-                          '--log-every-sec', '5'], stdin=data)
-        assert rc == 0, err
-        assert 'Final: 4 batches' in err, err
-
-    def test_max_batches_caps(self):
-        """--max-batches stops the count even with more available."""
-        data = gen(n_batches=10)
         _, err, rc = run([
-            PYTHON, 'scripts/bench_throughput.py',
-            '--log-every-sec', '5', '--max-batches', '3'],
-            stdin=data)
+            PYTHON, '-m', 'datagen', '--gen-count', '1', '--count', '4',
+            '--rule', 'cap=2', '--batch-size', '32', '--twins', '1',
+            '--n-states', '4', '-v'], timeout=60)
         assert rc == 0, err
-        assert 'Final: 3 batches' in err, err
-
-    def test_errors_on_bad_input(self):
-        """Non-RVT input fails with a clear error."""
-        _, err, rc = run([PYTHON, 'scripts/bench_throughput.py'],
-                         stdin=b'NOT-A-VALID-STREAM-HEADER')
-        assert rc != 0
-        assert 'Unknown format' in err, err
+        assert 'datagen: 4 batches' in err, err
 
     def test_emits_periodic_log(self):
-        """Live pipe with small --log-every-sec should emit at least
-        one periodic status line. A large -n gives enough wall time to
-        fire the 0.05s timer."""
-        gen_proc = __import__('subprocess').Popen([
-            PYTHON, 'scripts/gen_batches.py',
-            '--rule', 'cap=2', '--batch-size', '32',
-            '--twins', '2', '--n-states', '4',
-            '-n', '2000', '--seed', '42'],
-            stdout=__import__('subprocess').PIPE,
-            stderr=__import__('subprocess').DEVNULL,
-            cwd=str(ROOT))
-        try:
-            r = subprocess.run([
-                PYTHON, 'scripts/bench_throughput.py',
-                '--log-every-sec', '0.05'],
-                stdin=gen_proc.stdout, capture_output=True,
-                cwd=str(ROOT), timeout=60)
-        finally:
-            gen_proc.wait(timeout=10)
+        """A small --log-every-sec emits at least one windowed status line
+        over a --count-bounded run. stdout → /dev/null so the (large) data
+        stream isn't buffered into the test; only stderr is captured."""
+        r = subprocess.run([
+            PYTHON, '-m', 'datagen', '--gen-count', '2', '--count', '3000',
+            '--rule', 'cap=2', '--batch-size', '32', '--twins', '2',
+            '--n-states', '4', '-v', '--log-every-sec', '0.05'],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE, cwd=str(ROOT), timeout=60)
         err = r.stderr.decode()
         assert r.returncode == 0, err
-        # At least one periodic line of the form `[N.Ns] total=...`.
+        # At least one periodic line of the form `[  N.Ns] total=...`.
         import re
         assert re.search(r'^\[\s*\d+\.\d+s\] total=', err, re.MULTILINE), err
-        assert 'Final: 2000 batches' in err, err
+        assert 'datagen: 3000 batches' in err, err
+
+
+class TestStdin:
+    """A piped/redirected stdin (FIFO or regular file) is auto-muxed as an
+    input; a tty or /dev/null (char devices) is skipped so bare generation is
+    unaffected. `run(stdin=bytes)` feeds the child via a pipe (a FIFO)."""
+
+    def test_stdin_passthrough_pure_mux(self):
+        """`cat corpus | datagen --gen-count 0` passes the piped corpus
+        straight through (no generation) — the old corpus-replay path."""
+        corpus = gen(n_batches=4, seed=3)
+        out, err, rc = run([PYTHON, '-m', 'datagen', '--gen-count', '0'],
+                            stdin=corpus)
+        assert rc == 0, err
+        assert _count_batches(out) == 4
+
+    def test_stdin_muxed_with_workers(self):
+        """A piped stdin coexists with generation workers; --count bounds the
+        joined stream (the run completes and reaps regardless of stdin)."""
+        corpus = gen(n_batches=4, seed=3)
+        out, err, rc = run([
+            PYTHON, '-m', 'datagen', '--gen-count', '2', '--count', '12',
+            '--rule', 'cap=2', '--batch-size', '8', '--twins', '1',
+            '--n-states', '4'], stdin=corpus, timeout=120)
+        assert rc == 0, err
+        assert _count_batches(out) == 12
+
+    def test_count_bounds_piped_stdin(self):
+        """`--count` on a pure-mux stdin pass bounds it (the retired
+        `batch_slice --count` on a stream)."""
+        corpus = gen(n_batches=10, seed=5)
+        out, err, rc = run([PYTHON, '-m', 'datagen', '--gen-count', '0',
+                            '--count', '3'], stdin=corpus)
+        assert rc == 0, err
+        assert _count_batches(out) == 3
+
+
+class TestMalformedInputFatal:
+    """A malformed batch from ANY source aborts the whole run loudly (fail
+    early, fail loud) — never a silently-dropped source. A CLEAN EOF is not
+    malformed and just drains the source (covered by the mux/stdin tests)."""
+
+    def test_garbage_stdin_is_fatal(self):
+        out, err, rc = run([PYTHON, '-m', 'datagen', '--gen-count', '0'],
+                           stdin=b'NOTAVALIDRVTSTREAMXXXX')
+        assert rc != 0, 'malformed input must fail'
+        assert 'FATAL' in err and 'stdin' in err, err
+
+    def test_garbage_after_good_is_fatal(self):
+        """Valid batches THEN garbage (mid-stream corruption) still aborts."""
+        good = gen(n_batches=3, seed=7)
+        out, err, rc = run([PYTHON, '-m', 'datagen', '--gen-count', '0'],
+                           stdin=good + b'GARBAGE!')
+        assert rc != 0, err
+        assert 'FATAL' in err, err
+
+    def test_fatal_reaps_worker_pool(self):
+        """A malformed input mid-generation kills the whole tree — no worker
+        survives the fatal abort."""
+        proc = subprocess.Popen([
+            PYTHON, '-m', 'datagen', '--gen-count', '4', '--count', '100000',
+            '--rule', 'branch+cap=8', '--batch-size', '64', '--twins', '3',
+            '--n-states', '8'],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE, cwd=str(ROOT))
+        # Observe workers, then feed garbage to trigger the fatal path.
+        workers = set()
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            workers = _children_of(proc.pid)
+            if len(workers) >= 4:
+                break
+            time.sleep(0.1)
+        assert len(workers) >= 4, f'expected 4 workers, saw {sorted(workers)}'
+        # Feed garbage now that workers are up. Read stderr directly (not
+        # communicate(), which would re-close the stdin we close here).
+        try:
+            proc.stdin.write(b'GARBAGE!!')
+            proc.stdin.flush()
+        except BrokenPipeError:
+            pass  # datagen may already be aborting
+        proc.stdin.close()
+        err = proc.stderr.read()
+        proc.stderr.close()
+        proc.wait(timeout=30)
+        assert proc.returncode != 0, 'fatal must exit non-zero'
+        assert b'FATAL' in err, err
+        deadline = time.time() + 15
+        survivors = {w for w in workers if _alive(w)}
+        while time.time() < deadline and survivors:
+            time.sleep(0.2)
+            survivors = {w for w in workers if _alive(w)}
+        assert not survivors, f'workers survived the fatal abort: {sorted(survivors)}'
 
 
 def _train_t1(tmp, name='t1'):
@@ -404,7 +465,7 @@ def _train_t2(tmp, t1_enc, name='t2'):
 
 class TestTraining:
     def test_encoder_train_smoke(self):
-        """gen_batches | train_encoder smoke (single step). T1 now runs the
+        """datagen | train_encoder smoke (single step). T1 now runs the
         unified canonical vp on out_regs (present for every rule), so
         --n-anchor-states must match gen's --n-states (4) per invariant 1."""
         data = gen(n_batches=2, batch_size=8)
@@ -463,82 +524,5 @@ class TestEval:
             assert 'state_max_err=' in text, text
             assert 'GVN collapse' in text, text
 
-
-class TestStreamFmt:
-    """_streamfmt header validation + format detection rejection paths.
-    The RVT header is 5 fields: (B, max_tokens, max_n_instrs, n_anchors, OB)."""
-
-    @staticmethod
-    def _prefix():
-        sys.path.insert(0, str(ROOT))
-        from datagen import RVT_FORMAT
-        return RVT_FORMAT._prefix_struct.pack(
-            RVT_FORMAT.magic, RVT_FORMAT.version, RVT_FORMAT.dtype_chars)
-
-    @staticmethod
-    def _batch_bytes(B, max_tokens, max_n_instrs, n_anchors, OB=0,
-                     magic=None, version=None):
-        sys.path.insert(0, str(ROOT))
-        from datagen import RVT_FORMAT
-        m = RVT_FORMAT.magic if magic is None else magic
-        v = RVT_FORMAT.version if version is None else version
-        prefix = RVT_FORMAT._prefix_struct.pack(
-            m, v, RVT_FORMAT.dtype_chars)
-        header = RVT_FORMAT.batch_header.pack(
-            B, max_tokens, max_n_instrs, n_anchors, OB)
-        return prefix + header
-
-    def test_validate_rejects_out_of_bounds_header(self):
-        sys.path.insert(0, str(ROOT))
-        from scripts._streamfmt import _validate_rvt, _MAX_B
-        # B == 0 (must be > 0).
-        with pytest.raises(ValueError, match='Invalid RVT header'):
-            _validate_rvt(self._batch_bytes(0, 32, 1, 4))
-        # B > _MAX_B.
-        with pytest.raises(ValueError, match='Invalid RVT header'):
-            _validate_rvt(self._batch_bytes(_MAX_B + 1, 32, 1, 4))
-        # n_anchors > 256.
-        with pytest.raises(ValueError, match='Invalid RVT header'):
-            _validate_rvt(self._batch_bytes(4, 32, 1, 300))
-
-    def test_validate_accepts_good_header(self):
-        sys.path.insert(0, str(ROOT))
-        from scripts._streamfmt import _validate_rvt
-        vals = _validate_rvt(self._batch_bytes(4, 32, 1, 4, OB=4))
-        assert vals == (4, 32, 1, 4, 4)
-
-    def test_detect_format_unknown_magic(self):
-        import io
-        sys.path.insert(0, str(ROOT))
-        from scripts._streamfmt import detect_format
-        buf = b'XYZ\x00' + self._batch_bytes(4, 32, 1, 4)[4:]
-        f = io.BufferedReader(io.BytesIO(buf))
-        with pytest.raises(ValueError, match='Unknown format'):
-            detect_format(f)
-
-    def test_detect_format_wrong_version(self):
-        import io
-        sys.path.insert(0, str(ROOT))
-        from scripts._streamfmt import detect_format
-        buf = self._batch_bytes(4, 32, 1, 4, 4, version=99)
-        f = io.BufferedReader(io.BytesIO(buf))
-        with pytest.raises(ValueError, match='version'):
-            detect_format(f)
-
-    def test_detect_format_peeks(self):
-        """detect_format must PEEK, not consume: after detection the next
-        read still yields batch 0 byte-for-byte."""
-        import io
-        sys.path.insert(0, str(ROOT))
-        from scripts._streamfmt import detect_format
-        from datagen import RVT_FORMAT
-        data = gen(n_batches=2, batch_size=4, twins=0, n_states=4,
-                   rule='cap=2')
-        f = io.BufferedReader(io.BytesIO(data))
-        fmt = detect_format(f)
-        assert fmt.name == 'rvt'
-        after_detect = fmt.read_bytes(f)
-        # Same bytes a fresh reader would see for batch 0.
-        g = io.BufferedReader(io.BytesIO(data))
-        fresh = RVT_FORMAT.read_batch_bytes(g)
-        assert after_detect == fresh, 'detect_format consumed the header'
+# Wire-format unit tests (magic peek, dtype guard, header-bounds validator)
+# live with the format itself in datagen/tests/test_batch.py.

@@ -105,7 +105,7 @@ matters.
 state machine + losses fold into ONE compiled CUDA-graph step at a
 fixed-padded instruction count (verified bit-identical to the ragged path):
 **T2 at 8–9 ms/step / 95–97% GPU util**. Streaming pipeline:
-`mux_batches (N× gen_batches) | batch_slice | train_t2_encoder` — CPU
+`datagen (all cores, --count) | train_t2_encoder` — CPU
 generates/analyzes chunks, the trainer only does forward/backward. RVT wire
 format is **v8** (5-field header; the retired raw row-outputs path is gone).
 
@@ -146,27 +146,27 @@ scripts/        Training and evaluation entry points
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# Train T1 (single-instruction encoder). gen_batches streams RVT batches;
-# the trainer reads until stdin EOF (--n-steps only shapes the LR schedule).
-python scripts/gen_batches.py --rule single --twins 2 --batch-size 128 \
-    --n-batches 250000 --n-states 8 --anchor-seed 0 \
-    --config configs/instr_default.json \
+# Train T1 (single-instruction encoder). datagen generates on all CPU
+# cores; --count bounds the run; the trainer reads until stdin EOF
+# (--n-steps only shapes the LR schedule).
+python -m datagen --rule single --twins 2 --batch-size 128 \
+    --n-states 8 --anchor-seed 0 --config configs/instr_default.json \
+    --count 250000 \
   | python scripts/train_encoder.py --d-model 128 --n-heads 4 --n-layers 2 \
     --d-out 64 --max-window 32 --n-steps 250000 --out-dir t1_run
 
-# Train T2 (chunk encoder on a frozen T1). Several gen workers via
-# mux_batches keep the compiled trainer saturated.
-python scripts/mux_batches.py --gen-count 8 --mode fifo --seed 0 -- \
-    --rule "branch+cap=4" --twins 3 --batch-size 128 --n-batches 2000000 \
+# Train T2 (chunk encoder on a frozen T1). datagen fills all cores to keep
+# the compiled trainer saturated; --count bounds the run.
+python -m datagen --rule "branch+cap=4" --twins 3 --batch-size 128 \
     --n-states 8 --anchor-seed 0 --config configs/instr_t2.json \
-  | python scripts/batch_slice.py --count 2000000 \
+    --count 2000000 \
   | python scripts/train_t2_encoder.py --t1-model runs/t1_run/encoder.pt \
     --d-out 512 --d-event 16 --route binding \
     --n-steps 2000000 --anchor-seed 0 --n-anchor-states 8 --out-dir t2_run
 
 # Train a decoder on a frozen encoder
-python scripts/gen_batches.py --rule single --twins 0 --batch-size 128 \
-    --n-batches 5000 --config configs/instr_default.json \
+python -m datagen --rule single --twins 0 --batch-size 128 \
+    --config configs/instr_default.json --count 5000 \
   | python scripts/train_decoder.py --t1-model runs/t1_run/encoder.pt \
     --d-model 128 --n-heads 4 --n-layers 2 --n-steps 5000 --out-dir dec_run
 

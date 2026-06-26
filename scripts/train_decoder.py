@@ -6,14 +6,14 @@ stdin; only valid rows contribute to the reconstruction loss (the decoder
 has no target for non-decodable token sequences). Reports per-token and
 per-instruction accuracy at each log point.
 
-Pre-generate a corpus for fair comparison across encoder checkpoints:
-    gen_batches.py --rule single --twins 0 \\
-        --batch-size 256 -n 5000 > /tmp/decoder_corpus.rvt
+Pre-generate a fixed corpus for fair comparison across encoder checkpoints:
+    python -m datagen --rule single --twins 0 --batch-size 256 \\
+        --count 5000 > /tmp/decoder_corpus.rvt
 
-Then pipe a bounded stream to each checkpoint (reads until stdin EOF like
-the encoders; --n-steps only shapes the LR schedule. Encoder arch is read
-from its companion hparams.json):
-    batch_slice.py --count 5000 /tmp/decoder_corpus.rvt | \\
+Then replay it into each checkpoint (reads until stdin EOF like the encoders;
+--n-steps only shapes the LR schedule. Encoder arch is read from its companion
+hparams.json):
+    cat /tmp/decoder_corpus.rvt | \\
         train_decoder.py --t1-model runs/XXX/encoder.pt --n-steps 5000
 """
 

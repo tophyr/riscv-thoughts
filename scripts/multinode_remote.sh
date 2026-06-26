@@ -1,9 +1,9 @@
 #!/bin/bash
-# Remote half of multinode_gen: runs mux_batches | lz4 | nc on the
-# generator host. Owns its lifecycle via a pidfile so a prior run that
-# died abruptly can be cleaned up deterministically by the next run.
+# Remote half of multinode_gen: runs datagen | nc on the generator
+# host. Owns its lifecycle via a pidfile so a prior run that died
+# abruptly can be cleaned up deterministically by the next run.
 #
-# Args: REMOTE_DIR REMOTE_PYTHON -- <args to mux_batches.py...>
+# Args: REMOTE_DIR REMOTE_PYTHON <args to datagen...>
 
 set -uo pipefail
 
@@ -39,7 +39,8 @@ echo "=== remote-half started $(date -u +%FT%TZ) pid=$$ ===" >> "$LOG"
 # of arenas per worker process and massive page-zeroing churn (the
 # `clear_page_erms` kernel function was the #1 hotspot before this).
 export MALLOC_ARENA_MAX=2
-"$REMOTE_PYTHON" scripts/mux_batches.py "$@" 2>>"$LOG" \
+# </dev/null: this is a pure generator — never auto-mux an inherited ssh stdin.
+"$REMOTE_PYTHON" -m datagen "$@" </dev/null 2>>"$LOG" \
     | nc -l -q 0 6464 2>>"$LOG"
 EC=$?
 echo "=== remote-half ended $(date -u +%FT%TZ) exit=$EC ===" >> "$LOG"

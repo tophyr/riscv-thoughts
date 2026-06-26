@@ -1,99 +1,96 @@
 ---
 name: datagen
 description: >
-  Reference for the RVT data-generation pipeline — the datagen/ package and the
-  scripts/ stream tools (gen_batches, mux_batches, batch_slice, bench_throughput,
-  multinode_gen.sh, gen_corpus.sh, multinode_remote.sh). Load this BEFORE
+  Reference for the RVT data-generation pipeline — the datagen/ package (the
+  `python -m datagen` generator tool) and the multinode wrappers
+  (multinode_gen.sh, gen_corpus.sh, multinode_remote.sh). Load this BEFORE
   generating a corpus, editing datagen/ or any pipeline script, changing the RVT
   format, debugging worker/throughput/OOM issues, or wiring gen→train. Carries
   the invariants that are silent-corruption traps if violated (anchor-seed match,
-  fixed batch shape, raw-vs-canonical anchors, orphan workers).
+  fixed batch shape, raw-vs-canonical anchors).
 ---
 
 # RVT data-generation pipeline
 
 The pipeline turns a random RV32I instruction stream into binary training
-batches consumed over stdin by the trainers. One tool, one format.
+batches consumed over stdin by the trainers. One generator, one format.
 
 ```
-gen_batches.py        random instrs → chunks → twins/aux → packed Batch → stdout (RVT bytes)
-mux_batches.py        spawn N gen_batches and/or read files → interleave → stdout
-batch_slice.py        slice/inspect an RVT stream (--info/--count/--skip/--tail)
-bench_throughput.py   terminal stage: count batch/s + MB/s
+python -m datagen     fork one worker per core → each: instrs → chunks → twins/aux
+                      → packed Batch; interleave all workers (+ external RVT
+                      inputs) → stdout (RVT bytes). --count N bounds the run;
+                      -v reports throughput.
 train_encoder.py      T1 trainer (reads RVT on stdin)
 train_t2_encoder.py   T2 trainer (reads RVT on stdin, needs a frozen T1)
 ```
 
-Every stage is a UNIX filter over the **RVT binary stream**. Stages talk only
-through that stream. `print()` inside the stream tools is redirected to stderr
-(`binary_stdout()` in `scripts/_streamfmt.py:106`) so stdout stays pure data.
+The generator and trainers are UNIX filters over the **RVT binary stream**;
+they talk only through that stream. `print()` inside the generator is redirected
+to stderr (`binary_stdout()` in `datagen/__main__.py:59`) so stdout stays
+pure data. (Bounding the count and measuring throughput used to be separate
+`batch_slice` / `bench_throughput` filter stages; both are now `datagen`'s own
+`--count` and `-v` — there is no on-disk-corpus tooling.)
 
-## ALWAYS mux. A single generator process almost never feeds the GPU.
+## `datagen` is parallel by default — there is no single-worker mode.
 
 Generation+analysis (SSA, anchor execution, twins, value-prediction precompute)
-is CPU-bound Python, and `gen_batches` is single-threaded — one process pins one
-core. The GPU is far faster than one core can supply, so a bare
-`gen_batches | train_*` pipeline leaves the trainer starved and the GPU idle most
-of the step. This is the default failure mode, not an edge case.
+is CPU-bound Python and one worker pins one core. The GPU is far faster than one
+core can supply, so a single-core generator silently starves the trainer and
+idles the GPU — historically the project's standard way to waste GPU-hours.
 
-**Rule: for any live gen→train run, drive the trainer through `mux_batches` with
-`--gen-count ≥ 8` (16 is common; scale toward core count).** Confirm the GPU is
-actually the bottleneck before settling — if `bench_throughput.py` (or the
-trainer's step time) shows the trainer waiting, add workers. Single-process
-`gen_batches` is only appropriate for tiny smoke tests, deterministic one-batch
-debugging, or writing a small fixture to disk — never to feed real training.
+`datagen` therefore spawns **one worker per CPU core by default** (override
+with `--gen-count N`), forked as an INTERNAL function with no CLI of its own:
+you *cannot* run a lone worker by hand, by design. Generation is **infinite** by
+default — bound the run with `--count N` (emit N batches then stop & reap), or
+let the trainer close the pipe. Still confirm the GPU is the bottleneck: run
+with `-v` to print windowed throughput (batch/s, MB/s) — if that rate sits above
+the trainer's step rate the GPU is the bottleneck; if it tracks the trainer you
+are core-bound (add cores / mux in more).
 
-(For an already-materialized on-disk corpus, `cat corpus.rvt | train_*` reads at
-disk speed and needs no workers — the multi-worker rule is about *live*
-generation.)
+To mux an external RVT stream alongside the live workers, pass it as a
+positional input — a file, a process substitution, or a piped/redirected stdin
+(all auto-detected): `python -m datagen 8:<(nc host port) --rule …`, or simply
+`cat corpus.rvt | python -m datagen --rule …`. A tty or `/dev/null` on stdin is
+skipped, so bare generation (and a generator run with `</dev/null` in a script)
+is unaffected. (To replay a pure corpus with no generation: `cat corpus.rvt |
+python -m datagen --gen-count 0`.)
 
 ## Canonical commands (verified against README.md — copy these, don't improvise)
 
-T1 (single-instruction encoder). **The bare single-process form below is the
-README's illustrative minimal example — fine for a smoke test, but for a real
-run wrap generation in `mux_batches --gen-count 8/16` exactly like the T2 example
-(see "ALWAYS mux" above); one core will not keep the GPU fed.**
+`datagen` defaults to all cores; bound the run with `--count N`.
+Generation flags are first-class — there is no `--` separator.
+
+T1 (single-instruction encoder):
 ```bash
-python scripts/gen_batches.py --rule single --twins 2 --batch-size 128 \
-    --n-batches 250000 --n-states 8 --anchor-seed 0 \
-    --config configs/instr_default.json \
-  | python scripts/train_encoder.py --d-model 128 --n-heads 4 --n-layers 2 \
-    --d-out 64 --max-window 32 --n-steps 250000 --out-dir t1_run
-```
-Real T1 run — mux'd generation (mirror of the T2 invocation, `--rule single`):
-```bash
-python scripts/mux_batches.py --gen-count 16 --mode fifo --seed 0 -- \
-    --rule single --twins 2 --batch-size 128 --n-batches 250000 \
+python -m datagen --rule single --twins 2 --batch-size 128 \
     --n-states 8 --anchor-seed 0 --config configs/instr_default.json \
+    --count 250000 \
   | python scripts/train_encoder.py --d-model 128 --n-heads 4 --n-layers 2 \
     --d-out 64 --max-window 32 --n-steps 250000 --out-dir t1_run
 ```
 
-T2 (chunk encoder on a frozen T1) — oversupply workers, cap with `batch_slice`:
+T2 (chunk encoder on a frozen T1):
 ```bash
-python scripts/mux_batches.py --gen-count 8 --mode fifo --seed 0 -- \
-    --rule "branch+cap=4" --twins 3 --batch-size 128 --n-batches 2000000 \
+python -m datagen --rule "branch+cap=4" --twins 3 --batch-size 128 \
     --n-states 8 --anchor-seed 0 --config configs/instr_t2.json \
-  | python scripts/batch_slice.py --count 2000000 \
+    --count 2000000 \
   | python scripts/train_t2_encoder.py --t1-model runs/t1_run/encoder.pt \
     --d-out 512 --d-event 16 --route binding \
     --n-steps 2000000 --anchor-seed 0 --n-anchor-states 8 --out-dir t2_run
 ```
-Note: with `--gen-count 8` and per-worker `--n-batches 2000000`, the pool can
-emit up to 16M batches; `batch_slice --count 2000000` bounds what the trainer
-sees. When slice stops, mux gets BrokenPipe and reaps the workers (see Orphan
-workers below).
+`--count 2000000` emits exactly that many batches then closes stdout and reaps
+the whole worker pool.
 
 `--n-steps` only shapes the cosine-LR schedule and the ETA display — it is NOT a
-hard step cap. Training runs until stdin EOF (`scripts/_common.py:33`). Bound the
-batch count upstream with `batch_slice --count N` or the generator's `-n`.
+hard step cap. Training runs until stdin EOF (`scripts/_common.py:32`). Bound the
+batch count with `datagen --count N` (`datagen` has no per-worker `-n`).
 
 ## INVARIANTS — violating these silently corrupts data or training
 
 1. **anchor-seed AND n-states must match gen↔train.** value_predict supervision
    is computed against anchor states reconstructed from `--anchor-seed` +
-   `--n-anchor-states` (`scripts/train_encoder.py:61-66`, `train_t2_encoder.py:81-84`).
-   The generator's `--anchor-seed`/`--n-states` must equal the trainer's
+   `--n-anchor-states` (`scripts/train_encoder.py:60-63`, `train_t2_encoder.py:65-67`).
+   `datagen`'s `--anchor-seed`/`--n-states` must equal the trainer's
    `--anchor-seed`/`--n-anchor-states`. Mismatch → wrong targets, no error.
    `make_anchor_states` is `datagen/compare.py:369`. (Anchor seed only needs to
    match gen↔train; it is *not* needed for cross-worker comparability — distances
@@ -135,9 +132,10 @@ batch count upstream with `batch_slice --count N` or the generator's `-n`.
    encoder sees them for magnitude/validity), but its aux row is zero-mask /
    `AUX_CE_IGNORE` and its value-prediction row is masked off (`pair_valid=False`).
 
-## gen_batches.py reference
+## datagen reference
 
-`--rule` grammar (`scripts/gen_batches.py:67`, rules in `datagen/generate.py:628`):
+`--rule` grammar (`datagen/__main__.py:64` `_parse_rule`, rules in
+`datagen/generate.py:628`):
 - `single` — one instruction per chunk (T1). `max_len=1`. Ships canonical
   out_regs like every other rule (the T1/T2 unification).
 - `cap=N` — fixed length N.
@@ -145,62 +143,75 @@ batch count upstream with `batch_slice --count N` or the generator's `-n`.
 - `transform+cap=N` — terminate at a memory-op / branch / jump OR length N.
 - Components join with `+` and compose via `either()` (terminate when ANY fires).
 - **A bare `branch` or `transform` (no `cap=`) is rejected eagerly** — it can
-  build an unbounded chunk. Error says "unbounded … add a cap". This is enforced
-  in `_parse_rule` AND in `collect_groups` via `rule.max_len is None`.
+  build an unbounded chunk. Error says "unbounded … add a cap". Validated in the
+  PARENT before forking (`datagen/__main__.py:480` calls `_parse_rule`) and again in
+  `collect_groups` via `rule.max_len is None` (`datagen/generate.py:734`).
 
-Key flags: `--twins T` (relabeled equivalents per valid source chunk),
-`--batch-size B` (source rows; twins extend the batch beyond B),
-`--n-states` (anchor count), `--anchor-seed`, `--inject-invalid R`,
-`--inject-equiv R`, `--config PATH`, `-n/--n-batches` (required), `--seed`.
-CLI flags override the JSON config's `equivalences.rate` / `invalidity.rate`.
+Generation flags (per worker, first-class — NO `--` separator): `--rule`,
+`--twins T` (relabeled equivalents per valid source chunk), `--batch-size B`
+(source rows; twins extend the batch beyond B), `--n-states` (anchor count),
+`--anchor-seed`, `--inject-invalid R`, `--inject-equiv R`, `--max-invalid-window`,
+`--config PATH`, `--seed` (base; worker i gets seed+i). CLI flags override the
+JSON config's `equivalences.rate` / `invalidity.rate`. There is **no
+`--n-batches`** — generation is infinite; bound the total with `--count N`.
 
-Per-batch stderr timing (`compute_ms`/`write_ms`) is logged per worker pid.
-BrokenPipeError on shutdown is benign and swallowed (`gen_batches.py:214`).
+Pool / mux flags: `--gen-count N` (default = all CPU cores; `0` = pure mux of the
+external inputs), `--gen-weight`, positional `inputs` (`path` or `WEIGHT:path`,
+files or pipes), `--mode` (`fifo` as-ready default / `round-robin` / `weighted`,
+auto-selected if any `W:path` weight ≠ 1.0; weights bias ORDER not count),
+`--shuffle-seed`, `--worker-log-every N` (per-worker stderr heartbeat; 0 =
+start/end only — workers are noisy at scale). A piped/redirected **stdin** (FIFO
+or regular file — not a tty or `/dev/null`) is auto-added as an input at weight
+1.0; it's read lazily through a private dup of fd 0 (so an early `--count` exit
+can't deadlock interpreter shutdown on `sys.stdin`'s buffer lock).
 
-## mux_batches.py reference
+Output flags (folded in from the retired batch_slice / bench_throughput tools;
+both hook the single `_Writer` chokepoint): `--count N` — emit exactly N batches
+total (workers + muxed inputs) then stop and reap; `-v` — windowed throughput
+(batch/s, MB/s) every `--log-every-sec` (default 5) plus a final summary.
 
-Spawns gen_batches workers and/or reads file inputs, interleaves into one stream.
+**A malformed batch from ANY source is fatal** (`_InputParseError`): datagen
+prints `FATAL — malformed batch from <source>: …`, reaps the whole worker pool
+(`killpg`), and exits non-zero — fail early, fail loud, never train on a
+silently-truncated corpus. A CLEAN end-of-stream (`read_bytes` → None) is not
+malformed; it just drains that source. (Normal `--count` shutdown stops reading
+at the cap, so it never trips on a truncated tail — including the multinode nc
+stream cut by the BrokenPipe cascade.)
 
-- **Everything after `--` is forwarded verbatim to each spawned worker.** mux only
-  appends a per-worker `--seed (base + i)` so workers diverge
-  (`mux_batches.py:230`). Worker config is NOT re-declared in mux.
-- `--gen-count N` spawns N workers. File inputs: `path` or `WEIGHT:path`.
-- Modes (`--mode`): `fifo` (as-ready; default), `round-robin` (one batch each),
-  `weighted` (auto-selected if any `W:path` weight ≠ 1.0). Weights bias ORDER,
-  not total count — every input drains fully.
-- Worker stderr is inherited unconditionally so worker crashes/tracebacks are
-  visible (`mux_batches.py:233`).
+### Workers cannot orphan — PR_SET_PDEATHSIG (was the project's #1 hazard)
+Workers are forked `multiprocessing.Process` children that arm
+`PR_SET_PDEATHSIG(SIGKILL)` as their first act (`datagen` `_arm_pdeathsig`),
+so the kernel SIGKILLs each worker the instant the parent dies — **even on
+`kill -9` of the parent**, which the old reap-on-clean-exit path could not cover.
+All workers share one process group reaped via `killpg` on normal/BrokenPipe
+exit (`WorkerPool.reap`). The regression test `test_no_orphan_workers_after_kill`
+SIGKILLs the parent and asserts zero survivors.
 
-### Orphan workers — the project's #1 recurring hazard (see CLAUDE.md)
-gen_batches workers are spawned via `subprocess.Popen` and **do NOT die when their
-parent dies** — they reparent to init and survive until they hit a write to a
-closed pipe, which can be minutes if mid-compute. mux's normal exit path reaps
-them (`terminate()` + `wait()`, `mux_batches.py:271`), and the regression test
-`test_no_orphan_workers_after_exit` guards it. But after ANY manual kill of a
-mux/multinode pipeline, **explicitly verify and kill survivors by PID**:
-```bash
-pgrep -af scripts/gen_batches.py        # list survivors
-kill -9 <pid> <pid> ...                 # kill each listed PID
-```
-`pkill -9 -f scripts/gen_batches.py` sometimes silently fails under the
-permission system — prefer the explicit pgrep→kill form. Do this on the remote
-(odin) too after killing a multinode run.
+The old manual `pgrep→kill` ritual is no longer required after killing a
+`datagen`/multinode pipeline — pdeathsig handles it. If you ever suspect a
+straggler anyway, the backstop check is `pgrep -P <datagen_pid>` (workers are
+fork children sharing the parent's argv, so identify them by parentage, not by
+cmdline).
 
 ## RVT binary format (datagen/batch.py)
 
-- **Version 8.** `RVT_FORMAT` in `datagen/batch.py`. A version bump is a hard
-  break — readers reject mismatched versions and tell you to regenerate (older
-  streams won't read).
+- **No version field.** There is exactly one RVT format; any change to it is
+  immediate and global (no long-lived disk corpora, no out-of-sync remote
+  generators), so there is no compatibility to negotiate and no legacy read
+  path. The per-batch **dtype signature** still rejects a schema-mismatched
+  stream — a body-field change shifts it and readers raise `Dtype mismatch`.
 - **No stream header — every batch is self-describing** (4-byte magic `RVT\x00` +
-  1-byte version + dtype signature, then a 5-uint32 dimension header, then the
-  body). This is the load-bearing property: **RVT streams concatenate with `cat`.**
+  dtype signature, then a 5-uint32 dimension header, then the body). This is the
+  load-bearing property: **RVT streams concatenate with `cat`.**
   - Combine corpora: `cat a.rvt b.rvt > both.rvt`
   - **Second epoch = `cat corpus.rvt corpus.rvt | trainer`.** There is no built-in
     repeat; epochs are shell-level `cat`.
 - Header fields: `B, max_tokens, max_n_instrs, n_anchors, OB`. `OB` is the
   out_regs row count (`B` when the oracle is shipped — always, now — else 0).
   Body field list + dtypes are in the `BodyField(...)` block in
-  `datagen/batch.py`; header validation bounds in `scripts/_streamfmt.py`.
+  `datagen/batch.py`; the per-field header sanity bounds are the
+  `header_bounds={...}` on `RVT_FORMAT` there, enforced on every read by
+  `BinaryFormat._check_header_bounds`.
 - Per-instruction segmentation is NOT preserved on the wire — relabeling/aux
   happen at generation time while the `list[Instruction]` is still in hand.
 
@@ -224,24 +235,28 @@ these near the origin (low magnitude); valid windows sit near the unit sphere.
 
 Two different scripts — do not confuse them:
 
-- **`multinode_gen.sh BATCHES_PER_WORKER`** — ships datagen sources to `odin` over
-  ssh (tar stream), runs a remote mux pool that streams RVT back over `nc` (port
-  6464), and joins it with a local mux pool. Output to stdout/file or piped to a
-  trainer. 104 total workers = 96 remote + 8 local by default (hardcoded to the
-  machines). `REMOTE=chrissarbora@odin`.
+- **`multinode_gen.sh TOTAL_BATCHES`** — ships datagen sources to `odin` over
+  ssh (tar stream), runs a remote `datagen` pool that streams RVT back over
+  `nc` (port 6464), and joins it with a local `datagen` pool. Output to
+  stdout/file or piped to a trainer. Both pools generate infinitely; the local
+  side bounds the joined stream to exactly `TOTAL_BATCHES` with `--count`, and on
+  reaching it the BrokenPipe cascade (local→nc→remote) reaps every worker.
+  Worker counts (48 remote, 8 local, hardcoded) now set the gen mix ratio, not
+  the total. `REMOTE=chrissarbora@odin`.
 - **`gen_corpus.sh TOTAL_BATCHES OUT_PATH`** — writes an on-disk corpus. **Despite
-  its header comment mentioning "remote", the script itself runs `mux_batches`
-  LOCALLY** (`gen_corpus.sh:64`) and writes `OUT` on the local disk. "Remote" =
-  the *intended usage* is to ssh into odin and run it there; there is no
-  auto-shipping. `TOTAL` must be divisible by `WORKERS` (default 100). Defaults
-  to T2 settings (`branch+cap=8`, `instr_t2.json`, no invalid injection).
+  its header comment mentioning "remote", the script itself runs `datagen`
+  LOCALLY** (`gen_corpus.sh`) and writes `OUT` on the local disk via
+  `datagen … --count TOTAL > OUT`. "Remote" = the *intended usage* is to ssh
+  into odin and run it there; there is no auto-shipping. Defaults to T2
+  settings (`branch+cap=8`, `instr_t2.json`, no invalid injection); `WORKERS`
+  unset → all CPU cores.
 
 Both override knobs via env vars: `BATCH_SIZE TWINS N_STATES RULE CONFIG
-INJECT_INVALID INJECT_EQUIV` (and `WORKERS` for gen_corpus).
+INJECT_INVALID INJECT_EQUIV` (and `WORKERS` for gen_corpus → `--gen-count`).
 
 Remote operational facts:
 - **`export MALLOC_ARENA_MAX=2`** is required in the remote/local pool scripts
-  (`multinode_remote.sh:41`, `gen_corpus.sh:57`). Default glibc makes `8*ncpus`
+  (`multinode_remote.sh:41`, `gen_corpus.sh`). Default glibc makes `8*ncpus`
   arenas per worker; on a 64-core box that makes `clear_page_erms` page-zeroing
   the #1 hotspot. Don't remove it.
 - `multinode_remote.sh` owns its lifecycle via a pidfile
@@ -254,18 +269,7 @@ Remote operational facts:
   ends.
 - `binary_stdout()` forces the fd to blocking mode because `tee` (and other
   consumers) flip pipes non-blocking, which would raise BlockingIOError mid-batch
-  and truncate the reader (`_streamfmt.py:106`).
-
-## Inspecting / debugging a corpus
-
-```bash
-python scripts/batch_slice.py --info corpus.rvt          # count batches/items, batch size
-python scripts/batch_slice.py --count 100 corpus.rvt > head.rvt
-python scripts/batch_slice.py --skip 50 --count 10 corpus.rvt
-python scripts/batch_slice.py --tail 5 corpus.rvt
-cat corpus.rvt | python scripts/bench_throughput.py --log-every-sec 5
-```
-`--lenient` absorbs a truncated tail (useful on a partially-written file).
+  and truncate the reader (`datagen/__main__.py`, `binary_stdout`).
 
 ## Constants / token budget math
 
@@ -285,7 +289,7 @@ cat corpus.rvt | python scripts/bench_throughput.py --log-every-sec 5
   are large binary, keep them out of commits.
 - `runs/<name>/` — checkpoints + hparams.json + losses.json (gitignored).
 - Pipeline regression tests: `scripts/tests/test_pipeline.py` (covers rule
-  parsing, format detect/validate, mux modes, the orphan-worker guard, and
+  parsing, format detect/validate, mux modes, the pdeathsig orphan guard, and
   end-to-end 1-step train smokes). Run `python -m pytest scripts/tests`.
 - This guide lives at `datagen/SKILL.md` — a tracked path, committed alongside
   the code it documents. Read it directly when touching the pipeline.
@@ -296,5 +300,5 @@ cat corpus.rvt | python scripts/bench_throughput.py --log-every-sec 5
   trainer-side validity weight — that's `compressor/train.py` + EXPERIMENT_LOG,
   not datagen. Don't assert training-loss behavior from this file.
 - Measured throughput numbers — they drift with machine/arch; measure with
-  `bench_throughput.py` rather than quoting a remembered figure
+  `datagen -v` rather than quoting a remembered figure
   (CLAUDE.md: no speculative numbers).

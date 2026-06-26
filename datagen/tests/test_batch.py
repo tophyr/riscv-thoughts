@@ -184,9 +184,9 @@ def test_bad_magic_raises():
 
 
 # ---------------------------------------------------------------------------
-# Wire-format failure modes — truncation, version, and dtype corruption.
-# Each batch is self-describing: prefix (4 magic + 1 version + N dtype chars)
-# then a uint32 dimension header then the raw body.
+# Wire-format failure modes — truncation and dtype corruption.
+# Each batch is self-describing: prefix (4 magic + N dtype chars) then a
+# uint32 dimension header then the raw body. There is no version field.
 # ---------------------------------------------------------------------------
 
 def _serialized_sample():
@@ -239,19 +239,12 @@ def test_truncated_body_passthrough_raises():
         RVT_FORMAT.read_batch_bytes(io.BytesIO(data[:-1]))
 
 
-def test_bad_version_raises():
-    data = bytearray(_serialized_sample())
-    # Version byte sits immediately after the 4-byte magic.
-    assert data[4] == RVT_FORMAT.version
-    data[4] = RVT_FORMAT.version + 1
-    with pytest.raises(ValueError, match='version'):
-        RVT_FORMAT.read_batch(io.BytesIO(bytes(data)), Batch)
-
-
 def test_corrupt_dtype_signature_raises():
     data = bytearray(_serialized_sample())
-    # Dtype-signature chars follow magic(4) + version(1).
-    sig_start = 5
+    # Dtype-signature chars follow the 4-byte magic. A schema change shifts
+    # this signature, so it (not a version field) is what rejects a
+    # mismatched stream.
+    sig_start = 4
     data[sig_start] ^= 0xFF
     with pytest.raises(ValueError, match='[Dd]type'):
         RVT_FORMAT.read_batch(io.BytesIO(bytes(data)), Batch)
@@ -304,15 +297,31 @@ def test_pack_rejects_aux_first_dim_mismatch():
                    target_max_n_instrs=4, aux_payload=bad_aux)
 
 
-def test_recognized_by_streamfmt():
-    from scripts._streamfmt import detect_format, RVT
+def test_peek_magic_accepts_and_does_not_consume():
     b = _sample_batch()
     buf = io.BytesIO()
     RVT_FORMAT.write_batch(buf, b)
-    # detect_format peeks, so wrap in a buffered (peekable) reader, as the
-    # real tools' open(...,'rb')/stdin.buffer streams already are.
+    # peek_magic peeks, so wrap in a buffered (peekable) reader, as the real
+    # tools' open(...,'rb')/stdin.buffer streams already are.
     f = io.BufferedReader(io.BytesIO(buf.getvalue()))
-    assert detect_format(f) is RVT
+    RVT_FORMAT.peek_magic(f)              # accepts a valid stream, no raise
+    assert RVT_FORMAT.read_batch(f, Batch) is not None  # did not consume
+
+
+def test_peek_magic_rejects_bad_magic():
+    bad = io.BufferedReader(io.BytesIO(b'XXXX' + b'\x00' * 64))
+    with pytest.raises(ValueError, match='Bad magic'):
+        RVT_FORMAT.peek_magic(bad)
+
+
+def test_header_bounds_reject_garbage_dims():
+    # A syntactically-valid header with an insane dimension is rejected on read
+    # (structural validation), not trusted to size a gigantic body read.
+    with pytest.raises(ValueError, match='Invalid rvt header'):
+        RVT_FORMAT._check_header_bounds((0, 32, 1, 4, 0))      # B == 0
+    with pytest.raises(ValueError, match='Invalid rvt header'):
+        RVT_FORMAT._check_header_bounds((4, 32, 1, 300, 4))    # n_anchors > 256
+    RVT_FORMAT._check_header_bounds((4, 32, 1, 4, 4))          # in-bounds: ok
 
 
 # ---------------------------------------------------------------------------

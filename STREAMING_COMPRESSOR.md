@@ -293,7 +293,7 @@ the dependency structure is in the tokens, not hidden in semantics.
 ## Data Pipeline
 
 The current pipeline is the single self-describing **RVT** binary stream (one
-format for every tier), driven by `gen_batches` / `mux_batches` / `batch_slice`
+format for every tier), driven by `datagen`
 — see datagen/SKILL.md. A streaming-segmentation layer would consume a raw token
 stream rather than pre-chunked batches; that input path is part of the deferred
 design, not yet built.
@@ -351,7 +351,7 @@ match found." That criterion must be learned.
    instruction ≈ 4-8 tokens), so homogenization is not an issue.
 
 4. **Training data.** Resolved: one self-describing RVT stream for
-   every tier (`gen_batches` / `mux_batches` / `batch_slice`,
+   every tier (`datagen`,
    cat-concatenable). See datagen/SKILL.md.
 
 5. **Gate training signal.** Resolved: per-iteration decoder

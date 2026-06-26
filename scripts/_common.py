@@ -1,7 +1,7 @@
 """Shared support for the model-running CLIs (train_* and eval_*).
 
-The compute-side counterpart to _streamfmt (which is the stream-format
-wire layer): device selection, the common training arg spine, run-dir IO,
+The compute-side counterpart to the RVT wire layer (datagen.batch's
+BinaryFormat): device selection, the common training arg spine, run-dir IO,
 and checkpoint loading.
 
   resolve_device:                       'auto'/'cuda'/'cpu' → concrete device.
@@ -30,7 +30,7 @@ def add_common_train_args(p, *, lr=3e-4):
     p.add_argument('--n-steps', type=int, required=True,
                    help='Cosine-LR T_max and ETA display. NOT a hard cap on '
                         'duration — training reads until stdin EOF. Bound the '
-                        'pipeline upstream with `batch_slice --count N` to '
+                        'pipeline upstream with `datagen --count N` to '
                         'control how many batches the trainer sees.')
     p.add_argument('--log-every', type=int, default=100)
     p.add_argument('--out-dir', type=str, default=None,

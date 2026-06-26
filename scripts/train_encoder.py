@@ -7,10 +7,9 @@ compressor.train.train_encoder; saves encoder.pt + hparams.json
 + losses.json into a run directory.
 
 Usage:
-    gen_batches.py --rule branch+cap=8 --twins 3 \\
-        --inject-invalid 0.1 -n 5000 -v > corpus.rvt
-    cat corpus.rvt |
-        train_encoder.py --n-steps 50000
+    python -m datagen --rule branch+cap=8 --twins 3 --inject-invalid 0.1 \\
+        --count 50000 \\
+        | train_encoder.py --n-steps 50000
 """
 
 import argparse
@@ -56,13 +55,13 @@ def main():
                         'Uses anchor_states '
                         'reconstructed from --anchor-seed and '
                         '--n-anchor-states — these MUST match the '
-                        'values gen_batches used or the targets and '
+                        'values datagen used or the targets and '
                         'inputs will be inconsistent.')
     p.add_argument('--anchor-seed', type=int, default=0,
                    help='Anchor-states seed for value-prediction. Must '
-                        'match gen_batches --anchor-seed.')
+                        'match datagen --anchor-seed.')
     p.add_argument('--n-anchor-states', type=int, default=8,
-                   help='Anchor states count. Must match gen_batches '
+                   help='Anchor states count. Must match datagen '
                         '--n-states.')
     p.add_argument('--no-compile', action='store_true',
                    help='Disable torch.compile (CUDA-graph) of the train '

@@ -54,30 +54,32 @@ hours.
 
 ## When recognizing a previously-diagnosed bug
 
-If I diagnosed a failure mode earlier in the same session (e.g.,
-gen_batches workers orphan-survive their parent and need explicit
-cleanup), and the same symptoms reappear, it's the same bug. Apply
-the previous remediation. Don't re-diagnose from scratch and don't
-forget to clean up.
+If I diagnosed a failure mode earlier in the same session, and the same
+symptoms reappear, it's the same bug. Apply the previous remediation.
+Don't re-diagnose from scratch and don't forget to clean up. (The
+canonical example — generation workers orphan-surviving their parent —
+is now fixed at the OS level; see the next section.)
 
-### Specific recurring trap: orphan gen_batches workers
+### Formerly-recurring trap: orphan generation workers (now fixed)
 
-`gen_batches.py` workers spawned by `mux_batches.py` (via
-`subprocess.Popen`) DO NOT die when their parent dies. They reparent
-to init and stay alive until they hit a write to a closed pipe — which
-can be many minutes if they're mid-compute on a slow pair. Killing the
-multinode_gen pipeline (or any of its descendants) leaves them as
-zombies that eat CPU forever.
+History: `gen_batches.py` workers spawned by `mux_batches.py` via
+`subprocess.Popen` did NOT die when their parent died — they reparented
+to init and ate CPU for hours. I left orphans running multiple times
+even after diagnosing the pattern.
 
-After ANY kill of multinode_gen / mux_batches, *always* explicitly
-kill remaining gen_batches by PID. `pkill -9 -f "scripts/gen_batches.py"`
-sometimes silently fails (under Claude Code's permission system or
-otherwise). Reliable form: pgrep -af gen_batches, then `kill -9 <pids>`
-listing each PID. Also do this on the remote via ssh.
+RESOLVED: both scripts are merged into the `datagen` package itself —
+the tool is now `python -m datagen` (`datagen/__main__.py`), whose
+generation workers are forked `multiprocessing.Process` children that
+arm `PR_SET_PDEATHSIG(SIGKILL)`. The kernel now SIGKILLs every worker
+the instant the parent dies — including on `kill -9` of the parent.
+The `test_no_orphan_workers_after_kill` regression guards it.
 
-Today (2026-05-06/07) I left orphan workers running for hours at least
-three times. Each time I had already diagnosed the pattern. Re-read this
-section before the next kill.
+So the manual pgrep→kill ritual is no longer required. Backstop only:
+if you ever suspect a straggler after killing a `datagen` / multinode
+pipeline, list workers by parentage (they share the parent's argv, so a
+cmdline scan won't find them):
+`pgrep -P <datagen_pid>`, then `kill -9 <pids>`. Check the remote (odin)
+too after killing a multinode run.
 
 ## When making a refactor or vectorize change
 
