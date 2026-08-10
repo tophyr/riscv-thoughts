@@ -116,7 +116,8 @@ class RegisterStateMachine(nn.Module):
 
     def __init__(self, d_value, d_event, d_content, n_regs=32, op_cell_depth=1,
                  n_pool_heads=1, pool_mode='pma', pool_extra='none',
-                 read_time_mode='stamp', op_cell_rank=False):
+                 read_time_mode='stamp', op_cell_rank=False,
+                 seed_mode='tags'):
         super().__init__()
         self.d_value = d_value
         self.d_event = d_event
@@ -137,7 +138,25 @@ class RegisterStateMachine(nn.Module):
         self.op_cell_rank = op_cell_rank
         assert not (op_cell_rank and read_time_mode != 'rank'), \
             'op_cell_rank needs read_time_mode=rank (stamp is not a position)'
-        self.tag_proj = nn.Linear(1, d_value)
+        # How an input register's leaf identity enters the state. 'tags' = the
+        # random-node-feature trick: a per-chunk random tag, distinguishable but
+        # anonymous, with invariance to it LEARNED. 'rank' = its canonical read
+        # position, written on first read: the same distinguishability, but
+        # deterministic, so there is no tag to be invariant to. Under 'rank' the
+        # pool sees the same multiset of leaf vectors for a commutative swap
+        # (the ranks move between registers, the sum does not), so that collapse
+        # is by construction rather than trained.
+        assert seed_mode in ('tags', 'rank'), seed_mode
+        assert not (seed_mode == 'rank' and read_time_mode != 'rank'), \
+            'seed_mode=rank needs read_time_mode=rank'
+        self.seed_mode = seed_mode
+        # Only the active mode's parameter exists, so a checkpoint carries
+        # exactly the seeding it was trained with and cannot silently load into
+        # the other mode.
+        if seed_mode == 'rank':
+            self.rank_emb = nn.Embedding(n_regs, d_value)
+        else:
+            self.tag_proj = nn.Linear(1, d_value)
         self.op_cell = nn.Sequential(
             nn.Linear(d_content + 2 * d_value + (2 if op_cell_rank else 0),
                       4 * d_value), nn.ReLU(),
@@ -192,7 +211,11 @@ class RegisterStateMachine(nn.Module):
         not_x0 = torch.ones(self.n_regs, device=device)
         not_x0[X0_SLOT] = 0.0
         not_x0_row = not_x0.view(1, -1)
-        value = self.tag_proj(tags.unsqueeze(-1)) * not_x0.view(1, -1, 1)
+        if self.seed_mode == 'rank':
+            value = torch.zeros(content.shape[0], self.n_regs, self.d_value,
+                                device=device)
+        else:
+            value = self.tag_proj(tags.unsqueeze(-1)) * not_x0.view(1, -1, 1)
         event = torch.zeros(
             content.shape[0], self.n_regs, self.d_event, device=device)
         # Per-slot ORDER timestamps (the cross-instruction analog of read_role):
@@ -209,16 +232,26 @@ class RegisterStateMachine(nn.Module):
             step_sig = float(k + 1) / float(K)              # normalized step ramp
             oh0 = F.one_hot(in0[:, k], self.n_regs).to(value.dtype)
             oh1 = F.one_hot(in1[:, k], self.n_regs).to(value.dtype)
-            r0 = torch.bmm(oh0.unsqueeze(1), value).squeeze(1)   # (B,d_value)
-            r1 = torch.bmm(oh1.unsqueeze(1), value).squeeze(1)
             c = content[:, k]
             oh0e = oh0 * not_x0_row
             oh1e = oh1 * not_x0_row
-            # Read-order is stamped BEFORE the op-cell so this step's operands
-            # carry their own canonical position. Nothing between the two points
-            # reads read_time, so with op_cell_rank off the step is unchanged.
-            read_time, n_read = self._stamp_reads(
+            # Read-order is stamped BEFORE the operands are read, so seed_mode
+            # 'rank' can seed this step's own inputs and op_cell_rank can see
+            # their positions. Nothing between the two points read the state, so
+            # with both off the step is unchanged.
+            read_time, n_read, firsts, ranks = self._stamp_reads(
                 read_time, n_read, write_time, oh0e, oh1e, a, k)
+            if self.seed_mode == 'rank':
+                # An input's leaf identity IS its canonical position, written on
+                # first read. Indexed by read ORDER, not by register, so a rename
+                # permutes it exactly like the random tag it replaces.
+                for fr, rk in zip(firsts, ranks):
+                    e = self.rank_emb(
+                        rk.clamp(max=self.n_regs - 1).long()).squeeze(1)
+                    fr = fr.unsqueeze(-1)
+                    value = value * (1.0 - fr) + fr * e.unsqueeze(1)
+            r0 = torch.bmm(oh0.unsqueeze(1), value).squeeze(1)   # (B,d_value)
+            r1 = torch.bmm(oh1.unsqueeze(1), value).squeeze(1)
             cell_in = [c, r0, r1]
             if self.op_cell_rank:
                 # the position of the register each operand reads, normalized;
@@ -305,6 +338,7 @@ class RegisterStateMachine(nn.Module):
         equivariance is unaffected.
         """
         rank = self.read_time_mode == 'rank'
+        firsts, ranks = [], []
         for oh, role in ((oh0e, 0.0), (oh1e, 1.0)):
             fresh = (read_time == 0).to(read_time.dtype)
             if rank:
@@ -315,7 +349,9 @@ class RegisterStateMachine(nn.Module):
                 read_time = read_time + fr * n_read
             else:
                 read_time = read_time + fr * (2.0 * (k + 1) + role)
-        return read_time, n_read
+            firsts.append(fr)
+            ranks.append(n_read)
+        return read_time, n_read, firsts, ranks
 
     def apply_slot_head(self, head, T):
         """Per-slot readout: Linear(d_slot,1) over every register slot ->
@@ -424,7 +460,7 @@ class Compressor(nn.Module):
     def __init__(self, *, d_content, d_out, d_event, op_cell_depth=1,
                  vp_head_depth=_VP_HEAD_DEPTH, n_pool_heads=1, pool_mode='pma',
                  pool_extra='none', read_time_mode='stamp',
-                 op_cell_rank=False):
+                 op_cell_rank=False, seed_mode='tags'):
         super().__init__()
         self.d_content = d_content
         self.d_out = d_out
@@ -437,7 +473,8 @@ class Compressor(nn.Module):
             d_value=d_out, d_event=d_event, d_content=d_content, n_regs=N_REGS,
             op_cell_depth=op_cell_depth, n_pool_heads=n_pool_heads,
             pool_mode=pool_mode, pool_extra=pool_extra,
-            read_time_mode=read_time_mode, op_cell_rank=op_cell_rank)
+            read_time_mode=read_time_mode, op_cell_rank=op_cell_rank,
+            seed_mode=seed_mode)
 
         # Binding heads read the per-slot state T (d_out+d_event), one score per
         # register slot (equivariant); pc_writes + value_predict read the
@@ -497,7 +534,8 @@ class T1Compressor(nn.Module):
     def __init__(self, *, vocab_size, d_model, n_heads, n_layers, max_window,
                  d_out, d_event, op_cell_depth=1, vp_head_depth=_VP_HEAD_DEPTH,
                  n_pool_heads=1, pool_mode='pma', pool_extra='none',
-                 read_time_mode='stamp', op_cell_rank=False):
+                 read_time_mode='stamp', op_cell_rank=False,
+                 seed_mode='tags'):
         super().__init__()
         self.embedder = TokenEmbedder(
             vocab_size=vocab_size, d_model=d_model, n_heads=n_heads,
@@ -507,7 +545,8 @@ class T1Compressor(nn.Module):
             op_cell_depth=op_cell_depth, vp_head_depth=vp_head_depth,
             n_pool_heads=n_pool_heads, pool_mode=pool_mode,
             pool_extra=pool_extra,
-            read_time_mode=read_time_mode, op_cell_rank=op_cell_rank)
+            read_time_mode=read_time_mode, op_cell_rank=op_cell_rank,
+            seed_mode=seed_mode)
         # dim interface (plain ints — delegated by value, not submodules)
         self.n_regs = self.compressor.n_regs
         self.d_out = self.compressor.d_out
@@ -539,14 +578,14 @@ class T1Compressor(nn.Module):
 def T2Compressor(*, d_t1, d_out, d_event, op_cell_depth=1,
                  vp_head_depth=_VP_HEAD_DEPTH, n_pool_heads=1, pool_mode='pma',
                  pool_extra='none', read_time_mode='stamp',
-                 op_cell_rank=False):
+                 op_cell_rank=False, seed_mode='tags'):
     """T2 preset: a Compressor fed a lower tier's essence (d_content=d_t1)."""
     return Compressor(d_content=d_t1, d_out=d_out, d_event=d_event,
                       op_cell_depth=op_cell_depth, vp_head_depth=vp_head_depth,
                       n_pool_heads=n_pool_heads, pool_mode=pool_mode,
                       pool_extra=pool_extra,
                       read_time_mode=read_time_mode,
-                      op_cell_rank=op_cell_rank)
+                      op_cell_rank=op_cell_rank, seed_mode=seed_mode)
 
 
 class Decoder(nn.Module):

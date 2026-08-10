@@ -66,49 +66,53 @@ rows on a fixed corpus, not to de-bias vp.)
 parallel work. When task 1 lands: update these documents and the memory notes,
 then hand off to a fresh session rather than rolling on.
 
-### 1. [CURRENT] Tag-invariance, regressed by `--op-cell-rank`
+### 1. [CURRENT] Commutative collapse, regressed by canonical read-order
 
-**The operand-binding deficit this task started as is solved.** Feeding the
-op-cell each operand's canonical read position (`--op-cell-rank`, requires
-`--read-time-mode rank`) takes the `s1 overlap` column from 21.2% to **100.000%**
-exact 32-bit match and operand-position recovery from ~4–49% to ~98%, at equal
-step count. The pool could never do this because it never sees `content` and so
-must use read-order unconditionally; the op-cell sees the opcode and both
-operands together and can symmetrize per opcode.
+Operand binding on shared-source pairs is solved (`s1 overlap` 21.2% →
+100.000% exact), as is tag-invariance. `--seed-mode rank` writes an input
+register's leaf identity from its canonical read position on first read instead
+of from a per-chunk random tag, which removes the tag entirely — tag-invariance
+sits at the architectural floor and vp is at its best value. It makes
+`--op-cell-rank` redundant: the position already reaches the op-cell through
+`r0`/`r1`, and enabling both is slightly worse.
 
-**What blocks adoption is tag-invariance.** Scored at `--gvn-chunk-len 2`,
-`op_cell_rank` against the `stamp` baseline:
+len=2, 250k, `--gvn-chunk-len 2`:
 
-| row | baseline | op_cell_rank |
-|---|---|---|
-| rename (equivariance assertion) | 0.0002 | 0.0008 |
-| tag-invariance | 0.0010 | **0.0255** |
-| behavioral / commutative | 0.0027 | **0.0366** |
-| separation | 462× | **35.5×** |
+| cell | vp | rename | tag-invar | behavioral | distinct |
+|---|---|---|---|---|---|
+| baseline (`stamp`) | 0.0405 | 0.0002 | 0.0010 | **0.0027** | 1.2487 |
+| `op_cell_rank` | 0.0184 | 0.0009 | 0.0255 | 0.0366 | 1.3000 |
+| **`seed_mode=rank`** | **0.0129** | 0.0008 | **0.0008** | 0.0426 | 1.3183 |
+| both | 0.0154 | 0.0008 | 0.0008 | 0.0444 | 1.3353 |
 
-Equivariance is intact — `state_max_err` is `0.00e+00` and the rename row reads
-~0. The regression is in the *learned* property: the essence became 25× more
-sensitive to the anonymous per-chunk tags, and commutative collapse degraded
-with it. Commutative distance is only 1.4× its own tag floor here against 2.7×
-for the baseline, so treat tag-invariance as the cause and commutative collapse
-as downstream of it.
+**The blocker is commutative collapse: 0.0027 → ~0.043, in every cell where
+canonical read-order reaches the essence.** The behavioral row measures this
+honestly — commute pairs share the vp target on 97% of len=2 chunks and 100% at
+len=1.
 
-**Leading fix — delete the random tags rather than penalize them.** Tags exist
-for exactly one reason (RISCV_DESIGN, "Distinct anonymous leaf tags"): inputs
-must be *distinguishable* while carrying no intrinsic identity, so `add r2,r3`
-differs from `add r2,r2`. Canonical read rank now supplies that same property
-deterministically — two distinct inputs get ranks 1 and 2, a repeated input gets
-one rank twice — which makes the random tag a redundant input the model is no
-longer pressured to cancel. Seeding the state from rank instead of `tag_proj`
-attacks the cause structurally. Equivariance should survive by the existing
-argument: rank is assigned by read ORDER, which permutes with a rename, so it is
-not a per-register embedding `f(r)`. Verify that rather than assume it.
+**Leading hypothesis: the invariance is learned rather than structural, and
+nothing trains it.** A commutative swap changes first-read order and therefore
+which register gets which rank, while leaving the vp target identical. Without
+read-order in the value path such pairs cannot move the essence at all; with it,
+the model must learn to ignore read-order exactly where the opcode is
+commutative. That is representable — the op-cell is content-conditioned — but
+unrewarded: `configs/instr_alu_writers.json` has no `equivalences` block, so
+training never puts two commutative variants of a chunk in front of the model.
 
-Fallback if that fails: an explicit tag-invariance penalty (encode a chunk under
-two tag draws, penalize the essence difference).
+Candidates, cheapest first:
 
-Score any variant on `s1 overlap` (must hold at 100%), the tag-invariance and
-commutative rows, and `state_max_err`.
+- Run `seed_mode=rank` to 1M. If the mechanism is "learned rather than free",
+  collapse should improve with training; the baseline's own collapse is recorded
+  at 250k and 1M for comparison.
+- Inject commutative equivalents into the corpus (`--inject-equiv`), so equivalent
+  chunks with identical vp targets actually co-occur.
+- An explicit invariance term is the last resort: the project removed equivalence
+  losses deliberately (equivalence is emergent), so adding one back is a design
+  regression, not a fix.
+
+Score every variant on `s1 overlap` (must hold at 100%), the behavioral and
+tag-invar rows, `distinct` (not just the ratio — rank-seeding changes it), and
+`state_max_err`.
 
 ### 2. I-type immediate encoding
 
@@ -218,11 +222,32 @@ Standing candidates:
   any channel unconditionally; that is the reason, and it does **not** extend to
   content-conditioned consumers. The op-cell is the one consumer this line does
   not cover — see open task 1.
+- **Treating tag-sensitivity as the cause of the commutative-collapse
+  regression.** Removing the random tags entirely (`--seed-mode rank`) takes
+  tag-invariance to the architectural floor and leaves collapse unchanged (0.0426
+  against `op_cell_rank`'s 0.0366 and a 0.0027 baseline). Both are downstream of
+  read-order reaching the essence.
+- **Treating the behavioral row as contaminated.** Commute pairs share the vp
+  target on 100% of len=1 and 97% of len=2 chunks, so the row measures what it
+  claims and the regression is not an artifact of it.
 - **Probe methodology.** Several conclusions had to be withdrawn. Always
   calibrate a probe against a number known independently, and compare its score
   against the base rate — a probe scoring at the majority-class frequency has
   learned nothing, and one scoring below the model's own trained head is
   measuring itself.
+
+## Known defects
+
+- **`_behaviorally_equal` (`compressor/eval.py`) is over-strict.** It compares the
+  whole 32-register canonical file, including input registers that `_canonical_state`
+  merely relocated, so it reports only 9.2% of genuine commutative equivalences as
+  equivalent at len=1 (the vp target is identical for 100% of them). vp supervises
+  the written slots only, so the comparison should be `out_regs` at `out_slot_regs`.
+  It gates the `distinct` pool, where unrelated chunks are almost never equivalent,
+  so the effect there is small — but the predicate is wrong wherever else it is used.
+- **The test suite does not load any real checkpoint**, so it cannot catch a
+  state_dict incompatibility: adding an unconditional `rank_emb` passed all 283
+  tests and failed at step 0 of the next run against the frozen T1.
 
 ## How to run
 
@@ -232,12 +257,14 @@ Standing candidates:
   `--vp-head-depth`, `--n-pool-heads`, `--pool-mode`, `--pool-extra`,
   `--read-time-mode`, `--op-cell-rank`. Current best on vp:
   `op_cell=4 vp_head=1 n_pool_heads=16 pma pool_extra=write_time
-  read_time_mode=rank --op-cell-rank`; current best on the GVN rows is the same
-  without `--op-cell-rank` (open task 1). Defaults reproduce pre-Phase-15
-  behaviour and old checkpoints load unchanged; `--op-cell-rank` widens the
-  op-cell input, so its checkpoints are not interchangeable with the others.
+  read_time_mode=rank --seed-mode rank`; current best on commutative collapse is
+  the same with neither `--seed-mode rank` nor `--op-cell-rank` (open task 1).
+  Defaults reproduce pre-Phase-15 behaviour and old checkpoints load unchanged.
+  `--op-cell-rank` widens the op-cell input and `--seed-mode rank` swaps
+  `tag_proj` for `rank_emb`, so checkpoints are only interchangeable within a
+  setting.
 - One training cell, generation offloaded to odin:
-  `LEN=2 STEPS=250000 MODES=pma NPOOL=16 PEXTRAS=write_time RTMODE=rank OCRANK=1 bash scripts/run_t2.sh`
+  `LEN=2 STEPS=250000 MODES=pma NPOOL=16 PEXTRAS=write_time RTMODE=rank SEEDMODE=rank bash scripts/run_t2.sh`
   — trains, then runs `scripts/eval.py` and the faithfulness probe. `TAG=<name>`
   suffixes the run dir so a re-run of a recorded cell does not overwrite it.
 - **Method: probe first, then train.** Diagnose on frozen checkpoints until the

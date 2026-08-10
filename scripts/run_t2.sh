@@ -26,13 +26,14 @@ MODES=${MODES:-"pma compete"}
 PEXTRAS=${PEXTRAS:-"write_time"}
 RTMODE=${RTMODE:-stamp}
 OCRANK=${OCRANK:-0}   # feed the op-cell each operand's canonical read position
+SEEDMODE=${SEEDMODE:-tags}  # leaf identity: random tag, or canonical read rank
 # Distinguishes a re-run of an already-recorded cell (the run dir is otherwise a
 # pure function of the knobs, so it would silently overwrite it).
 TAG=${TAG:-}
 
 cell() {  # MODE POOL_EXTRA
   local MODE=$1 PE=$2
-  local OUT=t2_len${LEN}_d${DOUT}_s${STEPS}_dep${OC}_vp${VP}_pool${NPOOL}_${MODE}_pe${PE}_rt${RTMODE}${OCRANK:+$([ "$OCRANK" = 1 ] && echo _ocrank)}${TAG:+_$TAG}_writers
+  local OUT=t2_len${LEN}_d${DOUT}_s${STEPS}_dep${OC}_vp${VP}_pool${NPOOL}_${MODE}_pe${PE}_rt${RTMODE}${OCRANK:+$([ "$OCRANK" = 1 ] && echo _ocrank)}$([ "$SEEDMODE" != tags ] && echo _seed$SEEDMODE)${TAG:+_$TAG}_writers
   echo "######## $(date '+%m-%d %H:%M:%S')  mode=$MODE  pool_extra=$PE  -> $OUT"
   # Generation runs on odin (multinode_gen.sh, LOCAL_GEN=0) so local cores stay
   # free for the trainer's per-step host work. ANCHOR_SEED must equal the
@@ -44,7 +45,8 @@ cell() {  # MODE POOL_EXTRA
     | python scripts/train_t2_encoder.py --t1-model "$T1" \
       --d-out "$DOUT" --d-event 16 --op-cell-depth "$OC" --vp-head-depth "$VP" \
       --n-pool-heads "$NPOOL" --pool-mode "$MODE" --pool-extra "$PE" \
-      --read-time-mode "$RTMODE" $([ "$OCRANK" = 1 ] && echo --op-cell-rank) --route binding \
+      --read-time-mode "$RTMODE" $([ "$OCRANK" = 1 ] && echo --op-cell-rank) \
+      --seed-mode "$SEEDMODE" --route binding \
       --n-steps "$STEPS" --anchor-seed 0 --n-anchor-states 8 --out-dir "$OUT" \
       > "$D/t2_${OUT}.log" 2>&1
   local RC=$?

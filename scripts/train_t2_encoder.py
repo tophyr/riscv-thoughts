@@ -80,6 +80,15 @@ def main():
                         'Requires --read-time-mode rank; widens op_cell, so '
                         'checkpoints trained with it are not interchangeable.')
 
+    p.add_argument('--seed-mode', choices=('tags', 'rank'), default='tags',
+                   help="how an input register's leaf identity enters the "
+                        "state. 'tags' = a per-chunk random tag "
+                        '(distinguishable but anonymous; invariance to it is '
+                        "LEARNED). 'rank' = its canonical read position, "
+                        'written on first read — the same distinguishability '
+                        'deterministically, so there is no tag to be invariant '
+                        'to. Requires --read-time-mode rank.')
+
     add_common_train_args(p, lr=1e-4)
     p.add_argument('--warmup-steps', type=int, default=10000,
                    help='Linear LR warmup from ~0 to --lr over this many '
@@ -159,6 +168,7 @@ def main():
         vp_head_depth=args.vp_head_depth, n_pool_heads=args.n_pool_heads,
         pool_mode=args.pool_mode, pool_extra=args.pool_extra,
         read_time_mode=args.read_time_mode, op_cell_rank=args.op_cell_rank,
+        seed_mode=args.seed_mode,
         lr=args.lr, n_steps=args.n_steps, log_every=args.log_every,
         warmup_steps=args.warmup_steps,
         valid_weight=args.valid_weight,

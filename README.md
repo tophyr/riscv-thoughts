@@ -118,23 +118,25 @@ equivariant architecture), **behavioral-non-rename (commutativity) `0.024`**
 non-rename collapse is the real result: the register-state machine performs
 global value numbering, not merely the free rename-twin collapse.
 
-**Phase 15 (open) — ORDER, then operand BINDING.** The essence is a sum over the
-32 register slots; that sum is what makes it rename-invariant, but it is also
-order-blind, while the essence must encode *"output 1 is this, output 2 is
-that"*. Feeding the pool one scalar per slot — the write step (`--pool-extra
-write_time`) — took value-prediction loss **0.3525 → 0.0396** at 2-instruction
-chunks (**0.0198** with 4× training) and decode-back **72.9% → 91.5%** per
-instruction at 8, while *improving* equivalence collapse.
+**Phase 15 (open) — what the essence must carry beyond the register set.** The
+essence is a sum over the 32 register slots. That sum is what makes it
+rename-invariant, but it is also blind to ORDER, and the essence must encode
+*"output 1 is this, output 2 is that"* and *which input feeds which operand*.
 
-What remained was operand binding when two instructions share a source register
-— 21.2% exact 32-bit match on that subset. No channel fed to the *pool* can fix
-it: the pool never sees `content`, so it must use read-order unconditionally,
-and a commutative swap changes read-order. The **op-cell** can, since it sees the
-opcode and both operands in one activation and can symmetrize per opcode. Giving
-it each operand's canonical read position (`--op-cell-rank`) takes that subset to
-**100.0% exact** and aggregate vp to 0.0184 at 250k, beating the baseline's 1M.
-It is not adopted yet: it regresses tag-invariance 25× (0.0010 → 0.0255), which
-drags commutative collapse with it. Equivariance is untouched. See EXPERIMENT_LOG
+Two order channels close that. Per-slot **write step** (`--pool-extra
+write_time`) supplies output order: value-prediction loss **0.3525 → 0.0396** at
+2-instruction chunks, decode-back **72.9% → 91.5%** per instruction at 8.
+Per-slot **canonical read position** supplies operand binding, which the pool
+structurally cannot — the pool never sees `content`, so it must apply read-order
+unconditionally, and a commutative swap changes read-order. Routing the position
+through the value path instead (`--seed-mode rank`, which also replaces the
+anonymous random tag) takes exact 32-bit match on shared-source pairs from 21.2%
+to **100.0%** and vp to **0.0129** at 250k.
+
+Neither read-order form is adopted: both cost commutative collapse (0.0027 →
+~0.043). With no read-order in the value path a commutative swap could not move
+the essence at all, so that invariance was structural and is now something the
+loss set has to supply. Equivariance is exact throughout. See EXPERIMENT_LOG
 Phase 15.
 
 `vp` is a real objective with no intrinsic floor: single-instruction vp is

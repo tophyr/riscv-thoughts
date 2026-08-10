@@ -73,7 +73,7 @@ equivalence-collapse is not put at risk. Most of the gain survives with
 single-head pooling; multi-head's separate contribution is geometric, keeping
 essences on the unit sphere (0.7% off-sphere vs 27.7% with one head).
 
-| len=2, 250k steps | vp | rename dist | commutative dist | separation | off-sphere |
+| len=2, 250k steps (GVN columns pre-metric-fix, finding 12) | vp | rename dist | commutative dist | separation | off-sphere |
 |---|---|---|---|---|---|
 | before | 0.3525 | 0.0023 | 0.0097 | 268× | 3.7% |
 | after | **0.0396** | **0.0014** | **0.0084** | **337×** | **0.7%** |
@@ -97,7 +97,7 @@ accuracy, and it splits into two independent causes:
   Operation identity survives (opcode recovered at 99%+); what fails is knowing
   *which* input feeds which operand — recoverable at ~99.8% on disjoint pairs but
   only ~49%/~4% (operand 0 / operand 1) on overlapping ones. **Solved by
-  `--op-cell-rank`** (finding 11).
+  read-order in the value path** (finding 11).
 - **~35% — encoding of immediate values.** Visible even on single
   instructions, concentrated exactly in bits 0–11, the 12-bit immediate field.
   This shrinks with training rather than being structural.
@@ -142,57 +142,80 @@ block carries operand read-order, and a commutative swap changes exactly that
 1M halves vp (0.0404 → 0.0198) while reconstruction stays flat or drifts down.
 The two goals have decoupled.
 
-**11. Feeding the op-cell each operand's canonical read position solves the
-shared-source deficit outright.** The pool never sees `content`, so it must use
-read-order unconditionally; the op-cell sees the opcode and both operands in one
-activation and can symmetrize per opcode. `--op-cell-rank` (with
-`--read-time-mode rank`) at 250k, against the `stamp` baseline at the same step
-count, same probe, same corpus:
+**11. Read-order in the value path solves operand binding, and costs
+commutative collapse.** The pool never sees `content`, so it must use read-order
+unconditionally; the op-cell sees the opcode and both operands in one activation
+and can symmetrize per opcode. Two ways to get the canonical read position to
+it — `--op-cell-rank` (two extra scalars on the op-cell input) and
+`--seed-mode rank` (an input register's leaf identity written from its canonical
+position on first read, replacing `tag_proj` of a random tag). **`--seed-mode
+rank` is the better form**: same binding win, best vp, no tag left to be
+invariant to, and it makes `--op-cell-rank` redundant since the position already
+reaches the op-cell through `r0`/`r1`.
 
-| `s1 overlap` | baseline | op_cell_rank |
+`s1 overlap`, 250k, same probe and corpus:
+
+| | baseline (`stamp`) | read-order in the value path |
 |---|---|---|
 | vp per-bit | 81.1% | 100.0% |
 | vp EXACT 32-bit | 21.2% | **100.0%** |
 | operand0 / operand1 canonical position | 49.2% / 4.3% | 98.2% / 97.9% |
 | overlap-only control, vp exact | 30.5% | 100.0% |
 
-Aggregate vp 0.0405 → 0.0184, i.e. 250k beats the baseline's 1M (0.0198). The
-4.3% on operand1 is the off-by-one `stamp` produces on exactly this subset. A
-probe gated the run first (`probes/opcell_rank_sufficiency.py`): slot B's state
-plus the true ranks predicts its output at 97.4% exact on the overlap subset
-against 37.4% without them, so the information was present and only the
-association was missing.
+The 4.3% on operand1 is the off-by-one `stamp` produces on exactly this subset.
+A probe gated the run (`probes/opcell_rank_sufficiency.py`): slot B's state plus
+the true ranks predicts its output at 97.4% exact on the overlap subset against
+37.4% without, so the information was present and only the association was
+missing.
 
-**12. The cost is tag-invariance, not equivariance.** At `--gvn-chunk-len 2`,
-rename 0.0002 → 0.0008 (~0, as exact equivariance requires), tag-invariance
-0.0010 → 0.0255, commutative 0.0027 → 0.0366, separation 462× → 35.5×. The
-essence became 25× more sensitive to the anonymous per-chunk tags and
-commutative collapse followed: commutative distance is 1.4× its own tag floor
-here against 2.7× for the baseline. Under the project constraint this blocks
-adoption.
+Whole-model rows, len=2/250k at `--gvn-chunk-len 2`:
 
-**13. `gvn_collapse`'s rename row was measuring tag-invariance.** `enc()` drew
+| cell | vp | rename | tag-invar | behavioral | distinct |
+|---|---|---|---|---|---|
+| baseline (`stamp`) | 0.0405 | 0.0002 | 0.0010 | **0.0027** | 1.2487 |
+| `op_cell_rank` | 0.0184 | 0.0009 | 0.0255 | 0.0366 | 1.3000 |
+| **`seed_mode=rank`** | **0.0129** | 0.0008 | **0.0008** | 0.0426 | 1.3183 |
+| both | 0.0154 | 0.0008 | 0.0008 | 0.0444 | 1.3353 |
+
+Equivariance is untouched (rename ~0, `state_max_err` `0.00e+00`). Tag-invariance
+is a property of the tags, and disappears with them. **The blocker is commutative
+collapse, 0.0027 → ~0.043 in every cell where read-order reaches the essence** —
+not tag-sensitivity (removing the tags entirely leaves collapse unchanged) and
+not a metric artifact (finding 15). With no read-order in the value path a
+commutative swap could not move the essence at all; recording it makes that
+invariance learned rather than structural, and nothing trains it —
+`configs/instr_alu_writers.json` has no `equivalences` block, so the model never
+sees two commutative variants together.
+
+**12. `gvn_collapse`'s rename row was measuring tag-invariance.** `enc()` drew
 fresh random tags per call, so base and twin got independent tags while the
 comment above it claimed they were pinned. Since equivariance is exact, that row
 could only ever be nonzero because of tags. It now permutes the twin's tags by
 the same relabeling (making it an architecture assertion that reads ~0) and
-reports tag-invariance as its own row. **Every GVN number recorded before this
-is not comparable** — including this phase's own table above and Phase 14's.
+reports tag-invariance as its own row. **Every GVN number measured before this is
+not comparable**, including Phase 14's.
 
-**14. `rank` counts registers read BEFORE written.** Counting reads of in-chunk
+**13. `rank` counts registers read BEFORE written.** Counting reads of in-chunk
 results consumes a rank and pushes every later input off by one — the `stamp`
 bug with dataflow as the trigger. Agreement with the frame the vp target is
 built in: 96.6% of len=2 chunks, 83.7% at len=4, 52.9% at len=8. The residual is
 dead code, which no causal read-time counter can know, so `rank` is exact on the
 shared-source subset and approximate at len=8 by construction.
 
-**15. The canonical-frame caveat is common, and harmless.** Canonical positions
+**14. The canonical-frame caveat is common, and harmless.** Canonical positions
 cover all live syntactic inputs while `in_slot_regs` lists only the behavioral
 subset, so a dropped input shifts every later slot and the vp head is fed a value
 the target never used: 5.9% of len=2 chunks, 14.8% at len=4, 26.6% at len=8, 0%
 at len=1. Measured on the best len=2 checkpoint, the shifted rows score 99.09%
 per-bit / 96.7% exact against 99.21% / 94.5% for the rest — an input is dropped
 precisely when the output does not depend on it.
+
+**15. The behavioral row is a valid equivalence measure.** Commute pairs share
+the vp target on 100% of len=1 and 97% of len=2 chunks. Separately,
+`_behaviorally_equal` is over-strict — it compares the whole canonical register
+file including inputs that `_canonical_state` merely relocated, so it reports
+only 9.2% of genuine commutative equivalences as equivalent at len=1 while their
+vp targets are identical for 100%. It gates the `distinct` pool only.
 
 ## Decisions taken
 
@@ -208,10 +231,10 @@ precisely when the output does not depend on it.
   ordering fix *reduced* effective dimensionality (26→15) while improving
   reconstruction 19 points, contradicting the Round-1 theory that
   concentration was the pathology.
-- **`--op-cell-rank` is not adopted yet.** It meets the len=2 acceptance
-  criterion but fails the equivalence-collapse constraint (findings 11–12). The
-  open question is whether the random tags can be removed now that rank supplies
-  distinguishability deterministically.
+- **`--seed-mode rank` is the adopted form of read-order in the value path**, and
+  supersedes `--op-cell-rank`: same binding win, better vp, one fewer knob.
+  Neither is adopted into the default config yet — both fail the
+  equivalence-collapse constraint (finding 11).
 - **Report vp discretely.** `probes/vp_slot_b_split.py` prints exact 32-bit match
   alongside per-bit; 81% per-bit on the overlap column was 21% exact, so per-bit
   alone made a mostly-broken subset look nearly solved.
@@ -276,25 +299,17 @@ zero, so the bar is demonstrated rather than aspirational.
 
 ## Open threads
 
-1. **Tag-invariance under `--op-cell-rank`.** The binding half of this thread is
-   closed (findings 11–12): the op-cell, being the one consumer that sees the
-   opcode and both operands together, uses read-order conditionally where the
-   pool could only use it unconditionally, and that takes `s1 overlap` to 100%
-   exact. What it costs is tag-invariance (0.0010 → 0.0255), which drags
-   commutative collapse with it (0.0027 → 0.0366, separation 462× → 35.5×).
+1. **Commutative collapse under canonical read-order.** Binding and
+   tag-invariance are settled (finding 11). What remains is that
+   commutative collapse degrades 0.0027 → ~0.043 in every cell where read-order
+   reaches the essence, and it is not a metric artifact (finding 15).
 
-   The leading fix is subtractive: the anonymous random tags exist only to make
-   inputs *distinguishable* without intrinsic identity, and canonical read rank
-   now supplies exactly that deterministically, so the tag is a redundant random
-   input the model is no longer pressured to cancel. Seed the state from rank
-   instead of `tag_proj` and re-check `state_max_err`, `s1 overlap`, and the tag
-   / commutative rows. Fallback: an explicit tag-invariance penalty (one chunk,
-   two tag draws, penalize the essence difference).
-
-   `read_time_mode` must be `rank` for any of this: `stamp` overshoots whenever a
-   repeat read leaves a hole, i.e. it is wrong *exactly on the shared-source
-   subset*, and `--op-cell-rank` asserts on it rather than accepting a wrong
-   coordinate system.
+   Live hypothesis: the invariance used to be free and now must be learned, and
+   the corpus never presents a commutative pair. Cheapest tests, in order — run
+   `seed_mode=rank` to 1M and watch the behavioral row; inject commutative
+   equivalents (`--inject-equiv`) so equivalent chunks with identical vp targets
+   co-occur. An explicit invariance loss is a last resort: equivalence is
+   supposed to be emergent here, so adding one back is a design regression.
 
 2. **Immediate encoding** — ~35% of the remaining error. T2 has a built but
    unused immediate head, skipped because a chunk has no single immediate — but

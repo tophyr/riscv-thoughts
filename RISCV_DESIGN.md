@@ -366,8 +366,16 @@ regress. The **canonical read rank** (first-read order over registers read
 before written) supplies the same distinguishability deterministically: two
 distinct inputs get ranks 1 and 2, a repeated input gets one rank twice. It is
 assigned by read ORDER, which permutes with π, so it is not a per-register
-embedding and the torsion argument does not apply to it. Whether rank can
-replace the random tag outright is open (TODO.md task 1).
+embedding and the torsion argument does not apply to it. Seeding from rank
+instead of a random tag (`--seed-mode rank`) preserves distinguishability and
+exact equivariance and removes the learned-invariance burden entirely — there is
+no tag left to be invariant to.
+
+The tradeoff it carries: a state with no read-order in it cannot move under a
+commutative operand swap, because nothing records which operand was read first,
+so that invariance is structural. Rank records it, which makes the same
+invariance learned and per-opcode. Whether the behavioral loss set alone supplies
+that pressure is open (TODO.md task 1).
 
 ### The tier contract — never re-embed tokens
 

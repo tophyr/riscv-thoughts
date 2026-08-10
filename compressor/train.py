@@ -515,6 +515,7 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
                      d_out=128, d_event=16, op_cell_depth=1, vp_head_depth=4,
                      n_pool_heads=1, pool_mode='pma', pool_extra='none',
                      read_time_mode='stamp', op_cell_rank=False,
+                     seed_mode='tags',
                      d_model=128, n_heads=4, n_layers=2, max_window=72,
                      route='binding',
                      lr=3e-4, n_steps=None, log_every=100, lr_min=1e-6,
@@ -564,7 +565,7 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
             op_cell_depth=op_cell_depth, vp_head_depth=vp_head_depth,
             n_pool_heads=n_pool_heads, pool_mode=pool_mode,
             pool_extra=pool_extra, read_time_mode=read_time_mode,
-            op_cell_rank=op_cell_rank)
+            op_cell_rank=op_cell_rank, seed_mode=seed_mode)
         model = comp.to(device)
         model_file = 't2.pt'
     else:
@@ -576,7 +577,7 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
             pool_mode=pool_mode,
             pool_extra=pool_extra,
             read_time_mode=read_time_mode,
-            op_cell_rank=op_cell_rank).to(device)
+            op_cell_rank=op_cell_rank, seed_mode=seed_mode).to(device)
         comp = model.compressor
         model_file = 'encoder.pt'
     route_binding = (route == 'binding')
@@ -1517,6 +1518,7 @@ def train_t2_encoder(batch_iter, t1_encoder, *,
                      d_out=256, d_event=16, op_cell_depth=1, vp_head_depth=4,
                      n_pool_heads=1, pool_mode='pma', pool_extra='none',
                      read_time_mode='stamp', op_cell_rank=False,
+                     seed_mode='tags',
                      lr=3e-4, n_steps=None, log_every=100, lr_min=1e-6,
                      warmup_steps=0,
                      valid_weight=0.0,
@@ -1539,7 +1541,7 @@ def train_t2_encoder(batch_iter, t1_encoder, *,
         vp_head_depth=vp_head_depth, n_pool_heads=n_pool_heads,
         pool_mode=pool_mode, pool_extra=pool_extra,
         read_time_mode=read_time_mode, op_cell_rank=op_cell_rank,
-        route=t2_route,
+        seed_mode=seed_mode, route=t2_route,
         lr=lr, n_steps=n_steps, log_every=log_every, lr_min=lr_min,
         warmup_steps=warmup_steps,
         valid_weight=valid_weight, live_in_weight=live_in_weight,
