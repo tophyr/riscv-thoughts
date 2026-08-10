@@ -1,3 +1,11 @@
+# Bootstrapping a session
+
+If you cannot already state the current mission and why it is the mission, you
+are not oriented yet: **run the `bootstrap` skill** before touching anything. It
+walks the doc reading order, the code checks that keep the docs honest, and the
+questions to bring back to me before starting. I would much rather spend time
+clarifying up front than have you build on a wrong premise.
+
 # Verification Protocol
 
 Failure modes I (Claude) have repeatedly fallen into on this project.
@@ -101,13 +109,76 @@ value.
 
 ## Data generation pipeline
 
-Nearly every task in this project touches datagen, so the pipeline guide
-is imported in full below. It carries the silent-corruption invariants
-(anchor-seed match, fixed batch shape, raw-vs-canonical anchors) and the
-orphan-worker remediation — apply them when editing `datagen/`, the
-`scripts/` stream tools, the RVT format, or the multinode generators.
+Nearly every task here touches datagen. The pipeline guide — canonical commands,
+the flag reference, the RVT wire format, configs, multinode operation — is the
+**`datagen` skill**. Invoke it before editing `datagen/`, the `scripts/` stream
+tools, the RVT format, or the multinode generators, and before running any
+generation or training pipeline. Do not improvise a datagen command from memory;
+copy the skill's canonical commands.
 
-@datagen/SKILL.md
+The invariants below stay here, always loaded, because violating one silently
+corrupts data or training with no error — you cannot opt into a warning you do
+not know you need.
+
+### The invariants
+
+1. **anchor-seed AND n-states must match gen↔train.** value_predict supervision
+   is computed against anchor states reconstructed from `--anchor-seed` +
+   `--n-anchor-states` (`scripts/train_encoder.py:71-76`,
+   `scripts/train_t2_encoder.py:118-121`, both funnelled into
+   `make_anchor_states` at `compressor/train.py:603`).
+   `datagen`'s `--anchor-seed`/`--n-states` must equal the trainer's
+   `--anchor-seed`/`--n-anchor-states`. Mismatch → wrong targets, no error.
+   `make_anchor_states` is `datagen/compare.py:319`. (Anchor seed only needs to
+   match gen↔train; it is *not* needed for cross-worker comparability — distances
+   are self-contained per row.)
+
+2. **Fixed batch shape, derived from the rule's length cap.** Every emitted batch
+   is padded to identical (B, max_tokens, max_n_instrs) so PyTorch's caching
+   allocator doesn't fragment. Stochastically-varying batch shape is a real OOM
+   trigger we hit (~step 500 of t1_cosine_full). The targets come from
+   `max_chunk_len = rule.max_len` (`datagen/batch.py:648-658` inside
+   `collect_into_batches`, `datagen/batch.py:615`).
+   This is why a `--rule` with no cap is REJECTED (see Rule grammar). Don't add a
+   code path that emits a differently-shaped batch mid-run.
+
+3. **EVERY rule ships the CANONICAL out_regs oracle (`OB == B`).**
+   `single` (T1) and multi-instruction (T2) rules both go through `build_twins`
+   and ship the full canonical `out_regs` register file (`OB == B`, carrying
+   `n_anchors == --n-states`). There is no per-rule payload split — both tiers
+   feed one canonical value-prediction target.
+   (`scripts/tests/test_pipeline.py::test_out_regs_mode_header`.)
+
+4. **value_predict is CANONICAL for both tiers.** `out_regs` is the
+   rename-invariant canonical baseline: `precompute_chunk` relocates the chunk's
+   i-th live syntactic input to canonical position i+1 (`_canonical_state`,
+   `datagen/compare.py:331`, positions `_CANON_POSITIONS = range(1, 32)` at
+   `datagen/compare.py:84`; applied at `datagen/compare.py:610`) and
+   executes there, so `out_regs[:, r]` depends only on operand structure. The vp
+   loss (`t2_value_predict_loss`, `compressor/train.py:1063`, used by BOTH T1 and
+   T2) therefore feeds the head
+   the canonical-position values `anchor[:, k+1]` for input slot k — never the raw
+   value at the slot's actual register. Feeding raw input values against the
+   canonical target is mathematically inconsistent — the head must see canonical
+   inputs to match the canonical output.
+   (Known accepted caveat, documented at `compressor/train.py:1111-1114`:
+   canonical positions are assigned over ALL live syntactic inputs while
+   `in_slot_regs` lists only the *behavioral* subset, so slot k ↔ position k+1
+   can drift for a degenerate op with a live-but-value-irrelevant input, e.g.
+   `ANDI _,_,0`. Rare; accepted, not a bug to "fix" casually.)
+
+5. **x0 is fixed under relabeling.** `random_perm`/`relabel` require `perm[0]==0`
+   (`datagen/generate.py:287,301`; the check is `datagen/generate.py:309-310`).
+   x0 is hardwired zero, not a register.
+
+6. **Memory-op chunks get no twins and no aux (V1 scope).** `build_twins`
+   (`datagen/batch.py:528`) drops chunks containing LOAD/STORE from twin+aux
+   construction because their `Precomputed` is
+   unavailable — `precompute_chunk` raises NotImplementedError on memory ops
+   (`datagen/compare.py:585,593`). The chunk's tokens are still shipped (so the
+   encoder sees them for magnitude/validity), but its aux row is zero-mask /
+   `AUX_CE_IGNORE` and its value-prediction row is masked off via
+   `out_regs_valid=False` (`_out_regs_from_precomputeds`, `datagen/batch.py:363`).
 
 ## Anchored memory
 
@@ -127,3 +198,5 @@ connection is what makes the lesson land:
 - `feedback_no_storytime_comments.md` — comments state WHY, briefly
 - `feedback_confirm_gpu_saturation.md` — never leave a long run at low
   util; fix the throughput bottleneck first, don't defer it
+- `feedback_no_vestigial_options.md` — delete the worse way once a
+  better one is settled; verify new-vs-old rather than keeping a flag

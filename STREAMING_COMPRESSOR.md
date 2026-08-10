@@ -288,7 +288,7 @@ the dependency structure is in the tokens, not hidden in semantics.
 
 The current pipeline is the single self-describing **RVT** binary stream (one
 format for every tier), driven by `datagen`
-— see datagen/SKILL.md. A streaming-segmentation layer would consume a raw token
+— see the `datagen` skill. A streaming-segmentation layer would consume a raw token
 stream rather than pre-chunked batches; that input path is part of the deferred
 design, not yet built.
 
@@ -302,7 +302,21 @@ value-prediction; equivalence is emergent. The piece this layer adds is **gate
 training**: discrete accept/emit/evict decisions break the gradient chain
 (Gumbel-sigmoid through Python control flow gives zero gradient), so gates are
 trained by Bernoulli sampling + REINFORCE with a per-iteration reward from how
-emittable / decodable the window is. Joint training of gates + encoder +
+emittable / decodable the window is.
+
+Joint training of gates + encoder + decoder was never reached. The staged
+version — gates supervised against a *frozen* encoder and decoder — plateaued at
+~70% emit-transition accuracy across eight mechanism variants
+(EXPERIMENT_LOG.md Phase 9), and the diagnosis was representational, not
+mechanical: the encoder of the day had been trained only on valid single
+instructions, so it structurally lacked the "is this window a complete
+instruction" feature the emit gate needed to read. That finding is what motivated
+the magnitude-as-validity retrain (Phase 10). `train_gates()` was removed from
+the codebase; the architecture description above is retained as the design to
+resume from, and gate training resumes only once an encoder carries validity in
+its magnitude on a corpus that actually contains invalid windows (TODO.md open
+task 3).
+
 ---
 
 ## Relationship to LZ77
@@ -343,7 +357,7 @@ match found." That criterion must be learned.
 
 4. **Training data.** Resolved: one self-describing RVT stream for
    every tier (`datagen`,
-   cat-concatenable). See datagen/SKILL.md.
+   cat-concatenable). See the `datagen` skill.
 
 5. **Gate training signal.** Resolved: per-iteration decoder
    evaluation provides reconstruction quality at every step.
@@ -372,16 +386,23 @@ match found." That criterion must be learned.
 
 ### Open
 
-7. **Feedback loop stability.** T2 feedback into T1 creates
+8. **Feedback loop stability.** T2 feedback into T1 creates
    recurrence. Untested. The structural argument (eviction ensures
    fresh bottom-up signal) may be sufficient.
 
-8. **Feedback mechanism.** Cross-attention from T2 state is the
+9. **Feedback mechanism.** Cross-attention from T2 state is the
    planned approach. Alternatives (additive conditioning, gating
    modulation) exist. Empirical when T2 is built.
 
-9. **Output space per level.** d_out=128 on S^127 was the original
-10. **Memory in state delta.** Per-register deltas work for the
+10. **Output space per level.** d_out=128 on S^127 was the original
+    choice, from before magnitude carried validity. The tiers that
+    exist now are sized to information content instead — T1 at
+    d_out=64, T2 at 256–512 — and live in the open ball, not on a
+    sphere. Whether each level should keep its own dimensionality,
+    and how to pick it, is still open (WHAT_IS_A_THOUGHT.md,
+    "Level-Specific Dimensionality").
+
+11. **Memory in state delta.** Per-register deltas work for the
     current instruction set. Memory effects (load/store) are
     captured via shared SparseMemory across instructions in a
     sequence, but not explicitly in the distance metric.

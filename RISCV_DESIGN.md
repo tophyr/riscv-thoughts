@@ -462,20 +462,39 @@ invariant essence):
 - `in_slot` / `out_slot`: read/write ORDER, as ListMLE (Plackett–Luce)
   over per-register scalar score heads (argsort to decode; duplicate-free).
 
-**Value-prediction (`value_predict`).** Per-anchor, per-output-slot MSE:
-from `(essence, canonical input-slot values)` predict each output register's
-**canonical** value (the `out_regs` baseline — inputs relocated to canonical
-first-read positions, so the target depends only on operand structure, not
-register names), on a fixed set of sampled anchor input states. Feeding the
-head canonical inputs to match the canonical target is load-bearing: the
-earlier bug fed *raw* register values against a *canonical* target, making
-the task mathematically inconsistent. vp is a **diagnostic probe** of whether
-the essence carries the operator's I/O function — it sits at an intrinsic
-floor (regressing wrapped/bitwise ops from log-compressed scalars is hard for
-any MLP) and its absolute value is not the objective. The operator-clustering
-that the flat encoder could never get from vp comes instead **for free from
-the equivariant core** (rename-invariant essence = the value-number) plus the
-canonical vp target collapsing the non-structural equivalences.
+**Value-prediction (`value_predict`).** Per-anchor, per-output-slot per-bit BCE
+(plus a bounded smooth-magnitude term): from `(essence, canonical input-slot
+values)` predict each output register's **canonical** value (the `out_regs`
+baseline — inputs relocated to canonical first-read positions, so the target
+depends only on operand structure, not register names), on a fixed set of
+sampled anchor input states. Feeding the head canonical inputs to match the
+canonical target is load-bearing: the earlier bug fed *raw* register values
+against a *canonical* target, making the task mathematically inconsistent.
+
+**vp is the primary objective, and it has no intrinsic floor.**
+Single-instruction vp is exactly `0.000`, and the head is fed raw value *bits*,
+not log-compressed scalars. vp measures whether the essence is a lossless
+behavioral description of its chunk, which is precisely what a future T3 will
+consume — so it is the metric the current phase is driving to zero (TODO.md;
+EXPERIMENT_LOG.md Phase 15).
+
+The head reads the **unit-normalized** essence (`F.normalize(vecs)`,
+`t2_value_predict_loss`): magnitude is reserved for validity, so if vp's gradient
+reached ‖essence‖ then "produces register output" would start proxying for
+"is valid" — only register-writers get vp shaping. The operator identity vp needs
+lives in the direction.
+
+The operator-clustering that the flat encoder could never get from vp comes
+**for free from the equivariant core** (rename-invariant essence = the
+value-number), and the canonical vp target is what collapses the
+*non-structural* equivalences. GVN collapse and vp are both load-bearing — a vp
+gain that craters the GVN rows is a regression, not a win.
+
+One scope caveat on the metric: vp is supervised and scored against a small
+fixed anchor set (8 states, seed 0, shared by generator, trainer, eval and every
+probe), so `vp = 0` certifies the I/O function *at those points*, not everywhere.
+Adequate for the current happy-path corpus; see TODO.md milestone 3 for when
+that has to get stronger.
 
 **Emergent equivalence.** With the behavioral targets alone, provably
 equivalent instructions/chunks collapse without any equivalence loss:

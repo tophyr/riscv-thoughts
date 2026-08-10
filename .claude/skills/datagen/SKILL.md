@@ -5,9 +5,8 @@ description: >
   `python -m datagen` generator tool) and the multinode wrappers
   (multinode_gen.sh, gen_corpus.sh, multinode_remote.sh). Load this BEFORE
   generating a corpus, editing datagen/ or any pipeline script, changing the RVT
-  format, debugging worker/throughput/OOM issues, or wiring gen→train. Carries
-  the invariants that are silent-corruption traps if violated (anchor-seed match,
-  fixed batch shape, the canonical value-prediction frame).
+  format, debugging worker/throughput/OOM issues, or wiring gen→train. Copy its
+  canonical commands rather than improvising one from memory.
 ---
 
 # RVT data-generation pipeline
@@ -116,65 +115,12 @@ argparse error, not a silent no-op. (`--pool-extra` replaced the old boolean
 `scripts/_common.py:69-74`, `pool_reads_order: true` → `pool_extra:
 'write_time'`.)
 
-## INVARIANTS — violating these silently corrupts data or training
+## INVARIANTS
 
-1. **anchor-seed AND n-states must match gen↔train.** value_predict supervision
-   is computed against anchor states reconstructed from `--anchor-seed` +
-   `--n-anchor-states` (`scripts/train_encoder.py:71-76`,
-   `scripts/train_t2_encoder.py:118-121`, both funnelled into
-   `make_anchor_states` at `compressor/train.py:603`).
-   `datagen`'s `--anchor-seed`/`--n-states` must equal the trainer's
-   `--anchor-seed`/`--n-anchor-states`. Mismatch → wrong targets, no error.
-   `make_anchor_states` is `datagen/compare.py:319`. (Anchor seed only needs to
-   match gen↔train; it is *not* needed for cross-worker comparability — distances
-   are self-contained per row.)
-
-2. **Fixed batch shape, derived from the rule's length cap.** Every emitted batch
-   is padded to identical (B, max_tokens, max_n_instrs) so PyTorch's caching
-   allocator doesn't fragment. Stochastically-varying batch shape is a real OOM
-   trigger we hit (~step 500 of t1_cosine_full). The targets come from
-   `max_chunk_len = rule.max_len` (`datagen/batch.py:648-658` inside
-   `collect_into_batches`, `datagen/batch.py:615`).
-   This is why a `--rule` with no cap is REJECTED (see Rule grammar). Don't add a
-   code path that emits a differently-shaped batch mid-run.
-
-3. **EVERY rule ships the CANONICAL out_regs oracle (`OB == B`).**
-   `single` (T1) and multi-instruction (T2) rules both go through `build_twins`
-   and ship the full canonical `out_regs` register file (`OB == B`, carrying
-   `n_anchors == --n-states`). There is no per-rule payload split — both tiers
-   feed one canonical value-prediction target.
-   (`scripts/tests/test_pipeline.py::test_out_regs_mode_header`.)
-
-4. **value_predict is CANONICAL for both tiers.** `out_regs` is the
-   rename-invariant canonical baseline: `precompute_chunk` relocates the chunk's
-   i-th live syntactic input to canonical position i+1 (`_canonical_state`,
-   `datagen/compare.py:331`, positions `_CANON_POSITIONS = range(1, 32)` at
-   `datagen/compare.py:84`; applied at `datagen/compare.py:610`) and
-   executes there, so `out_regs[:, r]` depends only on operand structure. The vp
-   loss (`t2_value_predict_loss`, `compressor/train.py:1063`, used by BOTH T1 and
-   T2) therefore feeds the head
-   the canonical-position values `anchor[:, k+1]` for input slot k — never the raw
-   value at the slot's actual register. Feeding raw input values against the
-   canonical target is mathematically inconsistent — the head must see canonical
-   inputs to match the canonical output.
-   (Known accepted caveat, documented at `compressor/train.py:1111-1114`:
-   canonical positions are assigned over ALL live syntactic inputs while
-   `in_slot_regs` lists only the *behavioral* subset, so slot k ↔ position k+1
-   can drift for a degenerate op with a live-but-value-irrelevant input, e.g.
-   `ANDI _,_,0`. Rare; accepted, not a bug to "fix" casually.)
-
-5. **x0 is fixed under relabeling.** `random_perm`/`relabel` require `perm[0]==0`
-   (`datagen/generate.py:287,301`; the check is `datagen/generate.py:309-310`).
-   x0 is hardwired zero, not a register.
-
-6. **Memory-op chunks get no twins and no aux (V1 scope).** `build_twins`
-   (`datagen/batch.py:528`) drops chunks containing LOAD/STORE from twin+aux
-   construction because their `Precomputed` is
-   unavailable — `precompute_chunk` raises NotImplementedError on memory ops
-   (`datagen/compare.py:585,593`). The chunk's tokens are still shipped (so the
-   encoder sees them for magnitude/validity), but its aux row is zero-mask /
-   `AUX_CE_IGNORE` and its value-prediction row is masked off via
-   `out_regs_valid=False` (`_out_regs_from_precomputeds`, `datagen/batch.py:363`).
+The six invariants that silently corrupt data or training when violated live in
+**CLAUDE.md** ("Data generation pipeline"), which is always loaded — you cannot
+opt into a warning you do not know you need. They are kept in one place, there;
+do not restate them here.
 
 ## datagen reference
 
@@ -264,7 +210,7 @@ cmdline).
 - The "no version field" statement is current and load-bearing in the code, not
   aspirational: the only per-batch schema check is magic + dtype-signature
   (`datagen/batch.py:81-88,140-145`). EXPERIMENT_LOG's "format v7→v8"
-  (`EXPERIMENT_LOG.md:2765`) is history from when the format was still
+  (`EXPERIMENT_LOG/phase-14-rename-equivariant-t1-t2.md`) is history from when the format was still
   versioned — do not reintroduce a version field on its authority.
 - Per-instruction segmentation is NOT preserved on the wire — relabeling/aux
   happen at generation time while the `list[Instruction]` is still in hand.
@@ -312,12 +258,11 @@ Two different scripts — do not confuse them:
   cascade (local→nc→remote) reaps every worker. `REMOTE=chrissarbora@odin`.
   Worker split is `REMOTE_GEN` (default 96) / `LOCAL_GEN` (default **0**):
   local datagen contends with a local GPU trainer's per-step H2D prep and
-  starves the GPU — **measured 16.6 ms/step with local gen vs 9 ms with ALL
-  generation on odin**, the latter matching the documented compiled-step figure
-  (README "T2 at 8–9 ms/step"). Judge this by ms/step only; the utilisation
-  numbers that used to be quoted alongside it (~54% vs ~90%) are not a reliable
-  signal on this box — util swings ~2.5× at constant step rate. So the default
-  offloads EVERY worker to
+  starves the GPU — **measured ~54% util / 16.6 ms/step with local gen, vs ~90%
+  util / 9 ms with ALL generation on odin**, the latter matching the documented
+  compiled-step figure (README "T2 at 8–9 ms/step"). Judge saturation by GPU
+  utilisation, with ms/step against the same config's known-good figure as a
+  floor check. So the default offloads EVERY worker to
   odin; bump `LOCAL_GEN>0` only for a pure on-disk corpus with no local trainer.
   Other defaults: `RULE=single`, `CONFIG=configs/instr_default.json`,
   `INJECT_INVALID=0` (clean corpus regardless of what the config says) — set
@@ -382,15 +327,15 @@ Remote operational facts:
 ## Where things live / what's tracked
 
 - `corpora/` — on-disk `.rvt` corpora. Present but empty by default; **NOT in
-  .gitignore** (which lists `.env/ .claude/ .venv/ **/__pycache__/
-  .pytest_cache/ runs/`), yet not committed — `.rvt` files are large binary,
-  keep them out of commits.
+  .gitignore**, yet not committed — `.rvt` files are large binary, keep them out
+  of commits.
 - `runs/<name>/` — checkpoints + hparams.json + losses.json (gitignored).
 - Pipeline regression tests: `scripts/tests/test_pipeline.py` (covers rule
   parsing, format detect/validate, mux modes, the pdeathsig orphan guard, and
   end-to-end 1-step train smokes). Run `python -m pytest scripts/tests`.
-- This guide lives at `datagen/SKILL.md` — a tracked path, committed alongside
-  the code it documents. Read it directly when touching the pipeline.
+- This guide is the `datagen` skill (`.claude/skills/datagen/SKILL.md`), tracked
+  by the `!.claude/skills/` exception in `.gitignore`. It loads on demand —
+  invoke it before touching the pipeline rather than working from memory.
 
 ## Things this skill does NOT cover (read the code, don't guess)
 

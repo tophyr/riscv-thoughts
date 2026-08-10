@@ -4,6 +4,27 @@ An experimental ML research project investigating whether learned
 compression can produce vector spaces with smooth, factored, interpolable
 geometry — and whether search-based decoding can invert the compression.
 
+## Reading order
+
+1. This file — the map and the current status.
+2. [WHAT_IS_A_THOUGHT.md](WHAT_IS_A_THOUGHT.md) — the theory the whole project
+   is an attempt to test.
+3. [RISCV_DESIGN.md](RISCV_DESIGN.md) — the testbed and the architecture, with
+   the durable rationale for why it is shaped this way.
+4. [EXPERIMENT_LOG.md](EXPERIMENT_LOG.md) — an index over one file per phase in
+   `EXPERIMENT_LOG/`. Read the index, then **Phases 14 and 15 in full**; earlier
+   phases are superseded design kept for their dead ends — open one when you are
+   about to revisit the question it settled.
+5. [TODO.md](TODO.md) — the live mission, the open tasks, and the dead ends.
+
+[DECODER_STRATEGY.md](DECODER_STRATEGY.md) and
+[STREAMING_COMPRESSOR.md](STREAMING_COMPRESSOR.md) describe deferred, unbuilt
+layers — read their status banners and skip the rest unless you are working on
+them. [TRANSFERABLE_LESSONS.md](TRANSFERABLE_LESSONS.md) is background from the
+predecessor project. The data-generation pipeline is documented in the `datagen`
+skill (`.claude/skills/datagen/SKILL.md`); its silent-corruption invariants live
+in `CLAUDE.md`. Read both before touching data generation.
+
 ## The Idea
 
 LLMs are excellent summarizers — to a point. At 2000 words they
@@ -110,20 +131,23 @@ being trained for. Remaining error at len=2 is ~65% operand binding when two
 instructions share a source register, ~35% immediate encoding. See
 EXPERIMENT_LOG Phase 15.
 
-(A note for readers of older revisions: `vp` was previously described here as
-sitting at an "intrinsic floor" because wrapped/bitwise ops are hard to
-regress. That is **wrong** — single-instruction vp is exactly `0.000`, and the
-head is fed raw value bits, not log-compressed scalars. vp is a real objective,
-not a floor-limited probe.)
+`vp` is a real objective with no intrinsic floor: single-instruction vp is
+exactly `0.000`, and the head is fed raw value bits, not log-compressed scalars.
+Driving it to zero is the current mission (TODO.md), scored discretely as a 100%
+exact 32-bit match rate rather than as a loss value. Decode-back is a non-goal of
+this phase.
 
 **Infrastructure.** The frozen-T1 encode + predicted-binding routing + T2
 state machine + losses fold into ONE compiled CUDA-graph step at a
 fixed-padded instruction count (verified bit-identical to the ragged path):
-**T2 at 8–9 ms/step**. Streaming pipeline:
+**T2 at 8–9 ms/step @ ~90%+ util**. Streaming pipeline:
 `datagen (all cores, --count) | train_t2_encoder` — CPU generates/analyzes
-chunks, the trainer only does forward/backward. Judge throughput by
-**ms/step**, not by the GPU-utilisation graph: on this box utilisation swings
-2.5× while step rate holds constant, so it is a poor signal. There is one RVT
+chunks, the trainer only does forward/backward. Judge saturation by **GPU
+utilisation**, using ms/step against the same config's known-good figure as a
+floor check — ms/step is architecture-dependent and says nothing about how long
+the GPU spent waiting. (Ignore transient/periodic dips in the util reading;
+those are sampling artifacts. Sustained low util is the thing to fix, and to fix
+*before* letting a long run ride.) There is one RVT
 wire format and no version field — each batch is self-describing (magic +
 dtype signature + 5-field header), so a schema change is immediate and global.
 
@@ -177,7 +201,7 @@ python -m datagen --rule single --twins 2 --batch-size 128 \
 # NOTE: on the GPU box, local datagen workers contend with the trainer's
 # per-step H2D prep and starve the GPU (~54% util). For a real run, offload
 # generation to odin with multinode_gen.sh (same flags via env vars) — it
-# restores the ~90% / 9ms-step ideal. See datagen/SKILL.md.
+# restores the ~90% / 9ms-step ideal. See the `datagen` skill.
 #   RULE="branch+cap=4" CONFIG=configs/instr_t2.json ./multinode_gen.sh 2000000 \
 #     | python scripts/train_t2_encoder.py --t1-model runs/t1_run/encoder.pt ...
 python -m datagen --rule "branch+cap=4" --twins 3 --batch-size 128 \

@@ -357,9 +357,8 @@ class TokenEmbedder(nn.Module):
 # Head hidden capacities. Never tuned, so they live here as named constants
 # rather than constructor params. vp_head is large and fixed (does not scale
 # with d_out): the capacity is "don't be the bottleneck" rather than a fitted
-# size. (An earlier comment here called vp a diagnostic probe sitting at an
-# intrinsic floor. That is false — single-instruction vp is exactly 0.000 and
-# the head is fed raw value bits, so vp is a real, movable objective.)
+# size — vp is the training objective, not a diagnostic, so the head must not
+# be what limits it.
 def _build_vp_head(vp_in, vp_out, depth):
     """vp value-prediction head with `depth` hidden layers of _VP_HIDDEN.
     depth=0 -> a single linear readout. depth=4 reproduces the historical
