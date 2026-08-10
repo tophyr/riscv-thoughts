@@ -1,16 +1,10 @@
 # Streaming Compressor Architecture
 
-> **Status.** The T1/T2 *encoder* is now the rename-equivariant register-state
-> machine (RISCV_DESIGN.md), which ingests pre-segmented instructions/chunks;
-> validity and equivalence are handled by the behavioral loss set +
-> magnitude-as-validity, not the token-transducer encoder sketched here. This
-> document is retained for the **deferred streaming-segmentation layer**:
-> learned shift-reduce gates that *discover* thought boundaries instead of being
-> handed them — the open "validity / parse" problem in RISCV_DESIGN.md. The
-> durable content below is the gate mechanism, cross-level feedback, and
-> boundary-discovery design; the specific encoder internals, the per-loss list,
-> and the data formats are superseded by the current architecture. Streaming
-> experimental history is in EXPERIMENT_LOG.md Phases 7–9.
+> **Status: unproven theory.** Nothing in this document has been built or
+> validated. No code implements it. The T1/T2 encoder that exists is the
+> rename-equivariant register-state machine in RISCV_DESIGN.md, which is
+> handed pre-segmented chunks; this document describes a deferred layer that
+> would discover those boundaries instead.
 
 ## Motivation
 
@@ -309,9 +303,6 @@ training**: discrete accept/emit/evict decisions break the gradient chain
 (Gumbel-sigmoid through Python control flow gives zero gradient), so gates are
 trained by Bernoulli sampling + REINFORCE with a per-iteration reward from how
 emittable / decodable the window is. Joint training of gates + encoder +
-decoder from scratch fails on circular dependencies; components are trained
-separately and assembled (EXPERIMENT_LOG.md Phases 7–9).
-
 ---
 
 ## Relationship to LZ77
@@ -390,11 +381,6 @@ match found." That criterion must be learned.
    modulation) exist. Empirical when T2 is built.
 
 9. **Output space per level.** d_out=128 on S^127 was the original
-   target; Exp 25 PCA showed ~94 effective dims of signal. Current
-   encoder uses d_out=64 in the unit ball; direction carries
-   semantics, magnitude carries the 1-D validity scalar. Whether
-   each level needs its own dimensionality is empirical.
-
 10. **Memory in state delta.** Per-register deltas work for the
     current instruction set. Memory effects (load/store) are
     captured via shared SparseMemory across instructions in a

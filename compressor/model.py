@@ -39,6 +39,25 @@ from datagen import N_REGS, MAX_INPUT_SLOTS, MAX_OUTPUT_SLOTS
 X0_SLOT = 0
 
 
+# What the essence pool reads per slot, beyond the `value` channels. The pool is
+# a symmetric sum over slots, so it is blind to anything not fed to it — and
+# every ORDER channel withheld so far has turned out to cost real accuracy:
+#   'write_time' — which step wrote the slot. Without it the essence sees an
+#       unordered bag and cannot tell output 1 from output 2 (measured: pooled
+#       bit accuracy 80.0 -> 98.6 at len=2).
+#   'order'      — write_time + read_time. read_time IS the canonical input
+#       position (operand r at step k is stamped 2(k+1)+r, so sorting recovers
+#       first-read order). Without it the essence cannot place an operand in the
+#       canonical frame when two instructions share a source register — measured
+#       82.96% vs 99.999% on overlapping- vs disjoint-source pairs.
+#   'event'      — the whole event block, i.e. pool_src == T. RISCV_DESIGN's
+#       position: the essence/binding split is emergent, and the vector must NOT
+#       be hand-partitioned into "these dims = operator, those = binding".
+# 'none' reproduces the pre-ordering-fix model bit-for-bit, and is still the
+# constructor/CLI default; 'write_time' is the adopted setting for new runs.
+POOL_EXTRA = ('none', 'write_time', 'order', 'event')
+
+
 def instruction_wiring(instr):
     """Map an Instruction to its GP-register wiring for the state machine:
     (in0, in1, out) slot indices, x0 (=0) standing for an absent operand.
@@ -95,15 +114,36 @@ class RegisterStateMachine(nn.Module):
     loop) so the step captures into the compiled CUDA-graph train step.
     """
 
-    def __init__(self, d_value, d_event, d_content, n_regs=32):
+    def __init__(self, d_value, d_event, d_content, n_regs=32, op_cell_depth=1,
+                 n_pool_heads=1, pool_mode='pma', pool_extra='none',
+                 read_time_mode='stamp'):
         super().__init__()
         self.d_value = d_value
         self.d_event = d_event
         self.n_regs = n_regs
+        self.n_pool_heads = n_pool_heads
+        self.pool_mode = pool_mode
+        assert pool_extra in POOL_EXTRA, f'bad pool_extra: {pool_extra}'
+        self.pool_extra = pool_extra
+        assert read_time_mode in ('stamp', 'rank'), read_time_mode
+        self.read_time_mode = read_time_mode
         self.tag_proj = nn.Linear(1, d_value)
         self.op_cell = nn.Sequential(
             nn.Linear(d_content + 2 * d_value, 4 * d_value), nn.ReLU(),
             nn.Linear(4 * d_value, d_value))
+        # Extra RESIDUAL FFN blocks on op_cell's output (op_cell_depth > 1). The
+        # op-cell is reused RECURRENTLY once per instruction, so a naive deep
+        # stack becomes a depth×K gradient path that won't train — the skip
+        # connection (res = res + blk(res)) is the highway that keeps it
+        # trainable. depth=1 -> empty list -> op_cell is bit-identical to the
+        # shallow baseline and its state_dict is UNCHANGED, so depth-1
+        # checkpoints (incl. the frozen T1) still load. Static ModuleList loop
+        # -> unrolls at trace time, no graph break under torch.compile.
+        self.op_cell_blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_value, 4 * d_value), nn.ReLU(),
+                nn.Linear(4 * d_value, d_value))
+            for _ in range(op_cell_depth - 1)])
         # content-dependent read pulse: a behaviorally-irrelevant read
         # (AND rs1,x0) can be marked differently from a relevant one, so the
         # magnitude-filtered live_in target is recoverable.
@@ -115,11 +155,22 @@ class RegisterStateMachine(nn.Module):
         # preserved) is what lets in_score recover which operand is slot 0.
         self.read_role = nn.Parameter(torch.randn(2, d_event) * 0.1)
         self.write_pulse = nn.Parameter(torch.randn(d_event) * 0.1)
-        # essence pool: single learned query, no positional -> the softmax
-        # over the register axis is exactly permutation-invariant.
-        self.pool_q = nn.Parameter(torch.randn(d_value) * 0.02)
-        self.pool_k = nn.Linear(d_value, d_value)
-        self.pool_v = nn.Linear(d_value, d_value)
+        # essence pool: Pooling-by-Multihead-Attention (Set Transformer). k=
+        # n_pool_heads learned seed QUERIES, each doing a permutation-invariant
+        # attention pool over the register slots (softmax over slots, no
+        # positional -> exactly rename-invariant). A single query (k=1) SUMS all
+        # slots -> superimposes multiple output values irrecoverably; k>1 lets
+        # different heads content-address different slots, keeping outputs
+        # separable. Heads concatenate to an essence of the SAME width d_value
+        # (each head d_value/k), so no downstream interface changes. pool_q is
+        # stored FLAT (k*d_key,), so k=1 -> shape (d_value,) = the old
+        # single-query param exactly -> existing checkpoints load unchanged.
+        assert d_value % n_pool_heads == 0, 'd_value must be divisible by n_pool_heads'
+        d_pool_in = d_value + {'none': 0, 'write_time': 1,
+                               'order': 2, 'event': d_event}[pool_extra]
+        self.pool_q = nn.Parameter(torch.randn(n_pool_heads * d_value) * 0.02)
+        self.pool_k = nn.Linear(d_pool_in, d_value)
+        self.pool_v = nn.Linear(d_pool_in, d_value // n_pool_heads)
 
     def forward(self, content, in0, in1, out, active, tags):
         """content (B,K,d_content); in0/in1/out (B,K) long; active (B,K)
@@ -139,6 +190,7 @@ class RegisterStateMachine(nn.Module):
         # Register-INDEPENDENT step values placed by the (permuted) wiring, so a
         # rename permutes them identically — equivariance preserved.
         read_time = torch.zeros(content.shape[0], self.n_regs, device=device)
+        n_read = torch.zeros(content.shape[0], 1, device=device)
         write_time = torch.zeros(content.shape[0], self.n_regs, device=device)
 
         for k in range(K):
@@ -150,6 +202,8 @@ class RegisterStateMachine(nn.Module):
             r1 = torch.bmm(oh1.unsqueeze(1), value).squeeze(1)
             c = content[:, k]
             res = self.op_cell(torch.cat([c, r0, r1], dim=-1))   # (B,d_value)
+            for blk in self.op_cell_blocks:                      # residual depth
+                res = res + blk(res)
             # write value at dest (x0 write = nop), active rows only.
             oh_out = F.one_hot(out[:, k], self.n_regs).to(value.dtype) \
                 * not_x0_row
@@ -169,10 +223,32 @@ class RegisterStateMachine(nn.Module):
             # within a step, so same-instruction inputs aren't tied — the
             # within-instruction order read_role also marks); last write
             # overwrites (SSA write order).
+            #
+            # 'stamp' (legacy) writes 2(k+1)+role. That equals the canonical
+            # input position MINUS ONE only while every read is fresh: a repeat
+            # read is (correctly) not re-stamped, which leaves a HOLE in the
+            # sequence, so every later operand's stamp overshoots its true rank.
+            # The supervision's canonical positions are RANKS (first-read
+            # order), so with any shared source register the two coordinate
+            # systems disagree — measured as operand-position recovery at ~5%
+            # (confidently off by one) on overlapping-source pairs vs ~99.9% on
+            # disjoint ones. 'rank' stamps the running count of DISTINCT
+            # registers read, so read_time IS the canonical position for every
+            # consumer, with no conversion. The counter is a per-chunk scalar
+            # with no register index and is placed through the same one-hot, so
+            # equivariance is unaffected.
             fr0 = (oh0e * a) * (read_time == 0).to(value.dtype)
-            read_time = read_time + fr0 * (2.0 * (k + 1))
+            if self.read_time_mode == 'rank':
+                n_read = n_read + fr0.sum(-1, keepdim=True)
+                read_time = read_time + fr0 * n_read
+            else:
+                read_time = read_time + fr0 * (2.0 * (k + 1))
             fr1 = (oh1e * a) * (read_time == 0).to(value.dtype)
-            read_time = read_time + fr1 * (2.0 * (k + 1) + 1.0)
+            if self.read_time_mode == 'rank':
+                n_read = n_read + fr1.sum(-1, keepdim=True)
+                read_time = read_time + fr1 * n_read
+            else:
+                read_time = read_time + fr1 * (2.0 * (k + 1) + 1.0)
             wr = oh_out * a
             write_time = write_time * (1.0 - wr) + wr * step_sig
         # fold the order timestamps into event channels 0 (read) and 1 (write),
@@ -181,9 +257,42 @@ class RegisterStateMachine(nn.Module):
         event = event + F.pad(order, (0, self.d_event - 2))
         T = torch.cat([value, event], dim=-1)
 
-        kk = self.pool_k(value)
-        att = torch.softmax((kk * self.pool_q.view(1, 1, -1)).sum(-1), dim=1)
-        essence = (att.unsqueeze(-1) * self.pool_v(value)).sum(1)
+        # Essence pool. k seed queries; heads concatenate to width d_value.
+        # pool_src carries the per-slot write ORDER when enabled (see __init__):
+        # register-indexed, so it permutes with a rename and the pool stays
+        # exactly invariant.
+        # Everything appended here is register-indexed, so a rename permutes it
+        # with the slots and the pool stays exactly invariant. 'event' feeds the
+        # whole slot state (pool_src == T); note its channels 0,1 carry the
+        # timestamps already mixed with the read/write pulses, whereas 'order'
+        # feeds the clean ramps.
+        if self.pool_extra == 'write_time':
+            pool_src = torch.cat([value, write_time.unsqueeze(-1)], dim=-1)
+        elif self.pool_extra == 'order':
+            pool_src = torch.cat([value, order], dim=-1)
+        elif self.pool_extra == 'event':
+            pool_src = T
+        else:
+            pool_src = value
+        q = self.pool_q.view(self.n_pool_heads, -1)          # (k, d_value)
+        kk = self.pool_k(pool_src)                           # (B, n_regs, d_value)
+        logits = kk @ q.t()                                  # (B, n_regs, k)
+        if self.pool_mode == 'compete':
+            # Slot-Attention competition: each register slot softmax-ASSIGNS
+            # across the k heads (dim=2), so slots divide among heads (no more
+            # than one head can 'own' a slot) -> heads are forced to COVER
+            # different slots instead of piling on the salient few. Then each
+            # head takes a weighted mean of ITS slots (per-head normalize over
+            # slots). The final per-head sum over slots is symmetric -> still
+            # rename-invariant. (k=1 would be a uniform mean, so this mode is
+            # for k>1 only; k=1 stays 'pma'.)
+            att = torch.softmax(logits, dim=2)
+            att = att / (att.sum(dim=1, keepdim=True) + 1e-8)
+        else:  # 'pma': each head independently softmaxes over slots (no competition)
+            att = torch.softmax(logits, dim=1)               # (B, n_regs, k) over slots
+        vv = self.pool_v(pool_src)                           # (B, n_regs, d_value//k)
+        heads = att.transpose(1, 2) @ vv                     # (B, k, d_value//k)
+        essence = heads.reshape(value.shape[0], -1)          # (B, d_value)
         return T, essence
 
     def apply_slot_head(self, head, T):
@@ -208,6 +317,11 @@ class TokenEmbedder(nn.Module):
         self.max_window = max_window
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.win_pos_emb = nn.Embedding(max_window, d_model)
+        # A learnable aggregator (CLS) token, read out in place of a pool: a
+        # mean would average the place-valued immediate digits uniformly and
+        # destroy the additive magnitude, so the transformer's layers learn the
+        # combination through this token instead.
+        self.cls = nn.Parameter(torch.randn(d_model) * 0.02)
         layer = nn.TransformerEncoderLayer(
             d_model, n_heads, dim_feedforward=d_model * 4,
             dropout=0.0, batch_first=True)
@@ -218,33 +332,56 @@ class TokenEmbedder(nn.Module):
             layer, n_layers, enable_nested_tensor=False)
 
     def forward(self, tokens, pad):
-        """(N, L) tokens + pad -> (N, d_model) content."""
-        L = tokens.shape[1]
+        """(N, L) tokens + pad -> (N, d_model) content.
+
+        Prepend the never-masked aggregator token; read out its final state. It
+        attends only to opcode+immediate content (registers masked), so content
+        stays rename-invariant. A fully-masked row (invalid window) leaves the
+        token attending to itself only — finite, no NaN guard needed. The
+        content tokens keep their win_pos_emb place (added before the prepend),
+        so the immediate's place value is preserved."""
+        N, L = tokens.shape
         device = tokens.device
         x = self.tok_emb(tokens) + self.win_pos_emb(
             torch.arange(L, device=device))
         is_reg = (tokens >= REG_TOKEN_LO) & (tokens < REG_TOKEN_HI)
         content_pad = pad | is_reg
-        # Guard a fully-masked row (an invalid window with no content token,
-        # e.g. all-register / no-opcode) so the attention softmax doesn't NaN.
-        # Only position 0 of such a row is unmasked, and the pool still excludes
-        # register tokens — valid instructions (opcode at 0) are unaffected and
-        # content stays rename-invariant. Col-0 slice assign is compile-safe.
-        attn_pad = content_pad.clone()
-        attn_pad[:, 0] = content_pad[:, 0] & ~content_pad.all(dim=1)
+        cls = self.cls.view(1, 1, -1).expand(N, 1, -1)
+        x = torch.cat([cls, x], dim=1)                          # (N, 1+L, d)
+        cls_pad = torch.zeros(N, 1, dtype=content_pad.dtype, device=device)
+        attn_pad = torch.cat([cls_pad, content_pad], dim=1)
         x = self.content_encoder(x, src_key_padding_mask=attn_pad)
-        keep = (~content_pad).to(x.dtype).unsqueeze(-1)         # (N,L,1)
-        return (x * keep).sum(1) / keep.sum(1).clamp(min=1.0)
+        return x[:, 0]
 
 
 # Head hidden capacities. Never tuned, so they live here as named constants
-# rather than constructor params. Note vp_head is large and fixed (doesn't
-# scale with d_out) — value_predict is a diagnostic probe (GVN collapse, not
-# vp, is the headline metric), and its error is at an intrinsic floor, so the
-# capacity is "don't be the bottleneck" rather than a fitted size.
+# rather than constructor params. vp_head is large and fixed (does not scale
+# with d_out): the capacity is "don't be the bottleneck" rather than a fitted
+# size. (An earlier comment here called vp a diagnostic probe sitting at an
+# intrinsic floor. That is false — single-instruction vp is exactly 0.000 and
+# the head is fed raw value bits, so vp is a real, movable objective.)
+def _build_vp_head(vp_in, vp_out, depth):
+    """vp value-prediction head with `depth` hidden layers of _VP_HIDDEN.
+    depth=0 -> a single linear readout. depth=4 reproduces the historical
+    head exactly (same nn.Sequential layout -> same state_dict keys, so
+    existing checkpoints load unchanged)."""
+    if depth <= 0:
+        return nn.Linear(vp_in, vp_out)
+    layers = [nn.Linear(vp_in, _VP_HIDDEN), nn.ReLU()]
+    for _ in range(depth - 1):
+        layers += [nn.Linear(_VP_HIDDEN, _VP_HIDDEN), nn.ReLU()]
+    layers.append(nn.Linear(_VP_HIDDEN, vp_out))
+    return nn.Sequential(*layers)
+
+
 _IN_SCORE_HIDDEN = 256
 _VP_HIDDEN = 1024
-_VP_DEPTH = 3          # number of hidden _VP_HIDDEN -> _VP_HIDDEN blocks
+_VP_HEAD_DEPTH = 4     # vp_head hidden layers (default). 0 = linear readout —
+                       # weakening the head forces the essence to expose value
+                       # structure geometrically instead of the head untangling
+                       # it (the essence cone-collapse / dim-underuse fix).
+_VP_VALUE_BITS = 32    # two's-complement bit width of the vp value target (RV32)
+_IMM_N_FREQ = 12       # rotary immediate: power-of-2 periods 2..4096 (2*this = target dim)
 
 
 class Compressor(nn.Module):
@@ -263,7 +400,9 @@ class Compressor(nn.Module):
     d_content, d_out, d_event are required — each tier specifies them.
     """
 
-    def __init__(self, *, d_content, d_out, d_event):
+    def __init__(self, *, d_content, d_out, d_event, op_cell_depth=1,
+                 vp_head_depth=_VP_HEAD_DEPTH, n_pool_heads=1, pool_mode='pma',
+                 pool_extra='none', read_time_mode='stamp'):
         super().__init__()
         self.d_content = d_content
         self.d_out = d_out
@@ -273,7 +412,10 @@ class Compressor(nn.Module):
         self.max_output_slots = MAX_OUTPUT_SLOTS
 
         self.core = RegisterStateMachine(
-            d_value=d_out, d_event=d_event, d_content=d_content, n_regs=N_REGS)
+            d_value=d_out, d_event=d_event, d_content=d_content, n_regs=N_REGS,
+            op_cell_depth=op_cell_depth, n_pool_heads=n_pool_heads,
+            pool_mode=pool_mode, pool_extra=pool_extra,
+            read_time_mode=read_time_mode)
 
         # Binding heads read the per-slot state T (d_out+d_event), one score per
         # register slot (equivariant); pc_writes + value_predict read the
@@ -287,13 +429,23 @@ class Compressor(nn.Module):
             nn.Linear(_IN_SCORE_HIDDEN, 1))
         self.out_score_head = nn.Linear(d_slot, 1)
         self.pc_writes_head = nn.Linear(d_out, 1)
-        # value-prediction (canonical): predict per-anchor per-out-slot
-        # output values from (essence, canonical input-slot values).
-        vp_layers = [nn.Linear(d_out + MAX_INPUT_SLOTS, _VP_HIDDEN), nn.ReLU()]
-        for _ in range(_VP_DEPTH):
-            vp_layers += [nn.Linear(_VP_HIDDEN, _VP_HIDDEN), nn.ReLU()]
-        vp_layers.append(nn.Linear(_VP_HIDDEN, MAX_OUTPUT_SLOTS))
-        self.vp_head = nn.Sequential(*vp_layers)
+        # value-prediction (canonical): predict per-anchor per-out-slot output
+        # values from (essence, canonical input-slot values). Per slot: 32
+        # two's-complement bit-logits + 1 smooth-magnitude scalar (inputs fed
+        # likewise). Per-bit gives uniform resolution — the low bit (the +1
+        # immediate distinguisher) is equally weighted and carry-free — so the
+        # essence is pressured to retain immediates, which the older single
+        # loglog-scalar target crushed away.
+        vp_in = d_out + MAX_INPUT_SLOTS * (_VP_VALUE_BITS + 1)
+        vp_out = MAX_OUTPUT_SLOTS * (_VP_VALUE_BITS + 1)
+        self.vp_head = _build_vp_head(vp_in, vp_out, vp_head_depth)
+        # immediate head (T1 only): a LINEAR readout of a rotary/Fourier encoding
+        # of the instruction's immediate. Linear so the rotary structure is
+        # forced to live in the essence (imm+δ -> a consistent rotation of the
+        # essence's immediate subspace, opcode-independent), not hidden in a
+        # nonlinear head. Present but unused at T2 (chunk essence has no single
+        # immediate). See compressor.train._immediate_rotary.
+        self.imm_head = nn.Linear(d_out, 2 * _IMM_N_FREQ)
 
     def encode_state(self, content_seq, in0, in1, out, active, tags):
         """content_seq (B, K, d_content), wiring (B, K) long, active (B, K)
@@ -307,7 +459,7 @@ class Compressor(nn.Module):
 
 # Compressor head/loss interface that T1Compressor delegates to its compressor.
 _COMPRESSOR_HEADS = ('live_in_head', 'live_out_head', 'in_score_head',
-                     'out_score_head', 'pc_writes_head', 'vp_head')
+                     'out_score_head', 'pc_writes_head', 'vp_head', 'imm_head')
 
 
 class T1Compressor(nn.Module):
@@ -321,13 +473,18 @@ class T1Compressor(nn.Module):
     """
 
     def __init__(self, *, vocab_size, d_model, n_heads, n_layers, max_window,
-                 d_out, d_event):
+                 d_out, d_event, op_cell_depth=1, vp_head_depth=_VP_HEAD_DEPTH,
+                 n_pool_heads=1, pool_mode='pma', pool_extra='none', read_time_mode='stamp'):
         super().__init__()
         self.embedder = TokenEmbedder(
             vocab_size=vocab_size, d_model=d_model, n_heads=n_heads,
             n_layers=n_layers, max_window=max_window)
         self.compressor = Compressor(
-            d_content=d_model, d_out=d_out, d_event=d_event)
+            d_content=d_model, d_out=d_out, d_event=d_event,
+            op_cell_depth=op_cell_depth, vp_head_depth=vp_head_depth,
+            n_pool_heads=n_pool_heads, pool_mode=pool_mode,
+            pool_extra=pool_extra,
+            read_time_mode=read_time_mode)
         # dim interface (plain ints — delegated by value, not submodules)
         self.n_regs = self.compressor.n_regs
         self.d_out = self.compressor.d_out
@@ -356,9 +513,15 @@ class T1Compressor(nn.Module):
         return self.encode_state(tokens, pad, in0, in1, out, tags)[1]
 
 
-def T2Compressor(*, d_t1, d_out, d_event):
+def T2Compressor(*, d_t1, d_out, d_event, op_cell_depth=1,
+                 vp_head_depth=_VP_HEAD_DEPTH, n_pool_heads=1, pool_mode='pma',
+                 pool_extra='none', read_time_mode='stamp'):
     """T2 preset: a Compressor fed a lower tier's essence (d_content=d_t1)."""
-    return Compressor(d_content=d_t1, d_out=d_out, d_event=d_event)
+    return Compressor(d_content=d_t1, d_out=d_out, d_event=d_event,
+                      op_cell_depth=op_cell_depth, vp_head_depth=vp_head_depth,
+                      n_pool_heads=n_pool_heads, pool_mode=pool_mode,
+                      pool_extra=pool_extra,
+            read_time_mode=read_time_mode)
 
 
 class Decoder(nn.Module):

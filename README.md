@@ -90,24 +90,42 @@ dup 0 (in_slot's 91.5% vs 93.8% on ground-truth token wiring is the honest
 cost of routing off *predicted*, imperfect binding). Equivariance composes
 exactly over a chunk (`0.00e+00`).
 
-**The headline is GVN behavioral collapse, not value-prediction.** Essence
-distance split by pair type: rename-twins `0.008` (structural — free from the
+**Equivalence collapse (GVN) is the validated headline.** Essence distance
+split by pair type: rename-twins `0.008` (structural — free from the
 equivariant architecture), **behavioral-non-rename (commutativity) `0.024`**
 (TRAINED value-numbering — collapses ~28× vs distinct), distinct `0.659`. The
 non-rename collapse is the real result: the register-state machine performs
-global value numbering, and not merely the free rename-twin collapse. `vp` is
-a **diagnostic probe** sitting at an intrinsic floor (regressing wrapped /
-bitwise ops from log-compressed scalar operands is hard for any MLP) — do not
-read its absolute value as the objective; GVN collapse is the property that
-matters.
+global value numbering, not merely the free rename-twin collapse.
+
+**Phase 15 (open) — the chunk vector was losing output ORDER.** The essence is
+a sum over the 32 register slots; that sum is what makes it rename-invariant,
+but it is also order-blind, while the essence must encode *"output 1 is this,
+output 2 is that"*. It was never told which register was written first. Feeding
+the pool one scalar per slot — the write step (`--pool-extra write_time`) —
+took value-prediction loss **0.3525 → 0.0396** at 2-instruction chunks
+(**0.0198** with 4× training) and decode-back **72.9% → 91.5%** per instruction
+at 8 (~8% → ~49% for a whole chunk), while *improving* equivalence collapse.
+Both mission metrics moved from one change; reconstruction improved without
+being trained for. Remaining error at len=2 is ~65% operand binding when two
+instructions share a source register, ~35% immediate encoding. See
+EXPERIMENT_LOG Phase 15.
+
+(A note for readers of older revisions: `vp` was previously described here as
+sitting at an "intrinsic floor" because wrapped/bitwise ops are hard to
+regress. That is **wrong** — single-instruction vp is exactly `0.000`, and the
+head is fed raw value bits, not log-compressed scalars. vp is a real objective,
+not a floor-limited probe.)
 
 **Infrastructure.** The frozen-T1 encode + predicted-binding routing + T2
 state machine + losses fold into ONE compiled CUDA-graph step at a
 fixed-padded instruction count (verified bit-identical to the ragged path):
-**T2 at 8–9 ms/step / 95–97% GPU util**. Streaming pipeline:
-`datagen (all cores, --count) | train_t2_encoder` — CPU
-generates/analyzes chunks, the trainer only does forward/backward. RVT wire
-format is **v8** (5-field header; the retired raw row-outputs path is gone).
+**T2 at 8–9 ms/step**. Streaming pipeline:
+`datagen (all cores, --count) | train_t2_encoder` — CPU generates/analyzes
+chunks, the trainer only does forward/backward. Judge throughput by
+**ms/step**, not by the GPU-utilisation graph: on this box utilisation swings
+2.5× while step rate holds constant, so it is a poor signal. There is one RVT
+wire format and no version field — each batch is self-describing (magic +
+dtype signature + 5-field header), so a schema change is immediate and global.
 
 **GPU batch emulator.** All RV32I opcodes executable in parallel via
 `torch.where`, ~1.7ms for B=4096.
@@ -155,8 +173,13 @@ python -m datagen --rule single --twins 2 --batch-size 128 \
   | python scripts/train_encoder.py --d-model 128 --n-heads 4 --n-layers 2 \
     --d-out 64 --max-window 32 --n-steps 250000 --out-dir t1_run
 
-# Train T2 (chunk encoder on a frozen T1). datagen fills all cores to keep
-# the compiled trainer saturated; --count bounds the run.
+# Train T2 (chunk encoder on a frozen T1); --count bounds the run.
+# NOTE: on the GPU box, local datagen workers contend with the trainer's
+# per-step H2D prep and starve the GPU (~54% util). For a real run, offload
+# generation to odin with multinode_gen.sh (same flags via env vars) — it
+# restores the ~90% / 9ms-step ideal. See datagen/SKILL.md.
+#   RULE="branch+cap=4" CONFIG=configs/instr_t2.json ./multinode_gen.sh 2000000 \
+#     | python scripts/train_t2_encoder.py --t1-model runs/t1_run/encoder.pt ...
 python -m datagen --rule "branch+cap=4" --twins 3 --batch-size 128 \
     --n-states 8 --anchor-seed 0 --config configs/instr_t2.json \
     --count 2000000 \
@@ -164,11 +187,15 @@ python -m datagen --rule "branch+cap=4" --twins 3 --batch-size 128 \
     --d-out 512 --d-event 16 --route binding \
     --n-steps 2000000 --anchor-seed 0 --n-anchor-states 8 --out-dir t2_run
 
-# Train a decoder on a frozen encoder
-python -m datagen --rule single --twins 0 --batch-size 128 \
-    --config configs/instr_default.json --count 5000 \
-  | python scripts/train_decoder.py --t1-model runs/t1_run/encoder.pt \
-    --d-model 128 --n-heads 4 --n-layers 2 --n-steps 5000 --out-dir dec_run
+# Train a decoder on a frozen encoder — CURRENTLY BROKEN, do not use.
+# train_decoder predates the equivariant refactor: compressor/train.py:1632
+# calls a 2-arg `encoder.encode(tok, pad)`, but the current encode() also
+# needs the wiring (in0, in1, out) and tags, so it raises TypeError at step 1.
+# Decode-back is a non-goal of the current phase; see DECODER_STRATEGY.md.
+#   python -m datagen --rule single --twins 0 --batch-size 128 \
+#       --config configs/instr_default.json --count 5000 \
+#     | python scripts/train_decoder.py --t1-model runs/t1_run/encoder.pt \
+#       --d-model 128 --n-heads 4 --n-layers 2 --n-steps 5000 --out-dir dec_run
 
 # Test
 python -m pytest

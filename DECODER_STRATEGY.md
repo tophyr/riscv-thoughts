@@ -1,5 +1,12 @@
 # Decoder Strategy
 
+> **Status: unproven theory, and not the current objective.** Decode-back is
+> an explicit non-goal of the current phase — the live objective is `vp = 0.0`
+> (TODO.md). The encoder this document assumes has also been replaced: it is
+> now the rename-equivariant register-state machine in RISCV_DESIGN.md.
+> `scripts/train_decoder.py` does not run (`compressor/train.py:1632` calls a
+> 2-arg `encode()` that predates the refactor).
+
 ## The Problem
 
 Given a compressed thought vector, find a token sequence that
@@ -85,12 +92,9 @@ geometry is poor — so a decoding failure indicts the encoder geometry, not the
 search method. Discrete snapping to the nearest token sequence adds distance
 because the vocabulary is sparse in the continuous output space.
 
-These validate the proposer+verifier framework. The decoder must still be
-re-validated against the current equivariant T1's geometry (TODO.md).
-
 ---
 
-## Phase 2: Learned Decoder (Implemented)
+## Phase 2: Learned Decoder
 
 Replace gradient search with a neural network that jumps to the
 answer in one forward pass. An autoregressive transformer decoder

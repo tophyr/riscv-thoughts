@@ -9,11 +9,18 @@
 # is reaped. Pipe stdout to a file (or to a downstream consumer like
 # train_*).
 #
-# Generation knobs are applied identically to both datagen
-# invocations so local and remote workers produce the same shape of
-# data. Worker counts (48 odin, 8 local) are tuned to the specific
-# machines and stay hardcoded; they set the gen mix ratio, not the total
-# (which --count fixes).
+# Generation knobs are applied identically to both datagen invocations
+# so local and remote workers produce the same shape of data.
+#
+# Worker split (REMOTE_GEN / LOCAL_GEN) sets the gen mix ratio, not the
+# total (which --count fixes). LOCAL_GEN defaults to 0: when this stream
+# feeds a local GPU trainer, local datagen workers contend with the
+# trainer's per-step H2D prep and starve the GPU (measured: ~54% util /
+# 16.6ms/step with local gen, vs ~90% / 9ms with ALL generation on odin).
+# Offloading every worker to odin is therefore the default, and is what
+# makes this the natural front-end for a real training run. For a pure
+# on-disk corpus with no local trainer, set LOCAL_GEN>0 to use local
+# cores too.
 #
 # This is a personal aid for Chris Sarbora's setup; treat it as an
 # example pattern rather than a turnkey tool.
@@ -33,6 +40,11 @@
 #                    so the corpus is clean by default. Set to e.g. 0.2
 #                    to re-enable validity-training augmentation.)
 #   INJECT_EQUIV    (default unset — uses config's equivalences.rate)
+#   ANCHOR_SEED     (default 0 — passed to BOTH pools; MUST equal the
+#                    trainer's --anchor-seed, else value_predict targets
+#                    silently mismatch, INVARIANT 1.)
+#   REMOTE_GEN      (default 96 — odin worker count; it is a 128-core box)
+#   LOCAL_GEN       (default 0 — see the worker-split note above)
 
 set -euo pipefail
 
@@ -45,6 +57,9 @@ RULE=${RULE:-single}
 CONFIG=${CONFIG:-configs/instr_default.json}
 INJECT_INVALID=${INJECT_INVALID:-0}
 INJECT_EQUIV=${INJECT_EQUIV:-}
+ANCHOR_SEED=${ANCHOR_SEED:-0}
+REMOTE_GEN=${REMOTE_GEN:-96}
+LOCAL_GEN=${LOCAL_GEN:-0}
 
 REMOTE=chrissarbora@odin
 # The remote is expected to have a usable Python venv with numpy + scipy
@@ -89,10 +104,11 @@ fi
 
 ssh ${REMOTE} "bash ${REMOTE_DIR}/scripts/multinode_remote.sh \
     ${REMOTE_DIR} ${REMOTE_PYTHON} \
-    --gen-count 48 \
+    --gen-count ${REMOTE_GEN} \
     --rule ${RULE} \
     --batch-size ${BATCH_SIZE} \
     --twins ${TWINS} --n-states ${N_STATES} \
+    --anchor-seed ${ANCHOR_SEED} \
     --config ${CONFIG} \
     ${EXTRA_ARGS}" &
 SSH_PID=$!
@@ -101,16 +117,18 @@ SSH_PID=$!
 sleep 5
 kill -0 $SSH_PID 2>/dev/null || { echo "ERROR: remote process died" >&2; exit 1; }
 
-# Local pool: 8 local workers plus the remote netcat stream as an extra
-# mux input. --count TOTAL bounds the joined stream and, on reaching it,
-# reaps the local pool and (via BrokenPipe over nc) the remote pool.
+# Local pool: LOCAL_GEN local workers (default 0 = pure mux, all
+# generation on odin) plus the remote netcat stream as a mux input.
+# --count TOTAL bounds the joined stream and, on reaching it, reaps the
+# local pool and (via BrokenPipe over nc) the remote pool.
 # </dev/null: mux only the explicit <(nc …) input, never an inherited stdin.
 ${PYTHON} -m datagen \
-    --gen-count 8 \
+    --gen-count ${LOCAL_GEN} \
     <(nc odin 6464 -d) \
     --rule ${RULE} \
     --batch-size ${BATCH_SIZE} \
     --twins ${TWINS} --n-states ${N_STATES} \
+    --anchor-seed ${ANCHOR_SEED} \
     --config ${CONFIG} \
     --count ${TOTAL} \
     ${EXTRA_ARGS} </dev/null

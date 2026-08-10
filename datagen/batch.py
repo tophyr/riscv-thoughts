@@ -583,12 +583,13 @@ def build_twins(chunks, twins, anchor_states, rng):
 # Top-level: instruction stream → Batch stream
 # ===========================================================================
 
-def _yield_random_instructions(rng, opcode_table=None):
+def _yield_random_instructions(rng, opcode_table=None, dest_regs=None):
     while True:
-        yield random_instruction(rng, opcode_table=opcode_table)
+        yield random_instruction(rng, opcode_table=opcode_table,
+                                 dest_regs=dest_regs)
 
 
-def generate_chunks(rule, rng, *, opcode_table=None,
+def generate_chunks(rule, rng, *, opcode_table=None, dest_regs=None,
                     eq_rate=0.0, eq_max_per_class=8, eq_min_per_class=0,
                     eq_boost=None):
     """Yield Chunk objects (all valid) from a random-instruction stream
@@ -599,7 +600,8 @@ def generate_chunks(rule, rng, *, opcode_table=None,
     as additional chunks. This biases the stream toward chunks that the
     encoder must learn to collapse together.
     """
-    instr_iter = _yield_random_instructions(rng, opcode_table=opcode_table)
+    instr_iter = _yield_random_instructions(rng, opcode_table=opcode_table,
+                                            dest_regs=dest_regs)
     for group in collect_groups(instr_iter, rule):
         yield _make_valid_chunk(group)
         if eq_rate > 0 and rng.random() < eq_rate:

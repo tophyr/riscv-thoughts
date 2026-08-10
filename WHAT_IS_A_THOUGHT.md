@@ -44,7 +44,9 @@ properties its space would need to have.
 
 A thought is a compressed representation — a point in a continuous
 vector space produced by a deterministic compression function over
-tokens.
+tokens. (Strictly, a tier emits that point together with a *binding*
+naming which entities fill which roles; the point is the half that
+carries meaning. See "The Thought and Its Interface.")
 
 Thinking is the composition and transformation of thought-points
 within that space: analogy, inference, abstraction, planning. These
@@ -102,6 +104,9 @@ contains many points that are not thoughts in any meaningful sense.
 `encode("blue") + encode("justice")` lands somewhere that isn't
 "blue justice" — because there's no such compositional referent
 to be. Arithmetic produces points; not every point is a referent.
+(For a second reading of this same failure — the composition is
+underdetermined because addition discards the binding, rather than
+referentless — see "The Thought and Its Interface.")
 
 This has to be acknowledged in the geometry. A thought space where
 every point is equally a thought is a space where compositional
@@ -148,6 +153,91 @@ geometry itself distinguishes between thoughts and non-thoughts,
 continuously and differentiably. Validity is learned alongside
 meaning, from the same training data, and lives at the same
 address as the thought it pertains to.
+
+---
+
+## The Thought and Its Interface
+
+The core claim says a thought is a point. That is true of the part
+that carries meaning, but it is not the whole of what a compressor
+emits. Every tier emits a **pair**: an *essence* and a *binding*.
+
+The essence is the thought — a vector saying what this unit
+computes, invariant to how its operands happen to be named. The
+binding is the interface — which entities fill which roles, as
+references into the surrounding context. In the RISC-V testbed the
+essence is invariant to register renaming, and the binding carries
+the register identities and the order they are read and written in.
+
+The division is the one intuition already supplies. "Sorting" as a
+concept does not include which array is being sorted; that belongs
+to the call site, not to the idea. Two programs that sort should
+land on the same point on the Sort axis whether they sort `xs` or
+`ys`, in registers or on the stack. The essence is what must
+collapse; the binding is what must be kept out of it.
+
+This is not bookkeeping — it is what makes the equivalence criterion
+sharp. If operand identity leaked into the essence, two programs
+computing the same function over different registers could never
+compress to the same point, and "same meaning iff same point" would
+be false for trivial reasons. Holding identity in a separate channel
+is what lets the point mean only the meaning. Operationally the
+project already takes this position: equivalence collapse, value
+numbering, and every faithfulness metric are computed on essence
+distances alone.
+
+### What follows from the thought being half of a pair
+
+- **Thought arithmetic is defined on the essence only.** Adding,
+  subtracting, and interpolating are operations on the essence
+  vector. There is no corresponding operation on a binding — role
+  assignments are discrete references, and the group that permutes
+  them is non-abelian, so it has no additive shadow to exploit.
+  This was learned the hard way: see EXPERIMENT_LOG Phase 13, which
+  is why the symmetry was built into the architecture rather than
+  trained into a flat vector.
+
+- **The hierarchy carries a vector space plus a graph.** T_(n+1)
+  cannot consume a bare essence; it needs the binding to know how
+  the units it composes connect to one another. So what propagates
+  upward at every level is a pair, and the "space of thoughts" is a
+  vector space *together with* the wiring relating its points.
+
+- **Expression inverts a pair, not a point.** Lowering a thought
+  back to tokens means recovering both what was computed and what
+  it was computed over — and where the essence does not pin the
+  interface down, expression must *choose* one. That is not a
+  defect; it is the non-determinism described in "Decompression Is
+  Non-Deterministic," located precisely. A decoder handed only an
+  essence is being asked which of several equally faithful
+  lowerings to produce, which is why decode-back is harder than
+  the discriminative direction.
+
+- **The binding is what makes composition determinate.** Two
+  well-formed thoughts do not determine their combination.
+  "Chocolate" is sharp and "starfish" is sharp, but together they
+  could be a starfish the color of chocolate, a candy in the shape
+  of a starfish, or a lewd euphemism. Nothing in either essence
+  selects one. The binding does — it says how the parts connect,
+  and that is what turns two ideas into one idea. This is the
+  observation in "Not Every Point Is a Thought" seen from the other
+  side: `blue + justice` is underdetermined not because the geometry
+  fails, but because vector addition **discards the binding**. Ideas
+  need context to have a determinate meaning, and the binding is
+  that context made explicit.
+
+- **Internal wiring is absorbed; the external interface is exposed.**
+  Within a unit, how the parts connect to each other is *inside* the
+  essence — a chunk whose second instruction consumes the first's
+  output has that composition baked into the emitted vector. What
+  remains in the binding is only the unit's interface to its
+  siblings: what it takes from outside and what it offers back. So
+  binding is not a residue sitting outside the theory; it is the
+  relational structure *between* units at a level, absorbed into the
+  essence as you go up and re-chosen as you come down. At the apex
+  there are no siblings and no interface left to name — the essence
+  alone is the whole thought, which is what makes "a thought is a
+  point" exactly true where it matters most.
 
 ---
 
@@ -225,7 +315,9 @@ choices (where we're just exercising the algorithm).
 
 Given a thought (a compressed point), expression is the process of
 finding a token sequence whose compression matches it — lowering the
-thought into surface form.
+thought into surface form. What is inverted is strictly a pair, so
+where the point leaves the operand roles unfixed the search settles
+them itself (see "The Thought and Its Interface").
 
 This requires two components: a proposer that generates candidate token
 sequences, and the compressor that scores each candidate by compressing
@@ -388,7 +480,9 @@ representations. T1 representations compress to T2 proposition-level
 representations. And so on up through however many levels the problem
 demands. The levels need not share a vector space — each can have its
 own dimensionality, sized to the complexity of relationships at that
-level.
+level. What passes upward at each level is the full pair, not a bare
+point: T_(n+1) composes the units below it and needs their bindings to
+know how they connect (see "The Thought and Its Interface").
 
 Multi-level compression, viewed this way, is not a theory of
 abstraction. It is a multi-resolution scoring function that makes the
@@ -588,6 +682,14 @@ A thought is a compressed representation — a point produced by a
 deterministic compressor over tokens. Its meaning is defined by
 the compressor: two token sequences mean the same thing if and only
 if they compress to the same point.
+
+What a tier emits is a *pair*: the essence — the thought, the point
+above — and the binding, the interface saying which entities fill
+which roles. The essence is what the rest of this document is about.
+The binding is what keeps operand identity out of it, and what makes
+the combination of two thoughts determinate rather than ambiguous.
+At the apex of a hierarchy there is no interface left to name, and
+the essence alone is the whole thought.
 
 Thinking is what happens to thoughts in the compressed space:
 composition, transformation, analogy, inference. These are geometric

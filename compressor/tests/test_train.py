@@ -18,14 +18,19 @@ from tokenizer import BOS, EOS, PAD, VOCAB_SIZE
 
 from compressor.model import T1Compressor, T2Compressor
 from compressor.train import (
+    _VP_VALUE_BITS,
     _compute_chunk_out_regs,
     _listmle_loss,
-    _value_compress,
+    _value_bits,
+    _value_smooth,
     binding_losses,
     build_optim_sched,
     prepare_decoder_targets,
     t2_value_predict_loss,
 )
+
+# vp_head output width per slot: 32 two's-complement bit-logits + 1 smooth scalar.
+_VP_SLOT = _VP_VALUE_BITS + 1
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +71,8 @@ class _CaptureHead(torch.nn.Module):
 def test_t2_value_predict_loss_feeds_canonical_inputs_not_raw():
     """The head is fed the CANONICAL input value anchor[:, k+1] for
     filled input slot k — NOT the raw value at the slot's actual register
-    (the old bug). Unfilled slots feed 0."""
+    (the old bug). Each input slot is fed [32 bits, 1 smooth]. Unfilled slots
+    feed 0."""
     B, d, A = 1, 4, 2
     vecs = torch.zeros(B, d)
     # Distinct value per (anchor, position): pos p, anchor a -> 10*p + a.
@@ -80,20 +86,23 @@ def test_t2_value_predict_loss_feeds_canonical_inputs_not_raw():
     out_slot = torch.full((B, MAX_OUTPUT_SLOTS), AUX_CE_IGNORE, dtype=torch.int64)
     out_regs = torch.zeros(B, A, 32, dtype=torch.int32)
 
-    head = _CaptureHead(MAX_OUTPUT_SLOTS)
+    head = _CaptureHead(MAX_OUTPUT_SLOTS * _VP_SLOT)
     fake = type('T2', (), {'vp_head': head})()
     t2_value_predict_loss(
         fake, vecs, anchor, in_slot, out_slot, out_regs,
         torch.tensor([True]))
 
-    in_vals = head.last[..., d:]                       # (B, A, MAX_IN)
-    # Slot 0 fed canonical position 1 (= anchor[:, 1]), per anchor.
-    canon1 = _value_compress(anchor[:, 1].float())     # (A,)
-    raw7 = _value_compress(anchor[:, 7].float())
-    assert torch.allclose(in_vals[0, :, 0], canon1, atol=1e-5)
-    assert not torch.allclose(in_vals[0, :, 0], raw7)  # NOT the raw register
-    # Unfilled slots feed 0.
-    assert torch.allclose(in_vals[0, :, 1:], torch.zeros_like(in_vals[0, :, 1:]))
+    # (B, A, MAX_IN, 33): per slot [bits(0:32), smooth(32)].
+    in_feat = head.last[..., d:].reshape(B, A, MAX_INPUT_SLOTS, _VP_SLOT)
+    # Slot 0 fed canonical position 1 (= anchor[:, 1]), per anchor — NOT reg 7.
+    assert torch.equal(in_feat[0, :, 0, :_VP_VALUE_BITS],
+                       _value_bits(anchor[:, 1].long()))
+    assert not torch.equal(in_feat[0, :, 0, :_VP_VALUE_BITS],
+                           _value_bits(anchor[:, 7].long()))
+    assert torch.allclose(in_feat[0, :, 0, _VP_VALUE_BITS],
+                          _value_smooth(anchor[:, 1].float()), atol=1e-6)
+    # Unfilled slots feed 0 (bits + smooth all zero).
+    assert torch.count_nonzero(in_feat[0, :, 1:]) == 0
 
 
 def test_t2_value_predict_loss_gather_and_mask():
@@ -115,18 +124,23 @@ def test_t2_value_predict_loss_gather_and_mask():
     out_regs[0, 1, 9] = 40
     mask = torch.tensor([True, True])
 
-    fake = type('T2', (), {'vp_head': _ConstHead(MAX_OUTPUT_SLOTS, 0.0)})()
-    mse, count = t2_value_predict_loss(
+    fake = type('T2', (), {'vp_head': _ConstHead(MAX_OUTPUT_SLOTS * _VP_SLOT, 0.0)})()
+    loss, count = t2_value_predict_loss(
         fake, vecs, anchor, in_slot, out_slot, out_regs, mask,
-        return_count=True)
+        vp_smooth_weight=0.2, return_count=True)
 
     # Two valid (row, slot) pairs: (0,0) gathers reg5 -> [10,20];
-    # (0,1) gathers reg9 -> [30,40]. pred=0; per_slot = mean over anchors.
-    ps0 = (_value_compress(torch.tensor([10.0, 20.0])) ** 2).mean()
-    ps1 = (_value_compress(torch.tensor([30.0, 40.0])) ** 2).mean()
-    expected = ((ps0 + ps1) / 2).item()
+    # (0,1) gathers reg9 -> [30,40]. pred=0 (logits 0): every bit's BCE is
+    # log(2); the smooth scalar pred is 0 so its term is (0 - smooth(target))^2.
+    log2 = math.log(2.0)
+
+    def per_slot(vals):
+        sm = _value_smooth(torch.tensor(vals))
+        return log2 + 0.2 * (sm ** 2).mean().item()   # mean over anchors
+
+    expected = (per_slot([10.0, 20.0]) + per_slot([30.0, 40.0])) / 2
     assert count == 2
-    assert math.isclose(mse.item(), expected, rel_tol=1e-6)
+    assert math.isclose(loss.item(), expected, rel_tol=1e-5)
 
 
 def test_t2_value_predict_loss_empty_masks_are_zero():
@@ -139,7 +153,7 @@ def test_t2_value_predict_loss_empty_masks_are_zero():
     out_slot = torch.full((B, MAX_OUTPUT_SLOTS), AUX_CE_IGNORE, dtype=torch.int64)
     out_slot[0, 0] = 5
     out_regs = torch.zeros(B, A, 32, dtype=torch.int32)
-    fake = type('T2', (), {'vp_head': _ConstHead(MAX_OUTPUT_SLOTS, 0.0)})()
+    fake = type('T2', (), {'vp_head': _ConstHead(MAX_OUTPUT_SLOTS * _VP_SLOT, 0.0)})()
 
     # Empty row mask: not mask_t.any() -> first guard.
     z1 = t2_value_predict_loss(

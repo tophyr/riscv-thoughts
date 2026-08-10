@@ -57,6 +57,17 @@ def main():
                         '--n-anchor-states — these MUST match the '
                         'values datagen used or the targets and '
                         'inputs will be inconsistent.')
+    p.add_argument('--vp-smooth-weight', type=float, default=0.2,
+                   help='weight on the vp smooth-magnitude (ordering) term. The '
+                        'per-bit target carries resolution; this keeps '
+                        'numerically-close values ordered.')
+    p.add_argument('--imm-weight', type=float, default=1.0,
+                   help='weight on the immediate head — a LINEAR readout of a '
+                        'rotary/Fourier encoding of the (I-type) immediate, so '
+                        'the essence carries the immediate directly and imm+δ '
+                        'becomes a consistent, opcode-independent rotation. '
+                        '0 disables. T1 only (T2 chunks have no single '
+                        'immediate).')
     p.add_argument('--anchor-seed', type=int, default=0,
                    help='Anchor-states seed for value-prediction. Must '
                         'match datagen --anchor-seed.')
@@ -88,6 +99,7 @@ def main():
         in_slot_weight=args.in_slot_weight,
         out_slot_weight=args.out_slot_weight,
         value_predict_weight=args.value_predict_weight,
+        vp_smooth_weight=args.vp_smooth_weight, imm_weight=args.imm_weight,
         anchor_seed=args.anchor_seed,
         n_anchor_states=args.n_anchor_states,
         device=device,

@@ -145,6 +145,16 @@ Each transformation type produces a different kind of "paraphrase" —
 analogous to cross-lingual translation in the natural language setting.
 The compressor should map all equivalent sequences to the same point.
 
+**Exception — the two reordering transformations are raw-execution
+equivalences, not essence-level ones.** Reordering independent instructions
+(and non-overlapping loads/stores) leaves the final register file identical
+*with register identity intact*, but it permutes the canonical first-read
+input order and the write order, so the two chunks are different ordered
+identity-free I/O functions and receive **different** vp targets. Their
+equivalence is recovered at the `(essence, binding)` level, not in the essence
+(see "GVN: the invariant essence is the value-number"). Do not use them as
+positive pairs for an essence-collapse objective or metric.
+
 ### Near-equivalence pairs (controlled distance)
 
 Generate S. Modify one instruction to produce S' with a slightly
@@ -346,6 +356,20 @@ emits an `(essence, binding)` object: an essence vector (rename-invariant,
 "what this unit computes") and binding references (which registers, in which
 roles, as equivariant indices into the register axis).
 
+A tier's emission is therefore a **pair, not a single vector** — there is no
+concatenation step, and `encode_state` returns the two separately. Across the
+tier boundary the essence crosses as a float vector and the binding as integer
+slot indices (`argmax`/top-k of the score heads). The essence is the *thought*;
+the binding is the *interface*. WHAT_IS_A_THOUGHT.md ("The Thought and Its
+Interface") carries the conceptual consequences — thought arithmetic is defined
+on the essence only, the hierarchy propagates a vector space plus a graph,
+expression inverts a pair, and the binding is what makes *composing* two
+thoughts determinate rather than ambiguous. Note the division that follows: a
+unit's INTERNAL wiring is absorbed into its essence (a chunk whose second
+instruction consumes the first's output has that in the vector), while the
+binding carries only its EXTERNAL interface — what it reads from outside and
+what escapes to outside.
+
 - **T1** (one instruction): the state machine with `seq_len=1`, its per-step
   content the embedded **opcode + immediate tokens** (registers stripped to
   wiring). Essence = the operation; binding = the register filling each role.
@@ -367,11 +391,27 @@ The rename-invariant essence *is* a value-number — two computations producing
 the same value get the same essence; different values stay apart.
 Rename-equivalence collapses **structurally** (free, from the equivariant
 core). Other behavioral equivalences — commutative operand swaps (`a+b==b+a`),
-reordering of independent instructions, dead code, algebraic identities — are
-*not* structural and are **trained in** by the behavioral targets (the
-canonical `out_regs` value-prediction supervises the rename-invariant I/O
-function, so equivalent chunks receive identical targets). Distinct behaviors
-must stay apart — the essence is behavioral, not a syntactic hash.
+dead code, algebraic identities — are *not* structural and are **trained in**
+by the behavioral targets (the canonical `out_regs` value-prediction supervises
+the rename-invariant I/O function, so equivalent chunks receive identical
+targets). Distinct behaviors must stay apart — the essence is behavioral, not a
+syntactic hash.
+
+**Reordering independent instructions is NOT an essence-level equivalence** —
+this was previously listed above as trained-in, and that was wrong. The
+canonical frame assigns input positions by FIRST-READ order, so reordering
+permutes them: `[ADD x5,x1,x2 ; SUB x6,x3,x4]` canonicalizes to "out_A =
+in1+in2, out_B = in3−in4" while its swap canonicalizes to "out_A = in1−in2,
+out_B = in3+in4". Verified against the oracle: `in_slot` `[1,2,3,4]` → `[3,4,1,2]`,
+`out_slot` `[5,6]` → `[6,5]`, and the per-output-slot vp targets **differ**
+(they agree only on raw execution, with register identity intact). So the
+supervision actively separates them, correctly: as ordered identity-free I/O
+functions they *are* different functions, and their equivalence is recovered
+only at the `(essence, binding)` level — the essence says what is computed in
+what order, the binding says which register each result lands in. See
+WHAT_IS_A_THOUGHT.md, "The Thought and Its Interface". A consequence worth
+noting: the essence is **not** a canonical form for the dataflow DAG — the same
+DAG under a different linearization gets a different essence.
 
 ### Open problems (additive over the equivariance skeleton)
 
@@ -440,9 +480,12 @@ canonical vp target collapsing the non-structural equivalences.
 **Emergent equivalence.** With the behavioral targets alone, provably
 equivalent instructions/chunks collapse without any equivalence loss:
 rename-twins collapse *structurally* (the equivariant core), and non-rename
-behavioral equivalents (commutativity, reorder, dead code) collapse from the
-canonical vp target. Measured as GVN collapse split by pair type
-(EXPERIMENT_LOG.md Phase 14). A design constraint this surfaces: a
+behavioral equivalents (commutativity, dead code) collapse from the canonical
+vp target. Measured as GVN collapse split by pair type (EXPERIMENT_LOG.md
+Phase 14) — note the measurement covers commutative operand swaps only
+(`_commute_variant`), so treat the other types as expected-but-unmeasured.
+Instruction reordering is deliberately absent: it is not an essence-level
+equivalence at all (see the GVN section above). A design constraint this surfaces: a
 rename-*invariant* behavioral target (e.g. a GVN-bijection distance) is the
 WRONG objective here — it would weld apart the binding distinctions the
 equivariant representation deliberately keeps recoverable.
@@ -475,11 +518,15 @@ should handle this easily.
 
 Do provably equivalent sequences compress to the same point?
 - Register renaming equivalences
-- Instruction reordering equivalences
+- Commutative operand swaps
 - Strength reduction equivalences
 
 Metric: cosine similarity between equivalence pair compressed points.
 Target: > 0.99.
+
+*Instruction reordering does NOT belong on this list* — it is equivalent only
+with register identity attached, so the essence is expected (and supervised) to
+separate the two orderings. Scoring it here would penalize correct behavior.
 
 ### 2. Distance preservation (smoothness)
 
@@ -540,7 +587,7 @@ inversion, free verification.
 
 Does the compressor correctly handle transformation types not seen
 during training?
-- Train on register renaming and reordering only
+- Train on register renaming and commutative swaps only
 - Evaluate on strength reduction equivalences (held out)
 - If the compressor maps unseen equivalence types to the same point,
   it has learned execution semantics, not transformation patterns.

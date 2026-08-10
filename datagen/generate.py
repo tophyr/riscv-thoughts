@@ -73,24 +73,30 @@ def _random_jal_offset(rng):
     return int(rng.integers(-524288, 524288)) * 2
 
 
-def _make_instruction(rng, opcode, rd=None, rs1=None, rs2=None, imm=None):
+def _make_instruction(rng, opcode, rd=None, rs1=None, rs2=None, imm=None,
+                      dest_regs=None):
     """Build an instruction with the given opcode, filling unspecified
     operands with random valid values. Single point of truth for
     instruction construction — all generators below call this.
+
+    dest_regs: pool the random destination register (rd) is drawn from;
+    defaults to _DEST_REGS (x0 included). Pass range(1,32) to exclude
+    write-to-x0 (a corpus restriction for the register-writers-only tier).
     """
+    dest = _DEST_REGS if dest_regs is None else dest_regs
     if opcode in R_TYPE:
         return Instruction(opcode,
-                           rd if rd is not None else int(rng.choice(_DEST_REGS)),
+                           rd if rd is not None else int(rng.choice(dest)),
                            rs1 if rs1 is not None else int(rng.choice(_SRC_REGS)),
                            rs2 if rs2 is not None else int(rng.choice(_SRC_REGS)))
     elif opcode in I_TYPE:
         return Instruction(opcode,
-                           rd if rd is not None else int(rng.choice(_DEST_REGS)),
+                           rd if rd is not None else int(rng.choice(dest)),
                            rs1 if rs1 is not None else int(rng.choice(_SRC_REGS)),
                            imm if imm is not None else _i_type_imm(rng, opcode))
     elif opcode in LOAD_TYPE:
         return Instruction(opcode,
-                           rd if rd is not None else int(rng.choice(_DEST_REGS)),
+                           rd if rd is not None else int(rng.choice(dest)),
                            imm if imm is not None else _random_imm12(rng),
                            rs1 if rs1 is not None else int(rng.choice(_SRC_REGS)))
     elif opcode in STORE_TYPE:
@@ -105,15 +111,15 @@ def _make_instruction(rng, opcode, rd=None, rs1=None, rs2=None, imm=None):
                            imm if imm is not None else _random_branch_offset(rng))
     elif opcode in ('LUI', 'AUIPC'):
         return Instruction(opcode,
-                           rd if rd is not None else int(rng.choice(_DEST_REGS)),
+                           rd if rd is not None else int(rng.choice(dest)),
                            imm if imm is not None else _random_upper_imm(rng))
     elif opcode == 'JAL':
         return Instruction('JAL',
-                           rd if rd is not None else int(rng.choice(_DEST_REGS)),
+                           rd if rd is not None else int(rng.choice(dest)),
                            imm if imm is not None else _random_jal_offset(rng))
     elif opcode == 'JALR':
         return Instruction('JALR',
-                           rd if rd is not None else int(rng.choice(_DEST_REGS)),
+                           rd if rd is not None else int(rng.choice(dest)),
                            rs1 if rs1 is not None else int(rng.choice(_SRC_REGS)),
                            imm if imm is not None else _random_imm12(rng))
     else:
@@ -146,7 +152,7 @@ _CATEGORY_OPS = {
     'JALR': ['JALR'],
 }
 
-_CONFIG_EXTRA_KEYS = {'equivalences', 'invalidity'}
+_CONFIG_EXTRA_KEYS = {'equivalences', 'invalidity', 'exclude_x0_dest'}
 _EQUIVALENCES_KEYS = {'rate', 'max_per_class', 'min_per_class', 'boost'}
 _INVALIDITY_KEYS = {'rate', 'types'}
 
@@ -221,11 +227,13 @@ _OPCODE_DISTRIBUTION = build_opcode_table(DEFAULT_DISTRIBUTION)
 # Random instruction generators
 # ---------------------------------------------------------------------------
 
-def random_instruction(rng, opcode_table=None):
+def random_instruction(rng, opcode_table=None, dest_regs=None):
     """Generate a single random RV32I instruction.
 
     opcode_table: optional pre-built (weight, ops) list from
         `build_opcode_table`. Uses the default distribution if None.
+    dest_regs: optional rd pool (see _make_instruction) — pass range(1,32)
+        to exclude write-to-x0.
     """
     table = opcode_table if opcode_table is not None else _OPCODE_DISTRIBUTION
     roll = rng.random()
@@ -234,8 +242,8 @@ def random_instruction(rng, opcode_table=None):
         cumulative += weight
         if roll < cumulative:
             op = str(rng.choice(ops))
-            return _make_instruction(rng, op)
-    return _make_instruction(rng, 'JALR')
+            return _make_instruction(rng, op, dest_regs=dest_regs)
+    return _make_instruction(rng, 'JALR', dest_regs=dest_regs)
 
 
 # ===========================================================================

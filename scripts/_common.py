@@ -66,6 +66,14 @@ def open_run_dir(args, model_name, *, suffix=''):
 # Model loading — same pattern across train_*, eval suites, etc.
 # ---------------------------------------------------------------------------
 
+def _pool_extra(hp):
+    """pool_extra from hparams, mapping the older boolean
+    `pool_reads_order: true`, which fed write_time only."""
+    if 'pool_extra' in hp:
+        return hp['pool_extra']
+    return 'write_time' if hp.get('pool_reads_order', False) else 'none'
+
+
 def load_frozen_encoder(model_path, device):
     """Build a T1Compressor (TokenEmbedder + Compressor) from the encoder's
     companion hparams.json (next to model_path), load the checkpoint (old flat
@@ -83,6 +91,12 @@ def load_frozen_encoder(model_path, device):
         max_window=hp.get('max_window', 32),
         d_out=hp.get('d_out', 64),
         d_event=hp.get('d_event', 16),
+        op_cell_depth=hp.get('op_cell_depth', 1),
+        vp_head_depth=hp.get('vp_head_depth', 4),
+        n_pool_heads=hp.get('n_pool_heads', 1),
+        pool_mode=hp.get('pool_mode', 'pma'),
+        pool_extra=_pool_extra(hp),
+        read_time_mode=hp.get('read_time_mode', 'stamp'),
     ).to(device)
     encoder.load_state_dict(_split_t1_state(load_checkpoint(model_path, device)))
     encoder.eval()
@@ -98,6 +112,12 @@ def load_t2(t2_dir, t1, device):
     hp = json.loads((t2_dir / 'hparams.json').read_text())
     t2 = T2Compressor(
         d_t1=t1.d_out, d_out=hp['d_out'], d_event=hp.get('d_event', 16),
+        op_cell_depth=hp.get('op_cell_depth', 1),
+        vp_head_depth=hp.get('vp_head_depth', 4),
+        n_pool_heads=hp.get('n_pool_heads', 1),
+        pool_mode=hp.get('pool_mode', 'pma'),
+        pool_extra=_pool_extra(hp),
+        read_time_mode=hp.get('read_time_mode', 'stamp'),
     ).to(device)
     t2.load_state_dict(load_checkpoint(t2_dir / 't2.pt', device))
     t2.eval()

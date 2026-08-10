@@ -241,7 +241,9 @@ def _binding_metrics(model, T, essence, *, live_in, live_out, pc_writes,
 
     li = (torch.sigmoid(model.live_in_head(T).squeeze(-1)) > 0.5).float()
     lo = (torch.sigmoid(model.live_out_head(T).squeeze(-1)) > 0.5).float()
-    pc = (torch.sigmoid(model.pc_writes_head(essence).squeeze(-1)) > 0.5).float()
+    # pc reads essence DIRECTION only (magnitude = validity), matching training.
+    pc = (torch.sigmoid(
+        model.pc_writes_head(F.normalize(essence, dim=-1)).squeeze(-1)) > 0.5).float()
     li_acc = (((li == live_in).float().mean(-1)) * a).sum() / na
     lo_acc = (((lo == live_out).float().mean(-1)) * a).sum() / na
     pc_acc = ((pc == pc_writes).float() * a).sum() / na

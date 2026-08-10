@@ -2398,6 +2398,20 @@ the fifth is a negative control that should NOT collapse.
 | **NON_EQUIV (one source register changed)** | **0.002** | **0.001** | **WRONG: collapsed** |
 | random pairs across batch | 0.594 | 0.615 | (well-separated) |
 
+**CORRECTION (later): `indep_reorder` was mis-categorized here.** It sits in
+this table among classes expected to collapse, and its 0.074 is labelled
+"partial collapse" — i.e. read as a shortfall. It is not one. Reordering
+independent instructions is equivalent only *with register identity attached*;
+in the canonical identity-free frame it permutes the first-read input order and
+the write order, so the two chunks are different ordered I/O functions and the
+canonical `out_regs` oracle gives them **different** per-output-slot vp targets
+(verified directly; see RISCV_DESIGN.md "GVN: the invariant essence is the
+value-number"). The supervision therefore separates them on purpose, and a
+nonzero distance is correct behavior. Note the row immediately below it in the
+"What T2 *did* learn" list already reads the same number the right way
+("instruction order matters"), so this table and that list were in conflict.
+The measurement stands; only the interpretation changes.
+
 **Result: T2 has weak sensitivity to source-register operand changes
 within a fixed chunk shape.** The non-equivalent control differs by
 exactly one source register in one instruction, but T2 maps both
@@ -2810,6 +2824,14 @@ same width also fails to regress wrapped/bitwise R-type ops; the program-one-
 hot oracle *overfits*, train 0.21 / held-out 2.7) — **GVN collapse, not vp
 accuracy, is the metric that matters.**
 
+**CORRECTION (Phase 15): there is no intrinsic vp floor.** Single-instruction
+vp is exactly `0.000`, and the head is fed raw value bits, not the
+log-compressed scalars this claim assumed. The opcode oracle cited here gave
+opcodes but no dataflow, so it was never a full-information baseline, and the
+program-one-hot result is just memorisation failing to generalise. vp is a real
+objective that responds to architecture and training; treating it as
+floor-limited delayed the Phase-15 diagnosis.
+
 ### Unification — the litmus test holds in code
 
 After validation, a behavior-preserving refactor collapsed the T1/T2 code
@@ -2841,3 +2863,210 @@ the streaming shift-reduce parser for validity — remain open (RISCV_DESIGN.md
 "Open problems"). The dormant `behavioral_distance` oracle was deleted: it is
 rename-*invariant* (operator-only), so it is the wrong training target for a
 rename-*equivariant* representation that must keep binding recoverable.
+
+## Phase 15 (IN PROGRESS): making the T2 chunk vector faithful to the instructions it encodes
+
+**Status: open. This is working state, not settled record.** Corrections to
+earlier claims from within this same phase are collected near the end.
+
+### The question
+
+T2 compresses a short sequence of RISC-V instructions (a "chunk") into a single
+vector, the **essence**. Two properties have to hold for the project to work,
+and each has a metric:
+
+- **`vp`** — can the chunk's *output register values* be predicted from the
+  essence (given the input values)? This is the essence's quality as an input
+  to a future T3, which will only ever see what T2 preserved. Reported as a
+  loss; 0 is perfect, ln(2)≈0.69 is no better than guessing per bit.
+- **reconstruction** — can the essence be decoded back into the original
+  *instructions*? This is the "express a thought as tokens" half of the
+  framework.
+
+Phase 15 asked whether the essence is good enough at either. The setup is a
+deliberately easy corpus (`configs/instr_alu_writers.json`: R/I-type ALU only,
+always valid, never writing x0) on a frozen, verified T1
+(`runs/t1_writers_250k` — single-instruction vp exactly 0.000). Nothing in this
+phase is a T1 problem.
+
+**The starting symptom:** a single instruction is encoded perfectly, and
+quality falls off as chunks get longer — vp 0.34 / 0.60 / 0.68 at 2 / 4 / 8
+instructions, and reconstruction ~67% per instruction, which compounds to ~4%
+for a whole 8-instruction chunk. Decode-back did not work.
+
+### What was explored
+
+Two rounds, with different assumptions.
+
+**Round 1 — assume it is a capacity or training problem.** Swept training
+steps (200k–1M), vector width (256 vs 512), op-cell depth, the depth of the
+readout head that consumes the essence, the number of pooling heads, and an
+alternative pooling mode. Also measured how the essences are distributed in the
+vector space.
+
+**Round 2 — stop guessing and localise the loss.** Instead of training
+variants, probe frozen models: compare what a readout can recover from the
+whole-chunk essence against what it can recover from the encoder's *internal
+per-register state*, then split that state channel by channel until the
+missing piece is isolated.
+
+### What was discovered
+
+**1. It was not capacity, and it was not the T1→T2 handoff.** Width and steps
+barely moved vp. A T2 trained on single-instruction chunks reaches vp 0.000, so
+one instruction survives the tier boundary perfectly; the loss appears only
+when two or more are combined.
+
+**2. The information survives inside the encoder and is destroyed on the way
+out.** At 2 instructions, a readout recovers 80% of the output bits from the
+essence but 98% from the encoder's per-register state. So the encoder computes
+the right thing and the final pooling step loses it.
+
+**3. The cause: the pooling step is order-blind, and the essence has to
+describe an ordered function.** The essence is built by summing over the 32
+register slots. Summing is what makes it invariant to register renaming — a
+deliberate and load-bearing property — but it also means the essence receives
+an unordered bag of results with nothing marking which register was written
+first. It must nonetheless encode *"output 1 is this, output 2 is that"*.
+
+**4. One number per register fixes most of it.** Feeding the pool each slot's
+**write step** (`pool_extra=write_time`) supplies the missing ordering. It is
+safe on both properties the architecture depends on: it is indexed by register
+so renaming permutes it (invariance preserved, verified exactly), and a
+commutative operand swap does not change which slot was written or when, so
+equivalence-collapse is not put at risk. Most of the gain survives with
+single-head pooling; multi-head's separate contribution is geometric, keeping
+essences on the unit sphere (0.7% off-sphere vs 27.7% with one head).
+
+| len=2, 250k steps | vp | rename dist | commutative dist | separation | off-sphere |
+|---|---|---|---|---|---|
+| before | 0.3525 | 0.0023 | 0.0097 | 268× | 3.7% |
+| after | **0.0396** | **0.0014** | **0.0084** | **337×** | **0.7%** |
+
+Nothing was traded away — the equivalence-collapse metrics improved too. With
+4× the training: **vp 0.0198**. The gain holds at every length, shrinking as
+chunks grow: 8.9× at len 2, 2.5× at len 4, 1.5× at len 8.
+
+**5. Decode-back improved sharply, without being trained for.** At 8
+instructions, reconstruction went from 72.9% to **91.5%** per instruction —
+roughly **8% → 49%** for a whole chunk. Ordering was a bottleneck shared by
+both metrics. For scale, the entire Round-1 sweep (ten training runs) had moved
+this figure 66.9% → 72.5%.
+
+**6. What is left at len=2, and where.** Total error is ~0.77 points of bit
+accuracy, and it splits into two independent causes:
+
+- **~65% — instructions that share a source register with each other.** On
+  pairs with *disjoint* sources the essence is at 99.999%; on the ~12% of pairs
+  that share one it drops to ~83%. Operation identity survives (opcode
+  recovered at 99%+); what fails is knowing *which* input feeds which operand
+  — recoverable at ~99.8% on disjoint pairs but only ~51% on overlapping ones.
+- **~35% — encoding of immediate values.** Visible even on single
+  instructions, concentrated exactly in bits 0–11, the 12-bit immediate field.
+  This shrinks with training rather than being structural.
+
+**7. Composition depth is not the problem, and neither is the op-cell.**
+Slots written from other slots' results are worse individually but too rare to
+matter (~15% of the error). Running the trained model on single-instruction
+inputs gives 99.999% on R-type instructions, so the per-instruction
+computation is essentially exact.
+
+**8. Three plausible follow-on fixes were tried and all failed.** Each supplied
+*more* ordering information to the pool: the read-order channel, the entire
+event channel block, and a corrected read-order encoding. None changed the
+shared-register deficit (83% before and after, in all three). The reason
+appears to be that read-order is recorded on the register *being read*, while
+the fact needing it is stored on the slot *doing the reading* — associating the
+two requires a comparison across slots, which a sum cannot perform. Supplying
+the fact does not supply the ability to use it.
+
+**9. Feeding the pool everything has a real cost.** Handing it the whole event
+block improves vp ~17% but **doubles** the distance between behaviourally
+equivalent chunks and halves their separation from distinct ones. The event
+block carries operand read-order, and a commutative swap changes exactly that
+— so the essence stops being blind to a distinction it must be blind to.
+`write_time` is the one ordering channel that is free of this.
+
+**10. More training helps `vp` but no longer helps decode-back.** Going 250k →
+1M halves vp (0.0404 → 0.0198) while reconstruction stays flat or drifts down.
+The two goals have decoupled.
+
+### Decisions taken
+
+- **`pool_extra=write_time` is the adopted setting for new runs.** NB the
+  constructor and CLI default is still `none`, which reproduces the
+  pre-ordering-fix model; new runs must pass the flag explicitly.
+- **Feeding the pool the full event block is rejected** on the equivalence-
+  collapse cost (finding 9), despite its vp gain. Any future fix must keep
+  read-order out of the invariant essence.
+- **The op-cell and vector width are ruled out** as targets (findings 1, 7).
+  Effort moves to how the essence is *assembled*, not how much capacity it has.
+- **"Spread the essence over more dimensions" is abandoned as a goal.** The
+  ordering fix *reduced* effective dimensionality (26→15) while improving
+  reconstruction 19 points, contradicting the Round-1 theory that
+  concentration was the pathology.
+- **Decode-back is explicitly OUT OF SCOPE for this phase** — the objective is
+  vp. Finding 10 says only that if it is picked up later, more discriminative
+  training will not deliver it; it would need its own loss. Until then the
+  requirement is simply not to regress it (91.5% / 95.4% at len=8).
+- **Diagnosis before architecture.** Round 2's probes found in hours what Round
+  1's ten training runs did not. Localise with probes on frozen checkpoints
+  first; train only to test a specific mechanism.
+
+### Dead ends (do not re-run)
+
+- **Capacity and training budget.** Wider vectors (256 vs 512) and 5× steps
+  leave vp essentially unchanged at a given chunk length.
+- **`pool_mode=compete`** (slot-competition pooling, an attempt to force the
+  pooling heads to divide the register file between them). Tested in both the
+  original and the current configuration: no vp benefit, and with ordering
+  enabled it makes the essence sensitive to the anonymous per-chunk register
+  tags — rename distance 0.0251 against 0.0014 — which it must not be.
+- **Supplying more ordering information to the pool** — see findings 8 and 9.
+
+### A methodological note
+
+Several conclusions in this phase were drawn from probes — small readouts
+trained on a frozen model to test what a representation contains — and several
+had to be withdrawn. Two failure modes recurred:
+
+- **A probe scoring below the model's own trained head is measuring the probe,
+  not the model.** Under-powered or data-starved probes were repeatedly read as
+  evidence of missing information.
+- **A probe scoring near the majority-class frequency has learned nothing.** On
+  a task where 88% of cases share one answer, an 88% score means the readout is
+  answering by default; the minority case must be trained or evaluated
+  separately.
+
+Both are cheap to guard against: calibrate every probe against a quantity
+already known independently, and check its score against the base rate before
+believing it.
+
+### Open threads
+
+1. **Shared-source-register operand binding** — ~65% of the remaining len=2
+   error, and **no fix identified**. Three attempts (finding 8) all assumed the
+   position information merely needed to be supplied somewhere it could be
+   seen, and all three left the deficit completely unmoved. That the same
+   assumption failed three times is the most useful thing known about this
+   problem so far; the mechanism is not yet understood well enough to prescribe
+   a remedy, and further diagnosis is likely worth more than another attempt.
+   One *speculative, untested* idea: the op-cell reads only the `value`
+   channels of its operand slots and is the one consumer never modified —
+   supplying each operand's canonical position at the moment it is read might
+   let the slot's own value carry the binding, so no later cross-slot
+   comparison is needed. It shares the assumption the three failures made, so
+   it is a guess, not a plan. It would also route read-order into the value
+   channels, where the equivalence-collapse cost of finding 9 could reappear
+   and be harder to isolate.
+2. **Immediate encoding** — ~35% of the remaining error. T2 has a built but
+   unused immediate head, skipped because a chunk has no single immediate — but
+   it has one per instruction.
+3. **Decoder + reconstruction loss** — the standing untried lever for goal 2.
+4. **Flag cleanup** — decide which of `pool_extra` ∈ {none, write_time, order,
+   event} and `read_time_mode` ∈ {stamp, rank} survive. `rank` corrects a real
+   encoding bug (the stamp only equalled the canonical position when no
+   register was read twice) and is worth keeping on correctness grounds even
+   though it bought no accuracy.
+5. **Everything after the Round-1 sweep is len=2 only.** In particular,
+   input-ordering recovery sits at chance (0.518) at len=8 and is unexplained.

@@ -7,7 +7,7 @@ description: >
   generating a corpus, editing datagen/ or any pipeline script, changing the RVT
   format, debugging worker/throughput/OOM issues, or wiring gen→train. Carries
   the invariants that are silent-corruption traps if violated (anchor-seed match,
-  fixed batch shape, raw-vs-canonical anchors).
+  fixed batch shape, the canonical value-prediction frame).
 ---
 
 # RVT data-generation pipeline
@@ -60,6 +60,13 @@ python -m datagen --gen-count 0`.)
 `datagen` defaults to all cores; bound the run with `--count N`.
 Generation flags are first-class — there is no `--` separator.
 
+The commands below run generation LOCALLY — correct for smoke tests and quick
+runs. **For a real training run on the GPU box, front the trainer with
+`multinode_gen.sh` instead** so generation lands on odin and does not starve the
+GPU (see "Multinode / remote generation" — same generation flags via env vars,
+same `| trainer` tail). Swap `python -m datagen … --count N` for
+`<env-knobs> ./multinode_gen.sh N`.
+
 T1 (single-instruction encoder):
 ```bash
 python -m datagen --rule single --twins 2 --batch-size 128 \
@@ -82,17 +89,43 @@ python -m datagen --rule "branch+cap=4" --twins 3 --batch-size 128 \
 the whole worker pool.
 
 `--n-steps` only shapes the cosine-LR schedule and the ETA display — it is NOT a
-hard step cap. Training runs until stdin EOF (`scripts/_common.py:32`). Bound the
-batch count with `datagen --count N` (`datagen` has no per-worker `-n`).
+hard step cap. Training runs until stdin EOF (`scripts/_common.py:30-34`). Bound
+the batch count with `datagen --count N` (`datagen` has no per-worker `-n`).
+
+**Current T2 config** (writers-only happy path). `--pool-extra write_time` is
+load-bearing — omitting it reproduces the pre-ordering-fix model:
+
+```bash
+python -m datagen --rule "cap=$LEN" --twins 2 --batch-size 128 --n-states 8 \
+    --anchor-seed 0 --config configs/instr_alu_writers.json --count "$STEPS" \
+  | python scripts/train_t2_encoder.py --t1-model runs/t1_writers_250k/encoder.pt \
+    --d-out 256 --d-event 16 --op-cell-depth 4 --vp-head-depth 1 \
+    --n-pool-heads 16 --pool-mode pma --pool-extra write_time --route binding \
+    --n-steps "$STEPS" --anchor-seed 0 --n-anchor-states 8 --out-dir "$OUT"
+```
+
+Trainer-CLI asymmetry to know before improvising: the equivariant-core
+architecture flags — `--op-cell-depth`, `--vp-head-depth`, `--n-pool-heads`,
+`--pool-mode {pma,compete}`, `--pool-extra {none,write_time,order,event}`,
+`--read-time-mode {stamp,rank}` — exist **only on `scripts/train_t2_encoder.py`**
+(`scripts/train_t2_encoder.py:39-72`). `scripts/train_encoder.py` does not expose
+them even though `train_compressor` accepts them (`compressor/train.py:514-517`),
+so T1 always trains at their defaults. Passing one to `train_encoder.py` is an
+argparse error, not a silent no-op. (`--pool-extra` replaced the old boolean
+`--pool-reads-order`; old checkpoints are remapped on load by
+`scripts/_common.py:69-74`, `pool_reads_order: true` → `pool_extra:
+'write_time'`.)
 
 ## INVARIANTS — violating these silently corrupts data or training
 
 1. **anchor-seed AND n-states must match gen↔train.** value_predict supervision
    is computed against anchor states reconstructed from `--anchor-seed` +
-   `--n-anchor-states` (`scripts/train_encoder.py:60-63`, `train_t2_encoder.py:65-67`).
+   `--n-anchor-states` (`scripts/train_encoder.py:71-76`,
+   `scripts/train_t2_encoder.py:118-121`, both funnelled into
+   `make_anchor_states` at `compressor/train.py:603`).
    `datagen`'s `--anchor-seed`/`--n-states` must equal the trainer's
    `--anchor-seed`/`--n-anchor-states`. Mismatch → wrong targets, no error.
-   `make_anchor_states` is `datagen/compare.py:369`. (Anchor seed only needs to
+   `make_anchor_states` is `datagen/compare.py:319`. (Anchor seed only needs to
    match gen↔train; it is *not* needed for cross-worker comparability — distances
    are self-contained per row.)
 
@@ -100,7 +133,8 @@ batch count with `datagen --count N` (`datagen` has no per-worker `-n`).
    is padded to identical (B, max_tokens, max_n_instrs) so PyTorch's caching
    allocator doesn't fragment. Stochastically-varying batch shape is a real OOM
    trigger we hit (~step 500 of t1_cosine_full). The targets come from
-   `max_chunk_len = rule.max_len` (`datagen/batch.py:697`, `collect_into_batches`).
+   `max_chunk_len = rule.max_len` (`datagen/batch.py:648-658` inside
+   `collect_into_batches`, `datagen/batch.py:615`).
    This is why a `--rule` with no cap is REJECTED (see Rule grammar). Don't add a
    code path that emits a differently-shaped batch mid-run.
 
@@ -113,29 +147,39 @@ batch count with `datagen --count N` (`datagen` has no per-worker `-n`).
 
 4. **value_predict is CANONICAL for both tiers.** `out_regs` is the
    rename-invariant canonical baseline: `precompute_chunk` relocates the chunk's
-   i-th first-read input to canonical position i+1 (`_canonical_state`) and
+   i-th live syntactic input to canonical position i+1 (`_canonical_state`,
+   `datagen/compare.py:331`, positions `_CANON_POSITIONS = range(1, 32)` at
+   `datagen/compare.py:84`; applied at `datagen/compare.py:610`) and
    executes there, so `out_regs[:, r]` depends only on operand structure. The vp
-   loss (`t2_value_predict_loss`, used by BOTH T1 and T2) therefore feeds the head
+   loss (`t2_value_predict_loss`, `compressor/train.py:1063`, used by BOTH T1 and
+   T2) therefore feeds the head
    the canonical-position values `anchor[:, k+1]` for input slot k — never the raw
    value at the slot's actual register. Feeding raw input values against the
    canonical target is mathematically inconsistent — the head must see canonical
    inputs to match the canonical output.
+   (Known accepted caveat, documented at `compressor/train.py:1111-1114`:
+   canonical positions are assigned over ALL live syntactic inputs while
+   `in_slot_regs` lists only the *behavioral* subset, so slot k ↔ position k+1
+   can drift for a degenerate op with a live-but-value-irrelevant input, e.g.
+   `ANDI _,_,0`. Rare; accepted, not a bug to "fix" casually.)
 
 5. **x0 is fixed under relabeling.** `random_perm`/`relabel` require `perm[0]==0`
-   (`datagen/generate.py:279,293`). x0 is hardwired zero, not a register.
+   (`datagen/generate.py:287,301`; the check is `datagen/generate.py:309-310`).
+   x0 is hardwired zero, not a register.
 
 6. **Memory-op chunks get no twins and no aux (V1 scope).** `build_twins`
-   drops chunks containing LOAD/STORE from twin+aux construction because their
-   `Precomputed` is
+   (`datagen/batch.py:528`) drops chunks containing LOAD/STORE from twin+aux
+   construction because their `Precomputed` is
    unavailable — `precompute_chunk` raises NotImplementedError on memory ops
-   (`datagen/compare.py:674`). The chunk's tokens are still shipped (so the
+   (`datagen/compare.py:585,593`). The chunk's tokens are still shipped (so the
    encoder sees them for magnitude/validity), but its aux row is zero-mask /
-   `AUX_CE_IGNORE` and its value-prediction row is masked off (`pair_valid=False`).
+   `AUX_CE_IGNORE` and its value-prediction row is masked off via
+   `out_regs_valid=False` (`_out_regs_from_precomputeds`, `datagen/batch.py:363`).
 
 ## datagen reference
 
-`--rule` grammar (`datagen/__main__.py:64` `_parse_rule`, rules in
-`datagen/generate.py:628`):
+`--rule` grammar (`datagen/__main__.py:89` `_parse_rule`, rule constructors at
+`datagen/generate.py:704-729`). Default `--rule` is `branch+cap=8`:
 - `single` — one instruction per chunk (T1). `max_len=1`. Ships canonical
   out_regs like every other rule (the T1/T2 unification).
 - `cap=N` — fixed length N.
@@ -144,15 +188,18 @@ batch count with `datagen --count N` (`datagen` has no per-worker `-n`).
 - Components join with `+` and compose via `either()` (terminate when ANY fires).
 - **A bare `branch` or `transform` (no `cap=`) is rejected eagerly** — it can
   build an unbounded chunk. Error says "unbounded … add a cap". Validated in the
-  PARENT before forking (`datagen/__main__.py:480` calls `_parse_rule`) and again in
-  `collect_groups` via `rule.max_len is None` (`datagen/generate.py:734`).
+  PARENT before forking (`datagen/__main__.py:582-586` calls `_parse_rule`) and
+  again in `collect_groups` via `rule.max_len is None` (`datagen/generate.py:742`).
 
-Generation flags (per worker, first-class — NO `--` separator): `--rule`,
-`--twins T` (relabeled equivalents per valid source chunk), `--batch-size B`
-(source rows; twins extend the batch beyond B), `--n-states` (anchor count),
-`--anchor-seed`, `--inject-invalid R`, `--inject-equiv R`, `--max-invalid-window`,
-`--config PATH`, `--seed` (base; worker i gets seed+i). CLI flags override the
-JSON config's `equivalences.rate` / `invalidity.rate`. There is **no
+Generation flags (per worker, first-class — NO `--` separator; defaults in
+parens, from the argparse block at `datagen/__main__.py:503-521`): `--rule`
+(`branch+cap=8`), `--twins T` (3 — relabeled equivalents per valid source
+chunk), `--batch-size B` (128 — source rows; twins extend the batch beyond B),
+`--n-states` (8 — anchor count), `--anchor-seed` (0), `--inject-invalid R`
+(unset → config), `--inject-equiv R` (unset → config), `--max-invalid-window`
+(32), `--config PATH` (unset → `DEFAULT_DISTRIBUTION`), `--seed` (0; worker i
+gets seed+i). CLI flags override the JSON config's `equivalences.rate` /
+`invalidity.rate`. There is **no
 `--n-batches`** — generation is infinite; bound the total with `--count N`.
 
 Pool / mux flags: `--gen-count N` (default = all CPU cores; `0` = pure mux of the
@@ -206,24 +253,45 @@ cmdline).
   - Combine corpora: `cat a.rvt b.rvt > both.rvt`
   - **Second epoch = `cat corpus.rvt corpus.rvt | trainer`.** There is no built-in
     repeat; epochs are shell-level `cat`.
-- Header fields: `B, max_tokens, max_n_instrs, n_anchors, OB`. `OB` is the
-  out_regs row count (`B` when the oracle is shipped — always, now — else 0).
-  Body field list + dtypes are in the `BodyField(...)` block in
-  `datagen/batch.py`; the per-field header sanity bounds are the
-  `header_bounds={...}` on `RVT_FORMAT` there, enforced on every read by
-  `BinaryFormat._check_header_bounds`.
+- Header fields: `B, max_tokens, max_n_instrs, n_anchors, OB` (`RVT_FORMAT`,
+  `datagen/batch.py:286-288`). `OB` is the out_regs row count — `B` in practice,
+  always, since `build_twins` returns one out_regs row per output row
+  (`datagen/batch.py:363-376`); the format still permits 0.
+  Body field list + dtypes are the `BodyField(...)` block at
+  `datagen/batch.py:289-303`; the per-field header sanity bounds are the
+  `header_bounds={...}` at `datagen/batch.py:306`, enforced on every read by
+  `BinaryFormat._check_header_bounds` (`datagen/batch.py:148`).
+- The "no version field" statement is current and load-bearing in the code, not
+  aspirational: the only per-batch schema check is magic + dtype-signature
+  (`datagen/batch.py:81-88,140-145`). EXPERIMENT_LOG's "format v7→v8"
+  (`EXPERIMENT_LOG.md:2765`) is history from when the format was still
+  versioned — do not reintroduce a version field on its authority.
 - Per-instruction segmentation is NOT preserved on the wire — relabeling/aux
   happen at generation time while the `list[Instruction]` is still in hand.
 
 ## Configs (configs/*.json)
 
-Opcode-category mix (weights must sum to 1.0) + optional `equivalences` and
-`invalidity` sub-dicts. Validation: `datagen/generate.py:154`.
+Opcode-category mix (weights must sum to 1.0) + optional `equivalences`,
+`invalidity`, and `exclude_x0_dest`. Validation: `datagen/generate.py:160`
+`validate_distribution`; the accepted non-opcode keys are `_CONFIG_EXTRA_KEYS`
+(`datagen/generate.py:155`) and an unknown key is a hard error.
+- `instr_alu_writers.json` — **the corpus all current (Phase 15) work uses.**
+  R/I-type ALU only (0.55 / 0.45) + `exclude_x0_dest: true`. No equivalences,
+  no invalidity → a clean, all-valid, always-register-writing corpus. Every
+  chunk is pure ALU, so `cap=N` and `branch+cap=N` behave identically here and
+  the scripts use plain `cap=N`.
 - `instr_default.json` — T1 mix; equivalences rate 0.05; **invalidity rate 0.2**.
 - `instr_t2.json` — T2 mix (ALU-heavy, few branches/mem); equivalences only.
 - `instr_no_inject.json` — opcode mix only, no augmentation.
 - `instr_no_mem.json` — excludes LOAD/STORE (no mem-op chunks at all).
 - `instr_branch_heavy.json` — 50% branches.
+
+`exclude_x0_dest: true` narrows the **rd** pool to x1..x31 (`datagen/__main__.py:170`
+→ `dest_regs=range(1,32)`, consumed at `datagen/generate.py:86`), so every
+generated instruction actually writes a register — no write-to-x0 NOPs. It does
+NOT touch the source pool: rs1/rs2 still draw from x0..x31 (`_SRC_REGS`,
+`datagen/generate.py:41`), so x0-as-operand still occurs. There is no CLI flag
+for it; it is config-only.
 
 Invalid-window types (`datagen/invalidity.py`): `partial` (sub-slice of one
 instr), `spanning` (crosses an instr boundary mis-aligned), `multi` (2–3 whole
@@ -235,14 +303,34 @@ these near the origin (low magnitude); valid windows sit near the unit sphere.
 
 Two different scripts — do not confuse them:
 
-- **`multinode_gen.sh TOTAL_BATCHES`** — ships datagen sources to `odin` over
-  ssh (tar stream), runs a remote `datagen` pool that streams RVT back over
-  `nc` (port 6464), and joins it with a local `datagen` pool. Output to
-  stdout/file or piped to a trainer. Both pools generate infinitely; the local
-  side bounds the joined stream to exactly `TOTAL_BATCHES` with `--count`, and on
-  reaching it the BrokenPipe cascade (local→nc→remote) reaps every worker.
-  Worker counts (48 remote, 8 local, hardcoded) now set the gen mix ratio, not
-  the total. `REMOTE=chrissarbora@odin`.
+- **`multinode_gen.sh TOTAL_BATCHES`** — the standard front-end for a real
+  training run. Ships datagen sources to `odin` over ssh (tar stream), runs a
+  remote `datagen` pool that streams RVT back over `nc` (port 6464), and muxes
+  it with a local `datagen` pool. Output to stdout/file or piped to a trainer.
+  Both pools generate infinitely; the local side bounds the joined stream to
+  exactly `TOTAL_BATCHES` with `--count`, and on reaching it the BrokenPipe
+  cascade (local→nc→remote) reaps every worker. `REMOTE=chrissarbora@odin`.
+  Worker split is `REMOTE_GEN` (default 96) / `LOCAL_GEN` (default **0**):
+  local datagen contends with a local GPU trainer's per-step H2D prep and
+  starves the GPU — **measured 16.6 ms/step with local gen vs 9 ms with ALL
+  generation on odin**, the latter matching the documented compiled-step figure
+  (README "T2 at 8–9 ms/step"). Judge this by ms/step only; the utilisation
+  numbers that used to be quoted alongside it (~54% vs ~90%) are not a reliable
+  signal on this box — util swings ~2.5× at constant step rate. So the default
+  offloads EVERY worker to
+  odin; bump `LOCAL_GEN>0` only for a pure on-disk corpus with no local trainer.
+  Other defaults: `RULE=single`, `CONFIG=configs/instr_default.json`,
+  `INJECT_INVALID=0` (clean corpus regardless of what the config says) — set
+  them explicitly for any T2 / writers-only run.
+  `ANCHOR_SEED` (default 0) is passed to BOTH pools and MUST equal the trainer's
+  `--anchor-seed` (INVARIANT 1 — mismatch silently corrupts value_predict
+  targets). Pipe it straight to a trainer:
+  ```bash
+  RULE="branch+cap=4" CONFIG=configs/instr_t2.json ./multinode_gen.sh 2000000 \
+    | python scripts/train_t2_encoder.py --t1-model runs/t1_run/encoder.pt \
+      --d-out 512 --d-event 16 --route binding --n-steps 2000000 \
+      --anchor-seed 0 --n-anchor-states 8 --out-dir t2_run
+  ```
 - **`gen_corpus.sh TOTAL_BATCHES OUT_PATH`** — writes an on-disk corpus. **Despite
   its header comment mentioning "remote", the script itself runs `datagen`
   LOCALLY** (`gen_corpus.sh`) and writes `OUT` on the local disk via
@@ -252,14 +340,16 @@ Two different scripts — do not confuse them:
   unset → all CPU cores.
 
 Both override knobs via env vars: `BATCH_SIZE TWINS N_STATES RULE CONFIG
-INJECT_INVALID INJECT_EQUIV` (and `WORKERS` for gen_corpus → `--gen-count`).
+INJECT_INVALID INJECT_EQUIV` (plus `ANCHOR_SEED REMOTE_GEN LOCAL_GEN` for
+multinode_gen, and `WORKERS` for gen_corpus → `--gen-count`).
 
 Remote operational facts:
 - **`export MALLOC_ARENA_MAX=2`** is required in the remote/local pool scripts
-  (`multinode_remote.sh:41`, `gen_corpus.sh`). Default glibc makes `8*ncpus`
+  (`scripts/multinode_remote.sh:41`, `gen_corpus.sh:52`). Default glibc makes `8*ncpus`
   arenas per worker; on a 64-core box that makes `clear_page_erms` page-zeroing
   the #1 hotspot. Don't remove it.
-- `multinode_remote.sh` owns its lifecycle via a pidfile
+- `scripts/multinode_remote.sh` (shipped to the remote and invoked there by
+  `multinode_gen.sh`) owns its lifecycle via a pidfile
   (`/tmp/riscv-thoughts-multinode-remote.pid`) so a prior crashed run is cleaned
   up by the next. Its pipeline stderr persists to `/tmp/multinode-remote.log`
   (survives ssh teardown — read it for post-mortems).
@@ -273,20 +363,28 @@ Remote operational facts:
 
 ## Constants / token budget math
 
-- `MAX_INSTR_TOKENS = 9`, `VOCAB_SIZE = 89` (`tokenizer/tokenizer.py`).
+- `MAX_INSTR_TOKENS = 9`, `VOCAB_SIZE = 89` (`tokenizer/tokenizer.py:127,52` —
+  both are computed, not literals; verify by importing, not by reading).
 - A chunk's token budget: `target_max_tokens = max_chunk_len * 9`
-  (`datagen/batch.py:742`), widened to fit `--max-invalid-window` if larger.
+  (`datagen/batch.py:656`), then widened to `--max-invalid-window` if that is
+  larger (`datagen/batch.py:657-658`). That widening is **unconditional** — the
+  flag defaults to 32 and is applied even on a corpus with no invalid injection,
+  so `--rule single` emits `max_tokens=32`, not 9. (Verified: a 3-batch
+  `--rule single --config configs/instr_alu_writers.json` run ships
+  `tokens (24, 32)`.)
 - T1's TokenEmbedder needs `--max-window` (default 72 = 8×9) to cover this. T2's
   equivariant core has no position table — it unrolls to each batch's actual
   instruction count, so there is no T2 chunk-length flag.
 - N_REGS=32, MAX_INPUT_SLOTS=32, MAX_OUTPUT_SLOTS=16, AUX_CE_IGNORE=-100
-  (`datagen/compare.py:92,109-111`). PC_REG=32, MEM_REG=33 are pseudo-slots.
+  (`datagen/compare.py:77,91,92,93`). PC_REG=32, MEM_REG=33 are pseudo-slots
+  (`datagen/compare.py:37-38`).
 
 ## Where things live / what's tracked
 
 - `corpora/` — on-disk `.rvt` corpora. Present but empty by default; **NOT in
-  .gitignore** (only `runs/` and `.claude/` are), yet not committed — `.rvt` files
-  are large binary, keep them out of commits.
+  .gitignore** (which lists `.env/ .claude/ .venv/ **/__pycache__/
+  .pytest_cache/ runs/`), yet not committed — `.rvt` files are large binary,
+  keep them out of commits.
 - `runs/<name>/` — checkpoints + hparams.json + losses.json (gitignored).
 - Pipeline regression tests: `scripts/tests/test_pipeline.py` (covers rule
   parsing, format detect/validate, mux modes, the pdeathsig orphan guard, and

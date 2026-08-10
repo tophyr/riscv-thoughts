@@ -5,6 +5,7 @@ All tools share the single RVT format.
 """
 
 import glob
+import json
 import os
 import signal
 import subprocess
@@ -446,7 +447,7 @@ def _train_t1(tmp, name='t1'):
     return enc
 
 
-def _train_t2(tmp, t1_enc, name='t2'):
+def _train_t2(tmp, t1_enc, name='t2', extra_args=()):
     """Produce a tiny 1-step T2 checkpoint on top of a frozen T1.
     Returns the t2 run dir. branch+cap=8 → multi-instruction chunks."""
     run_dir = str(Path(tmp) / name)
@@ -456,7 +457,8 @@ def _train_t2(tmp, t1_enc, name='t2'):
         PYTHON, 'scripts/train_t2_encoder.py', '--t1-model', str(t1_enc),
         '--n-steps', '1', '--log-every', '1', '--out-dir', run_dir,
         '--d-out', '32', '--d-event', '16',
-        '--n-anchor-states', '4', '--warmup-steps', '0', '--no-compile'],
+        '--n-anchor-states', '4', '--warmup-steps', '0', '--no-compile',
+        *extra_args],
         stdin=data, timeout=180)
     assert rc == 0, f'T2 train failed: {err}'
     assert (Path(run_dir) / 't2.pt').exists(), f'no t2.pt in {run_dir}'
@@ -488,6 +490,30 @@ class TestTraining:
             t1_enc = _train_t1(tmp)
             t2_dir = _train_t2(tmp, t1_enc)
             assert (t2_dir / 't2.pt').exists()
+
+    @pytest.mark.parametrize('mode,s', [
+        ('regression', 0.0),    # exact-match indicator (binary control)
+        ('regression', 7.0),    # graded, knee at |Δ|~1e5-1e6
+        ('infonce', 7.0),       # soft-weighted NT-Xent fallback
+    ])
+    def test_t2_contrastive_train_smoke(self, mode, s):
+        """T2 with the behavioral-distance contrastive loss ON and vp demoted
+        to 0: exercises out_regs shipping under contrastive-only, the d_beh +
+        cosine matrices, and the regression/infonce heads (incl. s=0 indicator).
+        One step, exits 0, writes t2.pt — and the logged contrastive loss is a
+        finite number (no NaN from the masked softmax / empty-footprint guards)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            t1_enc = _train_t1(tmp)
+            t2_dir = _train_t2(
+                tmp, t1_enc, name=f't2_co_{mode}_{s}',
+                extra_args=['--value-predict-weight', '0',
+                            '--contrastive-weight', '1.0',
+                            '--contrastive-loss', mode,
+                            '--contrastive-s', str(s)])
+            losses = json.loads((t2_dir / 'losses.json').read_text())
+            co = losses[-1]['contrastive']
+            assert co == co, 'contrastive loss is NaN'     # NaN != NaN
+            assert co >= 0.0
 
 
 class TestEval:

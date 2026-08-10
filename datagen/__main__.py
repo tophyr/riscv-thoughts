@@ -166,8 +166,11 @@ def _build_batches_iter(cfg, seed):
                 rng, opcode_table, cfg.max_invalid_window, type_table)
             return tokens
 
+    # Optional corpus restriction: exclude write-to-x0 (rd drawn from 1..31).
+    dest_regs = list(range(1, 32)) if dist.get('exclude_x0_dest') else None
+
     chunks_iter = generate_chunks(
-        rule, rng, opcode_table=opcode_table,
+        rule, rng, opcode_table=opcode_table, dest_regs=dest_regs,
         eq_rate=eq_rate,
         eq_max_per_class=eq_cfg.get('max_per_class', 8),
         eq_min_per_class=eq_cfg.get('min_per_class', 0),

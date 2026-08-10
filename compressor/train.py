@@ -30,7 +30,7 @@ from datagen import (
     make_anchor_states, precompute_chunk,
     N_REGS, MAX_INPUT_SLOTS, MAX_OUTPUT_SLOTS, AUX_CE_IGNORE,
 )
-from emulator import Instruction
+from emulator import Instruction, I_TYPE
 from .model import (
     Compressor, T1Compressor, T2Compressor, Decoder, instruction_wiring,
     X0_SLOT)
@@ -211,12 +211,77 @@ def _h2d(arr, device, dtype=None):
     return t.to(device)
 
 
-def _value_compress(x):
-    """Sign-preserving double-log1p compression. Maps int32 range
-    [-2^31, 2^31] roughly to [-3.0, 3.0] while preserving sign and
-    monotonicity. Matches the project's residual-compression
-    convention used by the canonical-output comparison."""
-    return torch.sign(x) * torch.log1p(torch.log1p(x.abs()))
+_VP_VALUE_BITS = 32     # two's-complement width; must match model._VP_VALUE_BITS
+
+
+def _value_bits(x):
+    """Two's-complement 32-bit decomposition (LSB first) of an INTEGER tensor
+    (RV32 register values). Returns (..., 32) float in {0,1}. Uniform
+    resolution: the low bit — the +1 immediate distinguisher — is carry-free,
+    so it gets a clean gradient that loglog compression destroys (immediate-gap
+    finding). x MUST be an integer dtype — do NOT pre-cast to float32, which
+    silently loses every bit above 2^24 and corrupts exactly the low bits we
+    are here to supervise."""
+    xi = x.to(torch.int64) & 0xFFFFFFFF
+    shifts = torch.arange(_VP_VALUE_BITS, device=x.device, dtype=torch.int64)
+    return ((xi.unsqueeze(-1) >> shifts) & 1).to(torch.float32)
+
+
+def _value_smooth(x):
+    """Bounded sign-preserving smooth-magnitude encoding in (-1, 1). The vp
+    ordering term — resolution comes from the bits; this only keeps
+    numerically-close values close / ordered (the interpolation property)."""
+    return torch.tanh((torch.sign(x) * torch.log1p(x.abs())) / 8.0)
+
+
+# Rotary immediate encoding (T1). POWER-OF-2 periods 2,4,...,4096: each frequency
+# is `imm mod 2^k` = the low k bits, which are directly readable from the hex
+# tokens. This is bit-aligned and non-redundant across scales — unlike an
+# arbitrary geometric ladder, which asks the encoder for `imm mod 7` / `imm mod
+# 11` (modular reductions it can't compute, so it hedges those features to ~0 —
+# the diagnosed source of the residual imm+1 collisions). angular freq = 2π/period.
+_IMM_N_FREQ = 12        # must match model._IMM_N_FREQ (head output = 2*this)
+_IMM_OMEGA = (2.0 * np.pi / (2.0 ** np.arange(1, _IMM_N_FREQ + 1))).astype(np.float32)
+
+
+def _immediate_rotary_np(imm):
+    """Rotary/Fourier encoding of integer immediates: imm (B,) int ->
+    (B, 2*_IMM_N_FREQ) float [cos.. , sin..]. imm+δ rotates each frequency's
+    (cos,sin) pair by δ·ω — a consistent, composable, opcode-independent
+    transform (the geometry we want the essence's immediate axis to have),
+    multi-scale so high ω resolves +1 and low ω carries magnitude."""
+    ph = imm[:, None].astype(np.float32) * _IMM_OMEGA[None, :]     # (B, K)
+    return np.concatenate([np.cos(ph), np.sin(ph)], axis=1).astype(np.float32)
+
+
+def _t1_immediates(batch):
+    """Per single-instruction row: the in-scope (I-type ALU) immediate value +
+    a supervision mask. Only I_TYPE ops (ADDI / logical-imm / shifts) carry a
+    ≤12-bit data immediate we supervise; every other row is masked. Trainer-side
+    decode from the tokens (no RVT change). Returns (imm (B,) int64, mask (B,)
+    float32)."""
+    B = batch.tokens.shape[0]
+    imm = np.zeros(B, dtype=np.int64)
+    mask = np.zeros(B, dtype=np.float32)
+    for b in range(B):
+        if not batch.valid[b]:
+            continue
+        L = int(batch.token_lens[b])
+        try:
+            instr, _ = decode_instruction(batch.tokens[b, :L].tolist(), 0)
+        except Exception:
+            continue
+        # I-type wiring is (rd, rs1, imm). Supervise the immediate ONLY where it
+        # is behaviorally LIVE. An x0-write (rd==0) is a no-op — the result is
+        # discarded — so its immediate is dead: `ADDI x0,rs,k` is the same no-op
+        # for every k. The essence correctly COLLAPSES those equivalents (low
+        # magnitude, immediate-independent); supervising the dead immediate would
+        # fight that collapse with a gradient it can never satisfy (the ~3% imm
+        # floor). So mask x0-writes out, like memory-ops and non-I-type already are.
+        if instr.opcode in I_TYPE and instr.args[0] != 0:
+            imm[b] = instr.args[2]
+            mask[b] = 1.0
+    return imm, mask
 
 
 def build_optim_sched(params, lr, n_steps, *, warmup_steps=0,
@@ -447,7 +512,9 @@ def _t1_wiring(batch):
 
 
 def train_compressor(batch_iter, *, ingest, lower_encoder=None,
-                     d_out=128, d_event=16,
+                     d_out=128, d_event=16, op_cell_depth=1, vp_head_depth=4,
+                     n_pool_heads=1, pool_mode='pma', pool_extra='none',
+                     read_time_mode='stamp',
                      d_model=128, n_heads=4, n_layers=2, max_window=72,
                      route='binding',
                      lr=3e-4, n_steps=None, log_every=100, lr_min=1e-6,
@@ -455,6 +522,9 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
                      valid_weight=0.1, live_in_weight=0.1, live_out_weight=0.1,
                      pc_writes_weight=0.1, in_slot_weight=0.1,
                      out_slot_weight=0.1, value_predict_weight=1.0,
+                     vp_smooth_weight=0.2, imm_weight=1.0,
+                     contrastive_weight=0.0, contrastive_loss='regression',
+                     contrastive_s=0.0,
                      anchor_seed=0, n_anchor_states=8,
                      resume=None, device='auto', on_log=None,
                      compile_step=True):
@@ -470,8 +540,15 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
     core + losses folded in), the prefetcher, and the logging.
 
     Returns (model, losses). loss records: step, total, valid, live_in,
-    live_out, pc_writes, in_slot, out_slot, value_pred, pair, n_chunks,
+    live_out, pc_writes, in_slot, out_slot, value_pred, contrastive, n_chunks,
     n_instrs.
+
+    contrastive_weight: weight on the behavioral-distance contrastive loss on
+        the essence (contrastive_essence_loss). 0 = off. When > 0 the out_regs
+        oracle ships even if value_predict_weight is 0 (vp demoted to diagnostic).
+    contrastive_loss:   'regression' (cosine→1−d_beh MSE, primary) | 'infonce'.
+    contrastive_s:      φ saturation scale on the d_beh target (the swept knob;
+        0 = exact-match indicator/binary).
     """
     device = resolve_device(device)
     # `model` is the trained+saved+grad-clipped entity; `comp` is the Compressor
@@ -483,14 +560,21 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
             p.requires_grad = False
         lower_encoder = lower_encoder.to(device)
         comp = Compressor(
-            d_content=lower_encoder.d_out, d_out=d_out, d_event=d_event)
+            d_content=lower_encoder.d_out, d_out=d_out, d_event=d_event,
+            op_cell_depth=op_cell_depth, vp_head_depth=vp_head_depth,
+            n_pool_heads=n_pool_heads, pool_mode=pool_mode,
+            pool_extra=pool_extra, read_time_mode=read_time_mode)
         model = comp.to(device)
         model_file = 't2.pt'
     else:
         model = T1Compressor(
             vocab_size=VOCAB_SIZE, d_model=d_model, n_heads=n_heads,
             n_layers=n_layers, max_window=max_window, d_out=d_out,
-            d_event=d_event).to(device)
+            d_event=d_event, op_cell_depth=op_cell_depth,
+            vp_head_depth=vp_head_depth, n_pool_heads=n_pool_heads,
+            pool_mode=pool_mode,
+            pool_extra=pool_extra,
+            read_time_mode=read_time_mode).to(device)
         comp = model.compressor
         model_file = 'encoder.pt'
     route_binding = (route == 'binding')
@@ -523,7 +607,7 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
             f'step {r["step"]:>5d}  loss {r["total"]:.4f} '
             f'(val {r["valid"]:.4f} li {r["live_in"]:.3f} lo {r["live_out"]:.3f} '
             f'pc {r["pc_writes"]:.3f} is {r["in_slot"]:.3f} os {r["out_slot"]:.3f} '
-            f'vp {r["value_pred"]:.4f}) '
+            f'vp {r["value_pred"]:.4f} im {r["imm"]:.4f} co {r["contrastive"]:.4f}) '
             f'B={r["n_chunks"]} I={r["n_instrs"]}  '
             f'lr {lr_now:.1e}  {ms:.0f}ms/step  '
             f'eta {timedelta(seconds=int(eta))}')
@@ -547,7 +631,14 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
     IN_K = min(2 * MAX_NI, MAX_INPUT_SLOTS)
     OUT_K = min(MAX_NI, MAX_OUTPUT_SLOTS)
     vp_active = value_predict_weight > 0
-    out_regs_active = vp_active
+    # immediate head is T1-only: one instruction = one unambiguous immediate.
+    # (T2's chunk essence has no single immediate; its imm_head stays unused.)
+    imm_active = imm_weight > 0 and ingest == 'tokens'
+    contrastive_active = contrastive_weight > 0
+    # The contrastive loss reads the same out_regs oracle as vp, so out_regs
+    # must ship to the device when EITHER is on — demoting vp to weight 0 must
+    # not stop shipping out_regs out from under the contrastive term.
+    out_regs_active = vp_active or contrastive_active
     valid_active = valid_weight > 0
     model.train()
     _dummy = torch.zeros(1, device=device)
@@ -579,7 +670,7 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
     # at a fixed-padded instruction count (B*MNI). Host-sync-free, static-shape.
     def _fwd_loss(tok, pad, w0, w1, wo, active, t1_tags, t2_tags,
                   li, lo, pc, in_slot, out_slot, out_regs, vp_mask, valid_f,
-                  ike, oke):
+                  ike, oke, imm_target, imm_mask):
         content_seq, c0, c1, co = _content(tok, pad, w0, w1, wo, active, t1_tags)
         T, essence = comp.encode_state(content_seq, c0, c1, co, active, t2_tags)
         valid_loss = (((essence.norm(dim=-1) - valid_f) ** 2).mean()
@@ -589,19 +680,35 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
             in_slot_t=in_slot, out_slot_t=out_slot, in_k_eff=ike, out_k_eff=oke)
         vp = (t2_value_predict_loss(
                   comp, essence, anchor_states_t, in_slot, out_slot,
-                  out_regs, vp_mask)
+                  out_regs, vp_mask, vp_smooth_weight=vp_smooth_weight)
               if vp_active else essence.new_zeros(()))
+        contrastive = (contrastive_essence_loss(
+                           essence, out_regs, lo, vp_mask,
+                           mode=contrastive_loss, s=contrastive_s)
+                       if contrastive_active else essence.new_zeros(()))
+        # Immediate head (T1 only): linear readout of the essence must match the
+        # rotary encoding of the instruction's immediate, masked to I-type rows.
+        if imm_active:
+            # direction only (magnitude = validity); see t2_value_predict_loss.
+            imm_pred = comp.imm_head(F.normalize(essence, dim=-1))   # (B, 2*_IMM_N_FREQ)
+            imm_per = ((imm_pred - imm_target) ** 2).mean(-1)   # (B,)
+            imm = (imm_per * imm_mask).sum() / imm_mask.sum().clamp(min=1)
+        else:
+            imm = essence.new_zeros(())
         total = (valid_weight * valid_loss
                  + live_in_weight * bl['live_in']
                  + live_out_weight * bl['live_out']
                  + pc_writes_weight * bl['pc_writes']
                  + in_slot_weight * bl['in_slot']
                  + out_slot_weight * bl['out_slot']
-                 + value_predict_weight * vp)
+                 + value_predict_weight * vp
+                 + imm_weight * imm
+                 + contrastive_weight * contrastive)
         metrics = {'total': total, 'valid': valid_loss,
                    'live_in': bl['live_in'], 'live_out': bl['live_out'],
                    'pc_writes': bl['pc_writes'], 'in_slot': bl['in_slot'],
-                   'out_slot': bl['out_slot'], 'value_pred': vp}
+                   'out_slot': bl['out_slot'], 'value_pred': vp,
+                   'imm': imm, 'contrastive': contrastive}
         return total, metrics, None
 
     def _prep(item):
@@ -619,6 +726,13 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
             vp_mask_t = _h2d(batch.out_regs_valid, device)
         else:
             out_regs_t = vp_mask_t = _dummy
+        if imm_active:
+            imm_np, imm_mask_np = _t1_immediates(batch)
+            imm_target_t = _h2d(_immediate_rotary_np(imm_np), device,
+                                dtype=torch.float32)
+            imm_mask_t = _h2d(imm_mask_np, device, dtype=torch.float32)
+        else:
+            imm_target_t = imm_mask_t = _dummy
         return (_h2d(tok, device, dtype=torch.long), _h2d(pad, device),
                 _h2d(gi0, device, dtype=torch.long),
                 _h2d(gi1, device, dtype=torch.long),
@@ -630,7 +744,8 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
                 _h2d(batch.pc_writes, device, dtype=torch.float32),
                 _h2d(batch.in_slot_regs, device, dtype=torch.long),
                 _h2d(batch.out_slot_regs, device, dtype=torch.long),
-                out_regs_t, vp_mask_t, valid_f, IN_K, OUT_K)
+                out_regs_t, vp_mask_t, valid_f, IN_K, OUT_K,
+                imm_target_t, imm_mask_t)
 
     def _extra(item, aux):
         n_per_chunk = item[1][4]
@@ -651,7 +766,7 @@ def train_encoder(batch_iter, *,
                   live_in_weight=0.1, live_out_weight=0.1,
                   pc_writes_weight=0.1,
                   in_slot_weight=0.1, out_slot_weight=0.1,
-                  value_predict_weight=1.0,
+                  value_predict_weight=1.0, vp_smooth_weight=0.2, imm_weight=1.0,
                   anchor_seed=0, n_anchor_states=8,
                   device='auto', on_log=None, compile_step=True):
     """Train a T1 encoder on RVT batches.
@@ -693,6 +808,7 @@ def train_encoder(batch_iter, *,
         live_out_weight=live_out_weight, pc_writes_weight=pc_writes_weight,
         in_slot_weight=in_slot_weight, out_slot_weight=out_slot_weight,
         value_predict_weight=value_predict_weight,
+        vp_smooth_weight=vp_smooth_weight, imm_weight=imm_weight,
         anchor_seed=anchor_seed, n_anchor_states=n_anchor_states,
         device=device, on_log=on_log, compile_step=compile_step)
 
@@ -946,8 +1062,9 @@ def t2_chunk_forward(t1, t2, split_outputs, n_chunks, max_n_instrs, device,
 
 def t2_value_predict_loss(t2, vecs, anchor_states_t,
                           in_slot_regs_t, out_slot_regs_t,
-                          out_regs_t, mask_t, return_count=False):
-    """Per-anchor, per-out-slot value-prediction MSE (canonical).
+                          out_regs_t, mask_t, vp_smooth_weight=0.2,
+                          return_count=False):
+    """Per-anchor, per-out-slot value-prediction loss (canonical).
 
     The head reads (vec, CANONICAL input-slot values) and predicts per-anchor
     per-slot output values. Both the inputs fed and the target read are in the
@@ -971,8 +1088,9 @@ def t2_value_predict_loss(t2, vecs, anchor_states_t,
                         executing each chunk
       mask_t:           (B,) bool — rows to include (decoded successfully)
 
-    Returns scalar MSE over (row, output-slot, anchor) triplets where
-    out_slot_regs is not IGNORE.
+    Returns a scalar loss (per-bit BCE + vp_smooth_weight · smooth-magnitude
+    MSE) over (row, output-slot, anchor) triplets where out_slot_regs is not
+    IGNORE.
     """
     n_anchors = anchor_states_t.shape[0]
     max_in = in_slot_regs_t.shape[1]
@@ -996,37 +1114,148 @@ def t2_value_predict_loss(t2, vecs, anchor_states_t,
     in_filled = (in_slot_regs_t != AUX_CE_IGNORE).float()       # (B, max_in)
     # (A, max_in) canonical values, broadcast over rows, zeroed at unfilled
     # slots -> (B, A, max_in).
-    in_vals = (anchor_states_t[:, canon_pos].float().unsqueeze(0)
-               * in_filled.unsqueeze(1))
+    # INTEGER canonical input values (kept as int — float32 loses bits above
+    # 2^24, the bits the 'bits' path exists to supervise). Unfilled slots → 0.
+    in_filled_i = (in_slot_regs_t != AUX_CE_IGNORE).to(torch.int64)   # (B, max_in)
+    in_vals_i = (anchor_states_t[:, canon_pos].to(torch.int64).unsqueeze(0)
+                 * in_filled_i.unsqueeze(1))                 # (B, A, max_in) int64
 
-    in_vals_c = _value_compress(in_vals)
-
-    # Feature: (B, A, d + MAX_IN)
-    vec_exp = vecs.unsqueeze(1).expand(-1, n_anchors, -1)
-    feat = torch.cat([vec_exp, in_vals_c], dim=-1)
-
-    # Predict: (B, A, MAX_OUT).
-    pred = t2.vp_head(feat)
-
-    # Target: target[b, a, k] = out_regs[b, a, out_slot_regs[b, k]].
+    # Target[b, a, k] = out_regs[b, a, out_slot_regs[b, k]] (int, NOT floated).
     # Clamp IGNORE→0 for lookup; mask out via out_slot_valid below.
     out_lookup = out_slot_regs_t.clamp(min=0).long()    # (B, MAX_OUT)
     out_lookup_expanded = out_lookup.unsqueeze(1).expand(-1, n_anchors, -1)
-    target = out_regs_t.gather(dim=-1, index=out_lookup_expanded).float()
-    target_c = _value_compress(target)
+    target_i = out_regs_t.to(torch.int64).gather(
+        dim=-1, index=out_lookup_expanded)                  # (B, A, MAX_OUT) int64
 
     out_valid = (out_slot_regs_t != AUX_CE_IGNORE)    # (B, MAX_OUT)
     pair_mask = out_valid & mask_t.unsqueeze(-1)        # (B, MAX_OUT)
+    # DIRECTION only: magnitude is reserved for validity (valid_loss), so the
+    # semantic heads consume the unit-normalized essence — otherwise vp's gradient
+    # flows into ‖essence‖ and "produces register output" ends up proxying for
+    # validity (only register-writers get vp shaping). The operator identity vp
+    # needs lives in the direction.
+    vec_exp = F.normalize(vecs, dim=-1).unsqueeze(1).expand(-1, n_anchors, -1)
 
-    diff_sq = (pred - target_c) ** 2                    # (B, A, MAX_OUT)
-    per_slot = diff_sq.mean(dim=1)                      # (B, MAX_OUT)
+    # Per-bit BCE (uniform resolution) + a bounded smooth-magnitude term. Inputs
+    # fed as bits + smooth so the head can do the arithmetic; per-bit BCE on the
+    # two's-complement target keeps the low (immediate) bit supervised. Bits
+    # decompose from int; smooth floats it (magnitude — low bits moot there).
+    B = vecs.shape[0]
+    nbits = _VP_VALUE_BITS
+    in_feat = torch.cat(
+        [_value_bits(in_vals_i),
+         _value_smooth(in_vals_i.float()).unsqueeze(-1)],
+        dim=-1).reshape(B, n_anchors, max_in * (nbits + 1))
+    feat = torch.cat([vec_exp, in_feat], dim=-1)
+    pred = t2.vp_head(feat).reshape(B, n_anchors, -1, nbits + 1)
+    bit_loss = F.binary_cross_entropy_with_logits(
+        pred[..., :nbits], _value_bits(target_i), reduction='none').mean(-1)
+    sm_loss = (pred[..., nbits] - _value_smooth(target_i.float())) ** 2
+    per_slot = (bit_loss + vp_smooth_weight * sm_loss).mean(dim=1)  # (B, MAX_OUT)
+
     # Mask-multiply (not boolean index / early return) so the op stays
     # static-shape and host-sync-free — capturable in the full-step graph.
     # clamp(min=1) returns 0.0 for an all-masked batch, matching the old
     # early-return.
     pm = pair_mask.float()
-    mse = (per_slot * pm).sum() / pm.sum().clamp(min=1)
-    return (mse, int(pair_mask.sum())) if return_count else mse
+    loss = (per_slot * pm).sum() / pm.sum().clamp(min=1)
+    return (loss, int(pair_mask.sum())) if return_count else loss
+
+
+# InfoNCE temperature for the fallback contrastive head. Not swept (the swept
+# knob is contrastive_s on the d_beh target); a sane fixed value.
+_INFONCE_TAU = 0.2
+
+
+def _behavioral_distance_matrix(out_regs, live_out, s):
+    """Pairwise behavioral distance d_beh (B,B) in [0,1) from the canonical
+    out_regs oracle — the contrastive loss's ground-truth target.
+
+        d_beh[i,j] = mean over anchors a and registers r in
+                     (live_out_i ∪ live_out_j) of φ(|out_regs[i,a,r] − out_regs[j,a,r]|)
+        φ(d) = tanh(log1p(d) / s)   (s > 0);  φ(d) = 1[d>0]   (s == 0, exact-match)
+
+    diff-FIRST-then-φ: the |Δ| is taken on raw register values BEFORE any log
+    compression, so large-but-distinct outputs stay far apart (per-value
+    compression would crush them together). The normalizer is the union
+    live_out (modified-register) footprint — the behavioral set; untouched regs
+    would dilute, and out_slot is syntactic (counts write-back-same-value
+    no-ops). Pure function of the oracle: NO gradient path to the model, so the
+    caller runs it under no_grad and uses it only as a target.
+
+    out_regs: (B, A, N_REGS) int/float — canonical post-exec register file.
+    live_out: (B, N_REGS) float — modified-register mask.
+    s:        host float — φ saturation scale (the swept knob; 0 = indicator).
+    """
+    orf = out_regs.float()
+    delta = (orf.unsqueeze(1) - orf.unsqueeze(0)).abs()          # (B,B,A,R)
+    if s == 0:
+        phi = (delta > 0).to(orf.dtype)                          # exact-match
+    else:
+        phi = torch.tanh(torch.log1p(delta) / s)
+    phi_a = phi.mean(dim=2)                                       # (B,B,R)
+    union = torch.maximum(
+        live_out.unsqueeze(1), live_out.unsqueeze(0))            # (B,B,R)
+    num = (phi_a * union).sum(dim=-1)                            # (B,B)
+    den = union.sum(dim=-1).clamp(min=1.0)
+    return num / den
+
+
+def contrastive_essence_loss(essence, out_regs, live_out, valid, *,
+                             mode='regression', s=0.0):
+    """Behavioral-distance contrastive loss on the rename-invariant essence.
+
+    Pulls behaviorally-equivalent chunks' essences together and pushes distinct
+    ones apart, supervised by the canonical out_regs oracle (already register-
+    aligned, so there is no matching/bijection step). Two heads share the SAME
+    B×B objects — the cosine matrix and the d_beh matrix:
+
+      regression (primary): MSE( cos_sim(ess_i, ess_j), 1 − d_beh[i,j] ).
+        Bounded cosine sidesteps MDS scaling; the infeasibility of making many
+        distinct chunks mutually near-orthogonal forces dimension usage (the
+        ~7-dim essence-collapse fix). No trivial collapse — all-equal essences
+        are penalized on the distinct pairs (target cos → 0).
+      infonce (fallback): soft-weighted NT-Xent — per row a softmax over
+        candidate cosines with soft positive weights (1 − d_beh). Scale-free.
+
+    Static-shape and host-sync-free (capturable in the compiled CUDA-graph
+    step). The d_beh target carries no gradient, so it is built under no_grad;
+    only the cosine matrix flows grad into the essence.
+
+    essence:  (B, d) — pooled rename-invariant essence (grad flows here).
+    out_regs: (B, A, N_REGS) int — canonical oracle (no grad).
+    live_out: (B, N_REGS) float — modified-register mask.
+    valid:    (B,) bool/float — rows with a decodable oracle (out_regs_valid).
+    mode:     'regression' | 'infonce'.
+    s:        φ saturation scale (host float; 0 = exact-match indicator).
+    """
+    B = essence.shape[0]
+    with torch.no_grad():
+        d_beh = _behavioral_distance_matrix(out_regs, live_out, s)    # (B,B)
+        v = valid.float().view(-1)
+        # pair mask: both rows decodable, diagonal excluded (the self-pair is a
+        # trivial cos=1 / d_beh=0 match — it would only dilute the mean).
+        eye = torch.eye(B, device=essence.device, dtype=v.dtype)
+        pair = (v.unsqueeze(0) * v.unsqueeze(1)) * (1.0 - eye)        # (B,B)
+
+    e = F.normalize(essence, dim=-1)
+    cos = e @ e.T                                                     # (B,B)
+
+    if mode == 'infonce':
+        logits = (cos / _INFONCE_TAU).masked_fill(pair == 0, -1e4)
+        # finite mask (NOT -inf): a fully-masked row stays a valid uniform
+        # softmax (finite log-prob) rather than NaN; its weight is 0 anyway.
+        log_prob = F.log_softmax(logits, dim=-1)                      # (B,B)
+        w = (1.0 - d_beh) * pair
+        w = w / w.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        row_loss = -(w * log_prob).sum(dim=-1)                        # (B,)
+        row_valid = (pair.sum(dim=-1) > 0).float()
+        return (row_loss * row_valid).sum() / row_valid.sum().clamp(min=1.0)
+
+    # regression (primary)
+    target = 1.0 - d_beh
+    err = (cos - target) ** 2 * pair
+    return err.sum() / pair.sum().clamp(min=1.0)
 
 
 def _slot_k_eff(slot_regs_np):
@@ -1145,7 +1374,9 @@ def binding_losses(model, T, essence, *, live_in_t, live_out_t, pc_writes_t,
 
     li_logits = model.live_in_head(T).squeeze(-1)        # (B, n_regs)
     lo_logits = model.live_out_head(T).squeeze(-1)
-    pc_logits = model.pc_writes_head(essence).squeeze(-1)
+    # pc reads the essence DIRECTION only (magnitude = validity); binding heads
+    # above read per-slot T, which is off the essence-magnitude axis entirely.
+    pc_logits = model.pc_writes_head(F.normalize(essence, dim=-1)).squeeze(-1)
 
     li_per = F.binary_cross_entropy_with_logits(
         li_logits, live_in_t, reduction='none')
@@ -1280,14 +1511,18 @@ class TrainBatchPrefetcher:
 
 
 def train_t2_encoder(batch_iter, t1_encoder, *,
-                     d_out=256, d_event=16,
+                     d_out=256, d_event=16, op_cell_depth=1, vp_head_depth=4,
+                     n_pool_heads=1, pool_mode='pma', pool_extra='none',
+                     read_time_mode='stamp',
                      lr=3e-4, n_steps=None, log_every=100, lr_min=1e-6,
                      warmup_steps=0,
                      valid_weight=0.0,
                      live_in_weight=0.1, live_out_weight=0.1,
                      pc_writes_weight=0.1,
                      in_slot_weight=0.1, out_slot_weight=0.1,
-                     value_predict_weight=0.0,
+                     value_predict_weight=0.0, vp_smooth_weight=0.2,
+                     contrastive_weight=0.0, contrastive_loss='regression',
+                     contrastive_s=0.0,
                      anchor_seed=0, n_anchor_states=8,
                      t2_checkpoint=None, t2_route='binding',
                      device='auto',
@@ -1297,13 +1532,20 @@ def train_t2_encoder(batch_iter, t1_encoder, *,
     as T1; only the content provider + hparams differ."""
     return train_compressor(
         batch_iter, ingest='vectors', lower_encoder=t1_encoder,
-        d_out=d_out, d_event=d_event, route=t2_route,
+        d_out=d_out, d_event=d_event, op_cell_depth=op_cell_depth,
+        vp_head_depth=vp_head_depth, n_pool_heads=n_pool_heads,
+        pool_mode=pool_mode, pool_extra=pool_extra,
+        read_time_mode=read_time_mode,
+        route=t2_route,
         lr=lr, n_steps=n_steps, log_every=log_every, lr_min=lr_min,
         warmup_steps=warmup_steps,
         valid_weight=valid_weight, live_in_weight=live_in_weight,
         live_out_weight=live_out_weight, pc_writes_weight=pc_writes_weight,
         in_slot_weight=in_slot_weight, out_slot_weight=out_slot_weight,
         value_predict_weight=value_predict_weight,
+        vp_smooth_weight=vp_smooth_weight,
+        contrastive_weight=contrastive_weight,
+        contrastive_loss=contrastive_loss, contrastive_s=contrastive_s,
         anchor_seed=anchor_seed,
         n_anchor_states=n_anchor_states, resume=t2_checkpoint,
         device=device, on_log=on_log, compile_step=compile_step)
