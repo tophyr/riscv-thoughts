@@ -93,9 +93,11 @@ accuracy, and it splits into two independent causes:
 
 - **~65% — instructions that share a source register with each other.** On
   pairs with *disjoint* sources the essence is at 99.999%; on the ~12% of pairs
-  that share one it drops to ~83%. Operation identity survives (opcode
-  recovered at 99%+); what fails is knowing *which* input feeds which operand
-  — recoverable at ~99.8% on disjoint pairs but only ~51% on overlapping ones.
+  that share one it drops to ~83% per-bit, which is **21.2% exact 32-bit match**.
+  Operation identity survives (opcode recovered at 99%+); what fails is knowing
+  *which* input feeds which operand — recoverable at ~99.8% on disjoint pairs but
+  only ~49%/~4% (operand 0 / operand 1) on overlapping ones. **Solved by
+  `--op-cell-rank`** (finding 11).
 - **~35% — encoding of immediate values.** Visible even on single
   instructions, concentrated exactly in bits 0–11, the 12-bit immediate field.
   This shrinks with training rather than being structural.
@@ -140,6 +142,58 @@ block carries operand read-order, and a commutative swap changes exactly that
 1M halves vp (0.0404 → 0.0198) while reconstruction stays flat or drifts down.
 The two goals have decoupled.
 
+**11. Feeding the op-cell each operand's canonical read position solves the
+shared-source deficit outright.** The pool never sees `content`, so it must use
+read-order unconditionally; the op-cell sees the opcode and both operands in one
+activation and can symmetrize per opcode. `--op-cell-rank` (with
+`--read-time-mode rank`) at 250k, against the `stamp` baseline at the same step
+count, same probe, same corpus:
+
+| `s1 overlap` | baseline | op_cell_rank |
+|---|---|---|
+| vp per-bit | 81.1% | 100.0% |
+| vp EXACT 32-bit | 21.2% | **100.0%** |
+| operand0 / operand1 canonical position | 49.2% / 4.3% | 98.2% / 97.9% |
+| overlap-only control, vp exact | 30.5% | 100.0% |
+
+Aggregate vp 0.0405 → 0.0184, i.e. 250k beats the baseline's 1M (0.0198). The
+4.3% on operand1 is the off-by-one `stamp` produces on exactly this subset. A
+probe gated the run first (`probes/opcell_rank_sufficiency.py`): slot B's state
+plus the true ranks predicts its output at 97.4% exact on the overlap subset
+against 37.4% without them, so the information was present and only the
+association was missing.
+
+**12. The cost is tag-invariance, not equivariance.** At `--gvn-chunk-len 2`,
+rename 0.0002 → 0.0008 (~0, as exact equivariance requires), tag-invariance
+0.0010 → 0.0255, commutative 0.0027 → 0.0366, separation 462× → 35.5×. The
+essence became 25× more sensitive to the anonymous per-chunk tags and
+commutative collapse followed: commutative distance is 1.4× its own tag floor
+here against 2.7× for the baseline. Under the project constraint this blocks
+adoption.
+
+**13. `gvn_collapse`'s rename row was measuring tag-invariance.** `enc()` drew
+fresh random tags per call, so base and twin got independent tags while the
+comment above it claimed they were pinned. Since equivariance is exact, that row
+could only ever be nonzero because of tags. It now permutes the twin's tags by
+the same relabeling (making it an architecture assertion that reads ~0) and
+reports tag-invariance as its own row. **Every GVN number recorded before this
+is not comparable** — including this phase's own table above and Phase 14's.
+
+**14. `rank` counts registers read BEFORE written.** Counting reads of in-chunk
+results consumes a rank and pushes every later input off by one — the `stamp`
+bug with dataflow as the trigger. Agreement with the frame the vp target is
+built in: 96.6% of len=2 chunks, 83.7% at len=4, 52.9% at len=8. The residual is
+dead code, which no causal read-time counter can know, so `rank` is exact on the
+shared-source subset and approximate at len=8 by construction.
+
+**15. The canonical-frame caveat is common, and harmless.** Canonical positions
+cover all live syntactic inputs while `in_slot_regs` lists only the behavioral
+subset, so a dropped input shifts every later slot and the vp head is fed a value
+the target never used: 5.9% of len=2 chunks, 14.8% at len=4, 26.6% at len=8, 0%
+at len=1. Measured on the best len=2 checkpoint, the shifted rows score 99.09%
+per-bit / 96.7% exact against 99.21% / 94.5% for the rest — an input is dropped
+precisely when the output does not depend on it.
+
 ## Decisions taken
 
 - **`pool_extra=write_time` is the adopted setting for new runs.** NB the
@@ -154,6 +208,13 @@ The two goals have decoupled.
   ordering fix *reduced* effective dimensionality (26→15) while improving
   reconstruction 19 points, contradicting the Round-1 theory that
   concentration was the pathology.
+- **`--op-cell-rank` is not adopted yet.** It meets the len=2 acceptance
+  criterion but fails the equivalence-collapse constraint (findings 11–12). The
+  open question is whether the random tags can be removed now that rank supplies
+  distinguishability deterministically.
+- **Report vp discretely.** `probes/vp_slot_b_split.py` prints exact 32-bit match
+  alongside per-bit; 81% per-bit on the overlap column was 21% exact, so per-bit
+  alone made a mostly-broken subset look nearly solved.
 - **Decode-back is explicitly OUT OF SCOPE for this phase** — the objective is
   vp. Finding 10 says only that if it is picked up later, more discriminative
   training will not deliver it; it would need its own loss. Until then the
@@ -215,42 +276,25 @@ zero, so the bar is demonstrated rather than aspirational.
 
 ## Open threads
 
-1. **Shared-source-register operand binding** — ~65% of the remaining len=2
-   error.
+1. **Tag-invariance under `--op-cell-rank`.** The binding half of this thread is
+   closed (findings 11–12): the op-cell, being the one consumer that sees the
+   opcode and both operands together, uses read-order conditionally where the
+   pool could only use it unconditionally, and that takes `s1 overlap` to 100%
+   exact. What it costs is tag-invariance (0.0010 → 0.0255), which drags
+   commutative collapse with it (0.0027 → 0.0366, separation 462× → 35.5×).
 
-   What the two pool experiments (finding 8) share is that the pool never sees
-   `content` (`softmax(pool_k(pool_src) · q)` over slots,
-   `compressor/model.py:277-295`), so it must use any channel it receives
-   *unconditionally*. That one fact explains both halves of the result — why
-   nothing helped (read-order is recorded on the slot being *read*, while the
-   fact needing it lives on the slot doing the *reading*; associating them is a
-   cross-slot join a sum cannot perform) and why `event` cost equivalence
-   collapse (a commutative swap changes read-order, and the pool cannot know to
-   ignore that for `ADD` but not for `SUB`).
+   The leading fix is subtractive: the anonymous random tags exist only to make
+   inputs *distinguishable* without intrinsic identity, and canonical read rank
+   now supplies exactly that deterministically, so the tag is a redundant random
+   input the model is no longer pressured to cancel. Seed the state from rank
+   instead of `tag_proj` and re-check `state_max_err`, `s1 overlap`, and the tag
+   / commutative rows. Fallback: an explicit tag-invariance penalty (one chunk,
+   two tag draws, penalize the essence difference).
 
-   **The hypothesis this yields: the consumer has to be content-conditioned.**
-   The op-cell is the only consumer that sees the opcode and both operands in
-   one activation, and it is the only one never modified — it reads just the
-   `value` channels (`model.py:204`). Feeding it each operand's canonical read
-   rank makes the association local, and *unlike the pool*, it can use operand
-   position for `SUB`/`SLT`/`SRL` while symmetrizing it for the commutative ops.
-   Conditional vs unconditional use of read-order is the whole claim, and it is
-   falsifiable.
-
-   Test order: first a probe (readout given the frozen per-slot state *plus*
-   each operand's true canonical rank — if that does not reach ~100% on the
-   overlap subset, the information is gone upstream of the pool and the op-cell
-   change cannot help either), then one training run scored on vp **and** the
-   GVN rows. The failure mode to watch is finding 9 reappearing inside the value
-   channels: commutative distance doubling, separation halving.
-
-   `read_time_mode` must be `rank` for this: `stamp` overshoots whenever a
+   `read_time_mode` must be `rank` for any of this: `stamp` overshoots whenever a
    repeat read leaves a hole, i.e. it is wrong *exactly on the shared-source
-   subset that is failing*. `rank` counts only registers read before written, and
-   matches the oracle frame on 96.6% of len=2 chunks; the residual is dead code,
-   which no causal read-time counter can know, and it grows with length (52.9% at
-   len=8). The secondary candidate, `pool_extra=order` + `rank`, is a dead end
-   (finding 8), leaving the op-cell as the only remaining hypothesis.
+   subset*, and `--op-cell-rank` asserts on it rather than accepting a wrong
+   coordinate system.
 
 2. **Immediate encoding** — ~35% of the remaining error. T2 has a built but
    unused immediate head, skipped because a chunk has no single immediate — but

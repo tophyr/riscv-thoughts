@@ -116,7 +116,7 @@ class RegisterStateMachine(nn.Module):
 
     def __init__(self, d_value, d_event, d_content, n_regs=32, op_cell_depth=1,
                  n_pool_heads=1, pool_mode='pma', pool_extra='none',
-                 read_time_mode='stamp'):
+                 read_time_mode='stamp', op_cell_rank=False):
         super().__init__()
         self.d_value = d_value
         self.d_event = d_event
@@ -127,9 +127,20 @@ class RegisterStateMachine(nn.Module):
         self.pool_extra = pool_extra
         assert read_time_mode in ('stamp', 'rank'), read_time_mode
         self.read_time_mode = read_time_mode
+        # Give the op-cell each operand's canonical read position. The pool
+        # cannot use read-order (it never sees content, so it must apply it
+        # unconditionally, which breaks commutative collapse); the op-cell can,
+        # because it sees the opcode and both operands together and can
+        # symmetrize per opcode. Requires read_time_mode='rank' to be the
+        # canonical position. Widens op_cell's input, so old checkpoints only
+        # load with this off.
+        self.op_cell_rank = op_cell_rank
+        assert not (op_cell_rank and read_time_mode != 'rank'), \
+            'op_cell_rank needs read_time_mode=rank (stamp is not a position)'
         self.tag_proj = nn.Linear(1, d_value)
         self.op_cell = nn.Sequential(
-            nn.Linear(d_content + 2 * d_value, 4 * d_value), nn.ReLU(),
+            nn.Linear(d_content + 2 * d_value + (2 if op_cell_rank else 0),
+                      4 * d_value), nn.ReLU(),
             nn.Linear(4 * d_value, d_value))
         # Extra RESIDUAL FFN blocks on op_cell's output (op_cell_depth > 1). The
         # op-cell is reused RECURRENTLY once per instruction, so a naive deep
@@ -201,7 +212,22 @@ class RegisterStateMachine(nn.Module):
             r0 = torch.bmm(oh0.unsqueeze(1), value).squeeze(1)   # (B,d_value)
             r1 = torch.bmm(oh1.unsqueeze(1), value).squeeze(1)
             c = content[:, k]
-            res = self.op_cell(torch.cat([c, r0, r1], dim=-1))   # (B,d_value)
+            oh0e = oh0 * not_x0_row
+            oh1e = oh1 * not_x0_row
+            # Read-order is stamped BEFORE the op-cell so this step's operands
+            # carry their own canonical position. Nothing between the two points
+            # reads read_time, so with op_cell_rank off the step is unchanged.
+            read_time, n_read = self._stamp_reads(
+                read_time, n_read, write_time, oh0e, oh1e, a, k)
+            cell_in = [c, r0, r1]
+            if self.op_cell_rank:
+                # the position of the register each operand reads, normalized;
+                # 0 for an x0 operand (not an input). Per-chunk scalars placed
+                # by the wiring, so no register index enters — equivariance holds.
+                scale = float(self.n_regs)
+                cell_in += [((oh0e * read_time).sum(-1, keepdim=True) / scale),
+                            ((oh1e * read_time).sum(-1, keepdim=True) / scale)]
+            res = self.op_cell(torch.cat(cell_in, dim=-1))       # (B,d_value)
             for blk in self.op_cell_blocks:                      # residual depth
                 res = res + blk(res)
             # write value at dest (x0 write = nop), active rows only.
@@ -211,57 +237,12 @@ class RegisterStateMachine(nn.Module):
             value = value * (1.0 - w) + w * res.unsqueeze(1)
             # event channels: content-dependent read pulse (x0 reads leave no
             # trace) + write pulse.
-            oh0e = oh0 * not_x0_row
-            oh1e = oh1 * not_x0_row
             p0 = self.read_pulse(torch.cat([c, r0], dim=-1)) + self.read_role[0]
             p1 = self.read_pulse(torch.cat([c, r1], dim=-1)) + self.read_role[1]
             event = event + (oh0e * a).unsqueeze(-1) * p0.unsqueeze(1)
             event = event + (oh1e * a).unsqueeze(-1) * p1.unsqueeze(1)
             event = event + (oh_out * a).unsqueeze(-1) \
                 * self.write_pulse.view(1, 1, -1)
-            # order timestamps: first read sticks (operand 0 BEFORE operand 1
-            # within a step, so same-instruction inputs aren't tied — the
-            # within-instruction order read_role also marks); last write
-            # overwrites (SSA write order).
-            #
-            # 'stamp' (legacy) writes 2(k+1)+role. That equals the canonical
-            # input position MINUS ONE only while every read is fresh: a repeat
-            # read is (correctly) not re-stamped, which leaves a HOLE in the
-            # sequence, so every later operand's stamp overshoots its true rank.
-            # The supervision's canonical positions are RANKS (first-read
-            # order), so with any shared source register the two coordinate
-            # systems disagree — measured as operand-position recovery at ~5%
-            # (confidently off by one) on overlapping-source pairs vs ~99.9% on
-            # disjoint ones. 'rank' stamps the running count of DISTINCT
-            # registers read before written, so read_time IS the canonical
-            # position for every consumer, with no conversion. The counter is a
-            # per-chunk scalar with no register index and is placed through the
-            # same one-hot, so equivariance is unaffected. (It still diverges on
-            # a DEAD input: datagen's canonical positions cover live inputs
-            # only, and liveness is not knowable at read time.)
-            # 'rank' gates on write_time == 0 because the canonical positions
-            # count only registers read BEFORE written: ranking a read of an
-            # in-chunk result would push every later input off by one.
-            # write_time still reflects steps < k here (updated below), so a
-            # register read and written in the same step is still an input.
-            fresh = (read_time == 0).to(value.dtype)
-            if self.read_time_mode == 'rank':
-                fresh = fresh * (write_time == 0).to(value.dtype)
-            fr0 = (oh0e * a) * fresh
-            if self.read_time_mode == 'rank':
-                n_read = n_read + fr0.sum(-1, keepdim=True)
-                read_time = read_time + fr0 * n_read
-            else:
-                read_time = read_time + fr0 * (2.0 * (k + 1))
-            fresh = (read_time == 0).to(value.dtype)
-            if self.read_time_mode == 'rank':
-                fresh = fresh * (write_time == 0).to(value.dtype)
-            fr1 = (oh1e * a) * fresh
-            if self.read_time_mode == 'rank':
-                n_read = n_read + fr1.sum(-1, keepdim=True)
-                read_time = read_time + fr1 * n_read
-            else:
-                read_time = read_time + fr1 * (2.0 * (k + 1) + 1.0)
             wr = oh_out * a
             write_time = write_time * (1.0 - wr) + wr * step_sig
         # fold the order timestamps into event channels 0 (read) and 1 (write),
@@ -307,6 +288,34 @@ class RegisterStateMachine(nn.Module):
         heads = att.transpose(1, 2) @ vv                     # (B, k, d_value//k)
         essence = heads.reshape(value.shape[0], -1)          # (B, d_value)
         return T, essence
+
+    def _stamp_reads(self, read_time, n_read, write_time, oh0e, oh1e, a, k):
+        """Stamp this step's operands with their read ORDER; first read sticks.
+        Operand 0 is stamped before operand 1, so same-instruction inputs are
+        not tied (read_role marks the within-instruction order separately).
+
+        'stamp' (legacy) writes 2(k+1)+role, which equals the canonical position
+        minus one only while every read is fresh: a repeat read is correctly not
+        re-stamped, leaving a hole, so every later operand overshoots — wrong
+        exactly on the shared-source subset. 'rank' counts distinct registers
+        read BEFORE written, which IS the canonical position, so no consumer
+        needs a conversion. (It still diverges on a DEAD input: the canonical
+        frame covers live inputs only, and liveness is not knowable here.)
+        All values are per-chunk scalars placed through the wiring one-hots, so
+        equivariance is unaffected.
+        """
+        rank = self.read_time_mode == 'rank'
+        for oh, role in ((oh0e, 0.0), (oh1e, 1.0)):
+            fresh = (read_time == 0).to(read_time.dtype)
+            if rank:
+                fresh = fresh * (write_time == 0).to(read_time.dtype)
+            fr = (oh * a) * fresh
+            if rank:
+                n_read = n_read + fr.sum(-1, keepdim=True)
+                read_time = read_time + fr * n_read
+            else:
+                read_time = read_time + fr * (2.0 * (k + 1) + role)
+        return read_time, n_read
 
     def apply_slot_head(self, head, T):
         """Per-slot readout: Linear(d_slot,1) over every register slot ->
@@ -414,7 +423,8 @@ class Compressor(nn.Module):
 
     def __init__(self, *, d_content, d_out, d_event, op_cell_depth=1,
                  vp_head_depth=_VP_HEAD_DEPTH, n_pool_heads=1, pool_mode='pma',
-                 pool_extra='none', read_time_mode='stamp'):
+                 pool_extra='none', read_time_mode='stamp',
+                 op_cell_rank=False):
         super().__init__()
         self.d_content = d_content
         self.d_out = d_out
@@ -427,7 +437,7 @@ class Compressor(nn.Module):
             d_value=d_out, d_event=d_event, d_content=d_content, n_regs=N_REGS,
             op_cell_depth=op_cell_depth, n_pool_heads=n_pool_heads,
             pool_mode=pool_mode, pool_extra=pool_extra,
-            read_time_mode=read_time_mode)
+            read_time_mode=read_time_mode, op_cell_rank=op_cell_rank)
 
         # Binding heads read the per-slot state T (d_out+d_event), one score per
         # register slot (equivariant); pc_writes + value_predict read the
@@ -486,7 +496,8 @@ class T1Compressor(nn.Module):
 
     def __init__(self, *, vocab_size, d_model, n_heads, n_layers, max_window,
                  d_out, d_event, op_cell_depth=1, vp_head_depth=_VP_HEAD_DEPTH,
-                 n_pool_heads=1, pool_mode='pma', pool_extra='none', read_time_mode='stamp'):
+                 n_pool_heads=1, pool_mode='pma', pool_extra='none',
+                 read_time_mode='stamp', op_cell_rank=False):
         super().__init__()
         self.embedder = TokenEmbedder(
             vocab_size=vocab_size, d_model=d_model, n_heads=n_heads,
@@ -496,7 +507,7 @@ class T1Compressor(nn.Module):
             op_cell_depth=op_cell_depth, vp_head_depth=vp_head_depth,
             n_pool_heads=n_pool_heads, pool_mode=pool_mode,
             pool_extra=pool_extra,
-            read_time_mode=read_time_mode)
+            read_time_mode=read_time_mode, op_cell_rank=op_cell_rank)
         # dim interface (plain ints — delegated by value, not submodules)
         self.n_regs = self.compressor.n_regs
         self.d_out = self.compressor.d_out
@@ -527,13 +538,15 @@ class T1Compressor(nn.Module):
 
 def T2Compressor(*, d_t1, d_out, d_event, op_cell_depth=1,
                  vp_head_depth=_VP_HEAD_DEPTH, n_pool_heads=1, pool_mode='pma',
-                 pool_extra='none', read_time_mode='stamp'):
+                 pool_extra='none', read_time_mode='stamp',
+                 op_cell_rank=False):
     """T2 preset: a Compressor fed a lower tier's essence (d_content=d_t1)."""
     return Compressor(d_content=d_t1, d_out=d_out, d_event=d_event,
                       op_cell_depth=op_cell_depth, vp_head_depth=vp_head_depth,
                       n_pool_heads=n_pool_heads, pool_mode=pool_mode,
                       pool_extra=pool_extra,
-            read_time_mode=read_time_mode)
+                      read_time_mode=read_time_mode,
+                      op_cell_rank=op_cell_rank)
 
 
 class Decoder(nn.Module):

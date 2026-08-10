@@ -71,6 +71,15 @@ def main():
                         'DISTINCT registers read, so read_time IS the canonical '
                         'position.')
 
+    p.add_argument('--op-cell-rank', action='store_true',
+                   help="feed the op-cell each operand's canonical read "
+                        'position. The pool cannot use read-order (it never '
+                        'sees content, so it must apply it unconditionally, '
+                        'which breaks commutative collapse); the op-cell can, '
+                        'since it sees the opcode and both operands together. '
+                        'Requires --read-time-mode rank; widens op_cell, so '
+                        'checkpoints trained with it are not interchangeable.')
+
     add_common_train_args(p, lr=1e-4)
     p.add_argument('--warmup-steps', type=int, default=10000,
                    help='Linear LR warmup from ~0 to --lr over this many '
@@ -149,7 +158,7 @@ def main():
         d_out=args.d_out, d_event=args.d_event, op_cell_depth=args.op_cell_depth,
         vp_head_depth=args.vp_head_depth, n_pool_heads=args.n_pool_heads,
         pool_mode=args.pool_mode, pool_extra=args.pool_extra,
-        read_time_mode=args.read_time_mode,
+        read_time_mode=args.read_time_mode, op_cell_rank=args.op_cell_rank,
         lr=args.lr, n_steps=args.n_steps, log_every=args.log_every,
         warmup_steps=args.warmup_steps,
         valid_weight=args.valid_weight,

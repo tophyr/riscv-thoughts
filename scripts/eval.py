@@ -97,6 +97,8 @@ def main():
         print(f'  rename     mean={g["rename_mean"]:.4f} '
               f'ratio={rr:.4f}' if rr is not None else
               f'  rename     mean={g["rename_mean"]:.4f}')
+        print(f'  tag-invar  mean={g["tag_mean"]:.4f}   '
+              f'(same chunk, different anonymous tags — learned, not free)')
         print(f'  behavioral mean={g["behavioral_mean"]:.4f} '
               f'ratio={br:.4f}' if br is not None else
               f'  behavioral mean={g["behavioral_mean"]:.4f}')

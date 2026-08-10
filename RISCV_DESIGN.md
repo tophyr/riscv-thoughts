@@ -340,6 +340,16 @@ are recoverable from the emitted object; a pure value-state records only
 writes). The read pulse is content-dependent, so a behaviorally-irrelevant
 read (`AND rs1,x0`) is distinguishable from a relevant one.
 
+**Read-order must be consumed conditionally, and only the op-cell can do that.**
+Operand binding needs each operand's position in the canonical (first-read)
+frame. The essence pool cannot supply it: the pool is a symmetric sum that never
+sees `content`, so any channel fed to it is used unconditionally — and a
+commutative operand swap changes read-order, so an unconditional consumer stops
+being blind to a distinction it must be blind to. The op-cell sees the opcode
+and both operands in one activation, so it can use position for `SUB`/`SLT`/`SRL`
+and symmetrize it for `ADD`/`AND`/`OR`/`XOR`. This is why the fix belongs at the
+op-cell and why every pool channel is a recorded dead end.
+
 **Distinct anonymous leaf tags (subtle but essential).** Inputs must be
 *distinguishable* (so `add r2,r3` ≠ `add r2,r2`) but carry *no intrinsic
 identity* — a per-register learned embedding `f(r)` would have to be constant
@@ -348,6 +358,16 @@ feature trick: give each live-in register a random tag, sampled per chunk,
 that permutes with π. The network learns to use tags only as "these two
 inputs differ," not "this is register 5"; structurally-identical inputs
 collapse, distinct ones stay apart.
+
+Note what this property costs and what else can supply it. Tag-invariance is
+*learned*, not free — it is the one place the architecture relies on training
+rather than construction, so it is the thing a change is most likely to
+regress. The **canonical read rank** (first-read order over registers read
+before written) supplies the same distinguishability deterministically: two
+distinct inputs get ranks 1 and 2, a repeated input gets one rank twice. It is
+assigned by read ORDER, which permutes with π, so it is not a per-register
+embedding and the torsion argument does not apply to it. Whether rank can
+replace the random tag outright is open (TODO.md task 1).
 
 ### The tier contract — never re-embed tokens
 

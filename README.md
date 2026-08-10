@@ -118,18 +118,24 @@ equivariant architecture), **behavioral-non-rename (commutativity) `0.024`**
 non-rename collapse is the real result: the register-state machine performs
 global value numbering, not merely the free rename-twin collapse.
 
-**Phase 15 (open) — the chunk vector was losing output ORDER.** The essence is
-a sum over the 32 register slots; that sum is what makes it rename-invariant,
-but it is also order-blind, while the essence must encode *"output 1 is this,
-output 2 is that"*. It was never told which register was written first. Feeding
-the pool one scalar per slot — the write step (`--pool-extra write_time`) —
-took value-prediction loss **0.3525 → 0.0396** at 2-instruction chunks
-(**0.0198** with 4× training) and decode-back **72.9% → 91.5%** per instruction
-at 8 (~8% → ~49% for a whole chunk), while *improving* equivalence collapse.
-Both mission metrics moved from one change; reconstruction improved without
-being trained for. Remaining error at len=2 is ~65% operand binding when two
-instructions share a source register, ~35% immediate encoding. See
-EXPERIMENT_LOG Phase 15.
+**Phase 15 (open) — ORDER, then operand BINDING.** The essence is a sum over the
+32 register slots; that sum is what makes it rename-invariant, but it is also
+order-blind, while the essence must encode *"output 1 is this, output 2 is
+that"*. Feeding the pool one scalar per slot — the write step (`--pool-extra
+write_time`) — took value-prediction loss **0.3525 → 0.0396** at 2-instruction
+chunks (**0.0198** with 4× training) and decode-back **72.9% → 91.5%** per
+instruction at 8, while *improving* equivalence collapse.
+
+What remained was operand binding when two instructions share a source register
+— 21.2% exact 32-bit match on that subset. No channel fed to the *pool* can fix
+it: the pool never sees `content`, so it must use read-order unconditionally,
+and a commutative swap changes read-order. The **op-cell** can, since it sees the
+opcode and both operands in one activation and can symmetrize per opcode. Giving
+it each operand's canonical read position (`--op-cell-rank`) takes that subset to
+**100.0% exact** and aggregate vp to 0.0184 at 250k, beating the baseline's 1M.
+It is not adopted yet: it regresses tag-invariance 25× (0.0010 → 0.0255), which
+drags commutative collapse with it. Equivariance is untouched. See EXPERIMENT_LOG
+Phase 15.
 
 `vp` is a real objective with no intrinsic floor: single-instruction vp is
 exactly `0.000`, and the head is fed raw value bits, not log-compressed scalars.

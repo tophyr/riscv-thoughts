@@ -97,6 +97,7 @@ def load_frozen_encoder(model_path, device):
         pool_mode=hp.get('pool_mode', 'pma'),
         pool_extra=_pool_extra(hp),
         read_time_mode=hp.get('read_time_mode', 'stamp'),
+        op_cell_rank=hp.get('op_cell_rank', False),
     ).to(device)
     encoder.load_state_dict(_split_t1_state(load_checkpoint(model_path, device)))
     encoder.eval()
@@ -118,6 +119,7 @@ def load_t2(t2_dir, t1, device):
         pool_mode=hp.get('pool_mode', 'pma'),
         pool_extra=_pool_extra(hp),
         read_time_mode=hp.get('read_time_mode', 'stamp'),
+        op_cell_rank=hp.get('op_cell_rank', False),
     ).to(device)
     t2.load_state_dict(load_checkpoint(t2_dir / 't2.pt', device))
     t2.eval()

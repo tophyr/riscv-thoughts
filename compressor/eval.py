@@ -22,7 +22,7 @@ from datagen import (
     DEFAULT_DISTRIBUTION, build_opcode_table, random_instruction,
     AUX_CE_IGNORE, N_REGS,
 )
-from datagen.generate import random_relabel
+from datagen.generate import random_perm, relabel
 from emulator import Instruction, R_TYPE
 from tokenizer import encode_instruction, PAD
 
@@ -394,9 +394,12 @@ def gvn_collapse(t1, t2, *, device, route='binding', n=200, chunk_len=4,
                  seed=0):
     """Essence-distance GVN collapse, SPLIT by pair type:
 
-      rename     — chunk vs a random register-relabeling (structural; FREE
-                   from the equivariant architecture — twins dominate corpora,
-                   so this must be separated from the trained signal).
+      rename     — chunk vs a random register-relabeling, with the twin's TAGS
+                   permuted by the same relabeling. Equivariance is exact by
+                   construction, so this must read ~0 for ANY model: it is an
+                   architecture assertion, not a quality signal. (Drawing
+                   INDEPENDENT tags here instead makes it report tag-invariance,
+                   which is a different property — reported separately below.)
       behavioral — chunk vs a commutative-operand-swap variant (a+b==b+a):
                    behaviorally equivalent but NOT a rename, so collapsing it
                    is TRAINED value-numbering, not architecture.
@@ -410,7 +413,7 @@ def gvn_collapse(t1, t2, *, device, route='binding', n=200, chunk_len=4,
     anchors = make_anchor_states(8, 0)
     table = build_opcode_table(DEFAULT_DISTRIBUTION)
 
-    bases, twins, commutes, distinct_pool = [], [], [], []
+    bases, twins, commutes, perms = [], [], [], []
     while len(bases) < n:
         chunk = [random_instruction(rng, opcode_table=table)
                  for _ in range(chunk_len)]
@@ -421,21 +424,37 @@ def gvn_collapse(t1, t2, *, device, route='binding', n=200, chunk_len=4,
         cv = _commute_variant(chunk, rng)
         if cv is None:
             continue
+        perm = random_perm(rng)
         bases.append(chunk)
-        twins.append(random_relabel(chunk, rng))
+        twins.append(relabel(chunk, perm))
         commutes.append(cv)
+        perms.append(perm)
 
-    # Deterministic tags so the comparison is pure (essence is tag-invariant
-    # for a trained model, but pinning tags removes any residual noise).
+    # ONE tag draw shared by base / twin / commute, so each row isolates the
+    # distinction it names instead of also measuring tag noise. The twin's tags
+    # are PERMUTED by its own relabeling (a rename moves the register AND the
+    # anonymous tag riding on it); the commute variant keeps the same registers,
+    # so it keeps the same tags.
     R = t2.n_regs
+    base_tags = torch.from_numpy(
+        rng.standard_normal((len(bases), R)).astype(np.float32)).to(device)
+    twin_tags = torch.empty_like(base_tags)
+    for i, perm in enumerate(perms):
+        twin_tags[i, torch.from_numpy(perm.astype(np.int64)).to(device)] = \
+            base_tags[i]
+    alt_tags = torch.from_numpy(
+        rng.standard_normal((len(bases), R)).astype(np.float32)).to(device)
 
-    def enc(chunks):
-        tags = torch.from_numpy(
-            rng.standard_normal((len(chunks), R)).astype(np.float32)).to(device)
+    def enc(chunks, tags):
         v = encode_chunks_t2(t1, t2, chunks, device, route=route, tags=tags)
         return F.normalize(v, dim=-1)
 
-    eb, et, ec = enc(bases), enc(twins), enc(commutes)
+    eb, et, ec = (enc(bases, base_tags), enc(twins, twin_tags),
+                  enc(commutes, base_tags))
+    # tag-invariance: the SAME chunk under a different anonymous tag draw. Not
+    # architectural — the model must learn to use tags only as "these inputs
+    # differ", never as identity — so it belongs on its own row.
+    d_tag = (eb - enc(bases, alt_tags)).norm(dim=-1)
     d_rename = (eb - et).norm(dim=-1)
     d_behav = (eb - ec).norm(dim=-1)
     # distinct: pair base i with base j (i != j) only where behaviorally !=.
@@ -453,6 +472,7 @@ def gvn_collapse(t1, t2, *, device, route='binding', n=200, chunk_len=4,
                   float(d_distinct.mean()))
     return {
         'rename_mean': rn, 'behavioral_mean': bh, 'distinct_mean': ds,
+        'tag_mean': float(d_tag.mean()),
         'rename_ratio': rn / ds if ds > 1e-9 else None,
         'behavioral_ratio': bh / ds if ds > 1e-9 else None,
         'n_pairs': len(bases), 'n_distinct': len(d_distinct) if isinstance(
