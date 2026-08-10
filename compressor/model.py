@@ -233,17 +233,30 @@ class RegisterStateMachine(nn.Module):
             # systems disagree — measured as operand-position recovery at ~5%
             # (confidently off by one) on overlapping-source pairs vs ~99.9% on
             # disjoint ones. 'rank' stamps the running count of DISTINCT
-            # registers read, so read_time IS the canonical position for every
-            # consumer, with no conversion. The counter is a per-chunk scalar
-            # with no register index and is placed through the same one-hot, so
-            # equivariance is unaffected.
-            fr0 = (oh0e * a) * (read_time == 0).to(value.dtype)
+            # registers read before written, so read_time IS the canonical
+            # position for every consumer, with no conversion. The counter is a
+            # per-chunk scalar with no register index and is placed through the
+            # same one-hot, so equivariance is unaffected. (It still diverges on
+            # a DEAD input: datagen's canonical positions cover live inputs
+            # only, and liveness is not knowable at read time.)
+            # 'rank' gates on write_time == 0 because the canonical positions
+            # count only registers read BEFORE written: ranking a read of an
+            # in-chunk result would push every later input off by one.
+            # write_time still reflects steps < k here (updated below), so a
+            # register read and written in the same step is still an input.
+            fresh = (read_time == 0).to(value.dtype)
+            if self.read_time_mode == 'rank':
+                fresh = fresh * (write_time == 0).to(value.dtype)
+            fr0 = (oh0e * a) * fresh
             if self.read_time_mode == 'rank':
                 n_read = n_read + fr0.sum(-1, keepdim=True)
                 read_time = read_time + fr0 * n_read
             else:
                 read_time = read_time + fr0 * (2.0 * (k + 1))
-            fr1 = (oh1e * a) * (read_time == 0).to(value.dtype)
+            fresh = (read_time == 0).to(value.dtype)
+            if self.read_time_mode == 'rank':
+                fresh = fresh * (write_time == 0).to(value.dtype)
+            fr1 = (oh1e * a) * fresh
             if self.read_time_mode == 'rank':
                 n_read = n_read + fr1.sum(-1, keepdim=True)
                 read_time = read_time + fr1 * n_read

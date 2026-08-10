@@ -1105,10 +1105,11 @@ def t2_value_predict_loss(t2, vecs, anchor_states_t,
     # raw inputs = uncorrelated numbers). Canonical also leaks no register
     # identity into vp, which is the right choice for an equivariant encoder.
     # Unfilled slots (AUX_CE_IGNORE) feed 0 = "no input".
-    # (Caveat: canonical positions are assigned to all live syntactic inputs,
-    # while in_slot_regs lists only the behavioral subset; the two coincide for
-    # T1 and ~all T2 chunks, diverging only for degenerate ops with a live-but-
-    # value-irrelevant input, e.g. ANDI _,_,0 — rare, accepted.)
+    # (Caveat: canonical positions cover all live syntactic inputs while
+    # in_slot_regs lists only the behavioral subset, so a dropped input shifts
+    # every later slot and the head is fed a value the target never used. Common
+    # — 5.9% of len=2 chunks, 26.6% at len=8 — but measured not to cost vp, since
+    # an input is dropped precisely when the output does not depend on it.)
     device = anchor_states_t.device
     canon_pos = torch.arange(1, max_in + 1, device=device).clamp(max=N_REGS - 1)
     in_filled = (in_slot_regs_t != AUX_CE_IGNORE).float()       # (B, max_in)

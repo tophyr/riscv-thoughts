@@ -183,12 +183,18 @@ def fit_vp(TR, TE):
         loss = F.binary_cross_entropy_with_logits(
             net(torch.cat([ESS[i], in_feat(i, a)], -1)), _value_bits(TGT[i, a]))
         opt.zero_grad(); loss.backward(); opt.step()
-    acc = torch.zeros(TE.numel(), device=dev)
+    # Per-bit is the gradient, exact 32-bit match is the score: the acceptance
+    # criterion is 100% exact, and per-bit flatters a broken subset (83% per-bit
+    # on the overlap column is ~0% exact).
+    bit = torch.zeros(TE.numel(), device=dev)
+    exact = torch.zeros(TE.numel(), device=dev)
     with torch.no_grad():
         for a in range(N_ANCHORS):
-            acc += ((net(torch.cat([ESS[TE], in_feat(TE, a)], -1)) > 0).float()
-                    == _value_bits(TGT[TE, a])).float().mean(-1)
-    return acc / N_ANCHORS
+            hit = ((net(torch.cat([ESS[TE], in_feat(TE, a)], -1)) > 0).float()
+                   == _value_bits(TGT[TE, a]))
+            bit += hit.float().mean(-1)
+            exact += hit.all(-1).float()
+    return bit / N_ANCHORS, exact / N_ANCHORS
 
 
 print()
@@ -208,7 +214,9 @@ for sl in (0, 1):
     rp = rows[torch.randperm(rows.numel(),
                              generator=torch.Generator().manual_seed(0)).to(dev)]
     TR, TE = rp[:int(.85 * rp.numel())], rp[int(.85 * rp.numel()):]
-    out[sl] = (TE, {'vp (32-bit value)': fit_vp(TR, TE),
+    vp_bit, vp_exact = fit_vp(TR, TE)
+    out[sl] = (TE, {'vp (per-bit)': vp_bit,
+                    'vp (EXACT 32-bit)': vp_exact,
                     'OPCODE (10-way)': fit(OPC, len(OPS), False, TR, TE),
                     'operand0 canon POS': fit(P0, NPOS, False, TR, TE),
                     'operand1 canon POS': fit(P1, NPOS, False, TR, TE)})
@@ -219,14 +227,19 @@ rp = rows[torch.randperm(rows.numel(),
                          generator=torch.Generator().manual_seed(0)).to(dev)]
 TRo, TEo = rp[:int(.8 * rp.numel())], rp[int(.8 * rp.numel()):]
 print(f'    overlap rows={rows.numel()}  train={TRo.numel()}  test={TEo.numel()}')
-for nm, tgt, nc in (('vp (32-bit value)', None, 0),
+for nm, tgt, nc in (('vp', None, 0),
                     ('operand0 canon POS', P0, NPOS),
                     ('operand1 canon POS', P1, NPOS)):
-    r = fit_vp(TRo, TEo) if tgt is None else fit(tgt, nc, False, TRo, TEo)
+    if tgt is None:
+        b, e = fit_vp(TRo, TEo)
+        print(f'    {"vp (per-bit)":24s} {100 * float(b.mean()):7.3f}%')
+        print(f'    {"vp (EXACT 32-bit)":24s} {100 * float(e.mean()):7.3f}%')
+        continue
+    r = fit(tgt, nc, False, TRo, TEo)
     print(f'    {nm:24s} {100 * float(r.mean()):7.3f}%')
 
 print()
-for name in ('vp (32-bit value)', 'OPCODE (10-way)',
+for name in ('vp (per-bit)', 'vp (EXACT 32-bit)', 'OPCODE (10-way)',
              'operand0 canon POS', 'operand1 canon POS'):
     r0 = out[0][1][name]; TE1, r1 = out[1][0], out[1][1][name]
     d1 = DISJ[TE1]

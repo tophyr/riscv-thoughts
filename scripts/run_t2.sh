@@ -25,10 +25,13 @@ NPOOL=${NPOOL:-16}
 MODES=${MODES:-"pma compete"}
 PEXTRAS=${PEXTRAS:-"write_time"}
 RTMODE=${RTMODE:-stamp}
+# Distinguishes a re-run of an already-recorded cell (the run dir is otherwise a
+# pure function of the knobs, so it would silently overwrite it).
+TAG=${TAG:-}
 
 cell() {  # MODE POOL_EXTRA
   local MODE=$1 PE=$2
-  local OUT=t2_len${LEN}_d${DOUT}_s${STEPS}_dep${OC}_vp${VP}_pool${NPOOL}_${MODE}_pe${PE}_rt${RTMODE}_writers
+  local OUT=t2_len${LEN}_d${DOUT}_s${STEPS}_dep${OC}_vp${VP}_pool${NPOOL}_${MODE}_pe${PE}_rt${RTMODE}${TAG:+_$TAG}_writers
   echo "######## $(date '+%m-%d %H:%M:%S')  mode=$MODE  pool_extra=$PE  -> $OUT"
   # Generation runs on odin (multinode_gen.sh, LOCAL_GEN=0) so local cores stay
   # free for the trainer's per-step host work. ANCHOR_SEED must equal the

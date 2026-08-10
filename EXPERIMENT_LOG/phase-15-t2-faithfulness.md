@@ -120,10 +120,14 @@ The third run, `read_time_mode=rank`, was `pool_extra=write_time`
 so the corrected read-order never reached the pool — it changed only the event
 channels, which the essence does not see under `write_time`. It was structurally
 incapable of moving essence-side operand recovery and says nothing about whether
-a corrected read-order would help. The cell that would say — `pool_extra=order`
-with `read_time_mode=rank` — is **untried**: the `order` run used `stamp`, which
-is off-by-one exactly on shared-source pairs, so the pool was handed a corrupted
-read-order on precisely the failing subset.
+a corrected read-order would help.
+
+**`pool_extra=order` with `read_time_mode=rank` — the cell that would say — also
+fails, on the corrected `rank` encoding.** It is the worst of the four cells on
+vp (0.0434 against the `write_time` baseline's 0.0405) and pays the finding-9
+cost: GVN behavioral collapse 0.0084 → 0.0115, separation 310× → 224×. **The
+pool is therefore exhausted** — every channel it can be fed is spent, and the
+cross-slot-join argument predicts exactly this.
 
 **9. Feeding the pool everything has a real cost.** Handing it the whole event
 block improves vp ~17% but **doubles** the distance between behaviourally
@@ -242,11 +246,11 @@ zero, so the bar is demonstrated rather than aspirational.
 
    `read_time_mode` must be `rank` for this: `stamp` overshoots whenever a
    repeat read leaves a hole, i.e. it is wrong *exactly on the shared-source
-   subset that is failing*, and nothing has yet tested `rank` anywhere the
-   essence can see it. The secondary candidate, ranked below the op-cell, is the
-   untried `pool_extra=order` + `read_time_mode=rank` cell (finding 8) — the
-   cross-slot-join argument predicts it still fails and it carries the finding-9
-   equivalence risk, but it has never been run.
+   subset that is failing*. `rank` counts only registers read before written, and
+   matches the oracle frame on 96.6% of len=2 chunks; the residual is dead code,
+   which no causal read-time counter can know, and it grows with length (52.9% at
+   len=8). The secondary candidate, `pool_extra=order` + `rank`, is a dead end
+   (finding 8), leaving the op-cell as the only remaining hypothesis.
 
 2. **Immediate encoding** — ~35% of the remaining error. T2 has a built but
    unused immediate head, skipped because a chunk has no single immediate — but

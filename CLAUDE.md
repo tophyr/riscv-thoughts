@@ -164,8 +164,11 @@ not know you need.
    (Known accepted caveat, documented at `compressor/train.py:1111-1114`:
    canonical positions are assigned over ALL live syntactic inputs while
    `in_slot_regs` lists only the *behavioral* subset, so slot k ↔ position k+1
-   can drift for a degenerate op with a live-but-value-irrelevant input, e.g.
-   `ANDI _,_,0`. Rare; accepted, not a bug to "fix" casually.)
+   drifts for a degenerate op with a live-but-value-irrelevant input, e.g.
+   `ANDI _,_,0`. Not rare — 5.9% of len=2 chunks on the writers corpus, 26.6% at
+   len=8 — but measured not to cost vp, since the dropped input is dropped
+   exactly because the output does not depend on it. Accepted on that evidence,
+   not a bug to "fix" casually.)
 
 5. **x0 is fixed under relabeling.** `random_perm`/`relabel` require `perm[0]==0`
    (`datagen/generate.py:287,301`; the check is `datagen/generate.py:309-310`).

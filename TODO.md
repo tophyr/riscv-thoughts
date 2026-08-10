@@ -105,12 +105,9 @@ sum cannot perform) and `event` costs equivalence collapse (a commutative swap
 changes read-order, and the pool cannot know to ignore that for `ADD` but not for
 `SUB`).
 
-**`pool_extra=order` + `read_time_mode=rank` is untried.** The `order` run used
-`stamp`, which is off-by-one *exactly* on shared-source pairs — the pool was fed
-a corrupted read-order on precisely the failing subset. Cheap, and not a repeat.
-The cross-slot-join argument above predicts it still will not work, and it
-carries the finding-9 equivalence risk (read_time moves under a commutative
-swap), so it ranks below the op-cell hypothesis — but it is not a dead end.
+**The pool is exhausted.** Every channel it can be fed is a recorded dead end,
+including `order` on the corrected `rank` encoding (see Dead ends). Do not spend
+another cell there; read-order cannot be used unconditionally.
 
 **Leading hypothesis — the consumer has to be content-conditioned.** The op-cell
 is the one consumer that sees the opcode and both operands in the same
@@ -148,9 +145,14 @@ position only while every read is fresh; a repeat read is (correctly) not
 re-stamped, leaving a hole, so every later operand overshoots — i.e. `stamp` is
 wrong *exactly on the shared-source subset that is failing*
 (`compressor/model.py:226-239`). `rank` stamps the running count of distinct
-registers read, so `read_time` **is** the canonical position for every consumer,
-with no conversion. Nothing has yet tested `rank` in a place the essence can see
-it. See "Flag cleanup" below for what deleting `stamp` costs.
+registers read **before written**, matching the frame the vp target is built in
+(`live_input_regs`, `datagen/compare.py:602,610`) on 96.6% of len=2 chunks,
+83.7% at len=4, 52.9% at len=8. The residual is dead code: datagen drops reads
+whose result never reaches an output, and liveness is a backwards property no
+causal read-time counter can know. So `rank` is exact on the shared-source
+subset this task targets and approximate at len=8 by construction — a limit to
+weigh before milestone 2 leans on it. See "Flag cleanup" for what deleting
+`stamp` costs.
 
 ### 2. I-type immediate encoding
 
@@ -197,14 +199,14 @@ compared and shown not to have regressed.**
 
 Standing candidates:
 
-- **`read_time_mode`: delete the option, keep `rank` only.** `stamp` is a known
-  wrong encoding (open task 1), so there is nothing to preserve. Cost of doing
-  it: `stamp` is baked into *every* existing checkpoint — the frozen
-  `runs/t1_writers_250k` and every `t2_len2_*` run — so deleting it means
-  reminting T1 and re-running the current-best len=2 config, then checking the
-  new numbers against the recorded ones (vp, the `vp_slot_b_split` columns, the
-  GVN rows, `state_max_err`, binding accuracies). Do that comparison; do not
-  skip it because the change "should" be neutral.
+- **`read_time_mode`: delete the option, keep `rank` only.** The no-regression
+  comparison is satisfied — at the current-best len=2 config on one shared eval
+  corpus, `rank` vs `stamp` is vp 0.0415/0.0405, in_slot 0.973/0.976, out_slot
+  0.999 both, GVN rename 0.0014/0.0013, behavioral 0.0083/0.0084
+  (`runs/t2_len2_d256_s250000_dep4_vp1_pool16_pma_pewrite_time_rtrank_rankfix_writers`).
+  Remaining cost is reminting the frozen T1, which needs CLI plumbing first:
+  `scripts/train_encoder.py` exposes none of the equivariant-core flags, so T1
+  can only be trained at their defaults.
 - **`pool_extra`**: `order` and `event` are both recorded dead ends. Once task 1
   resolves, keep only the survivors (`write_time`, plus whatever task 1 adds).
 - **`pool_mode`**: `compete` is a recorded dead end.
@@ -243,15 +245,14 @@ Standing candidates:
   5× steps both leave it essentially unchanged.
 - **`pool_mode=compete`.** No vp benefit, and with ordering enabled the essence
   becomes sensitive to the anonymous per-chunk register tags.
-- **Supplying more ordering information TO THE POOL** — `pool_extra=order` and
-  `pool_extra=event` both leave the shared-source deficit at ~83%; `event`
-  additionally costs equivalence collapse. The pool cannot see `content`, so it
-  must use any channel unconditionally; that is the reason, and it does **not**
-  extend to content-conditioned consumers (open task 1). Two things this line
-  does NOT cover: the op-cell, the untried `order`+`rank` cell (the `order` run
-  used the buggy `stamp` encoding), and `read_time_mode=rank` (its one run had
-  `pool_extra=write_time`, so the corrected read-order never reached the
-  essence). See open task 1.
+- **Supplying more ordering information TO THE POOL.** Every `pool_extra` cell is
+  spent: `order` and `event` leave the shared-source deficit at ~83% and cost
+  equivalence collapse, and `order`+`rank` is the worst on vp (0.0434 vs the
+  `write_time` baseline's 0.0405) while paying that cost (behavioral 0.0084 →
+  0.0115, separation 310× → 224×). The pool cannot see `content`, so it must use
+  any channel unconditionally; that is the reason, and it does **not** extend to
+  content-conditioned consumers. The op-cell is the one consumer this line does
+  not cover — see open task 1.
 - **Probe methodology.** Several conclusions had to be withdrawn. Always
   calibrate a probe against a number known independently, and compare its score
   against the base rate — a probe scoring at the majority-class frequency has
