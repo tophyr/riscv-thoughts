@@ -45,6 +45,9 @@
 #                    silently mismatch, INVARIANT 1.)
 #   REMOTE_GEN      (default 96 — odin worker count; it is a 128-core box)
 #   LOCAL_GEN       (default 0 — see the worker-split note above)
+#   PORT            (default 6464 — the nc listener port. Give concurrent
+#                    runs distinct ports: the remote pidfile is keyed by it,
+#                    so sharing one makes the second run reap the first.)
 
 set -euo pipefail
 
@@ -60,6 +63,7 @@ INJECT_EQUIV=${INJECT_EQUIV:-}
 ANCHOR_SEED=${ANCHOR_SEED:-0}
 REMOTE_GEN=${REMOTE_GEN:-96}
 LOCAL_GEN=${LOCAL_GEN:-0}
+PORT=${PORT:-6464}
 
 REMOTE=chrissarbora@odin
 # The remote is expected to have a usable Python venv with numpy + scipy
@@ -77,7 +81,7 @@ cleanup() {
   if [ -n "${SSH_PID:-}" ]; then
     kill "${SSH_PID}" 2>/dev/null
   fi
-  ssh ${REMOTE} 'PID=$(cat /tmp/riscv-thoughts-multinode-remote.pid 2>/dev/null); if [ -n "$PID" ]; then pkill -P "$PID" 2>/dev/null; kill "$PID" 2>/dev/null; fi; rm -rf '"${REMOTE_DIR}"' 2>/dev/null' 2>/dev/null
+  ssh ${REMOTE} 'PID=$(cat /tmp/riscv-thoughts-multinode-remote.'"${PORT}"'.pid 2>/dev/null); if [ -n "$PID" ]; then pkill -P "$PID" 2>/dev/null; kill "$PID" 2>/dev/null; fi; rm -rf '"${REMOTE_DIR}"' 2>/dev/null' 2>/dev/null
   if [ -n "${SSH_PID:-}" ]; then
     wait "${SSH_PID}" 2>/dev/null
   fi
@@ -103,7 +107,7 @@ if [ -n "${INJECT_EQUIV}" ]; then
 fi
 
 ssh ${REMOTE} "bash ${REMOTE_DIR}/scripts/multinode_remote.sh \
-    ${REMOTE_DIR} ${REMOTE_PYTHON} \
+    ${REMOTE_DIR} ${REMOTE_PYTHON} ${PORT} \
     --gen-count ${REMOTE_GEN} \
     --rule ${RULE} \
     --batch-size ${BATCH_SIZE} \
@@ -124,7 +128,7 @@ kill -0 $SSH_PID 2>/dev/null || { echo "ERROR: remote process died" >&2; exit 1;
 # </dev/null: mux only the explicit <(nc …) input, never an inherited stdin.
 ${PYTHON} -m datagen \
     --gen-count ${LOCAL_GEN} \
-    <(nc odin 6464 -d) \
+    <(nc odin ${PORT} -d | lz4 -dc) \
     --rule ${RULE} \
     --batch-size ${BATCH_SIZE} \
     --twins ${TWINS} --n-states ${N_STATES} \

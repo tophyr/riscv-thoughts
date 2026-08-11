@@ -251,7 +251,7 @@ Two different scripts — do not confuse them:
 
 - **`multinode_gen.sh TOTAL_BATCHES`** — the standard front-end for a real
   training run. Ships datagen sources to `odin` over ssh (tar stream), runs a
-  remote `datagen` pool that streams RVT back over `nc` (port 6464), and muxes
+  remote `datagen` pool that streams RVT back over `nc` (`PORT`, default 6464), and muxes
   it with a local `datagen` pool. Output to stdout/file or piped to a trainer.
   Both pools generate infinitely; the local side bounds the joined stream to
   exactly `TOTAL_BATCHES` with `--count`, and on reaching it the BrokenPipe
@@ -285,8 +285,30 @@ Two different scripts — do not confuse them:
   unset → all CPU cores.
 
 Both override knobs via env vars: `BATCH_SIZE TWINS N_STATES RULE CONFIG
-INJECT_INVALID INJECT_EQUIV` (plus `ANCHOR_SEED REMOTE_GEN LOCAL_GEN` for
+INJECT_INVALID INJECT_EQUIV` (plus `ANCHOR_SEED REMOTE_GEN LOCAL_GEN PORT` for
 multinode_gen, and `WORKERS` for gen_corpus → `--gen-count`).
+
+### Running two pipelines at once
+
+**Give each run a distinct `PORT`.** The remote pidfile is keyed by it
+(`/tmp/riscv-thoughts-multinode-remote.$PORT.pid`), and that file's stale-run
+cleanup `pkill`s whatever PID it finds — so two runs sharing a port do not merely
+fail to bind, the second reaps the first's healthy worker pool, and whichever
+exits first tears down the other's pool and `rm -rf`s its shipped sources. The
+shipped `REMOTE_DIR` is already unique (`mktemp`). Halve `REMOTE_GEN` per run so
+the pools do not oversubscribe odin's 128 cores.
+
+Worth doing when a single trainer leaves the GPU idle: two concurrent len=2 runs
+hold it at 84–99% util against ~50% for one, at 11 ms/step each against 7 solo —
+**~1.3× aggregate**, not 2×, because the GPU becomes the binding constraint once
+host serialization is filled. Local cost is ~10 of 32 cores for two trainers.
+
+```bash
+PORT=6464 REMOTE_GEN=56 RULE="cap=2" CONFIG=configs/instr_alu_writers.json \
+  ./multinode_gen.sh 1000000 | python scripts/train_t2_encoder.py … &
+PORT=6465 REMOTE_GEN=56 RULE="cap=2" CONFIG=configs/instr_alu_writers.json \
+  ./multinode_gen.sh 1000000 | python scripts/train_t2_encoder.py … &
+```
 
 Remote operational facts:
 - **`export MALLOC_ARENA_MAX=2`** is required in the remote/local pool scripts
@@ -295,13 +317,24 @@ Remote operational facts:
   the #1 hotspot. Don't remove it.
 - `scripts/multinode_remote.sh` (shipped to the remote and invoked there by
   `multinode_gen.sh`) owns its lifecycle via a pidfile
-  (`/tmp/riscv-thoughts-multinode-remote.pid`) so a prior crashed run is cleaned
-  up by the next. Its pipeline stderr persists to `/tmp/multinode-remote.log`
+  (`/tmp/riscv-thoughts-multinode-remote.$PORT.pid` — keyed by port so the
+  cleanup is per-listener, not global) so a prior crashed run is cleaned up by
+  the next. Its pipeline stderr persists to `/tmp/multinode-remote.log`
   (survives ssh teardown — read it for post-mortems).
-- **lz4 is currently removed** from the remote nc transport (it was stripped
-  during failure-hunting because failures are byte-count-dependent and removing
-  lz4 reproduces them ~5x faster). If you re-add compression, re-add it on both
-  ends.
+- **lz4 compresses the remote nc transport** (`lz4 -1 -c` before `nc` on the
+  remote, `lz4 -dc` after `nc` locally). Both ends must match. Measured **3.79×**
+  on real RVT — padded numeric arrays compress well — which takes the link off
+  the critical path: the odin↔thor link measures **111 MB/s** over this same nc
+  transport (gigabit; ignore the 10 Gb/s the WSL2 virtual adapter reports in
+  `/sys/class/net/eth0/speed`), and one trainer alone drew 64 MB/s of it
+  uncompressed. It was removed once, deliberately, to make byte-count-dependent
+  failures reproduce ~5× faster while they were being diagnosed; strip it again
+  if that kind of hunt resumes.
+- **NVML cannot enumerate GPU processes under WSL2.** `nvidia-smi
+  --query-compute-apps` (and so `nvitop`) lists one or none of several live
+  trainers and reports `[N/A]` for memory. Judge a run by its own log's ms/step
+  and the aggregate `utilization.gpu`; confirm a process is on the GPU with
+  `grep -c 'nvidia\|dxg' /proc/<pid>/maps` if needed.
 - `binary_stdout()` forces the fd to blocking mode because `tee` (and other
   consumers) flip pipes non-blocking, which would raise BlockingIOError mid-batch
   and truncate the reader (`datagen/__main__.py`, `binary_stdout`).
