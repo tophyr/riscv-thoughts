@@ -377,16 +377,28 @@ def _commute_variant(instrs, rng):
     return out
 
 
+def _vp_target(p):
+    """The values value-prediction is supervised on: the canonical output
+    register file read at the WRITTEN slots, in write order. Comparing the whole
+    32-register file instead would call two chunks different whenever they merely
+    relocated their inputs to different canonical positions — true of most
+    commutative-swap pairs, whose written outputs are identical."""
+    slots = [int(r) for r in p.out_slot_regs if r != AUX_CE_IGNORE]
+    return np.stack([p.out_regs[:, r] for r in slots]) if slots else None
+
+
 def _behaviorally_equal(a_chunk, b_chunk, anchors):
-    """True iff two chunks have identical canonical out_regs across anchors
-    (GVN-equivalent) — the corpus's own equivalence label. None on undecodable
-    / memory-op chunks."""
+    """True iff two chunks compute the same function of their canonical inputs,
+    i.e. produce identical values at their written slots across anchors — the
+    corpus's own equivalence label. None on undecodable / memory-op chunks."""
     try:
-        pa = precompute_chunk(a_chunk, anchors)
-        pb = precompute_chunk(b_chunk, anchors)
+        ta = _vp_target(precompute_chunk(a_chunk, anchors))
+        tb = _vp_target(precompute_chunk(b_chunk, anchors))
     except Exception:
         return None
-    return bool(np.array_equal(pa.out_regs, pb.out_regs))
+    if ta is None or tb is None:
+        return ta is None and tb is None
+    return bool(ta.shape == tb.shape and np.array_equal(ta, tb))
 
 
 @torch.no_grad()
@@ -400,9 +412,13 @@ def gvn_collapse(t1, t2, *, device, route='binding', n=200, chunk_len=4,
                    architecture assertion, not a quality signal. (Drawing
                    INDEPENDENT tags here instead makes it report tag-invariance,
                    which is a different property — reported separately below.)
-      behavioral — chunk vs a commutative-operand-swap variant (a+b==b+a):
-                   behaviorally equivalent but NOT a rename, so collapsing it
-                   is TRAINED value-numbering, not architecture.
+      behavioral — chunk vs a commutative-operand-swap variant (a+b==b+a),
+                   reported SPLIT by whether the swap actually preserved the
+                   chunk's function. Collapsing the equivalent ones is TRAINED
+                   value-numbering, not architecture; the non-equivalent ones
+                   SHOULD be far apart. The mixed mean is not interpretable —
+                   the ~2% non-equivalent pairs sit at the `distinct` scale and
+                   dominate it.
       distinct   — two unrelated chunks confirmed behaviorally different.
 
     Returns mean (and the ratio) of normalized-essence L2 distance per type.
@@ -457,6 +473,17 @@ def gvn_collapse(t1, t2, *, device, route='binding', n=200, chunk_len=4,
     d_tag = (eb - enc(bases, alt_tags)).norm(dim=-1)
     d_rename = (eb - et).norm(dim=-1)
     d_behav = (eb - ec).norm(dim=-1)
+    # Swapping a commutative op's operands changes the chunk's first-read order.
+    # If a later instruction reads one of the swapped registers, the canonical
+    # input positions shift and the two chunks compute genuinely DIFFERENT
+    # functions — ~2% of pairs, and they sit at the `distinct` scale, so they
+    # dominate the mean. Separating them is correct behaviour, so the equivalent
+    # subset is the row to judge collapse on.
+    eq_flag = torch.tensor(
+        [_behaviorally_equal(b, c, anchors) is True
+         for b, c in zip(bases, commutes)], device=d_behav.device)
+    d_behav_eq = d_behav[eq_flag]
+    d_behav_ne = d_behav[~eq_flag]
     # distinct: pair base i with base j (i != j) only where behaviorally !=.
     perm = rng.permutation(len(bases))
     d_distinct = []
@@ -473,6 +500,9 @@ def gvn_collapse(t1, t2, *, device, route='binding', n=200, chunk_len=4,
     return {
         'rename_mean': rn, 'behavioral_mean': bh, 'distinct_mean': ds,
         'tag_mean': float(d_tag.mean()),
+        'behavioral_eq_mean': float(d_behav_eq.mean()) if d_behav_eq.numel() else None,
+        'behavioral_ne_mean': float(d_behav_ne.mean()) if d_behav_ne.numel() else None,
+        'n_behavioral_eq': int(eq_flag.sum()), 'n_behavioral_ne': int((~eq_flag).sum()),
         'rename_ratio': rn / ds if ds > 1e-9 else None,
         'behavioral_ratio': bh / ds if ds > 1e-9 else None,
         'n_pairs': len(bases), 'n_distinct': len(d_distinct) if isinstance(

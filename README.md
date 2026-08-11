@@ -119,24 +119,38 @@ non-rename collapse is the real result: the register-state machine performs
 global value numbering, not merely the free rename-twin collapse.
 
 **Phase 15 (open) — what the essence must carry beyond the register set.** The
-essence is a sum over the 32 register slots. That sum is what makes it
-rename-invariant, but it is also blind to ORDER, and the essence must encode
-*"output 1 is this, output 2 is that"* and *which input feeds which operand*.
+essence is a permutation-invariant pool over the 32 register slots. That
+symmetry is what makes it invariant to register renaming, but it also makes it
+blind to *order*, and a chunk's behavior depends on order twice over: the essence
+must encode which register was written first and second, and which input feeds
+which operand of each instruction.
 
-Two order channels close that. Per-slot **write step** (`--pool-extra
-write_time`) supplies output order: value-prediction loss **0.3525 → 0.0396** at
-2-instruction chunks, decode-back **72.9% → 91.5%** per instruction at 8.
-Per-slot **canonical read position** supplies operand binding, which the pool
-structurally cannot — the pool never sees `content`, so it must apply read-order
-unconditionally, and a commutative swap changes read-order. Routing the position
-through the value path instead (`--seed-mode rank`, which also replaces the
-anonymous random tag) takes exact 32-bit match on shared-source pairs from 21.2%
-to **100.0%** and vp to **0.0129** at 250k.
+Two per-slot ordering signals close both gaps. Recording the **step at which each
+slot was written** supplies output order, and taking it to the pool moved
+value-prediction loss from 0.3525 to 0.0396 on 2-instruction chunks, with
+decode-back rising 72.9% → 91.5% per instruction at 8. Operand binding needs the
+second signal, each input's **position in the chunk's first-read order**, and it
+cannot be delivered through the pool: the pool is a symmetric sum that never sees
+the instruction's opcode, so it would have to apply read-order unconditionally —
+and swapping the operands of a commutative instruction changes read-order without
+changing what the chunk computes. Making that position the *leaf identity* of
+each input register instead — the value its slot is seeded with, in place of an
+anonymous random tag — puts it where the per-instruction cell can use it
+conditionally. On chunks whose two instructions read a common register, exact
+32-bit match of the predicted output rose from **21.2% to 99.8%**, and vp reached
+**0.0082**.
 
-Neither read-order form is adopted: both cost commutative collapse (0.0027 →
-~0.043). With no read-order in the value path a commutative swap could not move
-the essence at all, so that invariance was structural and is now something the
-loss set has to supply. Equivariance is exact throughout. See EXPERIMENT_LOG
+Seeding from read position rather than a random tag also removes a learned
+property: with no tag, there is nothing for the encoder to learn to be invariant
+to. What it costs is that invariance to a commutative operand swap stops being
+structural — a state that records read-order can represent the difference, so the
+training signal has to suppress it, and does so imperfectly: equivalent chunks sit
+about 5× further apart than under a state that records no order at all. The
+exchange is accepted, because such a state earns its tighter collapse by also
+mapping chunks that compute genuinely *different* functions to a distance of
+0.0003, unable to separate them at all, and because the resulting 119× separation
+between equivalent and distinct chunks exceeds the 28× this architecture was
+validated on in Phase 14. Equivariance stays exact throughout. See EXPERIMENT_LOG
 Phase 15.
 
 `vp` is a real objective with no intrinsic floor: single-instruction vp is

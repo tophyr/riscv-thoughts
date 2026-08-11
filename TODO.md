@@ -21,22 +21,25 @@ rows on a fixed corpus, not to de-bias vp.)
 
 ## Milestones
 
-1. **[CURRENT] vp = 0.0 at len=2.** The acceptance criterion below is **met** by
-   `--op-cell-rank` (`runs/t2_len2_d256_s250000_dep4_vp1_pool16_pma_pewrite_time_rtrank_ocrank_writers`,
-   250k): `s1 overlap` 100.000% exact against the `stamp` baseline's 21.2% at the
-   same step count, aggregate vp 0.0184 against 0.0405. What blocks adoption is
-   the equivalence-collapse constraint, not vp — see open task 1.
+1. **vp = 0.0 at len=2 — essentially reached.** `--seed-mode rank` at 1M
+   (`runs/t2_len2_d256_s1000000_dep4_vp1_pool16_pma_pewrite_time_rtrank_seedrank_1m_writers`):
+   aggregate vp **0.0082**, against 0.0198 at equal steps for an encoder seeded
+   from random tags with no read-order in its value channels. Scored discretely
+   with `probes/vp_slot_b_split.py`, which measures exact 32-bit match of the
+   predicted output on two-instruction chunks: 100.000% on the first written
+   register, 99.948% on the second, and **99.806%** on the subset where both
+   instructions read a common source register — historically the failing case.
 
-   **`vp = 0.0` is meant literally, and it is scored discretely.** vp trains as a
-   per-bit BCE, so the loss value is asymptotic and cannot itself reach 0. The
-   *output* is discrete, so use that: the acceptance criterion is a **100% exact
-   32-bit match rate on the `probes/vp_slot_b_split.py` subset** — including its
-   overlap (shared-source) column, which is where the error lives. T1 and T2 at
-   len=1 have already reached exact-0, so this is a demonstrated bar, not an
-   aspiration.
-2. **vp = 0.0 at len=4, then len=8.** Now 0.244 and 0.461. Do not start these
-   until len=2 is solved — the len=2 case is the same mechanisms with less
-   noise, and every diagnosis so far has transferred.
+   The criterion is literally 100% on every column including overlap, so this is
+   short by ~13 row-anchor pairs of 6704 — small, but a real deficit rather than
+   sampling noise. `--op-cell-rank` reached exactly 100.000% on that column at
+   250k, so the last 0.2% is available; it is not worth a config change on its
+   own, since `seed_mode=rank` is better everywhere else.
+
+2. **[CURRENT] vp = 0.0 at len=4, then len=8.** Was 0.244 and 0.461 pre-rank.
+   Note `rank` matches the vp target's canonical frame on only 83.7% of len=4 and
+   52.9% of len=8 chunks (the residual is dead code, which no causal read-time
+   counter can know), so the len=2 mechanism may not transfer intact.
 3. **Beyond the happy path.** Everything above is writers-only (R/I-type ALU,
    valid, non-x0). Then: no-write instructions, PC/branches, memory, longer and
    looser chunks.
@@ -62,77 +65,29 @@ rows on a fixed corpus, not to de-bias vp.)
 
 ## Open tasks
 
-**Task 1 is the exclusive focus until it is solved.** Tasks 2–5 are queued, not
-parallel work. When task 1 lands: update these documents and the memory notes,
-then hand off to a fresh session rather than rolling on.
+Task 1 is the current focus; the rest are queued, not parallel work.
 
-### 1. [CURRENT] Commutative collapse, regressed by canonical read-order
+### 1. I-type immediate encoding
 
-Operand binding on shared-source pairs is solved (`s1 overlap` 21.2% →
-100.000% exact), as is tag-invariance. `--seed-mode rank` writes an input
-register's leaf identity from its canonical read position on first read instead
-of from a per-chunk random tag, which removes the tag entirely — tag-invariance
-sits at the architectural floor and vp is at its best value. It makes
-`--op-cell-rank` redundant: the position already reaches the op-cell through
-`r0`/`r1`, and enabling both is slightly worse.
-
-len=2, 250k, `--gvn-chunk-len 2`:
-
-| cell | vp | rename | tag-invar | behavioral | distinct |
-|---|---|---|---|---|---|
-| baseline (`stamp`) | 0.0405 | 0.0002 | 0.0010 | **0.0027** | 1.2487 |
-| `op_cell_rank` | 0.0184 | 0.0009 | 0.0255 | 0.0366 | 1.3000 |
-| **`seed_mode=rank`** | **0.0129** | 0.0008 | **0.0008** | 0.0426 | 1.3183 |
-| both | 0.0154 | 0.0008 | 0.0008 | 0.0444 | 1.3353 |
-
-**The blocker is commutative collapse: 0.0027 → ~0.043, in every cell where
-canonical read-order reaches the essence.** The behavioral row measures this
-honestly — commute pairs share the vp target on 97% of len=2 chunks and 100% at
-len=1.
-
-**Leading hypothesis: the invariance is learned rather than structural, and
-nothing trains it.** A commutative swap changes first-read order and therefore
-which register gets which rank, while leaving the vp target identical. Without
-read-order in the value path such pairs cannot move the essence at all; with it,
-the model must learn to ignore read-order exactly where the opcode is
-commutative. That is representable — the op-cell is content-conditioned — but
-unrewarded: `configs/instr_alu_writers.json` has no `equivalences` block, so
-training never puts two commutative variants of a chunk in front of the model.
-
-Candidates, cheapest first:
-
-- Run `seed_mode=rank` to 1M. If the mechanism is "learned rather than free",
-  collapse should improve with training; the baseline's own collapse is recorded
-  at 250k and 1M for comparison.
-- Inject commutative equivalents into the corpus (`--inject-equiv`), so equivalent
-  chunks with identical vp targets actually co-occur.
-- An explicit invariance term is the last resort: the project removed equivalence
-  losses deliberately (equivalence is emergent), so adding one back is a design
-  regression, not a fix.
-
-Score every variant on `s1 overlap` (must hold at 100%), the behavioral and
-tag-invar rows, `distinct` (not just the ratio — rank-seeding changes it), and
-`state_max_err`.
-
-### 2. I-type immediate encoding
-
-The remaining len=2 vp error once task 1's binding fix is in: on an R-only
-corpus `op_cell_rank` scores 100% exact, while aggregate vp on the 55/45 R/I
-training corpus is 0.0184. Concentrated in bits 0–11 (the 12-bit immediate
-field), and present even on single instructions with one output. It shrinks with training rather than being structural
-(`ADDI` 92.3% → 97.7% from 250k → 1M steps), so it may be a capacity or
-optimization problem rather than a representational one.
+Immediates are the whole of the remaining len=2 vp error. On a corpus of R-type
+instructions only — which carry no immediates — the encoder scores ~100% exact
+32-bit match, while on the training corpus (55% R-type, 45% I-type) aggregate vp
+is 0.0082. The error is concentrated in bits 0–11, the 12-bit immediate field,
+and is present even on single instructions with one output, so it is independent
+of anything to do with multi-instruction chunks. It shrinks with training rather
+than being structural (`ADDI` 92.3% → 97.7% from 250k → 1M steps), which suggests
+a capacity or optimization problem rather than a representational one.
 
 T2 has a built but unused `imm_head`, skipped on the grounds that a chunk has
 no single immediate — but it has one per instruction. Untried.
 
-### 3. Mint a production T1
+### 2. Mint a production T1
 
 Every T1 in use is a diagnostic trained on a clean corpus (`--inject-invalid 0`),
 so it has no validity task and cannot reject invalid input. Needed before
 anything leaves the happy path. Fold in the `rd==x0` immediate mask.
 
-### 4. No-write instructions are invisible to the essence
+### 3. No-write instructions are invisible to the essence
 
 Blocks milestone 3 (~⅓ of the ISA). Content reaches the essence only through a
 register write (`value[out] = res` is gated on `out != 0`), so for branches,
@@ -149,7 +104,7 @@ the result makes equivalent x0-write no-ops spuriously distinct across
 immediates; and whether branches also need a real PC-effect vp target (the SSA
 oracle already computes `SELECT_PC` but does not ship it).
 
-### 5. Flag cleanup — lands with task 1, not separately
+### 4. Flag cleanup
 
 **Project policy: options do not survive on their own.** Once a better way to do
 something is settled, the worse way gets deleted rather than kept behind a flag.
@@ -160,6 +115,10 @@ compared and shown not to have regressed.**
 
 Standing candidates:
 
+- **`seed_mode`: delete the option, keep `rank` only**, and **delete
+  `op_cell_rank` outright** — it feeds the op-cell each operand's canonical read
+  position as extra scalars, which `seed_mode=rank` already supplies through the
+  operand values it reads, and enabling both scores worse than seeding alone.
 - **`read_time_mode`: delete the option, keep `rank` only.** The no-regression
   comparison is satisfied — at the current-best len=2 config on one shared eval
   corpus, `rank` vs `stamp` is vp 0.0415/0.0405, in_slot 0.973/0.976, out_slot
@@ -176,24 +135,45 @@ Standing candidates:
 
 - **Exact equivariance.** `state_max_err` must stay `0.00e+00`. Anything fed to
   the pool must be register-indexed.
-- **Equivalence (GVN) collapse.** `gvn_collapse` reports four rows, and they
-  measure different kinds of thing. **rename** encodes the twin with its tags
-  permuted by the same relabeling, so it is an *architecture assertion* — exact
-  equivariance makes it ~0 for any model, and a nonzero value means the core is
-  broken, not the training. **tag-invariance** (same chunk, independent tag draw)
-  and **behavioral** (commutative operand swap, tags held fixed) are the learned
-  properties, and the ones a change can regress. Baseline at
-  `--gvn-chunk-len 2`: rename 0.0002, tag 0.0010, behavioral 0.0027, separation
-  462×. The constraint is on the measured outcome: a commutative operand swap
-  must not move the essence. Feeding read-order to the pool *unconditionally*
-  violates it (`pool_extra=event`). A content-conditioned consumer may use
-  read-order and still collapse commutative pairs — `op_cell_rank` does keep
-  rename at ~0, but regresses tag-invariance 25×, which drags commutative with
-  it (open task 1).
+- **Equivalence (GVN) collapse.** The requirement: two instruction sequences that
+  compute the same function must land on the same point. `scripts/eval.py` reports
+  it as four distances between essences, and they are not the same kind of
+  quantity.
 
-  Numbers recorded before this metric was corrected are NOT comparable: the old
-  `enc()` drew independent tags for base and twin, so its "rename" row was
-  reporting tag-invariance.
+  **rename** compares a chunk against the same chunk with its registers
+  relabeled, encoding the relabeled copy with its anonymous tags permuted to
+  match. Equivariance is exact by construction, so this reads ~0 for any model at
+  all; it is an assertion that the core is intact, not a measure of training
+  quality. **tag-invariance** compares a chunk against itself under a different
+  draw of the anonymous per-chunk tags — a property the model must learn, and
+  therefore one a change can regress. It is vacuous when the encoder seeds from
+  canonical read rank rather than random tags, since then there are no tags.
+  **behavioral** compares a chunk against a variant with a commutative
+  instruction's operands swapped. **distinct** is the separation denominator: the
+  distance between unrelated chunks.
+
+  `scripts/eval.py` reports the behavioral distance **split** by whether the
+  swap actually preserved the chunk's function, and the split is the thing to
+  read. Swapping a commutative op's operands changes the chunk's first-read
+  order, and if a later instruction reads one of the swapped registers the
+  canonical input positions shift and the two chunks compute genuinely different
+  functions. About 2% of generated pairs are non-equivalent in this way; they sit
+  at the `distinct` scale and can inflate the pooled mean several-fold. Judge
+  collapse on the equivalent subset (`behavioral`); the non-equivalent subset
+  (`behav-diff`) should be LARGE, and a model that collapses it is failing to
+  distinguish different functions. `behav-mixed` pools both and exists only for
+  continuity with older records.
+
+  Measured at `--gvn-chunk-len 2`, on genuinely-equivalent pairs. Seeding from
+  canonical read rank: 0.0110, separation 119×, and non-equivalent pairs held
+  apart at 0.88. Seeding from random tags with no read-order in the value
+  channels: 0.0021, separation 579× — tighter, but it collapses the
+  non-equivalent pairs to 0.0003, i.e. it cannot tell those functions apart at
+  all. For scale, the architecture was validated in Phase 14 at 0.0238 and 28×.
+
+  Numbers predating the correction to this metric are not comparable with these:
+  it previously drew independent tags for a chunk and its relabeled copy, so its
+  "rename" distance was reporting tag-invariance instead of equivariance.
 - **Magnitude-as-validity — a health check, not a live objective.** The writers
   corpus injects no invalid windows, so every row's validity target is 1 and vp
   consumes `F.normalize(vecs)` anyway; nothing we currently run should produce
@@ -222,6 +202,17 @@ Standing candidates:
   any channel unconditionally; that is the reason, and it does **not** extend to
   content-conditioned consumers. The op-cell is the one consumer this line does
   not cover — see open task 1.
+- **Injecting commutative equivalents (`--inject-equiv`) to train the
+  invariance.** Makes it worse, not better: on genuinely-equivalent pairs 0.0110
+  → 0.0235 and separation 119× → 54×, with vp 0.0082 → 0.0252. Nothing in the
+  loss ties an injected variant's essence to its base (there is no pairwise term,
+  by design), so it adds correlated rows without adding collapse pressure while
+  reducing effective diversity. Partially confounded — the injected rows displace
+  others, so that run saw 545 instructions per batch against 768 — but the
+  direction is unambiguous.
+- **More training as a fix for commutative collapse.** 250k → 1M moves it
+  0.0426 → 0.0373, while an encoder seeded from random tags moves 0.0027 →
+  0.0023 over the same 4×; the gap is untouched.
 - **Treating tag-sensitivity as the cause of the commutative-collapse
   regression.** Removing the random tags entirely (`--seed-mode rank`) takes
   tag-invariance to the architectural floor and leaves collapse unchanged (0.0426
@@ -237,6 +228,7 @@ Standing candidates:
   measuring itself.
 
 ## Known defects
+
 
 - **`_behaviorally_equal` (`compressor/eval.py`) is over-strict.** It compares the
   whole 32-register canonical file, including input registers that `_canonical_state`
@@ -257,8 +249,9 @@ Standing candidates:
   `--vp-head-depth`, `--n-pool-heads`, `--pool-mode`, `--pool-extra`,
   `--read-time-mode`, `--op-cell-rank`. Current best on vp:
   `op_cell=4 vp_head=1 n_pool_heads=16 pma pool_extra=write_time
-  read_time_mode=rank --seed-mode rank`; current best on commutative collapse is
-  the same with neither `--seed-mode rank` nor `--op-cell-rank` (open task 1).
+  read_time_mode=rank --seed-mode rank`, i.e. the pool reads each slot's write
+  step, read positions are counted as ranks over registers read before written,
+  and register slots are seeded from those positions rather than random tags.
   Defaults reproduce pre-Phase-15 behaviour and old checkpoints load unchanged.
   `--op-cell-rank` widens the op-cell input and `--seed-mode rank` swaps
   `tag_proj` for `rank_emb`, so checkpoints are only interchangeable within a

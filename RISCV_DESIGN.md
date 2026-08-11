@@ -350,32 +350,49 @@ and both operands in one activation, so it can use position for `SUB`/`SLT`/`SRL
 and symmetrize it for `ADD`/`AND`/`OR`/`XOR`. This is why the fix belongs at the
 op-cell and why every pool channel is a recorded dead end.
 
-**Distinct anonymous leaf tags (subtle but essential).** Inputs must be
-*distinguishable* (so `add r2,r3` ≠ `add r2,r2`) but carry *no intrinsic
-identity* — a per-register learned embedding `f(r)` would have to be constant
-to be equivariant, destroying distinctness. Resolution = the random-node-
-feature trick: give each live-in register a random tag, sampled per chunk,
-that permutes with π. The network learns to use tags only as "these two
-inputs differ," not "this is register 5"; structurally-identical inputs
-collapse, distinct ones stay apart.
+**Leaf identity for input registers (subtle but essential).** The state machine
+has to seed each register slot before the first instruction reads it, and that
+seed faces two opposing requirements. Inputs must be **distinguishable**, so that
+`add r2,r3` does not collapse onto `add r2,r2`. But they must carry **no
+intrinsic identity**, because a per-register learned embedding `f(r)` would have
+to be constant to be equivariant, which destroys distinctness. A seed satisfying
+both must therefore distinguish inputs *from each other* without naming any of
+them.
 
-Note what this property costs and what else can supply it. Tag-invariance is
-*learned*, not free — it is the one place the architecture relies on training
-rather than construction, so it is the thing a change is most likely to
-regress. The **canonical read rank** (first-read order over registers read
-before written) supplies the same distinguishability deterministically: two
-distinct inputs get ranks 1 and 2, a repeated input gets one rank twice. It is
-assigned by read ORDER, which permutes with π, so it is not a per-register
-embedding and the torsion argument does not apply to it. Seeding from rank
-instead of a random tag (`--seed-mode rank`) preserves distinguishability and
-exact equivariance and removes the learned-invariance burden entirely — there is
-no tag left to be invariant to.
+Two seeds satisfy that, and the difference between them matters.
 
-The tradeoff it carries: a state with no read-order in it cannot move under a
-commutative operand swap, because nothing records which operand was read first,
-so that invariance is structural. Rank records it, which makes the same
-invariance learned and per-opcode. Whether the behavioral loss set alone supplies
-that pressure is open (TODO.md task 1).
+The first is the random-node-feature trick from graph learning: give each
+live-in register a random tag, sampled fresh per chunk, that permutes with π.
+Nothing about the tag is tied to a register name, so equivariance holds, and two
+distinct inputs almost surely receive different tags. Its weakness is that
+invariance to the tag is *learned*: the network must discover that a tag means
+only "these two inputs differ" and never "this is register 5". Nothing in the
+architecture enforces it, so it is the one property a change can silently
+regress, and it must be measured rather than assumed.
+
+The second is the **canonical read rank** — the position of a register in the
+chunk's first-read order, counting only registers read before they are written.
+Two distinct inputs receive ranks 1 and 2; a register read twice receives one
+rank twice; so distinguishability is preserved exactly. Rank is assigned by read
+*order*, not by register name, so a rename permutes it along with the slots and
+equivariance remains exact — the torsion argument above does not apply, because
+rank is not a function of the register. Unlike a random tag there is nothing to
+be invariant to, so the learned-invariance burden disappears rather than being
+trained away. Rank is also the coordinate system the value-prediction target is
+already expressed in (see "Training"), which is why it doubles as the signal that
+lets a chunk's operands be bound to their canonical positions.
+
+Rank is the seeding used. The cost is a shift in *which* invariances come free.
+A state that records no read-order cannot move under a commutative operand swap,
+since nothing in it distinguishes `a+b` from `b+a` — that invariance is
+structural. A state that records read-order can represent the difference, so the
+same invariance becomes something the training signal has to supply per opcode,
+and it does so imperfectly: behaviorally-equivalent chunks sit measurably further
+apart than under a read-order-free state. The exchange is accepted because a
+read-order-free state earns its tighter equivalence collapse by also being unable
+to separate chunks that genuinely compute different functions — which is the
+worse failure for a representation whose purpose is to be a lossless behavioral
+description of its chunk.
 
 ### The tier contract — never re-embed tokens
 

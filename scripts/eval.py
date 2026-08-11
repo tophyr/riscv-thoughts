@@ -99,9 +99,19 @@ def main():
               f'  rename     mean={g["rename_mean"]:.4f}')
         print(f'  tag-invar  mean={g["tag_mean"]:.4f}   '
               f'(same chunk, different anonymous tags — learned, not free)')
-        print(f'  behavioral mean={g["behavioral_mean"]:.4f} '
-              f'ratio={br:.4f}' if br is not None else
-              f'  behavioral mean={g["behavioral_mean"]:.4f}')
+        if g['behavioral_eq_mean'] is not None:
+            print(f'  behavioral mean={g["behavioral_eq_mean"]:.4f}   '
+                  f'(commutative swap, pairs that ARE equivalent; n='
+                  f'{g["n_behavioral_eq"]}) <- judge collapse on this')
+        if g['behavioral_ne_mean'] is not None:
+            print(f'  behav-diff mean={g["behavioral_ne_mean"]:.4f}   '
+                  f'(swap changed the function; n={g["n_behavioral_ne"]} — '
+                  f'SHOULD be large)')
+        print(f'  behav-mixed mean={g["behavioral_mean"]:.4f} '
+              f'ratio={br:.4f}   (both kinds pooled — kept for continuity '
+              f'with older records; not interpretable on its own)'
+              if br is not None else
+              f'  behav-mixed mean={g["behavioral_mean"]:.4f}')
         print(f'  distinct   mean={g["distinct_mean"]:.4f}')
 
 

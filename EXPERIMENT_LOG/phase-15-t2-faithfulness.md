@@ -4,6 +4,12 @@
 corrected in place as they are disproven, so read it as current belief rather
 than as a chronology of what was believed when.
 
+**Headline:** two ordering channels — per-slot write step into the pool, and
+canonical read position as the input registers' leaf identity — take len=2 vp
+from 0.3525 to **0.0082** and shared-source operand binding from 21.2% to 99.8%
+exact. Adopted config: `--pool-extra write_time --read-time-mode rank
+--seed-mode rank`.
+
 ## The question
 
 T2 compresses a short sequence of RISC-V instructions (a "chunk") into a single
@@ -142,50 +148,62 @@ block carries operand read-order, and a commutative swap changes exactly that
 1M halves vp (0.0404 → 0.0198) while reconstruction stays flat or drifts down.
 The two goals have decoupled.
 
-**11. Read-order in the value path solves operand binding, and costs
-commutative collapse.** The pool never sees `content`, so it must use read-order
-unconditionally; the op-cell sees the opcode and both operands in one activation
-and can symmetrize per opcode. Two ways to get the canonical read position to
-it — `--op-cell-rank` (two extra scalars on the op-cell input) and
-`--seed-mode rank` (an input register's leaf identity written from its canonical
-position on first read, replacing `tag_proj` of a random tag). **`--seed-mode
-rank` is the better form**: same binding win, best vp, no tag left to be
-invariant to, and it makes `--op-cell-rank` redundant since the position already
-reaches the op-cell through `r0`/`r1`.
+**11. An input register's leaf identity should be its canonical read position,
+not a random tag.** Each register slot is seeded before the chunk runs, and that
+seed is what distinguishes one input from another. Seeding it with the register's
+position in the chunk's first-read order — counting only registers read before
+they are written — instead of a per-chunk random tag preserves what the seed is
+for (two distinct inputs get positions 1 and 2; a register read twice gets one
+position twice) while making it deterministic and carrying no register identity,
+so equivariance stays exact.
 
-`s1 overlap`, 250k, same probe and corpus:
+This is what fixes operand binding, and it has to arrive by this route. The
+essence pool is a symmetric sum that never sees an instruction's opcode, so any
+ordering channel handed to the pool is applied unconditionally — and swapping a
+commutative instruction's operands changes read-order without changing what the
+chunk computes, so an unconditional consumer stops being blind to a distinction
+it must be blind to. Putting the position in the seed instead means the
+per-instruction cell reads it as part of the operand values it already consumes,
+and that cell sees the opcode, so it can use position for `SUB`/`SLT`/`SRL` and
+symmetrize it for `ADD`/`AND`/`OR`/`XOR`.
 
-| | baseline (`stamp`) | read-order in the value path |
-|---|---|---|
-| vp per-bit | 81.1% | 100.0% |
-| vp EXACT 32-bit | 21.2% | **100.0%** |
-| operand0 / operand1 canonical position | 49.2% / 4.3% | 98.2% / 97.9% |
-| overlap-only control, vp exact | 30.5% | 100.0% |
+Measured on chunks of two instructions that read a common source register — the
+subset where the deficit lived — exact 32-bit match of the predicted output rose
+from 21.2% to 99.8%, and recovery of which canonical input feeds each operand
+from ~4–49% to ~98% (`probes/vp_slot_b_split.py`). A probe established this was
+worth trying before any training: given the encoder's per-slot state for the
+second output register plus the true read positions, a readout predicts that
+register's value at 97.4% exact against 37.4% without them, so the information
+was already present and only the association was missing
+(`probes/opcell_rank_sufficiency.py`). Feeding the positions to the
+per-instruction cell as extra inputs, rather than through the seed, reaches the
+same binding result but scores worse elsewhere and is redundant with seeding.
 
-The 4.3% on operand1 is the off-by-one `stamp` produces on exactly this subset.
-A probe gated the run (`probes/opcell_rank_sufficiency.py`): slot B's state plus
-the true ranks predicts its output at 97.4% exact on the overlap subset against
-37.4% without, so the information was present and only the association was
-missing.
+Chunks of 2 instructions, 1M steps, `--gvn-chunk-len 2`, with commute pairs split
+by whether the swap preserved the chunk's function (`scripts/eval.py` reports
+this split):
 
-Whole-model rows, len=2/250k at `--gvn-chunk-len 2`:
+| | random-tag seed, no read-order | **canonical-rank seed** | rank seed + injected commutative pairs |
+|---|---|---|---|
+| vp | 0.0198 | **0.0082** | 0.0252 |
+| rename (architecture assertion) | 0.0002 | 0.0005 | 0.0005 |
+| tag-invariance | 0.0006 | 0.0005 | 0.0004 |
+| commute pairs, same vp target | 0.0021 | 0.0110 | 0.0235 |
+| commute pairs, different vp target | 0.0003 | 0.8789 | 0.9144 |
+| separation on true equivalences | 579× | 119× | 54× |
 
-| cell | vp | rename | tag-invar | behavioral | distinct |
-|---|---|---|---|---|---|
-| baseline (`stamp`) | 0.0405 | 0.0002 | 0.0010 | **0.0027** | 1.2487 |
-| `op_cell_rank` | 0.0184 | 0.0009 | 0.0255 | 0.0366 | 1.3000 |
-| **`seed_mode=rank`** | **0.0129** | 0.0008 | **0.0008** | 0.0426 | 1.3183 |
-| both | 0.0154 | 0.0008 | 0.0008 | 0.0444 | 1.3353 |
-
-Equivariance is untouched (rename ~0, `state_max_err` `0.00e+00`). Tag-invariance
-is a property of the tags, and disappears with them. **The blocker is commutative
-collapse, 0.0027 → ~0.043 in every cell where read-order reaches the essence** —
-not tag-sensitivity (removing the tags entirely leaves collapse unchanged) and
-not a metric artifact (finding 15). With no read-order in the value path a
-commutative swap could not move the essence at all; recording it makes that
-invariance learned rather than structural, and nothing trains it —
-`configs/instr_alu_writers.json` has no `equivalences` block, so the model never
-sees two commutative variants together.
+**What recording read-order costs.** A state that records no read-order cannot
+represent the difference between `a+b` and `b+a`, so invariance to a commutative
+swap is structural. A state that records it can, so the same invariance becomes
+something the training signal must supply, and it does so imperfectly:
+genuinely-equivalent chunks sit 5× further apart. Neither more training (250k →
+1M moves it 0.0426 → 0.0373, while the random-tag encoder moves 0.0027 → 0.0023
+over the same 4×) nor injecting commutative variants into the corpus closes the
+gap — the latter makes it worse. Accepted, for two reasons: the random-tag
+encoder maps chunks computing genuinely *different* functions to 0.0003, i.e. it
+cannot separate them at all, which is the same information loss this phase
+exists to remove; and 119× separation is above the 28× Phase 14 validated the
+architecture on.
 
 **12. `gvn_collapse`'s rename row was measuring tag-invariance.** `enc()` drew
 fresh random tags per call, so base and twin got independent tags while the
@@ -210,16 +228,20 @@ at len=1. Measured on the best len=2 checkpoint, the shifted rows score 99.09%
 per-bit / 96.7% exact against 99.21% / 94.5% for the rest — an input is dropped
 precisely when the output does not depend on it.
 
-**15. The behavioral row is a valid equivalence measure.** Commute pairs share
-the vp target on 100% of len=1 and 97% of len=2 chunks. Separately,
-`_behaviorally_equal` is over-strict — it compares the whole canonical register
-file including inputs that `_canonical_state` merely relocated, so it reports
-only 9.2% of genuine commutative equivalences as equivalent at len=1 while their
-vp targets are identical for 100%. It gates the `distinct` pool only.
+**15. A pooled commutative-swap distance is not interpretable.** Swapping a
+commutative op's operands changes first-read order, and therefore the canonical
+function, whenever a later instruction reads one of the swapped registers — 2% of
+pairs at len=2. Those sit at the `distinct` scale and inflate a pooled mean
+several-fold (0.0102 equivalent-only against 0.0373 pooled, from 6 pairs in 200).
+`gvn_collapse` reports the split. The equivalence label behind it compares the
+values value-prediction is supervised on — the canonical register file at the
+WRITTEN slots — because comparing the whole 32-register file instead calls two
+chunks different whenever they merely relocated inputs to different canonical
+positions, which is true of 90.8% of genuine commutative equivalences at len=1.
 
 ## Decisions taken
 
-- **`pool_extra=write_time` is the adopted setting for new runs.** NB the
+- **The pool reads each slot's write step (`pool_extra=write_time`).** NB the
   constructor and CLI default is still `none`, which reproduces the
   pre-ordering-fix model; new runs must pass the flag explicitly.
 - **Feeding the pool the full event block is rejected** on the equivalence-
@@ -231,10 +253,13 @@ vp targets are identical for 100%. It gates the `distinct` pool only.
   ordering fix *reduced* effective dimensionality (26→15) while improving
   reconstruction 19 points, contradicting the Round-1 theory that
   concentration was the pathology.
-- **`--seed-mode rank` is the adopted form of read-order in the value path**, and
-  supersedes `--op-cell-rank`: same binding win, better vp, one fewer knob.
-  Neither is adopted into the default config yet — both fail the
-  equivalence-collapse constraint (finding 11).
+- **Seed register slots from canonical read position, count read positions as
+  ranks over registers read before written, and give the pool each slot's write
+  step** (`--seed-mode rank --read-time-mode rank --pool-extra write_time`).
+  Feeding the positions to the per-instruction cell as extra inputs
+  (`--op-cell-rank`) is a second route to the same binding result and redundant
+  with seeding. The 5× commutative-collapse cost is accepted on the evidence in
+  finding 11, not waived.
 - **Report vp discretely.** `probes/vp_slot_b_split.py` prints exact 32-bit match
   alongside per-bit; 81% per-bit on the overlap column was 21% exact, so per-bit
   alone made a mostly-broken subset look nearly solved.
@@ -299,27 +324,20 @@ zero, so the bar is demonstrated rather than aspirational.
 
 ## Open threads
 
-1. **Commutative collapse under canonical read-order.** Binding and
-   tag-invariance are settled (finding 11). What remains is that
-   commutative collapse degrades 0.0027 → ~0.043 in every cell where read-order
-   reaches the essence, and it is not a metric artifact (finding 15).
+1. **Immediate encoding** — the whole remaining len=2 vp error. On an R-only
+   corpus of R-type instructions, which carry no immediates, the encoder scores
+   ~100% exact 32-bit match; on the training corpus (55% R-type, 45% I-type)
+   aggregate vp is 0.0082, with the error concentrated in bits 0–11. T2 has
+   a built but unused `imm_head`, skipped because a chunk has no single immediate
+   — but it has one per instruction. Untried.
 
-   Live hypothesis: the invariance used to be free and now must be learned, and
-   the corpus never presents a commutative pair. Cheapest tests, in order — run
-   `seed_mode=rank` to 1M and watch the behavioral row; inject commutative
-   equivalents (`--inject-equiv`) so equivalent chunks with identical vp targets
-   co-occur. An explicit invariance loss is a last resort: equivalence is
-   supposed to be emergent here, so adding one back is a design regression.
-
-2. **Immediate encoding** — ~35% of the remaining error. T2 has a built but
-   unused immediate head, skipped because a chunk has no single immediate — but
-   it has one per instruction.
-3. **Decoder + reconstruction loss** — the standing untried lever for goal 2.
-4. **Flag cleanup** — decided in principle: **options do not survive on their
+2. **Decoder + reconstruction loss** — the standing untried lever for goal 2.
+3. **Flag cleanup** — decided in principle: **options do not survive on their
    own.** `read_time_mode` collapses to `rank` only (`stamp` is a known wrong
    encoding — it equals the canonical position only when no register is read
-   twice); `pool_extra` keeps `write_time` plus whatever open thread 1 adds, and
-   drops the recorded dead ends `order`/`event`; `pool_mode` drops `compete`.
+   twice); `seed_mode` collapses to `rank`; `op_cell_rank` is deleted, being a
+   redundant second route to the same read positions; `pool_extra` keeps `write_time` and drops the recorded
+   dead ends `order`/`event`; `pool_mode` drops `compete`.
    The cost is real and must be paid, not skipped: `stamp` is baked into every
    existing checkpoint including the frozen `runs/t1_writers_250k`, so deleting
    it means reminting T1 and re-running the current-best len=2 config, then
@@ -327,5 +345,5 @@ zero, so the bar is demonstrated rather than aspirational.
    `vp_slot_b_split` columns, the GVN rows, `state_max_err`, binding
    accuracies). Breaking changes are acceptable; unverified breaking changes are
    not.
-5. **Everything after the Round-1 sweep is len=2 only.** In particular,
+4. **Everything after the Round-1 sweep is len=2 only.** In particular,
    input-ordering recovery sits at chance (0.518) at len=8 and is unexplained.
