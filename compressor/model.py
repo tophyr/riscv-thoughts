@@ -195,12 +195,17 @@ class RegisterStateMachine(nn.Module):
         # (each head d_value/k), so no downstream interface changes. pool_q is
         # stored FLAT (k*d_key,), so k=1 -> shape (d_value,) = the old
         # single-query param exactly -> existing checkpoints load unchanged.
+        # pool_v is d_value wide and each head reads its OWN slice: one SHARED
+        # d_value/k projection would cap what the essence can carry about any
+        # single slot at d_value/k, however wide d_value is (it cost the 12-bit
+        # I-type immediate). Per-head slices also let head count and per-slot
+        # fidelity scale independently.
         assert d_value % n_pool_heads == 0, 'd_value must be divisible by n_pool_heads'
         d_pool_in = d_value + {'none': 0, 'write_time': 1,
                                'order': 2, 'event': d_event}[pool_extra]
         self.pool_q = nn.Parameter(torch.randn(n_pool_heads * d_value) * 0.02)
         self.pool_k = nn.Linear(d_pool_in, d_value)
-        self.pool_v = nn.Linear(d_pool_in, d_value // n_pool_heads)
+        self.pool_v = nn.Linear(d_pool_in, d_value)
 
     def forward(self, content, in0, in1, out, active, tags):
         """content (B,K,d_content); in0/in1/out (B,K) long; active (B,K)
@@ -317,8 +322,9 @@ class RegisterStateMachine(nn.Module):
             att = att / (att.sum(dim=1, keepdim=True) + 1e-8)
         else:  # 'pma': each head independently softmaxes over slots (no competition)
             att = torch.softmax(logits, dim=1)               # (B, n_regs, k) over slots
-        vv = self.pool_v(pool_src)                           # (B, n_regs, d_value//k)
-        heads = att.transpose(1, 2) @ vv                     # (B, k, d_value//k)
+        vv = self.pool_v(pool_src).view(                     # per-head slices
+            value.shape[0], self.n_regs, self.n_pool_heads, -1)
+        heads = torch.einsum('bsk,bskd->bkd', att, vv)       # (B, k, d_value//k)
         essence = heads.reshape(value.shape[0], -1)          # (B, d_value)
         return T, essence
 

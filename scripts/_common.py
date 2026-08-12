@@ -74,6 +74,31 @@ def _pool_extra(hp):
     return 'write_time' if hp.get('pool_reads_order', False) else 'none'
 
 
+def _tile_shared_pool_v(state, model):
+    """Widen a checkpoint's single shared pool value projection into the
+    per-head projections the pool now uses.
+
+    The pool used to give every head one shared projection of width
+    d_value/n_pool_heads; it now gives each head its own slice of a d_value-wide
+    projection. Repeating the shared weights once per head reproduces the old
+    computation exactly, so a checkpoint trained under the shared projection
+    keeps its behaviour and only gains the freedom to differentiate the heads if
+    it is trained further. Checkpoints with one pool head already match.
+    """
+    for prefix in ('', 'compressor.'):
+        key = f'{prefix}core.pool_v.weight'
+        if key not in state:
+            continue
+        want = model.state_dict()[key].shape[0]
+        have = state[key].shape[0]
+        if have != want:
+            reps = want // have
+            for suffix in ('weight', 'bias'):
+                k = f'{prefix}core.pool_v.{suffix}'
+                state[k] = state[k].repeat(reps, *([1] * (state[k].dim() - 1)))
+    return state
+
+
 def load_frozen_encoder(model_path, device):
     """Build a T1Compressor (TokenEmbedder + Compressor) from the encoder's
     companion hparams.json (next to model_path), load the checkpoint (old flat
@@ -100,7 +125,8 @@ def load_frozen_encoder(model_path, device):
         op_cell_rank=hp.get('op_cell_rank', False),
         seed_mode=hp.get('seed_mode', 'tags'),
     ).to(device)
-    encoder.load_state_dict(_split_t1_state(load_checkpoint(model_path, device)))
+    encoder.load_state_dict(_tile_shared_pool_v(
+        _split_t1_state(load_checkpoint(model_path, device)), encoder))
     encoder.eval()
     for p in encoder.parameters():
         p.requires_grad = False
@@ -123,6 +149,7 @@ def load_t2(t2_dir, t1, device):
         op_cell_rank=hp.get('op_cell_rank', False),
         seed_mode=hp.get('seed_mode', 'tags'),
     ).to(device)
-    t2.load_state_dict(load_checkpoint(t2_dir / 't2.pt', device))
+    t2.load_state_dict(_tile_shared_pool_v(
+        load_checkpoint(t2_dir / 't2.pt', device), t2))
     t2.eval()
     return t2, hp

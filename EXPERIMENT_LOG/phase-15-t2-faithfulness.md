@@ -53,10 +53,13 @@ missing piece is isolated.
 
 ## What was discovered
 
-**1. It was not capacity, and it was not the T1→T2 handoff.** Width and steps
-barely moved vp. A T2 trained on single-instruction chunks reaches vp 0.000, so
-one instruction survives the tier boundary perfectly; the loss appears only
-when two or more are combined.
+**1. Neither the tier boundary nor the model's overall width was the problem.**
+T1's essence carries a single instruction perfectly — its own value prediction
+is exact and a fitted readout recovers the 12-bit immediate at 100.000% — so
+nothing is lost in what T2 is handed. Scaling T2's dimensions and training steps
+barely moved vp either. (Width does matter in one specific place, the pool's
+per-slot projection; see finding 16. "More width" as a blunt lever is what
+failed, not width as such.)
 
 **2. The information survives inside the encoder and is destroyed on the way
 out.** At 2 instructions, a readout recovers 80% of the output bits from the
@@ -104,15 +107,16 @@ accuracy, and it splits into two independent causes:
   *which* input feeds which operand — recoverable at ~99.8% on disjoint pairs but
   only ~49%/~4% (operand 0 / operand 1) on overlapping ones. **Solved by
   read-order in the value path** (finding 11).
-- **~35% — encoding of immediate values.** Visible even on single
+- **~35% — encoding of immediate values.** Present even on single
   instructions, concentrated exactly in bits 0–11, the 12-bit immediate field.
-  This shrinks with training rather than being structural.
+  **Solved by per-head pool value projections** (finding 16).
 
-**7. Composition depth is not the problem, and neither is the op-cell.**
-Slots written from other slots' results are worse individually but too rare to
-matter (~15% of the error). Running the trained model on single-instruction
-inputs gives 99.999% on R-type instructions, so the per-instruction
-computation is essentially exact.
+**7. Composition depth costs the most per slot, but starts too rare to
+dominate.** Slots whose operand is another instruction's result rather than a
+chunk input carry a 30–60× higher error rate than depth-1 slots, on about 2.4%
+of slots — so they are ~15% of the total error while the two larger causes
+stand. Once those are fixed this becomes the whole residual, which is where
+len=2 now sits.
 
 **8. Two attempts to feed the pool more ordering information both failed, and a
 third run tested nothing.** `pool_extra=order` (the read-order channel, in the
@@ -239,6 +243,49 @@ WRITTEN slots — because comparing the whole 32-register file instead calls two
 chunks different whenever they merely relocated inputs to different canonical
 positions, which is true of 90.8% of genuine commutative equivalences at len=1.
 
+**16. The pool gave every attention head ONE shared value projection, capping
+what the essence could carry about any single slot at `d_value / n_pool_heads`.**
+The essence is `n_pool_heads` attention-weighted sums over the 32 register
+slots. Each head had its own query, but all of them drew from one `pool_v` of
+width `d_value / n_pool_heads` — 16 dimensions at d_value=256, n_pool_heads=16.
+A slot therefore reached the essence through 16 projected values plus its
+`n_pool_heads` attention logits, and no more: **the essence was 256 wide and its
+capacity for any one slot was 16.** Standard multi-head attention gives each
+head its own value projection; the shared one was a deviation.
+
+Giving each head its own slice of a `d_value`-wide projection raises a slot's
+image in the essence from 16 dimensions to 256. It also removes a standing
+tension — under the shared projection, adding heads to separate more written
+slots narrowed what each could carry, and the two now scale independently.
+
+Measured at len=2/1M against the same config with the shared projection: vp
+**0.0080 → 0.0021**; per-bit accuracy of the predicted output value 99.762% →
+**99.939%** at len=2 and 99.083% → **99.999%** at len=1; the model's own value
+prediction on I-type single instructions 65.9% → **99.954%** exact 32-bit match.
+Immediates fall from 61.7% of the len=2 residual to 39.4%, and every remaining
+category is now dominated by dataflow depth. The essence also sits better on
+the unit sphere (1st-percentile norm 0.924 → 0.977, none below 0.9).
+
+**Single-instruction chunks are lossless again, and the scope condition is part
+of the result.** A T2 trained at len=1 with 16 pool heads and per-head
+projections scores 100.000% exact 32-bit match on both R-type and I-type, at
+`value_pred = 1.3e-06`
+(`runs/t2_len1_d256_s250000_dep4_vp1_pool16_pma_pewrite_time_rtrank_seedrank_phv_writers`).
+The earlier len=1 result that this restores was measured at **one** pool head
+(`runs/t2_len1_d256_s200000_dep1_vp4_writers`, 2.7e-06), where the shared
+projection is the full `d_value` and the ceiling described above does not exist
+— so it stopped being true when pool heads were added for an unrelated reason,
+and nothing detected that. Any future change to `n_pool_heads` or to the pool's
+projections invalidates this number and requires re-running it.
+
+The cost is looser equivalence collapse: the distance between commutatively
+equivalent chunks rises 0.0102 → 0.0287 against a `distinct` mean of 1.28, so
+separation falls 128× → 45× — the same direction as finding 11's tradeoff, a
+more discriminative essence collapsing equivalents less, and still above the 28×
+Phase 14 validated on. Operand binding is unchanged (`in_slot` 0.979 → 0.980;
+the shared-source column of `vp_slot_b_split` 99.806% → 99.765%, within that
+probe's noise).
+
 ## Decisions taken
 
 - **The pool reads each slot's write step (`pool_extra=write_time`).** NB the
@@ -299,6 +346,30 @@ Both are cheap to guard against: calibrate every probe against a quantity
 already known independently, and check its score against the base rate before
 believing it.
 
+Two probe designs paid for themselves repeatedly, and are worth reaching for by
+default:
+
+- **To locate a loss, measure the SAME quantity at every stage of the pipeline
+  and find where it drops.** Exact recovery of the 12-bit immediate by a fitted
+  readout, stage by stage: T1's essence 100.000% → T2's written register slot
+  99.3% → the pool's view of that slot 79.2% → T2's essence 76.9%
+  (`probes/imm_ceiling.py`). The last two numbers agreeing is what rules out the
+  attention weights as the culprit and points at the projection underneath them.
+  A single end-to-end number cannot do this, and three separate hypotheses about
+  the cause were refuted for free by one measurement.
+- **To size a suspected bottleneck, refit it from scratch for one task and sweep
+  its width.** Reproducing the pool's projection as a trainable bottleneck of
+  varying width (`probes/pool_bottleneck.py`) gave 8→77.2%, 16→97.1%, 32→99.3%,
+  256→99.6% exact 32-bit match on I-type, R-type at 100% throughout. That
+  separates two explanations one number would have conflated: the deployed
+  16-wide projection is too narrow *and* it was performing below even its own
+  16-wide ceiling because it was multiplexing everything else. Both are answered
+  by widening; neither would have been answered by more supervision, which is
+  what the standing hypothesis (wire up T2's unused `imm_head`) proposed.
+
+Both probes are forward passes plus a small fit — minutes, against the hours a
+training run costs to test the same hypothesis wrongly.
+
 ## What `vp = 0` does and does not certify
 
 vp is supervised *and* scored against **8 fixed anchor states**
@@ -319,17 +390,27 @@ the RVT batch) is queued against TODO.md milestone 3.
 **Acceptance criterion for "len=2 solved":** vp trains as a per-bit BCE, so the
 loss value is asymptotic and never literally 0. The output is discrete, so score
 it discretely — **100% exact 32-bit match on the `probes/vp_slot_b_split.py`
-subset, including its overlap column.** T1 and T2-at-len=1 already reach exact
-zero, so the bar is demonstrated rather than aspirational.
+subset, including its overlap column.** T1 reaches exactly that on both operand
+types, so the bar is demonstrated rather than aspirational.
+
+**That criterion covers operand binding only, and must be read alongside a
+mixed-corpus score.** `vp_slot_b_split` generates from `configs/instr_r_only.json`,
+so its chunks carry no immediates at all: it was at 99.8% on its overlap column
+throughout the period when the model was recovering I-type outputs at 65.9%, and
+it did not move when that was fixed. `probes/vp_imm_share.py` scores the mixed
+training corpus and splits the error by operand type, which is what makes an
+immediate-encoding failure visible. A metric that cannot see a failure is not
+evidence of its absence.
 
 ## Open threads
 
-1. **Immediate encoding** — the whole remaining len=2 vp error. On an R-only
-   corpus of R-type instructions, which carry no immediates, the encoder scores
-   ~100% exact 32-bit match; on the training corpus (55% R-type, 45% I-type)
-   aggregate vp is 0.0082, with the error concentrated in bits 0–11. T2 has
-   a built but unused `imm_head`, skipped because a chunk has no single immediate
-   — but it has one per instruction. Untried.
+1. **Dataflow composition** — the whole remaining len=2 vp error, now that
+   ordering, operand binding and immediate encoding are each closed. Output
+   slots whose operand is another instruction's result score 98.6% (I-type) and
+   99.3% (R-type) per-bit against 99.95%+ for slots reading only chunk inputs.
+   This is the case where the op-cell must read back its own output, so the
+   cell's output geometry has to be legible to its own input — a demand the
+   depth-1 case, where every operand is a freshly seeded leaf, never makes.
 
 2. **Decoder + reconstruction loss** — the standing untried lever for goal 2.
 3. **Flag cleanup** — decided in principle: **options do not survive on their

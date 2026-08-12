@@ -70,108 +70,51 @@ See [RISCV_DESIGN.md](RISCV_DESIGN.md) for the testbed design.
 
 ## Current Status
 
-**Rename-equivariant T1/T2 — one Compressor, validated as a real tier
-recursion.** The encoder is a register-indexed state machine (one
-`Compressor` class, `compressor/model.py`): it seeds 32 register slots with
-per-chunk anonymous tags, then per instruction reads operand slots → applies
-a shared op-cell → writes the destination slot, and emits the final
-register-indexed state. Because the only register-indexed input is the
-anonymous tag and reads/writes are pure one-hot ops, a register rename
-**permutes the slots exactly** — equivariance is by construction, not trained.
-Essence (operator axis) is a permutation-invariant pool over the register
-axis; binding is the per-slot remainder. T1 is literally T2 with `seq_len=1`:
-the only tier-specific piece is the content provider — T1 embeds an
-instruction's opcode+immediate tokens (registers stripped to wiring); T2 is
-fed a **frozen T1's per-instruction essence** (the tier contract — never a
-re-embedded opcode). See RISCV_DESIGN.md for the theory.
+**The work in progress is T2, and its purpose is to prove the recursive tiering
+architecture.** Whether a hierarchy of thought-compressors is possible at all
+turns on one question: is a tier's emitted representation sufficient for the
+next tier to build on? T1 (one instruction) is a foundation, not evidence. T2
+(a chunk of instructions, built only from T1's output) is the first tier that
+can answer it.
 
-**Shared loss set; equivalence is emergent.** Both tiers train on the same
-behavioral losses (`compressor.train.binding_losses`): magnitude-as-validity
-(soft `(‖v‖−is_valid)²`), `live_in`/`live_out`, `pc_writes`,
-`in_slot`/`out_slot` (read/write ORDER via ListMLE score heads), and a
-canonical `value_predict` (predict canonical output-register values from
-canonical input values on sampled anchor states). There is **no equivalence
-loss** — equivalent chunks collapse from the behavioral targets alone.
+**The architecture under test.** A tier is a register-indexed state machine
+(one `Compressor` class, `compressor/model.py`): it seeds 32 register slots,
+then per instruction reads its operand slots, applies a shared op-cell, and
+writes the destination slot, emitting the final register-indexed state. Reads
+and writes are pure one-hot operations and no parameter is indexed by register,
+so renaming registers **permutes the slots exactly** — equivariance holds by
+construction, not by training. The essence is a permutation-invariant pool over
+that state; the per-slot remainder is the binding. T1 is literally T2 with
+`seq_len=1`; the only tier-specific piece is what supplies content — T1 embeds
+one instruction's tokens, T2 is fed a frozen T1's per-instruction essence.
+See RISCV_DESIGN.md for why.
 
-**T1 — validated** (`runs/t1_equiv_d128_canonvp_250k`, d128/n4/l2/d_out64,
-250k, `--rule single`): equivariance `0.00e+00` (exact, on the trained
-model), tag-invariance `1.0000`; binding live_in 99.9% / live_out 100% / pc
-100% / in_slot 100% / out_slot 100% / dup 0. Magnitude carries validity,
-direction carries semantics (open space — train *toward* the unit surface
-with the soft loss, never `F.normalize` onto it).
+**What has been shown.** Equivariance is exact on trained models. Both tiers
+train on the same behavioral losses with **no equivalence loss** — chunks that
+compute the same function collapse together from behavioral supervision alone,
+which is the property a value-numbering representation has to have. And T2
+derives each instruction's wiring from the frozen T1's own binding predictions
+rather than from decoded tokens, so the tier contract is actually exercised
+rather than assumed: nothing reaches T2 except what T1 emitted.
 
-**T2 — tier recursion validated** (`runs/t2_equiv_d512_cap4_2M_principled`,
-d_out=512, `branch+cap=4`, 2M, routing off T1's *predicted* binding). T2
-derives each instruction's wiring from the frozen T1's own binding
-predictions (`argmax`/top-k of its in/out-slot scores), **not** decoded
-tokens — so the run actually tests the claim the whole hierarchy rests on:
-*is T1's emitted representation sufficient for the next tier?* Held-out:
-live_in 99.7% / live_out 100% / pc 98.4% / in_slot 91.5% / out_slot 99.9% /
-dup 0 (in_slot's 91.5% vs 93.8% on ground-truth token wiring is the honest
-cost of routing off *predicted*, imperfect binding). Equivariance composes
-exactly over a chunk (`0.00e+00`).
+**What is open.** T2's essence is not yet a *lossless* behavioral description of
+its chunk. That is the current mission (TODO.md), measured by whether a chunk's
+output register values can be recovered from the essence, and scored discretely
+rather than as a loss value. It is lossless at one instruction and close at two;
+four and eight are open, as is everything outside the R/I-type ALU subset the
+work currently runs on. Beyond that lies T3, the first tier that must *compose*
+bindings rather than merely emit them.
 
-**Equivalence collapse (GVN) is the validated headline.** Essence distance
-split by pair type: rename-twins `0.008` (structural — free from the
-equivariant architecture), **behavioral-non-rename (commutativity) `0.024`**
-(TRAINED value-numbering — collapses ~28× vs distinct), distinct `0.659`. The
-non-rename collapse is the real result: the register-state machine performs
-global value numbering, not merely the free rename-twin collapse.
-
-**Phase 15 (open) — what the essence must carry beyond the register set.** The
-essence is a permutation-invariant pool over the 32 register slots. That
-symmetry is what makes it invariant to register renaming, but it also makes it
-blind to *order*, and a chunk's behavior depends on order twice over: the essence
-must encode which register was written first and second, and which input feeds
-which operand of each instruction.
-
-Two per-slot ordering signals close both gaps. Recording the **step at which each
-slot was written** supplies output order, and taking it to the pool moved
-value-prediction loss from 0.3525 to 0.0396 on 2-instruction chunks, with
-decode-back rising 72.9% → 91.5% per instruction at 8. Operand binding needs the
-second signal, each input's **position in the chunk's first-read order**, and it
-cannot be delivered through the pool: the pool is a symmetric sum that never sees
-the instruction's opcode, so it would have to apply read-order unconditionally —
-and swapping the operands of a commutative instruction changes read-order without
-changing what the chunk computes. Making that position the *leaf identity* of
-each input register instead — the value its slot is seeded with, in place of an
-anonymous random tag — puts it where the per-instruction cell can use it
-conditionally. On chunks whose two instructions read a common register, exact
-32-bit match of the predicted output rose from **21.2% to 99.8%**, and vp reached
-**0.0082**.
-
-Seeding from read position rather than a random tag also removes a learned
-property: with no tag, there is nothing for the encoder to learn to be invariant
-to. What it costs is that invariance to a commutative operand swap stops being
-structural — a state that records read-order can represent the difference, so the
-training signal has to suppress it, and does so imperfectly: equivalent chunks sit
-about 5× further apart than under a state that records no order at all. The
-exchange is accepted, because such a state earns its tighter collapse by also
-mapping chunks that compute genuinely *different* functions to a distance of
-0.0003, unable to separate them at all, and because the resulting 119× separation
-between equivalent and distinct chunks exceeds the 28× this architecture was
-validated on in Phase 14. Equivariance stays exact throughout. See EXPERIMENT_LOG
-Phase 15.
-
-`vp` is a real objective with no intrinsic floor: single-instruction vp is
-exactly `0.000`, and the head is fed raw value bits, not log-compressed scalars.
-Driving it to zero is the current mission (TODO.md), scored discretely as a 100%
-exact 32-bit match rate rather than as a loss value. Decode-back is a non-goal of
-this phase.
-
-**Infrastructure.** The frozen-T1 encode + predicted-binding routing + T2
-state machine + losses fold into ONE compiled CUDA-graph step at a
-fixed-padded instruction count (verified bit-identical to the ragged path):
-**T2 at 8–9 ms/step @ ~90%+ util**. Streaming pipeline:
-`datagen (all cores, --count) | train_t2_encoder` — CPU generates/analyzes
-chunks, the trainer only does forward/backward. Judge saturation by **GPU
-utilisation**, using ms/step against the same config's known-good figure as a
-floor check — ms/step is architecture-dependent and says nothing about how long
-the GPU spent waiting. (Ignore transient/periodic dips in the util reading;
-those are sampling artifacts. Sustained low util is the thing to fix, and to fix
-*before* letting a long run ride.) There is one RVT
-wire format and no version field — each batch is self-describing (magic +
-dtype signature + 5-field header), so a schema change is immediate and global.
+**Infrastructure.** The frozen-T1 encode, predicted-binding routing, T2 state
+machine and losses fold into one compiled CUDA-graph step at a fixed-padded
+instruction count (verified bit-identical to the ragged path). Training is a
+streaming pipeline — `datagen | train_t2_encoder` — where CPU workers generate
+and analyze chunks and the trainer only does forward/backward; on the GPU box
+those workers are offloaded to a second machine so they do not contend with the
+trainer. There is one RVT wire format and no version field: each batch is
+self-describing (magic + dtype signature + 5-field header), so a schema change
+is immediate and global. The `datagen` skill covers the pipeline, its flags, and
+how to judge whether the GPU is actually saturated.
 
 **GPU batch emulator.** All RV32I opcodes executable in parallel via
 `torch.where`, ~1.7ms for B=4096.
@@ -221,9 +164,9 @@ python -m datagen --rule single --twins 2 --batch-size 128 \
 
 # Train T2 (chunk encoder on a frozen T1); --count bounds the run.
 # NOTE: on the GPU box, local datagen workers contend with the trainer's
-# per-step H2D prep and starve the GPU (~54% util). For a real run, offload
-# generation to odin with multinode_gen.sh (same flags via env vars) — it
-# restores the ~90% / 9ms-step ideal. See the `datagen` skill.
+# per-step H2D prep and starve the GPU. For a real run, offload generation to
+# another machine with multinode_gen.sh (same flags via env vars). See the
+# `datagen` skill for what limits throughput once that is done.
 #   RULE="branch+cap=4" CONFIG=configs/instr_t2.json ./multinode_gen.sh 2000000 \
 #     | python scripts/train_t2_encoder.py --t1-model runs/t1_run/encoder.pt ...
 python -m datagen --rule "branch+cap=4" --twins 3 --batch-size 128 \

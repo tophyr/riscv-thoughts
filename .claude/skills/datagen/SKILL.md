@@ -113,7 +113,10 @@ so T1 always trains at their defaults. Passing one to `train_encoder.py` is an
 argparse error, not a silent no-op. (`--pool-extra` replaced the old boolean
 `--pool-reads-order`; old checkpoints are remapped on load by
 `scripts/_common.py:69-74`, `pool_reads_order: true` → `pool_extra:
-'write_time'`.)
+'write_time'`. A checkpoint trained when all pool heads shared one value
+projection is likewise remapped on load — `_tile_shared_pool_v` repeats those
+weights once per head, which reproduces the old computation exactly, so old
+multi-head checkpoints still score as they did.)
 
 ## INVARIANTS
 
@@ -258,12 +261,20 @@ Two different scripts — do not confuse them:
   cascade (local→nc→remote) reaps every worker. `REMOTE=chrissarbora@odin`.
   Worker split is `REMOTE_GEN` (default 96) / `LOCAL_GEN` (default **0**):
   local datagen contends with a local GPU trainer's per-step H2D prep and
-  starves the GPU — **measured ~54% util / 16.6 ms/step with local gen, vs ~90%
-  util / 9 ms with ALL generation on odin**, the latter matching the documented
-  compiled-step figure (README "T2 at 8–9 ms/step"). Judge saturation by GPU
-  utilisation, with ms/step against the same config's known-good figure as a
-  floor check. So the default offloads EVERY worker to
+  starves the GPU — measured **~54% util / 16.6 ms/step with local gen, against
+  9 ms with generation offloaded**. So the default offloads EVERY worker to
   odin; bump `LOCAL_GEN>0` only for a pure on-disk corpus with no local trainer.
+  Judge saturation by GPU utilisation, with ms/step against the same config's
+  known-good figure as a floor check.
+
+  **Offloading generation does not by itself saturate the GPU, and adding remote
+  workers will not either.** At len=2 the trainer's own per-step host work (RVT
+  parse, `_split_to_per_instruction`, `_t2_assemble`) is the constraint — it
+  does not overlap the GPU step, so utilisation sits near 40–50% with the
+  generators idle and backpressured. Measured at `REMOTE_GEN=120`: ~37% util,
+  odin at a load average of ~11 out of 128 cores, 20 MB/s over a ~118 MB/s link.
+  **Check odin's load before adding workers** — if it is low, generation is not
+  what is limiting you. TODO.md carries the diagnosis and the fix.
   Other defaults: `RULE=single`, `CONFIG=configs/instr_default.json`,
   `INJECT_INVALID=0` (clean corpus regardless of what the config says) — set
   them explicitly for any T2 / writers-only run.

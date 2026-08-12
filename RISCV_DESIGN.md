@@ -325,6 +325,24 @@ Realize the encoder as a register-indexed state machine over the dataflow:
   mean, which would drag in the random leaf-tags of untouched slots); binding
   = the per-slot structure, read back by the binding heads.
 
+**The pool's per-head value width is a capacity ceiling, separate from the
+essence width.** The pool runs `k` attention heads over the 32 slots and
+concatenates their outputs, so each head contributes `d_value / k` of the
+essence. If all heads share one value projection, a slot reaches the essence
+only through that single `d_value / k`-wide image (plus its `k` attention
+logits) — the essence can be 256 wide while its capacity for any one slot is 16.
+Each head therefore gets its **own** slice of a `d_value`-wide projection, as in
+standard multi-head attention, which makes a slot's image in the essence
+`d_value` rather than `d_value / k`. This also decouples two things that would
+otherwise trade against each other: heads exist to content-address *different*
+written slots, and under a shared projection adding heads to separate more slots
+narrowed what each one could carry.
+
+The ceiling binds on whichever field carries the most entropy. Operation
+identity is a choice among ten opcodes and survives a narrow channel; a 12-bit
+immediate does not, which is why a shared projection showed up as an I-type-only
+deficit.
+
 This is equivariant by construction: renaming registers permutes which slots
 are read and written, so `S` permutes and the symmetric-pool essence is
 invariant — *exactly*, with no training. Equivariance is exact precisely

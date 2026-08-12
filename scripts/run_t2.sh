@@ -55,8 +55,12 @@ cell() {  # MODE POOL_EXTRA
   fi
   echo "   final: $(grep "step $STEPS " "$D/t2_${OUT}.log" | tail -1)"
   echo "   --- binding + GVN (eval.py) ---"
+  # --gvn-chunk-len must match the cell's chunk length: gvn_collapse builds its
+  # OWN pairs and defaults to 4, so a len=2 cell would otherwise be scored
+  # entirely out of distribution.
   python scripts/eval.py --t1-model "$T1" --t2 "runs/$OUT" \
-      --t2-corpus "/tmp/t2_eval_${LEN}.rvt" --route binding --max-batches 20 2>&1 \
+      --t2-corpus "/tmp/t2_eval_${LEN}.rvt" --route binding --max-batches 20 \
+      --gvn-chunk-len "$LEN" 2>&1 \
     | grep -vE "Warning|readline|history" | sed 's/^/   /'
   echo "   --- faithfulness / on-sphere ---"
   python probes/t2_faithfulness.py "runs/$OUT" "$T1" "$LEN" 2>&1 \

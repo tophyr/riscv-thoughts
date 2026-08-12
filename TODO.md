@@ -22,19 +22,29 @@ rows on a fixed corpus, not to de-bias vp.)
 ## Milestones
 
 1. **vp = 0.0 at len=2 — essentially reached.** `--seed-mode rank` at 1M
-   (`runs/t2_len2_d256_s1000000_dep4_vp1_pool16_pma_pewrite_time_rtrank_seedrank_1m_writers`):
-   aggregate vp **0.0082**, against 0.0198 at equal steps for an encoder seeded
-   from random tags with no read-order in its value channels. Scored discretely
-   with `probes/vp_slot_b_split.py`, which measures exact 32-bit match of the
-   predicted output on two-instruction chunks: 100.000% on the first written
-   register, 99.948% on the second, and **99.806%** on the subset where both
-   instructions read a common source register — historically the failing case.
+   (`runs/t2_len2_d256_s1000000_dep4_vp1_pool16_pma_pewrite_time_rtrank_seedrank_phv_1m_writers`):
+   aggregate vp **0.0021**, and per-bit accuracy of the predicted output value
+   **99.939%** on two-instruction chunks, **99.999%** on single instructions.
 
-   The criterion is literally 100% on every column including overlap, so this is
-   short by ~13 row-anchor pairs of 6704 — small, but a real deficit rather than
-   sampling noise. `--op-cell-rank` reached exactly 100.000% on that column at
-   250k, so the last 0.2% is available; it is not worth a config change on its
-   own, since `seed_mode=rank` is better everywhere else.
+   Two probes score the two ways a chunk's behavior can be lost, and both are
+   needed because each is blind to the other's failure:
+
+   - `probes/vp_slot_b_split.py` scores OPERAND BINDING — exact 32-bit match of
+     the predicted output, broken out by whether the chunk's two instructions
+     read a common source register. It reaches 99.989% on the first written
+     register, 99.948% on the second, and **99.765%** on the shared-source
+     subset. Its corpus is R-type only (`configs/instr_r_only.json`), so it
+     carries no immediates and cannot see an immediate-encoding failure at all.
+   - `probes/vp_imm_share.py` scores the mixed training corpus and splits the
+     error by operand type, which is what exposes immediates.
+
+   The criterion is literally 100% on every binding column, so this is short by
+   ~2 row-anchor pairs of 6915 — small, but a real deficit rather than sampling
+   noise. `--op-cell-rank` reached exactly 100.000% on the shared-source column
+   at 250k, which suggested the last 0.2% was available for the taking — but
+   that was measured when all pool heads shared one value projection, and
+   per-head projections changed how much of a slot the essence can carry. Whether
+   it still helps, or is now redundant, has not been re-measured.
 
 2. **[CURRENT] vp = 0.0 at len=4, then len=8.** Was 0.244 and 0.461 pre-rank.
    Note `rank` matches the vp target's canonical frame on only 83.7% of len=4 and
@@ -67,19 +77,23 @@ rows on a fixed corpus, not to de-bias vp.)
 
 Task 1 is the current focus; the rest are queued, not parallel work.
 
-### 1. I-type immediate encoding
+### 1. Dataflow composition — chunks whose second instruction reads the first's result
 
-Immediates are the whole of the remaining len=2 vp error. On a corpus of R-type
-instructions only — which carry no immediates — the encoder scores ~100% exact
-32-bit match, while on the training corpus (55% R-type, 45% I-type) aggregate vp
-is 0.0082. The error is concentrated in bits 0–11, the 12-bit immediate field,
-and is present even on single instructions with one output, so it is independent
-of anything to do with multi-instruction chunks. It shrinks with training rather
-than being structural (`ADDI` 92.3% → 97.7% from 250k → 1M steps), which suggests
-a capacity or optimization problem rather than a representational one.
+The remaining len=2 error is concentrated on output slots at dataflow depth 2,
+where an instruction's operand is another instruction's result rather than a
+chunk input. Depth-1 slots reach 99.95–99.97% per-bit while depth-2 slots reach
+98.6% (I-type, n=397) and 99.3% (R-type, n=835) — a 30–60× higher error rate on
+about 2.4% of slots. R-type and I-type are now hit about equally (60% / 40% of
+total error), so this is composition, not operand encoding.
 
-T2 has a built but unused `imm_head`, skipped on the grounds that a chunk has
-no single immediate — but it has one per instruction. Untried.
+Depth-2 is where the op-cell must consume its own output: the value channels
+written by instruction 1 are read back as an operand of instruction 2, so the
+cell's output geometry has to be legible to its own input. That is a different
+demand from the depth-1 case, where every operand is a freshly seeded leaf.
+
+Untested levers: more residual blocks on the op-cell (`--op-cell-depth`); a
+wider value channel (`--d-out`); and supervising the intermediate value, which
+the SSA oracle already computes but the RVT batch does not ship.
 
 ### 2. Mint a production T1
 
@@ -127,9 +141,16 @@ Standing candidates:
   Remaining cost is reminting the frozen T1, which needs CLI plumbing first:
   `scripts/train_encoder.py` exposes none of the equivariant-core flags, so T1
   can only be trained at their defaults.
-- **`pool_extra`**: `order` and `event` are both recorded dead ends. Once task 1
-  resolves, keep only the survivors (`write_time`, plus whatever task 1 adds).
+- **`pool_extra`**: `order` and `event` are both recorded dead ends. Keep
+  `write_time`, delete the rest.
 - **`pool_mode`**: `compete` is a recorded dead end.
+
+### 5. Overlap the trainer's host-side work with the GPU step
+
+The bottleneck is diagnosed and measured — see the "Throughput" bullet under
+"How to run" — and what is missing is the fix: prefetch the next batch's
+preparation on a worker thread, or build the dense grid on-device. Worth ~2×
+wall-clock on every len=2 run.
 
 ## Constraints — do not regress
 
@@ -275,10 +296,14 @@ Standing candidates:
   work, not generation.** Measured during a len=2 cell: local trainer 633% CPU
   (6.3 cores) on per-step prep, odin's 98 workers at ~9.8% each (backpressured,
   not saturated), 64 MB/s over the wire. The GPU step is cheap at d256/len=2, so
-  the host prep dominates. Fix is overlap — prefetch the next batch's prep on a
-  worker thread, or build the dense grid on-device. Costs ~2× wall-clock on every
-  len=2 cell until then; a run comparing against a recorded baseline should keep
-  the pipeline as-is so the corpus mix the FIFO mux delivers is unchanged.
+  the host prep dominates. Adding remote workers does not help — re-measured at
+  `REMOTE_GEN=120`, where the GPU sat at ~37% while odin's load average was ~11
+  of 128 cores and the link carried 20 MB/s of a ~118 MB/s budget. A cheaper GPU
+  step lowers utilisation further, so utilisation falling after an architecture
+  change is not by itself evidence of a regression. Fix is overlap (task 5);
+  costs ~2× wall-clock on every len=2 cell until then. A run comparing against a
+  recorded baseline should keep the pipeline as-is so the corpus mix the FIFO mux
+  delivers is unchanged.
 - Probes (`probes/`, all read frozen checkpoints, none require training):
   `vp_slot_b_split.py` — operation vs operands, disjoint vs shared sources,
     reported per-bit AND as exact 32-bit match (the acceptance criterion; per-bit
@@ -287,8 +312,20 @@ Standing candidates:
     the operand→position association, with a no-rank calibration arm;
     `vp_superposition.py` — one output vs two, and asserts slot values are
     unchanged by the other instruction; `vp_imm_share.py` — R-type vs I-type
-    share and immediate bit positions (open task 2);
+    share, immediate bit positions, and error crossed with dataflow depth — the
+    mixed-corpus counterpart to `vp_slot_b_split`, which is R-only and so cannot
+    see an immediate failure at all; `imm_ceiling.py` — recovers one quantity at
+    each stage (T1 essence → T2's written slot → the pool's view of that slot →
+    T2 essence) to localize WHERE something is lost; `pool_bottleneck.py` —
+    refits a bottleneck for a single task and sweeps its width, to size a
+    suspected capacity limit before changing the architecture;
   `t2_reconstruct.py` and `t2_faithfulness.py` — regression checks only.
+
+  **Scoring GVN: pass `--gvn-chunk-len` matching the model's chunk length.**
+  `gvn_collapse` builds its own pairs and defaults to 4, so a len=2 model scored
+  without it is measured out of distribution — worth an order of magnitude
+  (equivalent-pair distance 0.0712 at chunk_len=4 against 0.0287 in
+  distribution, same checkpoint). `scripts/run_t2.sh` passes it.
 
 ## Long horizon
 
