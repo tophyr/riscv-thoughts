@@ -91,17 +91,30 @@ the whole worker pool.
 hard step cap. Training runs until stdin EOF (`scripts/_common.py:30-34`). Bound
 the batch count with `datagen --count N` (`datagen` has no per-worker `-n`).
 
-**Current T2 config** (writers-only happy path). `--pool-extra write_time` is
-load-bearing — omitting it reproduces the pre-ordering-fix model:
+**Current T2 config** (writers-only happy path). Three flags are load-bearing
+and non-default: `--pool-extra write_time` and `--read-time-mode rank` /
+`--seed-mode rank` supply the ordering the essence needs — omitting any of them
+reproduces an earlier, worse model rather than erroring:
 
 ```bash
 python -m datagen --rule "cap=$LEN" --twins 2 --batch-size 128 --n-states 8 \
     --anchor-seed 0 --config configs/instr_alu_writers.json --count "$STEPS" \
   | python scripts/train_t2_encoder.py --t1-model runs/t1_writers_250k/encoder.pt \
-    --d-out 256 --d-event 16 --op-cell-depth 4 --vp-head-depth 1 \
-    --n-pool-heads 16 --pool-mode pma --pool-extra write_time --route binding \
+    --d-out 512 --d-event 16 --op-cell-depth 4 --vp-head-depth 1 \
+    --n-pool-heads 16 --pool-mode pma --pool-extra write_time \
+    --read-time-mode rank --seed-mode rank --route binding \
     --n-steps "$STEPS" --anchor-seed 0 --n-anchor-states 8 --out-dir "$OUT"
 ```
+
+`--d-out 512` is the register-state width, and 512 is where it stays: 256 → 512
+is a real gain and 512 → 1024 buys nothing at any training budget measured, at
+2.6x the step time (EXPERIMENT_LOG phase-15, finding 17).
+
+`scripts/run_t2.sh` runs exactly this cell with each knob as an env var
+(`DOUT`, `LEN`, `STEPS`, `NPOOL`, …), names the run directory after them,
+offloads generation to odin, and scores the result. Prefer it to typing the
+pipeline by hand — but never edit it while a copy is running, since bash reads a
+script incrementally and the running shell will misparse the shifted file.
 
 Trainer-CLI asymmetry to know before improvising: the equivariant-core
 architecture flags — `--op-cell-depth`, `--vp-head-depth`, `--n-pool-heads`,

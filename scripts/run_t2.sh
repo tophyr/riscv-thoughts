@@ -1,25 +1,23 @@
 #!/bin/bash
-# Sweep: pool_mode {pma, compete} x pool_extra {none, write_time, order,
-# event}, at len=2 in the
-# known-good regime (op_cell=4, vp_head=1, n_pool_heads=16, d_out=256, 250k).
+# Train ONE T2 cell and score it. Every knob is an env var with the current
+# best config as its default, so a cell is named by what it changes:
 #
-# Why len=2: it is the smallest squash, and the probe (vp_pool_localize.py) put
-# the per-slot ceiling there at 98.3% bit accuracy vs the essence's ~80% — so
-# ~18 points are lost in the pool, ~13 of them recoverable from write_time
-# alone. This asks whether the ENCODER can exploit that, not just a readout.
+#   LEN=2 STEPS=250000 DEPTHW=8 TAG=depthw8 bash scripts/run_t2.sh
 #
-# Why compete is in the grid: it has only ever been run with the DEEP vp_head
-# (op_cell=1, vp_head=4), i.e. the regime that made multi-head pma look useless
-# too. Its cell in the weak-read-back regime is empty, not lost.
+# The run directory encodes the knobs, so two cells that differ in any of them
+# cannot overwrite each other; TAG separates a re-run of an already-recorded
+# cell from the record itself. MODES/PEXTRAS accept several values and the
+# script iterates their product.
 #
-# Scored on BOTH vp (encode-upward fidelity) and the GVN collapse rows
-# (rename / commutative / distinct) — a vp win that craters GVN is a regression.
+# Scored on vp (encode-upward fidelity), the binding heads, the GVN collapse
+# rows, and the vp error crossed with dataflow depth — a vp win that craters
+# GVN or the deep slots is a regression, not a result.
 set -u
 cd /home/tophy/Projects/riscv-thoughts
 source .venv/bin/activate
 D=/home/tophy/Projects/riscv-thoughts/logs
 T1=runs/t1_writers_250k/encoder.pt
-LEN=${LEN:-2} DOUT=256 STEPS=${STEPS:-250000} OC=4 VP=1
+LEN=${LEN:-2} DOUT=${DOUT:-256} STEPS=${STEPS:-250000} OC=${OC:-4} VP=1
 NPOOL=${NPOOL:-16}
 # compete is only meaningful for k>1 (k=1 degenerates to a uniform mean).
 MODES=${MODES:-"pma compete"}
@@ -27,13 +25,19 @@ PEXTRAS=${PEXTRAS:-"write_time"}
 RTMODE=${RTMODE:-stamp}
 OCRANK=${OCRANK:-0}   # feed the op-cell each operand's canonical read position
 SEEDMODE=${SEEDMODE:-tags}  # leaf identity: random tag, or canonical read rank
+# Weight an output slot at dataflow depth d by DEPTHW^(d-1). 1 = uniform.
+DEPTHW=${DEPTHW:-1}
+# RMSNorm every value entering a register slot (leaf and computed alike).
+VALNORM=${VALNORM:-0}
+# Direct linear path from an instruction's content to the slot it writes.
+SKIP=${SKIP:-0}
 # Distinguishes a re-run of an already-recorded cell (the run dir is otherwise a
 # pure function of the knobs, so it would silently overwrite it).
 TAG=${TAG:-}
 
 cell() {  # MODE POOL_EXTRA
   local MODE=$1 PE=$2
-  local OUT=t2_len${LEN}_d${DOUT}_s${STEPS}_dep${OC}_vp${VP}_pool${NPOOL}_${MODE}_pe${PE}_rt${RTMODE}${OCRANK:+$([ "$OCRANK" = 1 ] && echo _ocrank)}$([ "$SEEDMODE" != tags ] && echo _seed$SEEDMODE)${TAG:+_$TAG}_writers
+  local OUT=t2_len${LEN}_d${DOUT}_s${STEPS}_dep${OC}_vp${VP}_pool${NPOOL}_${MODE}_pe${PE}_rt${RTMODE}${OCRANK:+$([ "$OCRANK" = 1 ] && echo _ocrank)}$([ "$SEEDMODE" != tags ] && echo _seed$SEEDMODE)$([ "$DEPTHW" != 1 ] && echo _dw$DEPTHW)$([ "$VALNORM" = 1 ] && echo _vnorm)$([ "$SKIP" = 1 ] && echo _cskip)${TAG:+_$TAG}_writers
   echo "######## $(date '+%m-%d %H:%M:%S')  mode=$MODE  pool_extra=$PE  -> $OUT"
   # Generation runs on odin (multinode_gen.sh, LOCAL_GEN=0) so local cores stay
   # free for the trainer's per-step host work. ANCHOR_SEED must equal the
@@ -46,7 +50,9 @@ cell() {  # MODE POOL_EXTRA
       --d-out "$DOUT" --d-event 16 --op-cell-depth "$OC" --vp-head-depth "$VP" \
       --n-pool-heads "$NPOOL" --pool-mode "$MODE" --pool-extra "$PE" \
       --read-time-mode "$RTMODE" $([ "$OCRANK" = 1 ] && echo --op-cell-rank) \
-      --seed-mode "$SEEDMODE" --route binding \
+      --seed-mode "$SEEDMODE" --vp-depth-weight "$DEPTHW" \
+      $([ "$VALNORM" = 1 ] && echo --value-norm) \
+      $([ "$SKIP" = 1 ] && echo --content-skip) --route binding \
       --n-steps "$STEPS" --anchor-seed 0 --n-anchor-states 8 --out-dir "$OUT" \
       > "$D/t2_${OUT}.log" 2>&1
   local RC=$?
@@ -64,6 +70,9 @@ cell() {  # MODE POOL_EXTRA
     | grep -vE "Warning|readline|history" | sed 's/^/   /'
   echo "   --- faithfulness / on-sphere ---"
   python probes/t2_faithfulness.py "runs/$OUT" "$T1" "$LEN" 2>&1 \
+    | grep -vE "Warning|readline|history" | sed 's/^/   /'
+  echo "   --- vp error by operand type x dataflow depth ---"
+  python probes/vp_imm_share.py "runs/$OUT" "$T1" "$LEN" 300 2>&1 \
     | grep -vE "Warning|readline|history" | sed 's/^/   /'
 }
 

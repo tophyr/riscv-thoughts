@@ -89,21 +89,33 @@ that state; the per-slot remainder is the binding. T1 is literally T2 with
 one instruction's tokens, T2 is fed a frozen T1's per-instruction essence.
 See RISCV_DESIGN.md for why.
 
-**What has been shown.** Equivariance is exact on trained models. Both tiers
-train on the same behavioral losses with **no equivalence loss** — chunks that
-compute the same function collapse together from behavioral supervision alone,
-which is the property a value-numbering representation has to have. And T2
-derives each instruction's wiring from the frozen T1's own binding predictions
-rather than from decoded tokens, so the tier contract is actually exercised
-rather than assumed: nothing reaches T2 except what T1 emitted.
+**What has been shown.** Equivariance survives training — measured on every
+trained model, a rename permutes the emitted state to within zero error, so the
+construction above is not degraded by the losses acting on it. And T2 derives
+each instruction's wiring from the frozen T1's own binding predictions rather
+than from decoded tokens, so the tier contract is actually exercised rather than
+assumed: nothing reaches T2 except what T1 emitted.
 
-**What is open.** T2's essence is not yet a *lossless* behavioral description of
-its chunk. That is the current mission (TODO.md), measured by whether a chunk's
-output register values can be recovered from the essence, and scored discretely
-rather than as a loss value. It is lossless at one instruction and close at two;
-four and eight are open, as is everything outside the R/I-type ALU subset the
-work currently runs on. Beyond that lies T3, the first tier that must *compose*
-bindings rather than merely emit them.
+**What is open.** Two properties, and the framework needs both.
+
+*Faithfulness.* T2's essence is not yet a lossless behavioral description of its
+chunk, measured by whether the chunk's output register values can be recovered
+from the essence and scored discretely rather than as a loss value. It is
+lossless at one instruction and within a fraction of a percent at two; four and
+eight are open, as is everything outside the R/I-type ALU subset the work
+currently runs on.
+
+*Equivalence.* Two instruction sequences that compute the same function must
+compress to the same point — that is the framework's definition of meaning, and
+it is required for T2 to count as done. Sequences related by a register rename
+do, exactly. Sequences related by a *computed* equivalence do not: two chunks
+that fold two immediates into the same total land as far apart as two chunks
+computing different functions. The training objective is not pairwise, so
+nothing pushes equivalent chunks together; supplying that pressure is an
+outstanding design decision.
+
+Beyond both lies T3, the first tier that must *compose* bindings rather than
+merely emit them.
 
 **Infrastructure.** The frozen-T1 encode, predicted-binding routing, T2 state
 machine and losses fold into one compiled CUDA-graph step at a fixed-padded

@@ -343,6 +343,26 @@ identity is a choice among ten opcodes and survives a narrow channel; a 12-bit
 immediate does not, which is why a shared projection showed up as an I-type-only
 deficit.
 
+**An immediate is the field a slot drops first, and width is not what it is
+short of.** An instruction carries an opcode — a choice among ten — and, if it
+is I-type, a 12-bit literal. The literal is by far the higher-entropy field, and
+it is the one that fails when a slot has to hold anything else alongside it.
+
+Two conditions make a slot hold something else. One is that the chunk's two
+instructions read a common register, which forces both operations to be
+described against the same input. The other is that the slot's operand is
+another instruction's result rather than a chunk input, so the slot describes a
+composition. Measured on two-instruction chunks, every population carrying no
+immediate predicts its output values at 99.91% or better under either
+condition, and immediate-carrying instructions read in isolation reach 99.986%.
+An immediate under the first condition falls to 97.1%, under the second to
+92.5%, and under both to 80.9%.
+
+Doubling `d_value` from 256 to 512 improves those cells once; doubling again to
+1024 leaves the worst of them unchanged to three decimal places. Whatever a slot
+is short of when it must carry an immediate and a relationship at the same time,
+it is not room.
+
 This is equivariant by construction: renaming registers permutes which slots
 are read and written, so `S` permutes and the symmetric-pool essence is
 invariant — *exactly*, with no training. Equivariance is exact precisely
@@ -450,6 +470,13 @@ between the tiers is the ingestion front-end and the hparams.
 
 ### GVN: the invariant essence is the value-number
 
+**Global value numbering (GVN)** is the compiler analysis that assigns every
+computation in a program a *value number*, so that two computations receive the
+same number exactly when they are guaranteed to produce the same value. It is
+the standard name for the property this encoder has to have, and "GVN collapse"
+throughout these documents means the degree to which equivalent computations
+land on one point.
+
 The rename-invariant essence *is* a value-number — two computations producing
 the same value get the same essence; different values stay apart.
 Rename-equivalence collapses **structurally** (free, from the equivariant
@@ -460,9 +487,8 @@ the rename-invariant I/O function, so equivalent chunks receive identical
 targets). Distinct behaviors must stay apart — the essence is behavioral, not a
 syntactic hash.
 
-**Reordering independent instructions is NOT an essence-level equivalence** —
-this was previously listed above as trained-in, and that was wrong. The
-canonical frame assigns input positions by FIRST-READ order, so reordering
+**Reordering independent instructions is NOT an essence-level equivalence.**
+The canonical frame assigns input positions by FIRST-READ order, so reordering
 permutes them: `[ADD x5,x1,x2 ; SUB x6,x3,x4]` canonicalizes to "out_A =
 in1+in2, out_B = in3−in4" while its swap canonicalizes to "out_A = in1−in2,
 out_B = in3+in4". Verified against the oracle: `in_slot` `[1,2,3,4]` → `[3,4,1,2]`,

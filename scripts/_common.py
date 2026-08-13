@@ -124,6 +124,8 @@ def load_frozen_encoder(model_path, device):
         read_time_mode=hp.get('read_time_mode', 'stamp'),
         op_cell_rank=hp.get('op_cell_rank', False),
         seed_mode=hp.get('seed_mode', 'tags'),
+        value_norm=hp.get('value_norm', False),
+        content_skip=hp.get('content_skip', False),
     ).to(device)
     encoder.load_state_dict(_tile_shared_pool_v(
         _split_t1_state(load_checkpoint(model_path, device)), encoder))
@@ -148,6 +150,8 @@ def load_t2(t2_dir, t1, device):
         read_time_mode=hp.get('read_time_mode', 'stamp'),
         op_cell_rank=hp.get('op_cell_rank', False),
         seed_mode=hp.get('seed_mode', 'tags'),
+        value_norm=hp.get('value_norm', False),
+        content_skip=hp.get('content_skip', False),
     ).to(device)
     t2.load_state_dict(_tile_shared_pool_v(
         load_checkpoint(t2_dir / 't2.pt', device), t2))

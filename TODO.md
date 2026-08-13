@@ -5,13 +5,25 @@ architecture and rationale in RISCV_DESIGN.md. Nothing here is a history.
 
 ## Mission
 
-**Build a T2 encoder whose essence is a lossless behavioral description of its
-instruction chunk — vp = 0.0.**
+**T2 is done when its essence is a lossless behavioral description of its
+instruction chunk AND two chunks that compute the same function land on the same
+point.** Both are required; neither implies the other, and a model can score
+perfectly on one while failing the other completely.
 
-vp measures whether the chunk's output register values can be predicted from
-the essence given the input values. It is the metric that matters because T2's
-essence is what a future T3 consumes: a next tier can only recover what T2
-preserved.
+**Faithfulness — vp = 0.0.** vp measures whether the chunk's output register
+values can be predicted from the essence given the input values. It is the
+metric that matters because T2's essence is what a future T3 consumes: a next
+tier can only recover what T2 preserved.
+
+**Equivalence — computed equivalents collapse.** "Two token sequences mean the
+same thing if and only if they compress to the same point" is the framework's
+definition of meaning (WHAT_IS_A_THOUGHT.md), so an essence that separates
+`ADDI r1,r1,256; ADDI r1,r1,-16` from `ADDI r1,r1,32; ADDI r1,r1,208` is not a
+thought vector regardless of its vp. Rewrite equivalences — one operation
+expressed another way — already collapse. Computed ones, where seeing the
+equivalence requires arithmetic on the operands, do not collapse at all
+(milestone 2). vp cannot deliver this: it is not a pairwise objective, so two
+distinct points can both predict the same outputs correctly.
 
 **The vp number in a training log is already a held-out number.** `datagen`
 generates every batch fresh and the trainer never revisits one, so there is no
@@ -21,36 +33,79 @@ rows on a fixed corpus, not to de-bias vp.)
 
 ## Milestones
 
-1. **vp = 0.0 at len=2 — essentially reached.** `--seed-mode rank` at 1M
-   (`runs/t2_len2_d256_s1000000_dep4_vp1_pool16_pma_pewrite_time_rtrank_seedrank_phv_1m_writers`):
-   aggregate vp **0.0021**, and per-bit accuracy of the predicted output value
-   **99.939%** on two-instruction chunks, **99.999%** on single instructions.
+1. **[CURRENT] vp = 0.0 at len=2 — not reached.** Current best:
+   `--d-out 512 --pool-extra write_time --read-time-mode rank --seed-mode rank`
+   at 1M
+   (`runs/t2_len2_d512_s1000000_dep4_vp1_pool16_pma_pewrite_time_rtrank_seedrank_1m_writers`),
+   aggregate vp **0.0010**, per-bit **99.945%**, and on the criterion —
+   exact 32-bit match of the predicted output value — **99.756%**.
 
-   Two probes score the two ways a chunk's behavior can be lost, and both are
-   needed because each is blind to the other's failure:
+   The gap is one shape, and task 1 is the work of closing it: an immediate
+   survives in the essence when its instruction is read in isolation, and
+   degrades when that instruction must also share a source register with the
+   other instruction or take its operand from the other's result. Every
+   population carrying no immediate is at or above 99.91%.
 
-   - `probes/vp_slot_b_split.py` scores OPERAND BINDING — exact 32-bit match of
-     the predicted output, broken out by whether the chunk's two instructions
-     read a common source register. It reaches 99.989% on the first written
-     register, 99.948% on the second, and **99.765%** on the shared-source
-     subset. Its corpus is R-type only (`configs/instr_r_only.json`), so it
-     carries no immediates and cannot see an immediate-encoding failure at all.
-   - `probes/vp_imm_share.py` scores the mixed training corpus and splits the
-     error by operand type, which is what exposes immediates.
+   **Score this with `probes/vp_budget.py`**, which crosses the three properties
+   of an output slot that decide whether it is predicted correctly:
 
-   The criterion is literally 100% on every binding column, so this is short by
-   ~2 row-anchor pairs of 6915 — small, but a real deficit rather than sampling
-   noise. `--op-cell-rank` reached exactly 100.000% on the shared-source column
-   at 250k, which suggested the last 0.2% was available for the taking — but
-   that was measured when all pool heads shared one value projection, and
-   per-head projections changed how much of a slot the essence can carry. Whether
-   it still helps, or is now redundant, has not been re-measured.
+   - **sources** — `cross-instr` when the chunk's two instructions read a common
+     register, `distinct` otherwise.
+   - **immediate** — whether any instruction in the chunk carries one. R-type
+     ALU operations take two registers; I-type take a register and a 12-bit
+     literal.
+   - **depth** — the slot's dataflow depth: 1 when the instruction that wrote it
+     read only chunk inputs, 2 when one of its operands is another instruction's
+     result.
 
-2. **[CURRENT] vp = 0.0 at len=4, then len=8.** Was 0.244 and 0.461 pre-rank.
+   The unit is the (row, output slot, anchor) triple that vp supervises, and
+   **err mass** is the cell's share of all failing triples. A rate and a mass
+   are different facts: a rare cell can be terrible and carry little of the
+   error, a common one excellent and carry most of it.
+
+   | sources | immediate | depth | triples | exact | err mass |
+   |---|---|---|---|---|---|
+   | distinct | yes | **2** | 71k | **92.52%** | **42.8%** |
+   | **cross-instr** | yes | 1 | 176k | **97.11%** | **40.9%** |
+   | **cross-instr** | yes | **2** | 4.1k | **80.93%** | 6.3% |
+   | distinct | yes | 1 | 3.19M | 99.986% | 3.5% |
+   | cross-instr | no | 2 | 5.6k | 98.55% | 0.6% |
+   | distinct | no | 1 | 1.22M | 99.996% | 0.4% |
+   | cross-instr | no | 1 | 164k | 99.976% | 0.3% |
+   | distinct | no | 2 | 40k | 99.910% | 0.3% |
+
+   Worst individual opcode cells: depth-2 ADDI at 72.2% and depth-2 SLLI at
+   76.0%, ~3k triples each. Per-bit error is flat across bit positions
+   (0.037-0.082%, bit 0 mildly elevated), so an immediate's own bits are no
+   longer where it fails — only its interactions are.
+
+   Every probe's numbers describe the corpus it ran on, and the spread is wide:
+   this model reads 99.972% exact on `configs/instr_r_only.json` against 99.756%
+   on the mixed corpus it trains on. Quote the mixed-corpus figure for
+   statements about the model.
+
+2. **Computed equivalents collapse at len=2.** Two chunks that compute the same
+   function must land on the same point. They currently land as far apart as
+   two chunks computing different functions: on the best model, additive chains
+   with the same total offset sit **0.4008** apart against **0.4013** for chains
+   whose totals differ by 1 — separation **1.0x** — while a register rename sits
+   at 0.0031. XOR chains are worse, at 0.8x. Measured directly, with no fitted
+   readout, by `probes/additive_fusion.py`.
+
+   **Settle this before chunks get longer.** Every added instruction multiplies
+   the equivalences a chunk participates in, so a len=4 model would be learning
+   the same wrong geometry at four times the scale. It comes after milestone 1
+   because vp at len=2 is nearly closed and its diagnosis is in hand.
+
+   No loss, data augmentation or metric in the project has ever covered this
+   class: the equivalence manifest contains only single-instruction rewrites.
+   Task 2 has the evidence and the decisions to make before building.
+
+3. **vp = 0.0 at len=4, then len=8.** Was 0.244 and 0.461 pre-rank.
    Note `rank` matches the vp target's canonical frame on only 83.7% of len=4 and
    52.9% of len=8 chunks (the residual is dead code, which no causal read-time
    counter can know), so the len=2 mechanism may not transfer intact.
-3. **Beyond the happy path.** Everything above is writers-only (R/I-type ALU,
+4. **Beyond the happy path.** Everything above is writers-only (R/I-type ALU,
    valid, non-x0). Then: no-write instructions, PC/branches, memory, longer and
    looser chunks.
 
@@ -68,40 +123,132 @@ rows on a fixed corpus, not to de-bias vp.)
    corpus gets harder. Options when we get there: more anchors, a held-out
    anchor set the head never trained on, or anchors resampled per batch (which
    means shipping them in the RVT batch, i.e. a change to INVARIANT 1).
-4. **T3.** Sequences of T2 blocks. Prerequisite: decide what a *composed*
+5. **T3.** Sequences of T2 blocks. Prerequisite: decide what a *composed*
    binding is — T3 is the first tier that must combine bindings rather than
    just emit them (WHAT_IS_A_THOUGHT.md, "The Thought and Its Interface").
    Settle that before building, not during.
 
 ## Open tasks
 
-Task 1 is the current focus; the rest are queued, not parallel work.
+Task 1 is the current focus. Task 2 is required for the MVP and is sequenced
+after it, before chunks get longer. The rest are queued, not parallel work.
 
-### 1. Dataflow composition — chunks whose second instruction reads the first's result
+### 1. An immediate does not survive relocation or composition
 
-The remaining len=2 error is concentrated on output slots at dataflow depth 2,
-where an instruction's operand is another instruction's result rather than a
-chunk input. Depth-1 slots reach 99.95–99.97% per-bit while depth-2 slots reach
-98.6% (I-type, n=397) and 99.3% (R-type, n=835) — a 30–60× higher error rate on
-about 2.4% of slots. R-type and I-type are now hit about equally (60% / 40% of
-total error), so this is composition, not operand encoding.
+**The single open cause of the len=2 vp residual.** Value prediction is at or
+above 99.91% on every population carrying no immediate, and at 99.986% on
+immediate-carrying instructions read in isolation. The error lives in the three
+cells where an immediate meets a second condition (milestone 1's table):
 
-Depth-2 is where the op-cell must consume its own output: the value channels
-written by instruction 1 are read back as an operand of instruction 2, so the
-cell's output geometry has to be legible to its own input. That is a different
-demand from the depth-1 case, where every operand is a freshly seeded leaf.
+| condition paired with the immediate | exact | err mass |
+|---|---|---|
+| composed operand (dataflow depth 2) | 92.52% | 42.8% |
+| shared source register across the two instructions | 97.11% | 40.9% |
+| both | 80.93% | 6.3% |
 
-Untested levers: more residual blocks on the op-cell (`--op-cell-depth`); a
-wider value channel (`--d-out`); and supervising the intermediate value, which
-the SSA oracle already computes but the RVT batch does not ship.
+Each condition **alone** is solved: an immediate alone 99.986%, a shared source
+alone 99.976%, composition alone 99.910%. What fails is the combination, and the
+common factor is the immediate — the highest-entropy field an instruction
+carries, and the only one that has to survive being described against a shared
+input or folded into another instruction's result.
 
-### 2. Mint a production T1
+**Ruled out** (EXPERIMENT_LOG phase-15 finding 17, each against a ±0.75-point
+run-to-run noise floor):
+
+- **the vp head** — no refit, fine-tune, or deeper head beats the trained one;
+- **the two-step arithmetic chain** — handing a readout the true intermediate
+  value changes nothing;
+- **the pool** — the gap is already present in the register slot's own state;
+- **gradient share** — `--vp-depth-weight` at 8 and 32 leaves the hard cells
+  flat and degrades the rest;
+- **the operand scale mismatch** — `--value-norm` puts leaf and composed
+  operands on one shell and scores slightly worse, though the 0.08–0.14×
+  excitation gap it targets is real;
+- **content crowded out of the op-cell's first layer** — `--content-skip` gives
+  the content its own path into the slot and lands inside the noise;
+- **capacity** — `d_out` 256 → 512 buys a fixed amount, 512 → 1024 buys nothing
+  at either budget and leaves the worst cell at 97.11% → 97.10%.
+
+**Start with the shared-source cell.** It is 40.9% of the error, sits at depth 1
+so composition is not involved, and is completely insensitive to width — the
+simplest of the three to isolate. The mechanism to look at first is the
+canonical frame: a shared source shifts the second instruction's operands from
+canonical positions (3,4) to (2,3), and `--seed-mode rank` supplies that
+position through the slot seed. Whether the immediate and the position compete
+for the same channels in the op-cell's output is measurable on frozen
+checkpoints before any training.
+
+**Untested lever that remains:** supervising the intermediate value, which the
+SSA oracle computes and the RVT batch does not ship. Lower prior than it was —
+a readout can already recover the intermediate from the essence.
+
+### 2. Collapse computed equivalences (milestone 2 — required for MVP)
+
+Two chunks computing the same function must land on the same point. They do not,
+and the failure is total rather than partial. Distances between essences, where
+each chunk is two instructions of one opcode writing one register — so the
+essence describes only the composite, the intermediate having been overwritten:
+
+- **fusion** — the same composite reached by a different split of the two
+  immediates (`ADDI r1,r1,256; ADDI r1,r1,-16` against
+  `ADDI r1,r1,32; ADDI r1,r1,208`). Must be ~0.
+- **different** — a different composite. The denominator; without it a small
+  fusion distance would only mean the encoder collapses everything.
+- **separation** — different / fusion. Must be large.
+
+| family | fusion | different | separation |
+|---|---|---|---|
+| `ADDI/ADDI`, same total offset | 0.4008 | 0.4013 | **1.0x** |
+| `XORI/XORI`, same composite mask | 0.5067 | 0.3956 | **0.8x** |
+
+The same chunk with its registers relabelled sits at 0.0031, so the encoder is
+intact and the measurement is sound.
+`probes/additive_fusion.py` builds the chunks directly and takes a distance —
+no fitted readout — and asserts through the emulator that each `fusion` pair is
+behaviorally identical and each `different` pair is not. Extend it with a new
+family by adding a `combine`/`resplit`/`perturb` triple to `FAMILIES`.
+
+**Nothing in the project covers this class.** Equivalences are enumerated in
+one place — the manifest in `datagen/generate.py` — and all 15 of its classes
+are single-instruction **rewrites**, one operation expressed another way
+(`template_instr_counts=[1]`). Everything built on that manifest inherits the
+limit: the `--inject-equiv` data augmentation, `eval.py`'s `behavioral` GVN row,
+and a pairwise equivalence loss that the trainer carried until commit `7797c81`
+and which is recoverable from git history. A **fold** — where seeing the
+equivalence requires arithmetic on the operands — appears in none of them.
+Accordingly, every checkpoint spanning the current architecture fails it, the
+oldest worst at 0.5x, with equivalent chunks further apart than inequivalent
+ones.
+
+**vp cannot deliver it.** Two chunks computing the same function have the same
+vp target, and two distinct points can both predict it correctly. Nothing in the
+loss is pairwise — that was a deliberate design choice, and undoing it is the
+decision to make before building.
+
+Open questions, in order:
+
+- **How wide is the class?** Both families tested fail. Check whether any
+  computed equivalence collapses, and whether the rewrite classes that DO
+  collapse (commutative swap, 0.0309 at 42x separation) do so because they are
+  trained on or because the architecture makes them free.
+- **What is the objective?** A pairwise term over generated equivalent pairs is
+  the obvious candidate. `--inject-equiv` is a recorded failure at buying
+  collapse with data alone — it adds correlated rows without
+  adding collapse pressure, since nothing ties an injected variant's essence to
+  its base. The manifest would also need multi-instruction classes, which
+  requires generating folds rather than rewrites.
+- **What does it cost?** Every collapse gain so far has traded against
+  discriminativeness (findings 11, 16), and a term that pulls equivalents
+  together can pull inequivalents together too. `behav-diff` — pairs the
+  transformation did NOT leave equivalent — is the guard, and must stay large.
+
+### 3. Mint a production T1
 
 Every T1 in use is a diagnostic trained on a clean corpus (`--inject-invalid 0`),
 so it has no validity task and cannot reject invalid input. Needed before
 anything leaves the happy path. Fold in the `rd==x0` immediate mask.
 
-### 3. No-write instructions are invisible to the essence
+### 4. No-write instructions are invisible to the essence
 
 Blocks milestone 3 (~⅓ of the ISA). Content reaches the essence only through a
 register write (`value[out] = res` is gated on `out != 0`), so for branches,
@@ -118,7 +265,7 @@ the result makes equivalent x0-write no-ops spuriously distinct across
 immediates; and whether branches also need a real PC-effect vp target (the SSA
 oracle already computes `SELECT_PC` but does not ship it).
 
-### 4. Flag cleanup
+### 5. Flag cleanup
 
 **Project policy: options do not survive on their own.** Once a better way to do
 something is settled, the worse way gets deleted rather than kept behind a flag.
@@ -126,6 +273,13 @@ Ongoing branching/versioning complexity is a cost we do not pay if we can pay a
 one-time reshaping cost instead. Breaking changes — including reminting the
 frozen T1 — are acceptable **on the one condition that new and old can be
 compared and shown not to have regressed.**
+
+**Refuted this session, and due for deletion** — kept for now only so the
+evidence can be re-checked against the code that produced it, since each was
+tested once. Delete them deliberately rather than letting them become vestigial:
+`--vp-depth-weight` (and `slot_dataflow_depth`, which exists only to serve it),
+`--value-norm`, `--content-skip`. Each is refuted at len=2/250k against a
+measured noise floor; see task 1 and EXPERIMENT_LOG finding 17.
 
 Standing candidates:
 
@@ -145,7 +299,7 @@ Standing candidates:
   `write_time`, delete the rest.
 - **`pool_mode`**: `compete` is a recorded dead end.
 
-### 5. Overlap the trainer's host-side work with the GPU step
+### 6. Overlap the trainer's host-side work with the GPU step
 
 The bottleneck is diagnosed and measured — see the "Throughput" bullet under
 "How to run" — and what is missing is the fix: prefetch the next batch's
@@ -192,15 +346,16 @@ wall-clock on every len=2 run.
   non-equivalent pairs to 0.0003, i.e. it cannot tell those functions apart at
   all. For scale, the architecture was validated in Phase 14 at 0.0238 and 28×.
 
-  Numbers predating the correction to this metric are not comparable with these:
-  it previously drew independent tags for a chunk and its relabeled copy, so its
-  "rename" distance was reporting tag-invariance instead of equivariance.
+  The `rename` row encodes a chunk's relabeled copy with the SAME anonymous
+  per-chunk tags, permuted to match. Drawing independent tags for the two makes
+  that row report tag-invariance instead of equivariance, and inflates it —
+  recorded numbers only compare against each other when they share this.
 - **Magnitude-as-validity — a health check, not a live objective.** The writers
   corpus injects no invalid windows, so every row's validity target is 1 and vp
   consumes `F.normalize(vecs)` anyway; nothing we currently run should produce
   an invalid output. Essences should therefore sit on the unit sphere. A
   regression in `frac<0.9` is a symptom worth chasing, not a semantic failure.
-  Real validity supervision is deferred to open task 3.
+  Real validity supervision is deferred to open task 4.
 - **Decode-back / reconstruction is a NON-GOAL this phase.** Do not spend
   effort improving it. Do check it has not regressed — currently 91.5% opcode /
   95.4% immediate per instruction at len=8. (If anyone does pick it up later:
@@ -211,8 +366,27 @@ wall-clock on every len=2 run.
 
 ## Dead ends — do not re-run
 
-- **Capacity and training budget** for vp at a fixed chunk length: 2× width and
-  5× steps both leave it essentially unchanged.
+- **Capacity.** Scaling the model's dimensions and steps together leaves
+  aggregate vp essentially unchanged at a fixed chunk length. `d_out` 256 → 512
+  is the one exception and it does not repeat: 512 → 1024 gives +0.9 points of
+  depth-2 exact match at 250k and −0.7 at 1M, both inside the noise floor, with
+  GVN separation slipping 42× → 36×, and it leaves the error cells of task 1
+  unchanged to three decimal places. `d_out 512` is adopted; the remaining error
+  is not capacity-shaped.
+- **Weighting vp by dataflow depth** (`--vp-depth-weight`). Raising composed
+  slots' share of the vp gradient from 2.5% to 18% (W=8) and 46% (W=32) leaves
+  depth-2 flat at both settings and degrades depth-1 monotonically (overall bit
+  accuracy 99.834% → 99.751% → 98.839%). Composed slots are not gradient-starved.
+- **A content bypass into the slot** (`--content-skip`, a direct linear path
+  from an instruction's content to the slot it writes, so the content does not
+  share the op-cell's first layer with decoding the operands). Inside the noise
+  floor. The composed instruction's content is not blocked on its way into the
+  slot — it is fused with the operand once there.
+- **Normalizing values into the register slot** (`--value-norm`, RMSNorm on
+  every value as it enters a slot, so a seeded leaf and a computed op-cell
+  output share one scale). The scale gap is real and measured — a composed
+  operand excites the op-cell's operand weights at 0.08–0.14× a leaf's energy —
+  but closing it leaves depth-2 slightly worse (I-type 95.49% → 94.79%).
 - **`pool_mode=compete`.** No vp benefit, and with ordering enabled the essence
   becomes sensitive to the anonymous per-chunk register tags.
 - **Supplying more ordering information TO THE POOL.** Every `pool_extra` cell is
@@ -268,8 +442,11 @@ wall-clock on every len=2 run.
   `configs/instr_alu_writers.json`.
 - Model knobs on `scripts/train_t2_encoder.py`: `--op-cell-depth`,
   `--vp-head-depth`, `--n-pool-heads`, `--pool-mode`, `--pool-extra`,
-  `--read-time-mode`, `--op-cell-rank`. Current best on vp:
-  `op_cell=4 vp_head=1 n_pool_heads=16 pma pool_extra=write_time
+  `--read-time-mode`, `--op-cell-rank`, `--value-norm`, `--content-skip`, and
+  the loss knob `--vp-depth-weight`. `scripts/run_t2.sh` exposes each as an env
+  var (`DOUT`, `VALNORM`, `DEPTHW`, …) and names the run directory after them.
+  Current best on vp:
+  `d_out=512 op_cell=4 vp_head=1 n_pool_heads=16 pma pool_extra=write_time
   read_time_mode=rank --seed-mode rank`, i.e. the pool reads each slot's write
   step, read positions are counted as ranks over registers read before written,
   and register slots are seeded from those positions rather than random tags.
@@ -277,6 +454,13 @@ wall-clock on every len=2 run.
   `--op-cell-rank` widens the op-cell input and `--seed-mode rank` swaps
   `tag_proj` for `rank_emb`, so checkpoints are only interchangeable within a
   setting.
+- **Never edit `scripts/run_t2.sh` while a copy of it is running.** Bash reads a
+  script incrementally, so an edit shifts the file offsets under the running
+  shell. Doing this mid-sweep produced a spurious `syntax error near 'fi'` and
+  re-ran the eval-corpus block's redirect outside its `if`, truncating
+  `/tmp/t2_eval_2.rvt` to 0 bytes — which surfaces as `binding: … rows=0` in
+  every eval afterwards, GVN rows unaffected because they build their own pairs.
+  Wait for the sweep, or edit a copy.
 - One training cell, generation offloaded to odin:
   `LEN=2 STEPS=250000 MODES=pma NPOOL=16 PEXTRAS=write_time RTMODE=rank SEEDMODE=rank bash scripts/run_t2.sh`
   — trains, then runs `scripts/eval.py` and the faithfulness probe. `TAG=<name>`
@@ -300,7 +484,9 @@ wall-clock on every len=2 run.
   `REMOTE_GEN=120`, where the GPU sat at ~37% while odin's load average was ~11
   of 128 cores and the link carried 20 MB/s of a ~118 MB/s budget. A cheaper GPU
   step lowers utilisation further, so utilisation falling after an architecture
-  change is not by itself evidence of a regression. Fix is overlap (task 5);
+  change is not by itself evidence of a regression — and the converse holds:
+  `--d-out 512` runs at ~60% against d256's ~40% because its GPU step is more
+  expensive, not because anything about the pipeline improved. Fix is overlap (task 6);
   costs ~2× wall-clock on every len=2 cell until then. A run comparing against a
   recorded baseline should keep the pipeline as-is so the corpus mix the FIFO mux
   delivers is unchanged.
@@ -319,6 +505,21 @@ wall-clock on every len=2 run.
     T2 essence) to localize WHERE something is lost; `pool_bottleneck.py` —
     refits a bottleneck for a single task and sweeps its width, to size a
     suspected capacity limit before changing the architecture;
+  `vp_budget.py` — **the one to reach for first**: the whole error budget from
+    the model's own head, crossed over sources x immediate x depth plus opcode
+    and bit position, each bucket reported as a rate AND as its share of total
+    error. Takes a corpus config, so the same splits can be scored on the
+    population a past claim was measured on;
+  `additive_fusion.py` — whether two chunks computing the same function land on
+    the same point. Builds the chunks directly and takes a distance, with no
+    fitted readout, and asserts through the emulator that the pairs really are
+    equivalent;
+  `depth_composition.py` — whether a vp deficit is in the essence or the head,
+    by refitting and fine-tuning heads on frozen essences; `depth_stage.py` —
+    the same quantity recovered at each encoder stage (slot → pool view →
+    essence), split by dataflow depth; `depth_intermediate.py` — removes the
+    "composition is a harder function" confound by handing the readout the true
+    intermediate value;
   `t2_reconstruct.py` and `t2_faithfulness.py` — regression checks only.
 
   **Scoring GVN: pass `--gvn-chunk-len` matching the model's chunk length.**

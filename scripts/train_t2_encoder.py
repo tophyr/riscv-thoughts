@@ -89,6 +89,23 @@ def main():
                         'deterministically, so there is no tag to be invariant '
                         'to. Requires --read-time-mode rank.')
 
+    p.add_argument('--value-norm', action='store_true',
+                   help='RMSNorm every value as it enters a register slot. A '
+                        'slot holds either a seeded leaf (a chunk input) or '
+                        "the op-cell's own output, and the cell reads both "
+                        'back through the same operand weights; left free the '
+                        'two drift to very different scales. Adds parameters, '
+                        'so checkpoints are not interchangeable.')
+
+    p.add_argument('--content-skip', action='store_true',
+                   help="add a direct linear path from an instruction's "
+                        'content to the slot it writes. Without it the '
+                        'content reaches the slot only through the op-cell'
+                        "'s first layer, shared with whatever decoding the "
+                        'operands need — and a composed operand needs much '
+                        'more of it than a seeded leaf. Adds parameters, so '
+                        'checkpoints are not interchangeable.')
+
     add_common_train_args(p, lr=1e-4)
     p.add_argument('--warmup-steps', type=int, default=10000,
                    help='Linear LR warmup from ~0 to --lr over this many '
@@ -117,6 +134,13 @@ def main():
     p.add_argument('--vp-smooth-weight', type=float, default=0.2,
                    help='weight on the vp smooth-magnitude (ordering) term; the '
                         'per-bit target carries resolution.')
+    p.add_argument('--vp-depth-weight', type=float, default=1.0,
+                   help='weight an output slot at dataflow depth d by this '
+                        'value raised to (d-1). Composed slots — those whose '
+                        'instruction read another instruction\'s result — are '
+                        'rare and carry most of the per-slot vp error, so a '
+                        'uniform loss gives the hardest case a few percent of '
+                        'the gradient. 1.0 = uniform.')
     p.add_argument('--contrastive-weight', type=float, default=0.0,
                    help='Weight on the behavioral-distance contrastive loss on '
                         'the essence (0 = off). Pulls behaviorally-equivalent '
@@ -169,6 +193,8 @@ def main():
         pool_mode=args.pool_mode, pool_extra=args.pool_extra,
         read_time_mode=args.read_time_mode, op_cell_rank=args.op_cell_rank,
         seed_mode=args.seed_mode,
+        value_norm=args.value_norm,
+        content_skip=args.content_skip,
         lr=args.lr, n_steps=args.n_steps, log_every=args.log_every,
         warmup_steps=args.warmup_steps,
         valid_weight=args.valid_weight,
@@ -179,6 +205,7 @@ def main():
         out_slot_weight=args.out_slot_weight,
         value_predict_weight=args.value_predict_weight,
         vp_smooth_weight=args.vp_smooth_weight,
+        vp_depth_weight=args.vp_depth_weight,
         contrastive_weight=args.contrastive_weight,
         contrastive_loss=args.contrastive_loss,
         contrastive_s=args.contrastive_s,

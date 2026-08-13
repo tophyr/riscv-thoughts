@@ -117,7 +117,7 @@ class RegisterStateMachine(nn.Module):
     def __init__(self, d_value, d_event, d_content, n_regs=32, op_cell_depth=1,
                  n_pool_heads=1, pool_mode='pma', pool_extra='none',
                  read_time_mode='stamp', op_cell_rank=False,
-                 seed_mode='tags'):
+                 seed_mode='tags', value_norm=False, content_skip=False):
         super().__init__()
         self.d_value = d_value
         self.d_event = d_event
@@ -157,6 +157,17 @@ class RegisterStateMachine(nn.Module):
             self.rank_emb = nn.Embedding(n_regs, d_value)
         else:
             self.tag_proj = nn.Linear(1, d_value)
+        # A value slot holds one of two very different populations: a freshly
+        # seeded LEAF (a chunk input) or the op-cell's own OUTPUT (a computed
+        # value). Both are read back through the same operand weights of the
+        # cell, and left free they drift apart — measured on the len=2
+        # best-of-config, a composed value excites those weights at 0.08-0.14x
+        # a leaf's energy, and composed slots are where the vp error is.
+        # Normalizing every value AS IT ENTERS A SLOT puts the two populations
+        # on one shell, so the cell reads one code instead of two. Per-slot over
+        # the value axis, so a rename permutes it identically. Off by default:
+        # it adds parameters, so checkpoints are not interchangeable.
+        self.value_norm = nn.RMSNorm(d_value) if value_norm else None
         self.op_cell = nn.Sequential(
             nn.Linear(d_content + 2 * d_value + (2 if op_cell_rank else 0),
                       4 * d_value), nn.ReLU(),
@@ -169,6 +180,18 @@ class RegisterStateMachine(nn.Module):
         # shallow baseline and its state_dict is UNCHANGED, so depth-1
         # checkpoints (incl. the frozen T1) still load. Static ModuleList loop
         # -> unrolls at trace time, no graph break under torch.compile.
+        # A direct path from the instruction's own content to the slot it
+        # writes. Without it the content reaches the slot only through the
+        # cell's first linear, sharing that layer with whatever decoding the
+        # operands need — and when an operand is the cell's own previous output
+        # rather than a seeded leaf, that decoding is much more work. Measured
+        # on the len=2 best-of-config: a composed instruction's 12-bit immediate
+        # is recoverable from the slot it wrote at 35% against 87% for an
+        # independent one, on the opcodes where the immediate cannot be folded
+        # into the operand. Adds parameters, so checkpoints are not
+        # interchangeable.
+        self.content_skip = (nn.Linear(d_content, d_value)
+                             if content_skip else None)
         self.op_cell_blocks = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(d_value, 4 * d_value), nn.ReLU(),
@@ -220,7 +243,10 @@ class RegisterStateMachine(nn.Module):
             value = torch.zeros(content.shape[0], self.n_regs, self.d_value,
                                 device=device)
         else:
-            value = self.tag_proj(tags.unsqueeze(-1)) * not_x0.view(1, -1, 1)
+            seed = self.tag_proj(tags.unsqueeze(-1))
+            if self.value_norm is not None:
+                seed = self.value_norm(seed)
+            value = seed * not_x0.view(1, -1, 1)
         event = torch.zeros(
             content.shape[0], self.n_regs, self.d_event, device=device)
         # Per-slot ORDER timestamps (the cross-instruction analog of read_role):
@@ -253,6 +279,8 @@ class RegisterStateMachine(nn.Module):
                 for fr, rk in zip(firsts, ranks):
                     e = self.rank_emb(
                         rk.clamp(max=self.n_regs - 1).long()).squeeze(1)
+                    if self.value_norm is not None:
+                        e = self.value_norm(e)
                     fr = fr.unsqueeze(-1)
                     value = value * (1.0 - fr) + fr * e.unsqueeze(1)
             r0 = torch.bmm(oh0.unsqueeze(1), value).squeeze(1)   # (B,d_value)
@@ -268,6 +296,10 @@ class RegisterStateMachine(nn.Module):
             res = self.op_cell(torch.cat(cell_in, dim=-1))       # (B,d_value)
             for blk in self.op_cell_blocks:                      # residual depth
                 res = res + blk(res)
+            if self.content_skip is not None:
+                res = res + self.content_skip(c)
+            if self.value_norm is not None:
+                res = self.value_norm(res)
             # write value at dest (x0 write = nop), active rows only.
             oh_out = F.one_hot(out[:, k], self.n_regs).to(value.dtype) \
                 * not_x0_row
@@ -466,7 +498,8 @@ class Compressor(nn.Module):
     def __init__(self, *, d_content, d_out, d_event, op_cell_depth=1,
                  vp_head_depth=_VP_HEAD_DEPTH, n_pool_heads=1, pool_mode='pma',
                  pool_extra='none', read_time_mode='stamp',
-                 op_cell_rank=False, seed_mode='tags'):
+                 op_cell_rank=False, seed_mode='tags', value_norm=False,
+                 content_skip=False):
         super().__init__()
         self.d_content = d_content
         self.d_out = d_out
@@ -480,7 +513,8 @@ class Compressor(nn.Module):
             op_cell_depth=op_cell_depth, n_pool_heads=n_pool_heads,
             pool_mode=pool_mode, pool_extra=pool_extra,
             read_time_mode=read_time_mode, op_cell_rank=op_cell_rank,
-            seed_mode=seed_mode)
+            seed_mode=seed_mode, value_norm=value_norm,
+            content_skip=content_skip)
 
         # Binding heads read the per-slot state T (d_out+d_event), one score per
         # register slot (equivariant); pc_writes + value_predict read the
@@ -541,7 +575,7 @@ class T1Compressor(nn.Module):
                  d_out, d_event, op_cell_depth=1, vp_head_depth=_VP_HEAD_DEPTH,
                  n_pool_heads=1, pool_mode='pma', pool_extra='none',
                  read_time_mode='stamp', op_cell_rank=False,
-                 seed_mode='tags'):
+                 seed_mode='tags', value_norm=False, content_skip=False):
         super().__init__()
         self.embedder = TokenEmbedder(
             vocab_size=vocab_size, d_model=d_model, n_heads=n_heads,
@@ -552,7 +586,8 @@ class T1Compressor(nn.Module):
             n_pool_heads=n_pool_heads, pool_mode=pool_mode,
             pool_extra=pool_extra,
             read_time_mode=read_time_mode, op_cell_rank=op_cell_rank,
-            seed_mode=seed_mode)
+            seed_mode=seed_mode, value_norm=value_norm,
+            content_skip=content_skip)
         # dim interface (plain ints — delegated by value, not submodules)
         self.n_regs = self.compressor.n_regs
         self.d_out = self.compressor.d_out
@@ -584,14 +619,16 @@ class T1Compressor(nn.Module):
 def T2Compressor(*, d_t1, d_out, d_event, op_cell_depth=1,
                  vp_head_depth=_VP_HEAD_DEPTH, n_pool_heads=1, pool_mode='pma',
                  pool_extra='none', read_time_mode='stamp',
-                 op_cell_rank=False, seed_mode='tags'):
+                 op_cell_rank=False, seed_mode='tags', value_norm=False,
+                 content_skip=False):
     """T2 preset: a Compressor fed a lower tier's essence (d_content=d_t1)."""
     return Compressor(d_content=d_t1, d_out=d_out, d_event=d_event,
                       op_cell_depth=op_cell_depth, vp_head_depth=vp_head_depth,
                       n_pool_heads=n_pool_heads, pool_mode=pool_mode,
                       pool_extra=pool_extra,
                       read_time_mode=read_time_mode,
-                      op_cell_rank=op_cell_rank, seed_mode=seed_mode)
+                      op_cell_rank=op_cell_rank, seed_mode=seed_mode,
+                      value_norm=value_norm, content_skip=content_skip)
 
 
 class Decoder(nn.Module):
