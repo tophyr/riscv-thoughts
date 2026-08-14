@@ -149,26 +149,31 @@ not know you need.
    feed one canonical value-prediction target.
    (`scripts/tests/test_pipeline.py::test_out_regs_mode_header`.)
 
-4. **value_predict is CANONICAL for both tiers.** `out_regs` is the
-   rename-invariant canonical baseline: `precompute_chunk` relocates the chunk's
-   i-th live syntactic input to canonical position i+1 (`_canonical_state`,
-   `datagen/compare.py:331`, positions `_CANON_POSITIONS = range(1, 32)` at
-   `datagen/compare.py:84`; applied at `datagen/compare.py:610`) and
-   executes there, so `out_regs[:, r]` depends only on operand structure. The vp
-   loss (`t2_value_predict_loss`, `compressor/train.py:1063`, used by BOTH T1 and
-   T2) therefore feeds the head
+4. **value_predict is CANONICAL for both tiers, in the BEHAVIORAL frame.**
+   `out_regs` is the rename-invariant canonical baseline: `precompute_chunk`
+   relocates the chunk's i-th **behavioral** input to canonical position i+1
+   (`_canonical_state`, `datagen/compare.py:331`, positions
+   `_CANON_POSITIONS = range(1, 32)` at `datagen/compare.py:84`; applied at
+   `datagen/compare.py:635`) and executes there, so `out_regs[:, r]` depends only
+   on operand structure. The vp loss (`t2_value_predict_loss`,
+   `compressor/train.py:1063`, used by BOTH T1 and T2) therefore feeds the head
    the canonical-position values `anchor[:, k+1]` for input slot k — never the raw
    value at the slot's actual register. Feeding raw input values against the
    canonical target is mathematically inconsistent — the head must see canonical
    inputs to match the canonical output.
-   (Known accepted caveat, documented at `compressor/train.py:1111-1114`:
-   canonical positions are assigned over ALL live syntactic inputs while
-   `in_slot_regs` lists only the *behavioral* subset, so slot k ↔ position k+1
-   drifts for a degenerate op with a live-but-value-irrelevant input, e.g.
-   `ANDI _,_,0`. Not rare — 5.9% of len=2 chunks on the writers corpus, 26.6% at
-   len=8 — but measured not to cost vp, since the dropped input is dropped
-   exactly because the output does not depend on it. Accepted on that evidence,
-   not a bug to "fix" casually.)
+
+   **The frame must be behavioral, not syntactic, and the same one everywhere.**
+   `in_slot_regs` lists the behavioral inputs, so a canonical position spent on a
+   live-but-value-irrelevant read (e.g. `ANDI _,_,0`, or `SLTIU rd,rs,-k` whose
+   sign-extended immediate makes it the constant 1) shifts every later input off
+   its slot. The encoder is never given such a read — T1's binding heads are
+   behavioral and correctly omit it — so the target would depend on something
+   the encoder cannot see, and two chunks with a bit-identical encoder input
+   would carry different targets. Determining which inputs are behavioral needs a
+   frame to perturb within, so `precompute_chunk` builds a syntactic frame first,
+   uses it ONLY to compute `input_mags`, and re-executes in the behavioral frame.
+   The regression guard is
+   `test_canonical_positions_go_to_behavioral_inputs`.
 
 5. **x0 is fixed under relabeling.** `random_perm`/`relabel` require `perm[0]==0`
    (`datagen/generate.py:287,301`; the check is `datagen/generate.py:309-310`).

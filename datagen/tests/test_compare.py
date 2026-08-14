@@ -57,6 +57,34 @@ class TestAuxTargets:
         assert (pre.out_slot_regs[1:] == AUX_CE_IGNORE).all()
         assert pre.pc_explicit is False
 
+    def test_canonical_positions_go_to_behavioral_inputs(self):
+        """Behavioral input i must execute at canonical position i+1.
+
+        The value-prediction head is fed `anchor[:, k+1]` for input slot k, and
+        `in_slot_regs[k]` is the k-th behavioral input, so the baseline has to
+        put that input at that position. Spending a position on a live-but-
+        non-behavioral input shifts every later input off its slot: the target
+        then depends on a read that never reaches the encoder, and two chunks
+        the encoder cannot tell apart get different targets.
+
+        `SLTIU rd,rs,-300` compares UNSIGNED against a sign-extended
+        0xFFFFFED4, so it is the constant 1 and its source is read but not
+        behavioral.
+        """
+        anchors = make_anchor_states(8, seed=0)
+        second = Instruction('ADDI', 9, 5, 100)
+        # x11 is read, live (its instruction writes an output) and irrelevant.
+        far = precompute_chunk([Instruction('SLTIU', 7, 11, -300), second],
+                               anchors)
+        # the same chunk with no earlier read at all
+        near = precompute_chunk([Instruction('SLTIU', 7, 5, -300), second],
+                                anchors)
+        assert far.inputs == [11, 5] and far.behavioral_inputs == [5]
+        for pre in (far, near):
+            assert pre.in_slot_regs[0] == 5
+            # x9 = x5 + 100 with x5 sourced from canonical position 1
+            assert (pre.out_regs[:, 9] == anchors[:, 1] + 100).all()
+
     def test_memory_op_raises(self):
         # Mem ops are out of V1 distance scope; precompute_chunk raises so
         # batch.py routes them to the None/empty-aux path.

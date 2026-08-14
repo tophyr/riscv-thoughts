@@ -36,15 +36,22 @@ rows on a fixed corpus, not to de-bias vp.)
 1. **[CURRENT] vp = 0.0 at len=2 — not reached.** Current best:
    `--d-out 512 --pool-extra write_time --read-time-mode rank --seed-mode rank`
    at 1M
-   (`runs/t2_len2_d512_s1000000_dep4_vp1_pool16_pma_pewrite_time_rtrank_seedrank_1m_writers`),
-   aggregate vp **0.0010**, per-bit **99.945%**, and on the criterion —
-   exact 32-bit match of the predicted output value — **99.756%**.
+   (`runs/t2_len2_d512_s1000000_dep4_vp1_pool16_pma_pewrite_time_rtrank_seedrank_behavframe_writers`,
+   replicated at `…_behavframe_s7_writers`), on the criterion — exact 32-bit
+   match of the predicted output value — **99.744%** and **99.753%**. The two
+   seeds put the run-to-run noise floor at 1M steps at **±0.01 points** overall
+   and 0.1 points on any cell above 1k triples.
+
+   **Numbers from before the vp target was moved into the behavioral canonical
+   frame are not comparable to these** (EXPERIMENT_LOG finding 14). A model is
+   scored on the target it trained on and the two differ on 12.5% of rows; on
+   the rows where they agree, the change took 99.7383% → 99.8347%.
 
    The gap is one shape, and task 1 is the work of closing it: an immediate
    survives in the essence when its instruction is read in isolation, and
-   degrades when that instruction must also share a source register with the
-   other instruction or take its operand from the other's result. Every
-   population carrying no immediate is at or above 99.91%.
+   degrades when that instruction's operand is the other instruction's result.
+   Every population carrying no immediate is at or above 99.88%, and composition
+   without an immediate is at 99.957%.
 
    **Score this with `probes/vp_budget.py`**, which crosses the three properties
    of an output slot that decide whether it is predicted correctly:
@@ -65,31 +72,30 @@ rows on a fixed corpus, not to de-bias vp.)
 
    | sources | immediate | depth | triples | exact | err mass |
    |---|---|---|---|---|---|
-   | distinct | yes | **2** | 71k | **92.52%** | **42.8%** |
-   | **cross-instr** | yes | 1 | 176k | **97.11%** | **40.9%** |
-   | **cross-instr** | yes | **2** | 4.1k | **80.93%** | 6.3% |
-   | distinct | yes | 1 | 3.19M | 99.986% | 3.5% |
-   | cross-instr | no | 2 | 5.6k | 98.55% | 0.6% |
-   | distinct | no | 1 | 1.22M | 99.996% | 0.4% |
-   | cross-instr | no | 1 | 164k | 99.976% | 0.3% |
-   | distinct | no | 2 | 40k | 99.910% | 0.3% |
+   | distinct | yes | **2** | 17.4k | **93.01%** | **39.5%** |
+   | distinct | yes | 1 | 767k | 99.909% | 22.5% |
+   | distinct | no | 1 | 290k | 99.879% | 11.4% |
+   | **cross-instr** | yes | 1 | 42.2k | 99.228% | 10.6% |
+   | **cross-instr** | yes | **2** | 888 | **81.08%** | 5.4% |
+   | cross-instr | no | 2 | 1.5k | 98.24% | 0.8% |
+   | cross-instr | no | 1 | 39.2k | 99.980% | 0.3% |
+   | distinct | no | 2 | 9.4k | 99.957% | 0.1% |
 
-   Worst individual opcode cells: depth-2 ADDI at 72.2% and depth-2 SLLI at
-   76.0%, ~3k triples each. Per-bit error is flat across bit positions
-   (0.037-0.082%, bit 0 mildly elevated), so an immediate's own bits are no
-   longer where it fails — only its interactions are.
+   Worst individual opcode cells at depth 2: SLTIU 78.8%, SLLI 80.3%, ADDI
+   79.5%, ~1k triples each.
 
-   Every probe's numbers describe the corpus it ran on, and the spread is wide:
-   this model reads 99.972% exact on `configs/instr_r_only.json` against 99.756%
-   on the mixed corpus it trains on. Quote the mixed-corpus figure for
-   statements about the model.
+   Every probe's numbers describe the corpus it ran on, and the spread is wide
+   enough to have hidden a bug for a phase: an R-only corpus excludes the
+   `SLTIU rd,rs,-k` shape entirely, and reading 8.8× lower error there than on
+   the mixed corpus was taken as a property of the model (EXPERIMENT_LOG finding
+   19). Quote the mixed-corpus figure for statements about the model.
 
 2. **Computed equivalents collapse at len=2.** Two chunks that compute the same
    function must land on the same point. They currently land as far apart as
    two chunks computing different functions: on the best model, additive chains
-   with the same total offset sit **0.4008** apart against **0.4013** for chains
-   whose totals differ by 1 — separation **1.0x** — while a register rename sits
-   at 0.0031. XOR chains are worse, at 0.8x. Measured directly, with no fitted
+   with the same total offset sit **0.4634** apart against **0.3901** for chains
+   whose totals differ by 1 — separation **0.8x** — while a register rename sits
+   at 0.0057. XOR chains are 0.7x. Measured directly, with no fitted
    readout, by `probes/additive_fusion.py`.
 
    **Settle this before chunks get longer.** Every added instruction multiplies
@@ -133,24 +139,32 @@ rows on a fixed corpus, not to de-bias vp.)
 Task 1 is the current focus. Task 2 is required for the MVP and is sequenced
 after it, before chunks get longer. The rest are queued, not parallel work.
 
-### 1. An immediate does not survive relocation or composition
+### 1. An immediate does not survive composition
 
-**The single open cause of the len=2 vp residual.** Value prediction is at or
-above 99.91% on every population carrying no immediate, and at 99.986% on
-immediate-carrying instructions read in isolation. The error lives in the three
-cells where an immediate meets a second condition (milestone 1's table):
+**The single open cause of the len=2 vp residual.** The error lives in the cells
+where an immediate meets a **composed operand** — the writing instruction taking
+its operand from the other instruction's result rather than from a chunk input
+(milestone 1's table):
 
 | condition paired with the immediate | exact | err mass |
 |---|---|---|
-| composed operand (dataflow depth 2) | 92.52% | 42.8% |
-| shared source register across the two instructions | 97.11% | 40.9% |
-| both | 80.93% | 6.3% |
+| composed operand (dataflow depth 2) | 93.01% | 39.5% |
+| composed operand AND a shared source | 81.08% | 5.4% |
 
-Each condition **alone** is solved: an immediate alone 99.986%, a shared source
-alone 99.976%, composition alone 99.910%. What fails is the combination, and the
+Each condition **alone** is solved: an immediate alone 99.909%, a shared source
+alone 99.980%, composition alone 99.957%. What fails is the combination, and the
 common factor is the immediate — the highest-entropy field an instruction
-carries, and the only one that has to survive being described against a shared
-input or folded into another instruction's result.
+carries, and the only one that has to survive being folded into another
+instruction's result.
+
+**The shared-source half of this was a broken target, not an encoder limit**, and
+is closed: canonical positions were assigned over live syntactic inputs while the
+vp head was fed as though they covered only the behavioral ones, so two chunks
+with a bit-identical encoder input carried different targets. That cell went
+97.11% → 99.23%. See EXPERIMENT_LOG finding 14 for the mechanism and
+`probes/vp_drop_control.py` for the construction that isolates it — a
+manufactured collision, because no split of the corpus can see this class of
+defect.
 
 **Ruled out** (EXPERIMENT_LOG phase-15 finding 17, each against a ±0.75-point
 run-to-run noise floor):
@@ -167,20 +181,26 @@ run-to-run noise floor):
 - **content crowded out of the op-cell's first layer** — `--content-skip` gives
   the content its own path into the slot and lands inside the noise;
 - **capacity** — `d_out` 256 → 512 buys a fixed amount, 512 → 1024 buys nothing
-  at either budget and leaves the worst cell at 97.11% → 97.10%.
+  at either budget and leaves the error cells unchanged to three decimals.
 
-**Start with the shared-source cell.** It is 40.9% of the error, sits at depth 1
-so composition is not involved, and is completely insensitive to width — the
-simplest of the three to isolate. The mechanism to look at first is the
-canonical frame: a shared source shifts the second instruction's operands from
-canonical positions (3,4) to (2,3), and `--seed-mode rank` supplies that
-position through the slot seed. Whether the immediate and the position compete
-for the same channels in the op-cell's output is measurable on frozen
-checkpoints before any training.
+**Ruled out as of the behavioral-frame model** (`probes/vp_frame.py`): the
+remaining error in this cell is not a description mismatch. Restricting it to
+rows where T1's emitted wiring matches the tokens reads 93.43%, and restricting
+it to rows whose target is identical under either canonical frame reads 92.63% —
+both at the cell's own 93.01%. So neither T1's binding prediction nor the frame
+is what is failing here, unlike the shared-source cell.
 
-**Untested lever that remains:** supervising the intermediate value, which the
-SSA oracle computes and the RVT batch does not ship. Lower prior than it was —
-a readout can already recover the intermediate from the essence.
+**Untested levers that remain:**
+
+- **Supervising the intermediate value**, which the SSA oracle computes and the
+  RVT batch does not ship. Lower prior than it was — a readout can already
+  recover the intermediate from the essence.
+- **The op-cell's own composition step.** A depth-2 slot is
+  `op_cell(content, op_cell(content', a, b), c)`, and every refuted lever above
+  targeted what the slot is *made of* rather than the second application itself.
+  Nothing yet measures whether the immediate is present in the intermediate and
+  lost by the second application, or absent from the intermediate to begin
+  with — which is the first thing to localise, on frozen checkpoints.
 
 ### 2. Collapse computed equivalences (milestone 2 — required for MVP)
 
@@ -198,10 +218,10 @@ essence describes only the composite, the intermediate having been overwritten:
 
 | family | fusion | different | separation |
 |---|---|---|---|
-| `ADDI/ADDI`, same total offset | 0.4008 | 0.4013 | **1.0x** |
-| `XORI/XORI`, same composite mask | 0.5067 | 0.3956 | **0.8x** |
+| `ADDI/ADDI`, same total offset | 0.4634 | 0.3901 | **0.8x** |
+| `XORI/XORI`, same composite mask | 0.5722 | 0.3727 | **0.7x** |
 
-The same chunk with its registers relabelled sits at 0.0031, so the encoder is
+The same chunk with its registers relabelled sits at 0.0057, so the encoder is
 intact and the measurement is sound.
 `probes/additive_fusion.py` builds the chunks directly and takes a distance —
 no fitted readout — and asserts through the emulator that each `fusion` pair is
@@ -463,6 +483,15 @@ wall-clock on every len=2 run.
   Wait for the sweep, or edit a copy.
 - One training cell, generation offloaded to odin:
   `LEN=2 STEPS=250000 MODES=pma NPOOL=16 PEXTRAS=write_time RTMODE=rank SEEDMODE=rank bash scripts/run_t2.sh`
+- **A replicate needs `GEN_SEED`.** Both datagen pools default to `--seed 0`, so
+  re-running a cell otherwise redraws the same instruction stream and measures
+  only initialization variance. `GEN_SEED=7 … TAG=s7 bash scripts/run_t2.sh`
+  draws a different corpus from the same distribution. It is unrelated to
+  `ANCHOR_SEED`, which must stay equal to the trainer's `--anchor-seed`
+  (INVARIANT 1). At len=2/1M the floor is ±0.01 points of overall exact match.
+- **A run's `t2.pt` appears long before the run ends** — the trainer checkpoints
+  periodically. Wait on the trainer process exiting, or on `run_t2.sh` logging
+  `final:`; scoring the file as soon as it exists reads a partial model.
   — trains, then runs `scripts/eval.py` and the faithfulness probe. `TAG=<name>`
   suffixes the run dir so a re-run of a recorded cell does not overwrite it.
 - **Method: probe first, then train.** Diagnose on frozen checkpoints until the
@@ -510,6 +539,17 @@ wall-clock on every len=2 run.
     and bit position, each bucket reported as a rate AND as its share of total
     error. Takes a corpus config, so the same splits can be scored on the
     population a past claim was measured on;
+  `vp_frame.py` — whether the essence and the vp target describe the SAME chunk.
+    Splits vp by how T1's emitted wiring differs from the tokens' (a dropped
+    read, an added one, a swap, a repeat T1 cannot express) and by whether the
+    behavioral and syntactic canonical frames coincide. Reach for it when a cell
+    resists every capacity lever, which is what a mismatch looks like;
+  `vp_drop_control.py` — the same question answered causally: the second
+    instruction held identical while only the first varies, so a difference
+    cannot be explained by the chunks being harder. Use this shape whenever a
+    defect can make two different chunks produce the same encoder input — a
+    split of the corpus cannot see one, because the cost falls on the rows that
+    do NOT carry the defect;
   `additive_fusion.py` — whether two chunks computing the same function land on
     the same point. Builds the chunks directly and takes a distance, with no
     fitted readout, and asserts through the emulator that the pairs really are

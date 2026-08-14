@@ -1151,20 +1151,16 @@ def t2_value_predict_loss(t2, vecs, anchor_states_t,
     max_in = in_slot_regs_t.shape[1]
 
     # CANONICAL input values. `out_regs` is the canonical baseline:
-    # precompute_chunk relocates the chunk's i-th first-read input to canonical
+    # precompute_chunk relocates the chunk's i-th BEHAVIORAL input to canonical
     # position i+1 (_canonical_state) and executes there, so out_regs depends
-    # only on operand STRUCTURE, not register names. The vp head must therefore
-    # see the canonical-position values anchor[:, k+1] for input slot k — NOT
-    # the raw value at the slot's actual register (the old bug, which fed
-    # anchor[:, in_slot_regs] and asked the head to predict f(canon inputs) from
-    # raw inputs = uncorrelated numbers). Canonical also leaks no register
-    # identity into vp, which is the right choice for an equivariant encoder.
+    # only on operand STRUCTURE, not register names. in_slot_regs lists the same
+    # behavioral inputs in the same order, so input slot k is exactly position
+    # k+1 and the head must see anchor[:, k+1] — NOT the raw value at the slot's
+    # actual register (the old bug, which fed anchor[:, in_slot_regs] and asked
+    # the head to predict f(canon inputs) from raw inputs = uncorrelated
+    # numbers). Canonical also leaks no register identity into vp, which is the
+    # right choice for an equivariant encoder.
     # Unfilled slots (AUX_CE_IGNORE) feed 0 = "no input".
-    # (Caveat: canonical positions cover all live syntactic inputs while
-    # in_slot_regs lists only the behavioral subset, so a dropped input shifts
-    # every later slot and the head is fed a value the target never used. Common
-    # — 5.9% of len=2 chunks, 26.6% at len=8 — but measured not to cost vp, since
-    # an input is dropped precisely when the output does not depend on it.)
     device = anchor_states_t.device
     canon_pos = torch.arange(1, max_in + 1, device=device).clamp(max=N_REGS - 1)
     in_filled = (in_slot_regs_t != AUX_CE_IGNORE).float()       # (B, max_in)

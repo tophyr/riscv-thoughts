@@ -43,6 +43,11 @@
 #   ANCHOR_SEED     (default 0 — passed to BOTH pools; MUST equal the
 #                    trainer's --anchor-seed, else value_predict targets
 #                    silently mismatch, INVARIANT 1.)
+#   GEN_SEED        (default 0 — the instruction-stream seed; worker i draws
+#                    seed+i. Change it to draw a DIFFERENT corpus from the
+#                    same distribution, which is how a run-to-run noise floor
+#                    is measured. Unrelated to ANCHOR_SEED, which must not
+#                    move.)
 #   REMOTE_GEN      (default 96 — odin worker count; it is a 128-core box)
 #   LOCAL_GEN       (default 0 — see the worker-split note above)
 #   PORT            (default 6464 — the nc listener port. Give concurrent
@@ -61,6 +66,7 @@ CONFIG=${CONFIG:-configs/instr_default.json}
 INJECT_INVALID=${INJECT_INVALID:-0}
 INJECT_EQUIV=${INJECT_EQUIV:-}
 ANCHOR_SEED=${ANCHOR_SEED:-0}
+GEN_SEED=${GEN_SEED:-0}
 REMOTE_GEN=${REMOTE_GEN:-96}
 LOCAL_GEN=${LOCAL_GEN:-0}
 PORT=${PORT:-6464}
@@ -112,7 +118,7 @@ ssh ${REMOTE} "bash ${REMOTE_DIR}/scripts/multinode_remote.sh \
     --rule ${RULE} \
     --batch-size ${BATCH_SIZE} \
     --twins ${TWINS} --n-states ${N_STATES} \
-    --anchor-seed ${ANCHOR_SEED} \
+    --anchor-seed ${ANCHOR_SEED} --seed ${GEN_SEED} \
     --config ${CONFIG} \
     ${EXTRA_ARGS}" &
 SSH_PID=$!
@@ -132,7 +138,7 @@ ${PYTHON} -m datagen \
     --rule ${RULE} \
     --batch-size ${BATCH_SIZE} \
     --twins ${TWINS} --n-states ${N_STATES} \
-    --anchor-seed ${ANCHOR_SEED} \
+    --anchor-seed ${ANCHOR_SEED} --seed ${GEN_SEED} \
     --config ${CONFIG} \
     --count ${TOTAL} \
     ${EXTRA_ARGS} </dev/null

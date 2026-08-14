@@ -602,24 +602,43 @@ def precompute_chunk(chunk, anchor_states):
     inputs = live_input_regs(ssa, live)
     pc_explicit = pc_out is not None
 
-    # Baseline executes on a canonical state: the chunk's syntactic
-    # inputs are sourced from canonical anchor positions (canon_0,
-    # canon_1, ... in syntactic order). All outputs and magnitudes
-    # below are register-name-invariant — two GVN-equivalent chunks
-    # produce identical canonical out_regs / out_pcs / mags.
-    canon_state = _canonical_state(anchor_states, inputs, _CANON_POSITIONS)
-    out_regs, out_pcs = _eval_ssa_numpy(ssa, len(chunk), canon_state, live)
+    # Which inputs are BEHAVIORAL — the ones an output actually depends on —
+    # is what decides the canonical frame, and finding them needs a frame to
+    # perturb within. So the syntactic frame is built first and used only to
+    # answer that question; the shipped baseline is re-executed below.
+    probe_state = _canonical_state(anchor_states, inputs, _CANON_POSITIONS)
+    probe_regs, probe_pcs = _eval_ssa_numpy(ssa, len(chunk), probe_state, live)
+    input_mags = _input_magnitudes(
+        ssa, live, inputs, anchor_states,
+        probe_regs, probe_pcs, len(chunk),
+        _actually_modified(probe_regs, probe_state, sorted(reg_out.keys())),
+        pc_explicit)
+    behavioral_inputs = [r for r in inputs
+                         if input_mags[r] > BEHAVIORAL_RELEVANCE_THRESHOLD]
+
+    # Baseline executes on a canonical state: the chunk's BEHAVIORAL inputs are
+    # sourced from canonical anchor positions 1, 2, ... in read order, so
+    # behavioral input i is at position i+1 — exactly the mapping the value-
+    # prediction head applies when it feeds input slot k the value at position
+    # k+1, and exactly the read-order frame the encoder's own state machine
+    # builds. Positions must not be spent on a live-but-non-behavioral input:
+    # that shifts every later input off its slot and makes the target depend on
+    # a read the encoder is never given, so two chunks with identical encoder
+    # input end up with different targets. All outputs and magnitudes below are
+    # register-name-invariant — two GVN-equivalent chunks produce identical
+    # canonical out_regs / out_pcs / mags.
+    # Generation is CPU-bound, and the two frames coincide for most chunks —
+    # only a live-but-non-behavioral input separates them.
+    if behavioral_inputs == inputs:
+        canon_state, out_regs, out_pcs = probe_state, probe_regs, probe_pcs
+    else:
+        canon_state = _canonical_state(
+            anchor_states, behavioral_inputs, _CANON_POSITIONS)
+        out_regs, out_pcs = _eval_ssa_numpy(ssa, len(chunk), canon_state, live)
 
     ssa_reg_outs = sorted(reg_out.keys())
     actual_reg_outs = _actually_modified(out_regs, canon_state, ssa_reg_outs)
     out_mags = _output_magnitudes(out_regs, canon_state, actual_reg_outs)
-
-    input_mags = _input_magnitudes(
-        ssa, live, inputs, anchor_states,
-        out_regs, out_pcs, len(chunk),
-        actual_reg_outs, pc_explicit)
-    behavioral_inputs = [r for r in inputs
-                         if input_mags[r] > BEHAVIORAL_RELEVANCE_THRESHOLD]
 
     # Aux targets: live-in/out masks + per-slot register IDs.
     live_in_mask = np.zeros(N_REGS, dtype=bool)

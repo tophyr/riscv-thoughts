@@ -4,20 +4,26 @@
 corrected in place as they are disproven, so read it as current belief rather
 than as a chronology of what was believed when.
 
-**Headline.** Three fixes — per-slot write step into the pool, canonical read
-position as the input registers' leaf identity, and per-head pool value
-projections — take len=2 vp from 0.3525 to **0.0010** and the exact 32-bit match
-of the predicted output value to **99.756%**. Adopted config: `--d-out 512
---pool-extra write_time --read-time-mode rank --seed-mode rank`; best model
-`runs/t2_len2_d512_s1000000_dep4_vp1_pool16_pma_pewrite_time_rtrank_seedrank_1m_writers`.
+**Headline.** Four fixes — per-slot write step into the pool, canonical read
+position as the input registers' leaf identity, per-head pool value projections,
+and building the vp target in the behavioral rather than the syntactic canonical
+frame — take len=2 exact 32-bit match of the predicted output value to
+**99.744%**, from 99.738% on the rows where the last of those leaves the target
+unchanged. Adopted config: `--d-out 512 --pool-extra write_time
+--read-time-mode rank --seed-mode rank`; best model
+`runs/t2_len2_d512_s1000000_dep4_vp1_pool16_pma_pewrite_time_rtrank_seedrank_behavframe_writers`,
+replicated at `…_behavframe_s7_writers`.
 
-**What remains is one shape.** Every population that carries no immediate scores
-at or above 99.91%, and immediate-carrying instructions read in isolation score
-99.986%. The error is concentrated in the three cells where an immediate meets a
-second condition — a shared source register, a composed operand, or both — which
-together are 90% of it (finding 20). Separately, the essence does not collapse
-computed equivalences at all: two chunks that compute the same function sit as
-far apart as two that do not (finding 18).
+**Aggregates do not span the frame change** — a model is scored on the target it
+trained on, and the two targets differ on 12.5% of rows. Compare on the rows
+where they agree (finding 14).
+
+**What remains is one shape: a composed immediate.** The writing instruction
+takes an operand from another instruction's result *and* carries a 12-bit
+literal: 93.01% exact, 39.5% of all remaining error at 1.4% of the triples.
+Composition alone is at 99.957% and an immediate alone at 99.909%. Separately,
+the essence does not collapse computed equivalences at all: two chunks that
+compute the same function sit as far apart as two that do not (finding 18).
 
 ## The question
 
@@ -241,13 +247,89 @@ built in: 96.6% of len=2 chunks, 83.7% at len=4, 52.9% at len=8. The residual is
 dead code, which no causal read-time counter can know, so `rank` is exact on the
 shared-source subset and approximate at len=8 by construction.
 
-**14. The canonical-frame caveat is common, and harmless.** Canonical positions
-cover all live syntactic inputs while `in_slot_regs` lists only the behavioral
-subset, so a dropped input shifts every later slot and the vp head is fed a value
-the target never used: 5.9% of len=2 chunks, 14.8% at len=4, 26.6% at len=8, 0%
-at len=1. Measured on the best len=2 checkpoint, the shifted rows score 99.09%
-per-bit / 96.7% exact against 99.21% / 94.5% for the rest — an input is dropped
-precisely when the output does not depend on it.
+**14. The vp target has to be built in the BEHAVIORAL canonical frame. Built in
+the syntactic one, it is not a function of what the encoder is shown.**
+
+The canonical frame is what makes the target register-name-free. `out_regs` is
+not "x9 = x5 + 100" but "x9 = (the k-th input this chunk reads) + 100":
+`_canonical_state` re-sources each input from anchor position 1, 2, … in read
+order before executing, so two chunks computing the same function agree whatever
+registers they name.
+
+Which inputs get numbered decides everything, and two lines of
+`precompute_chunk` disagreed about it. Positions were assigned over the **live
+syntactic** inputs, while `in_slot_regs` — which decides what the head is fed —
+lists only the **behavioral** ones. `t2_value_predict_loss` then feeds input slot
+*k* the value at position *k+1*, asserting that behavioral input *k* sits at
+position *k+1*. That is false whenever a live-but-non-behavioral input precedes
+it, which is **13.1% of len=2 chunks** (7.1% at len=1, 21.4% at len=4, 31.7% at
+len=8).
+
+The encoder is never given such a read. T1's binding heads are behavioral, so
+`_t1_predicted_wiring` correctly omits it, and T2's own read-rank counter never
+sees it. So the target moved on evidence the encoder does not have:
+
+```
+SLTIU x7, x5,  -300 ; ADDI x9, x5, 100      target x9 = 588246066
+SLTIU x7, x11, -300 ; ADDI x9, x5, 100      target x9 =  47830916
+
+T1-emitted wiring, both:  in0 [0,5]  in1 [0,0]  out [7,9]
+essence cosine = 1.000000
+```
+
+A 12-bit immediate sign-extends to a huge UNSIGNED value, so `SLTIU rd,rs,-300`
+is the constant 1 and its source is read but irrelevant. In the first chunk `x5`
+is input #1; in the second, `x11` takes position 1 and `x5` becomes #2. The
+encoder cannot tell them apart, so **two identical inputs demanded different
+answers** and the head satisfied whichever was commoner — the shifted case, 15×
+more frequent, which it can serve by memorizing the fixed anchor constant.
+
+**Why the natural measurement says the opposite.** Splitting rows by whether
+their own frame shifted shows the shifted rows scoring BETTER (99.835% against
+99.754% exact). That reading is reproducible and useless: the shifted rows are
+the ones the model learned, and the cost is paid by the *unshifted* rows that
+collide with them. A split on "does this row have the defect" is structurally
+blind to a defect whose unit is a **pair** of rows. Manufacturing both sides of
+the collision is what exposes it — the second instruction held identical while
+only the first varies (`probes/vp_drop_control.py`, 24k triples per arm):
+
+| first instruction | before | after |
+|---|---|---|
+| `SLTIU rdA,rs,-k` — drops the scored slot's own source | **1.06%** | **100.0000%** |
+| `SLTIU rdA,rsB,-k` — drops an unrelated register | 99.99% | 100.0000% |
+| `SLTI rdA,rs,+k` — same shape, genuinely depends on `rs` | 99.99% | 100.0000% |
+| `ADDI rdA,rs,+k` | 99.71% | 99.9917% |
+
+**The fix** is to spend canonical positions on the behavioral inputs. Finding
+which inputs are behavioral needs a frame to perturb within, so
+`precompute_chunk` builds the syntactic frame, uses it only to compute
+`input_mags`, and re-executes in the behavioral frame (skipped when the two
+coincide, which is the common case). `out_regs` is unaffected by how a
+non-behavioral input is sourced, so GVN invariance is preserved; the oracle,
+`in_slot_regs`, T1's emitted wiring and T2's read ranks then share one frame.
+
+**Measured across the frames.** The two frames give byte-identical targets on
+the 87.5% of triples with no live-but-non-behavioral input, and that population
+is the only fair comparison — an aggregate over everything compares two
+different tasks. On it, at the same config and budget (len=2, `d_out` 512, 1M):
+
+| identical-target rows | syntactic frame | behavioral frame |
+|---|---|---|
+| all | 99.7383% | **99.8347%** |
+| `cross-instr \| imm \| depth 1` | 97.196% | **99.307%** |
+| `distinct \| imm \| depth 2` | 92.180% | 92.626% |
+| `same-instr \| no-imm \| depth 1` | 99.544% | 99.938% |
+| `cross-instr \| no-imm \| depth 1` | 99.980% | 99.980% |
+
+37% less error, better in every cell that moved. The whole-corpus aggregate
+barely moves (99.757% on the old target against 99.744%/99.753% on the new,
+two seeds) because each model is scored on its own convention — the syntactic-
+frame model reads 96.97% against the corrected target. **Do not compare
+aggregates across this change**; compare the identical-target rows.
+
+The two seeds also put the run-to-run noise floor at 1M steps at **±0.01 points
+of overall exact match**, and within 0.1 points on every cell above 1k triples —
+far tighter than the ±0.75 recorded at 250k in finding 17.
 
 **15. A pooled commutative-swap distance is not interpretable.** Swapping a
 commutative op's operands changes first-read order, and therefore the canonical
@@ -374,11 +456,11 @@ value-numbering encoder must map them to one point. On the best len=2 model
 
 | | essence distance |
 |---|---|
-| **fusion** — same total, different split (MUST be ~0) | **0.4008** |
-| **different** — totals differing by 1 (the denominator) | 0.4013 |
-| rename — the same chunk relabelled (~0 by construction) | 0.0031 |
+| **fusion** — same total, different split (MUST be ~0) | **0.4634** |
+| **different** — totals differing by 1 (the denominator) | 0.3901 |
+| rename — the same chunk relabelled (~0 by construction) | 0.0057 |
 
-Separation **1.0×**. The essence separates two chunks that compute the same
+Separation **0.8×**. The essence separates two chunks that compute the same
 function exactly as much as two that do not, while the rename row confirms the
 encoder is intact. `probes/additive_fusion.py` builds the chunks directly and
 takes the distance, so there is no fitted readout anywhere in it; it asserts the
@@ -395,7 +477,7 @@ It is also consistent with the loss. vp is not a pairwise objective: two chunks
 computing the same function have the same vp target, but nothing pushes their
 essences together, and two distinct points can both predict correctly. The same
 reasoning is already recorded for why `--inject-equiv` failed. What is new is
-that the gap is total rather than partial — 1.0× separation, not a loose
+that the gap is total rather than partial — 0.8× separation, not a loose
 collapse.
 
 A composed slot keeps the two instructions' immediates separately rather than
@@ -404,21 +486,30 @@ side: an encoder that fused them could not tell these two chunks apart, and this
 one tells them apart as readily as it tells apart chunks computing different
 functions.
 
-**19. The shared-source fix holds only where there is no immediate, and the
-interaction is now the single largest error bucket.** Finding 11's fix was
+**19. A category verified on a corpus that excludes immediates says nothing
+about the corpus the model trains on.** Finding 11's shared-source fix was
 verified on `configs/instr_r_only.json`, whose chunks carry no immediates.
-Scoring the same category on the corpus the model actually trains on
-(`probes/vp_budget.py`, model's own head, 4.0M supervised triples):
+Scoring the same category on the mixed training corpus (`probes/vp_budget.py`,
+model's own head) split it in two:
 
-| cross-instruction shared source | triples | exact | share of all error |
-|---|---|---|---|
-| chunk is all-R | 135k | **99.939%** | 0.8% |
-| chunk carries an immediate | 145k | **96.781%** | **47.4%** |
+| cross-instruction shared source | exact | share of all error |
+|---|---|---|
+| chunk is all-R | **99.939%** | 0.8% |
+| chunk carries an immediate | **96.781%** | **47.4%** |
 
 A 51× difference in error rate inside one category, same model and corpus. The
-whole corpus tells the same story: on `instr_r_only` the model reads 99.972%
-exact overall, on the mixed corpus 99.756% — 8.8× the error, for the same
-checkpoint.
+whole corpus told the same story: the syntactic-frame model read 99.972% exact
+overall on `instr_r_only` against 99.756% on the mixed corpus — 8.8× the error,
+same checkpoint.
+
+The gap was not a limit of the encoder. It was the syntactic canonical frame of
+finding 14, which lands almost entirely on chunks carrying an immediate:
+`SLTIU`/`SLTI` against a 12-bit immediate is the common way an instruction reads
+a register it does not depend on, and an all-R corpus has none. In the
+behavioral frame the same category reads **99.307%** against 97.196% on rows
+whose target is identical either way. The lesson about corpus scope stands
+regardless of the cause: the measurement was 51× off because the population was
+chosen to exclude the failing case.
 
 Also distinguish the two things called "a shared source", because only one is a
 problem: one instruction reading the same register twice (`ADD x3,x5,x5`) is at
@@ -445,41 +536,35 @@ whether it is predicted correctly:
   read only chunk inputs, 2 when one of its operands is another instruction's
   result.
 
-Crossed on the best len=2 model, over the 4.0M (row, output slot, anchor)
-triples that vp supervises, with each cell's share of all failing triples
-(`probes/vp_budget.py`):
+Crossed on the best len=2 model, over the 1.21M (row, output slot, anchor)
+triples that vp supervises in a 600-batch sample, with each cell's share of all
+failing triples (`probes/vp_budget.py`; the seed-7 replicate agrees within 0.1
+points on every cell above 1k triples):
 
 | sources | immediate | depth | triples | exact | err mass |
 |---|---|---|---|---|---|
-| distinct | yes | **2** | 71k | **92.52%** | **42.8%** |
-| **cross-instr** | yes | 1 | 176k | **97.11%** | **40.9%** |
-| **cross-instr** | yes | **2** | 4.1k | **80.93%** | 6.3% |
-| distinct | yes | 1 | 3.19M | 99.986% | 3.5% |
-| cross-instr | no | 2 | 5.6k | 98.55% | 0.6% |
-| distinct | no | 1 | 1.22M | 99.996% | 0.4% |
-| cross-instr | no | 1 | 164k | 99.976% | 0.3% |
-| distinct | no | 2 | 40k | 99.910% | 0.3% |
+| distinct | yes | **2** | 17.4k | **93.01%** | **39.5%** |
+| distinct | yes | 1 | 767k | 99.909% | 22.5% |
+| distinct | no | 1 | 290k | 99.879% | 11.4% |
+| **cross-instr** | yes | 1 | 42.2k | 99.228% | 10.6% |
+| **cross-instr** | yes | **2** | 888 | **81.08%** | 5.4% |
+| cross-instr | no | 2 | 1.5k | 98.24% | 0.8% |
+| cross-instr | no | 1 | 39.2k | 99.980% | 0.3% |
+| distinct | no | 2 | 9.4k | 99.957% | 0.1% |
 
-The three cells carrying 90% of the error are exactly the three that pair an
-immediate with a second condition. Each condition **alone** is at or above
-99.91%: an immediate on its own (99.986%), a shared source on its own (99.976%),
-composition on its own (99.910%). All four cells with no immediate sum to 1.6%
-of the error.
+**Of the two conditions an immediate had to survive, one was a broken target and
+one is real.** Being placed in the canonical frame alongside a shared source was
+the syntactic-frame bug of finding 14; in the behavioral frame that cell is at
+99.23% and carries a quarter of the error it did. Being **composed** — the
+writing instruction taking an operand from another instruction's result — is
+untouched by it, and is now the open problem: `distinct | immediate | depth 2`
+is at 93.01% with correct wiring and both frames agreeing, and carries 39.5% of
+all remaining error at 1.4% of the triples.
 
-Findings 11, 16 and 17 each hold on the axis they were measured on. What they
-jointly support is not "shared sources are solved" or "composition is what is
-left", but:
-
-**an immediate survives in the essence when its instruction is read in
-isolation, and degrades when that instruction must ALSO be placed in the
-canonical frame (a shared source shifts its operands' canonical positions) or
-composed (its operand is another instruction's result).** The immediate is the
-payload; the other two conditions are what it fails to survive.
-
-This also re-scopes finding 17: "dataflow composition" is not hard as such —
-all-R composed slots are at 99.910%. Composing an immediate-carrying instruction
-is. And it explains why `d_out` helped: width in the value path is exactly what a
-slot needs to carry an immediate *and* the structure it is being combined with.
+Composition is not hard as such: all-R composed slots are at 99.957%. Composing
+an **immediate-carrying** instruction is, by three orders of magnitude in error
+rate. That is also why `d_out` helped in finding 17 — width in the value path is
+what a slot needs to carry an immediate *and* the structure it is combined with.
 
 ## Decisions taken
 
@@ -520,10 +605,20 @@ slot needs to carry an immediate *and* the structure it is being combined with.
   these run lengths it costs ~35 minutes.
 - **Report an error BUDGET, not an accuracy.** A bucket's rate and its share of
   total error are different facts and neither implies the other:
-  immediate-carrying instructions at depth 1 are at 99.986% and are 3.5% of the
-  error, while composed slots with an immediate are at 92.5% and are 42.8% of
+  immediate-carrying instructions at depth 1 are at 99.909% and are 22.5% of the
+  error, while composed slots with an immediate are at 93.01% and are 39.5% of
   it. `probes/vp_budget.py` reports both, crossed. Localise with probes on frozen checkpoints
   first; train only to test a specific mechanism.
+- **Build the vp target in the behavioral canonical frame** — the same frame
+  T1's emitted binding and T2's read ranks are in, so the target is a function
+  of what the encoder is shown (finding 14). The syntactic frame is not an
+  option to keep behind a flag: it makes two chunks with a bit-identical encoder
+  input carry different targets.
+- **A defect whose cost falls on a different row than the one carrying it is
+  invisible to any split of the corpus.** Splitting by "does this row have the
+  defect" said the frame bug was harmless for as long as it was measured that
+  way. Where a defect can make two inputs collide, build both sides of the
+  collision and vary one thing (`probes/vp_drop_control.py`).
 
 ## Dead ends (do not re-run)
 
@@ -657,12 +752,14 @@ evidence of its absence.
 
 ## Open threads
 
-1. **Dataflow composition** — localised, and half-closed by width; see
-   finding 17. What stays open is how far width goes: `d_out` 512 halves the
-   depth-2 error without removing it, and nothing yet says whether 1024
-   continues the trend or whether something else binds after it. The same
-   question decides milestone 2, since a slot at depth *d* must describe *d*
-   instructions' worth of computation and len=4/8 chunks are mostly deep.
+1. **A composed immediate** — the whole of what is left at len=2, and not
+   capacity-shaped: `d_out` 512 → 1024 leaves it unchanged (finding 17), and the
+   head, the two-step arithmetic chain, the gradient share, the operand scale
+   mismatch and content crowding are each separately refuted. Composition alone
+   is at 99.957% and an immediate alone at 99.909%, so what fails is the pair.
+   The same question decides milestone 2, since a slot at depth *d* must
+   describe *d* instructions' worth of computation and len=4/8 chunks are mostly
+   deep.
 
 2. **Decoder + reconstruction loss** — the standing untried lever for goal 2.
 3. **Flag cleanup** — decided in principle: **options do not survive on their
