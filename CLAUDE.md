@@ -200,7 +200,12 @@ connection is what makes the lesson land:
 - `feedback_commit_at_boundaries.md` — wait for natural commit points
 - `feedback_no_storytime_comments.md` — docs are expository for a
   brand-new reader; audit against the four named categories, don't
-  just intend to "write status". Comments: WHY, in 1-2 lines
+  just intend to "write status". Comments: WHY, in 1-2 lines.
+  The **`document` skill** carries this standard in full, plus the
+  procedure around it — which document holds what, correcting a claim
+  in place, and the mechanical checks for narrative markers,
+  cross-references and scope conditions. Invoke it before any
+  documentation pass and before a commit that touches a `.md` file
 - `feedback_confirm_gpu_saturation.md` — never leave a long run at low
   util; fix the throughput bottleneck first, don't defer it
 - `feedback_no_vestigial_options.md` — delete the worse way once a
