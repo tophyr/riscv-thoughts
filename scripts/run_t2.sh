@@ -17,7 +17,11 @@ cd /home/tophy/Projects/riscv-thoughts
 source .venv/bin/activate
 D=/home/tophy/Projects/riscv-thoughts/logs
 T1=runs/t1_writers_250k/encoder.pt
-LEN=${LEN:-2} DOUT=${DOUT:-256} STEPS=${STEPS:-250000} OC=${OC:-4} VP=1
+# VP = vp-head hidden layers. The head must EVALUATE the chunk's function at the
+# anchor points, so its capacity is a confound in every vp number; refitting it
+# on frozen essences cannot test that, because depth-2 slots are 2.5% of the
+# data and a fresh head sees too few.
+LEN=${LEN:-2} DOUT=${DOUT:-256} STEPS=${STEPS:-250000} OC=${OC:-4} VP=${VP:-1}
 NPOOL=${NPOOL:-16}
 # compete is only meaningful for k>1 (k=1 degenerates to a uniform mean).
 MODES=${MODES:-"pma compete"}
@@ -71,8 +75,11 @@ cell() {  # MODE POOL_EXTRA
   echo "   --- faithfulness / on-sphere ---"
   python probes/t2_faithfulness.py "runs/$OUT" "$T1" "$LEN" 2>&1 \
     | grep -vE "Warning|readline|history" | sed 's/^/   /'
-  echo "   --- vp error by operand type x dataflow depth ---"
-  python probes/vp_imm_share.py "runs/$OUT" "$T1" "$LEN" 300 2>&1 \
+  # vp_budget, not vp_imm_share: the criterion is exact 32-bit match and the
+  # axes have to be crossed. Per-bit flatters a broken subset (96% per-bit has
+  # been 74% exact), and either axis alone hides the cells that carry the error.
+  echo "   --- vp error budget: sources x immediate x depth ---"
+  python probes/vp_budget.py "runs/$OUT" "$T1" "$LEN" 300 2>&1 \
     | grep -vE "Warning|readline|history" | sed 's/^/   /'
 }
 

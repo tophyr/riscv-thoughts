@@ -95,6 +95,11 @@ with open(CORPUS, 'rb') as f:
                 t1, split, nch, mni, dev, route='binding')
             ess = t2.encode(ct1, c0, c1, co, cact,
                             torch.randn(nch, t2.n_regs, device=dev))
+        # Cells describe the wiring T2 ACTUALLY RAN ON — T1's emitted binding —
+        # not the tokens'. The two differ on ~3% of len=2 chunks, and a cell
+        # labelled from the tokens would be describing a chunk the model was
+        # never shown.
+        e0, e1, eo = c0.cpu().numpy(), c1.cpu().numpy(), co.cpu().numpy()
 
         in_slot = torch.from_numpy(batch.in_slot_regs.astype(np.int64)).to(dev)
         out_slot = torch.from_numpy(batch.out_slot_regs.astype(np.int64)).to(dev)
@@ -119,17 +124,13 @@ with open(CORPUS, 'rb') as f:
             perbit = hit.float().mean(-1)
 
         # per-slot categories
-        order = np.argsort(chunk_idx * 1000 + slot_idx)
-        wo_s, w0_s, w1_s = wo[order], w0[order], w1[order]
         oreg = out_slot.clamp(min=0).cpu().numpy()
         vnp = valid.cpu().numpy()
         cats = {}          # (b, s) -> tuple of bucket labels
-        pos = 0
         for b in range(nch):
             n = int(n_per_chunk[b])
             if n:
-                dv = slot_depth(w0_s[pos:pos + n], w1_s[pos:pos + n],
-                                wo_s[pos:pos + n], n)
+                dv = slot_depth(e0[b], e1[b], eo[b], n)
                 try:
                     toks, p, ins = batch.tokens[b].tolist(), 0, []
                     for _ in range(n):
@@ -139,17 +140,17 @@ with open(CORPUS, 'rb') as f:
                     ins = []
                 if len(ins) == n:
                     # the opcode that last wrote each register
-                    last = {int(wo_s[pos + k]): ins[k].opcode
-                            for k in range(n) if int(wo_s[pos + k]) != 0}
+                    last = {int(eo[b, k]): ins[k].opcode
+                            for k in range(n) if int(eo[b, k]) != 0}
                     # Two different things get called "a shared source", and
                     # they are different questions for the encoder: one
                     # instruction reading the same register twice (ADD x3,x5,x5)
                     # collapses two operands of ONE op, while two instructions
                     # reading a common register ties two ops to one canonical
                     # input position.
-                    per_instr = [{int(w0_s[pos + k]), int(w1_s[pos + k])} - {0}
+                    per_instr = [{int(e0[b, k]), int(e1[b, k])} - {0}
                                  for k in range(n)]
-                    self_rep = any(int(w0_s[pos + k]) == int(w1_s[pos + k]) != 0
+                    self_rep = any(int(e0[b, k]) == int(e1[b, k]) != 0
                                    for k in range(n))
                     cross_rep = any(per_instr[a] & per_instr[b]
                                     for a in range(n) for b in range(a + 1, n))
@@ -173,7 +174,6 @@ with open(CORPUS, 'rb') as f:
                                 int(dv[oreg[b, s]]), op,
                                 'I' if op in I_TYPE else 'R', shared,
                                 how, anyi)
-            pos += n
 
         ex, pb = exact.cpu().numpy(), perbit.cpu().numpy()
         for (b, s), (d, op, typ, shared, how, anyi) in cats.items():

@@ -19,11 +19,24 @@ tier can only recover what T2 preserved.
 same thing if and only if they compress to the same point" is the framework's
 definition of meaning (WHAT_IS_A_THOUGHT.md), so an essence that separates
 `ADDI r1,r1,256; ADDI r1,r1,-16` from `ADDI r1,r1,32; ADDI r1,r1,208` is not a
-thought vector regardless of its vp. Rewrite equivalences — one operation
-expressed another way — already collapse. Computed ones, where seeing the
-equivalence requires arithmetic on the operands, do not collapse at all
-(milestone 2). vp cannot deliver this: it is not a pairwise objective, so two
-distinct points can both predict the same outputs correctly.
+thought vector regardless of its vp. How well a class collapses tracks how much
+the architecture has to *learn* to see it, not whether it needs arithmetic —
+measured as the distance between equivalent essences against the distance
+between inequivalent ones (`separation`, larger is better):
+
+| equivalence class | distance | separation |
+|---|---|---|
+| register rename — free by construction | 0.0008 | — |
+| commutative operand swap — the pool nearly gives it away | 0.0292 | 24.0× |
+| one no-op exchanged for another (`ADD xa,xa,x0` vs `ADDI xd,xd,0`) | 0.0901 | 5.9× |
+| additive chains with the same total offset | 0.4143 | 0.9× |
+
+**Nothing trains collapse**, which is the common cause: seeing that `+x0` is the
+identity needs no arithmetic at all and still only reaches 5.9×, so "the encoder
+cannot compute with operands" does not explain the failure on its own.
+vp cannot supply the pressure either — it is not a pairwise objective, so two
+distinct points can both predict the same outputs correctly, and for a true
+no-op it emits no supervised slot at all and therefore no gradient whatsoever.
 
 **The vp number in a training log is already a held-out number.** `datagen`
 generates every batch fresh and the trainer never revisits one, so there is no
@@ -36,22 +49,36 @@ rows on a fixed corpus, not to de-bias vp.)
 1. **[CURRENT] vp = 0.0 at len=2 — not reached.** Current best:
    `--d-out 512 --pool-extra write_time --read-time-mode rank --seed-mode rank`
    at 1M
-   (`runs/t2_len2_d512_s1000000_dep4_vp1_pool16_pma_pewrite_time_rtrank_seedrank_behavframe_writers`,
-   replicated at `…_behavframe_s7_writers`), on the criterion — exact 32-bit
-   match of the predicted output value — **99.744%** and **99.753%**. The two
-   seeds put the run-to-run noise floor at 1M steps at **±0.01 points** overall
-   and 0.1 points on any cell above 1k triples.
+   (`runs/t2_len2_d512_s1000000_dep4_vp1_pool16_pma_pewrite_time_rtrank_seedrank_oraclefix_writers`),
+   on the criterion — exact 32-bit match of the predicted output value —
+   **99.850%**. The run-to-run noise floor at 1M steps is **±0.01 points**
+   overall and 0.1 points on any cell above 1k triples — measured from two seeds
+   of this config on the previous oracle, and a variance estimate rather than a
+   figure the oracle change would move.
+
+   This is the first checkpoint both TRAINED and SCORED on the corrected oracle.
+   The `_actually_modified` correction (finding 24) was worth 0.10 points of
+   measurement and nothing of learning: the previous checkpoint reads 99.846%
+   against the corrected target and a model trained on it reaches 99.850%. The
+   old target was charging the model for rows nobody could answer.
 
    **Numbers from before the vp target was moved into the behavioral canonical
    frame are not comparable to these** (EXPERIMENT_LOG finding 14). A model is
    scored on the target it trained on and the two differ on 12.5% of rows; on
    the rows where they agree, the change took 99.7383% → 99.8347%.
 
-   The gap is one shape, and task 1 is the work of closing it: an immediate
-   survives in the essence when its instruction is read in isolation, and
-   degrades when that instruction's operand is the other instruction's result.
-   Every population carrying no immediate is at or above 99.88%, and composition
-   without an immediate is at 99.957%.
+   The gap is one shape: an immediate survives in the essence when its
+   instruction is read in isolation, and degrades when that instruction's
+   operand is the other instruction's result. The two composed-immediate cells
+   are 63% of all remaining error at 1.4% of the triples. Every population
+   carrying no immediate is at or above 99.95%, a shared source alone is at
+   99.98%, and composition without an immediate is at 99.95%.
+
+   **What fails is carry propagation through a composed operand, not the
+   immediate as such.** A bitwise chain at depth 2 is exact; a chain whose
+   second operation propagates carries is at ~15% whatever it consumes. Task 1
+   has the matrix. Milestone 2 does not close this — it covers only the subset
+   where a composite literal exists to fold.
 
    **Score this with `probes/vp_budget.py`**, which crosses the three properties
    of an output slot that decide whether it is predicted correctly:
@@ -72,14 +99,14 @@ rows on a fixed corpus, not to de-bias vp.)
 
    | sources | immediate | depth | triples | exact | err mass |
    |---|---|---|---|---|---|
-   | distinct | yes | **2** | 17.4k | **93.01%** | **39.5%** |
-   | distinct | yes | 1 | 767k | 99.909% | 22.5% |
-   | distinct | no | 1 | 290k | 99.879% | 11.4% |
-   | **cross-instr** | yes | 1 | 42.2k | 99.228% | 10.6% |
-   | **cross-instr** | yes | **2** | 888 | **81.08%** | 5.4% |
-   | cross-instr | no | 2 | 1.5k | 98.24% | 0.8% |
-   | cross-instr | no | 1 | 39.2k | 99.980% | 0.3% |
-   | distinct | no | 2 | 9.4k | 99.957% | 0.1% |
+   | distinct | yes | **2** | 16.8k | **93.72%** | **58.2%** |
+   | distinct | yes | 1 | 790k | 99.930% | 30.4% |
+   | **cross-instr** | yes | **2** | 752 | **80.59%** | 8.1% |
+   | cross-instr | no | 2 | 1.5k | 97.79% | 1.8% |
+   | distinct | no | 1 | 310k | 99.995% | 0.9% |
+   | cross-instr | yes | 1 | 37.6k | 99.984% | 0.3% |
+   | distinct | no | 2 | 10.0k | 99.950% | 0.3% |
+   | cross-instr | no | 1 | 40.4k | 100.0000% | 0.0% |
 
    Worst individual opcode cells at depth 2: SLTIU 78.8%, SLLI 80.3%, ADDI
    79.5%, ~1k triples each.
@@ -90,18 +117,24 @@ rows on a fixed corpus, not to de-bias vp.)
    the mixed corpus was taken as a property of the model (EXPERIMENT_LOG finding
    19). Quote the mixed-corpus figure for statements about the model.
 
-2. **Computed equivalents collapse at len=2.** Two chunks that compute the same
-   function must land on the same point. They currently land as far apart as
-   two chunks computing different functions: on the best model, additive chains
-   with the same total offset sit **0.4634** apart against **0.3901** for chains
-   whose totals differ by 1 — separation **0.8x** — while a register rename sits
-   at 0.0057. XOR chains are 0.7x. Measured directly, with no fitted
-   readout, by `probes/additive_fusion.py`.
+2. **Computed equivalents collapse at len=2.** Two chunks that compute
+   the same function must land on the same point. They currently land as far
+   apart as two chunks computing different functions: additive chains with the
+   same total offset sit **0.4143** apart against **0.3727** for chains whose
+   totals differ by 1 — separation **0.9x** — while a register rename sits at
+   0.0008. XOR chains are 0.7x. Measured directly, with no fitted readout, by
+   `probes/additive_fusion.py`.
 
-   **Settle this before chunks get longer.** Every added instruction multiplies
+   **It overlaps milestone 1 but does not contain it.** Collapsing two literals
+   onto their composite would turn `ADDI;ADDI` into the single-literal case the
+   head already predicts at 99.9%. It does nothing for `XORI;ADDI` or
+   `ADDI;XORI`, where no composite literal exists and the difficulty is the
+   carry arithmetic itself — and those score 14.05% and 47.78%, no better than
+   the fusible pair's 17.07%. Milestone 1 has to be closed on its own terms.
+
+   **Settle it before chunks get longer.** Every added instruction multiplies
    the equivalences a chunk participates in, so a len=4 model would be learning
-   the same wrong geometry at four times the scale. It comes after milestone 1
-   because vp at len=2 is nearly closed and its diagnosis is in hand.
+   the same wrong geometry at four times the scale.
 
    No loss, data augmentation or metric in the project has ever covered this
    class: the equivalence manifest contains only single-instruction rewrites.
@@ -129,6 +162,23 @@ rows on a fixed corpus, not to de-bias vp.)
    corpus gets harder. Options when we get there: more anchors, a held-out
    anchor set the head never trained on, or anchors resampled per batch (which
    means shipping them in the RVT batch, i.e. a change to INVARIANT 1).
+
+   **vp scores T1∘T2, not T2.** T2's operand and destination slots come from
+   T1's emitted binding (`_t1_predicted_wiring`), never from the tokens, while
+   the target is built from the tokens' SSA. When T1's binding disagrees with
+   the oracle's, T2 encodes one chunk and is graded against another, and the row
+   is unsatisfiable however good T2 is. **"T1 has perfect vp" does not license
+   reading the pipeline number as T2's performance** — vp scores `vp_head` on
+   T1's essence, while the wiring comes from `in_score_head` /
+   `out_score_head` / `live_in_head`, a different loss at a tenth of the weight.
+   Measured on the current pair, the two are close: T1's binding matches the
+   oracle on 96.6% of len=2 chunks and **92.6% of the residual sits on rows with
+   no mismatch at all**, so the pipeline figure is a fair proxy for T2 today.
+   That is a measurement, not a property — re-check it with
+   `probes/vp_frame.py` after any T1 change, and note the probe must compare
+   against the ORACLE's binding, since both it and T1 are behavioral while the
+   tokens are syntactic. Separating them properly, if it is ever needed, means
+   building the target from T1's emitted wiring rather than from the tokens.
 5. **T3.** Sequences of T2 blocks. Prerequisite: decide what a *composed*
    binding is — T3 is the first tier that must combine bindings rather than
    just emit them (WHAT_IS_A_THOUGHT.md, "The Thought and Its Interface").
@@ -136,8 +186,9 @@ rows on a fixed corpus, not to de-bias vp.)
 
 ## Open tasks
 
-Task 1 is the current focus. Task 2 is required for the MVP and is sequenced
-after it, before chunks get longer. The rest are queued, not parallel work.
+Task 1 is the current focus. Task 2 is required for the MVP, overlaps task 1 on
+one subset without containing it, and is sequenced after, before chunks get
+longer. The rest are queued, not parallel work.
 
 ### 1. An immediate does not survive composition
 
@@ -176,8 +227,12 @@ run-to-run noise floor):
 - **gradient share** — `--vp-depth-weight` at 8 and 32 leaves the hard cells
   flat and degrades the rest;
 - **the operand scale mismatch** — `--value-norm` puts leaf and composed
-  operands on one shell and scores slightly worse, though the 0.08–0.14×
-  excitation gap it targets is real;
+  operands on one shell. Re-run at the current config on the corrected target:
+  aggregate 99.7474% and the cell 92.97%, both inside noise. It is not a null
+  though — see the trade-off below;
+- **readout capacity as an aggregate lever** — `--vp-head-depth 4` end-to-end
+  leaves the aggregate at 99.7587% and the cell at 92.74%, and costs GVN
+  separation (16.7× against 23.9%/24.7×);
 - **content crowded out of the op-cell's first layer** — `--content-skip` gives
   the content its own path into the slot and lands inside the noise;
 - **capacity** — `d_out` 256 → 512 buys a fixed amount, 512 → 1024 buys nothing
@@ -190,17 +245,109 @@ it to rows whose target is identical under either canonical frame reads 92.63% �
 both at the cell's own 93.01%. So neither T1's binding prediction nor the frame
 is what is failing here, unlike the shared-source cell.
 
+**Localised: the immediate is encoded perfectly and destroyed on consumption.**
+Six arms of one depth-2 shape, only the literals moving
+(`probes/vp_compose_control.py`, 24k triples each; "intermediate" is the first
+instruction's own slot, "composed" the second's):
+
+| arm | intermediate | composed |
+|---|---|---|
+| `ADD ; ADD` | 100.0000% | **100.0000%** |
+| `ADD ; ADDI` | 100.0000% | 96.375% |
+| `ADDI ; ADD` | 99.946% | **68.196%** |
+| `ADDI ; ADDI` | 99.875% | **18.917%** |
+| `SLT ; ADDI` | 100.0000% | 99.571% |
+| `ADDI ; SLT` | 100.0000% | 100.0000% |
+
+Composition is free when no literal is involved. The producer's own slot carries
+its literal at 99.99%+ in every arm, so nothing is lost writing it — it is lost
+when that slot is *read* by the second instruction. On the corpus the same
+asymmetry holds: a literal in the producer carries 40.4% of depth-2 error
+against the writer's 30.0%, and a `cmp` producer, whose intermediate is one bit
+wide, sits at ~99.7% for every writer (`probes/vp_depth2.py`).
+
+**What the head produces instead is a near-miss, not a dropout.** On
+`ADDI;ADDI`, 96.6% of predictions land within one immediate's width of the
+target and only 0.13% drop a literal outright. The essence supplies the two
+literals separately; the head has to compute the composite and gets it
+approximately.
+
+**What decides it is CARRY PROPAGATION, not the immediate and not
+fusibility.** All I-type pairs of the same shape, composed slot scored, with the
+mean number of output bits that are constant across the 8 anchors beside each —
+bits the head gets without consulting the input at all, and the reason the
+`ORI`/`ANDI`/`SLLI` columns cannot be read as successes:
+
+| producer ↓ / writer → | `ADDI` | `XORI` | `ORI` | `ANDI` | `SLLI` |
+|---|---|---|---|---|---|
+| `ADDI` | 17.07% | 47.78% | 93.58% | 91.78% | 12.37% |
+| `XORI` | 14.05% | **98.77%** | 99.90% | 99.66% | 15.43% |
+| `ORI` | 46.00% | 99.50% | 99.98% | 99.90% | 48.77% |
+| `ANDI` | 48.83% | 99.73% | 99.97% | 99.92% | 46.27% |
+| `SLLI` | 67.47% | 77.93% | 99.61% | 99.93% | 63.78% |
+| *free bits (`ADDI`/`XORI` producer)* | *0.2* | *0.1* | *16.7* | *15.5* | *16.4* |
+
+The four cells at full difficulty — producer and writer both in
+{`ADDI`, `XORI`} — are the interpretable ones, and they order by carries, not by
+whether a composite literal exists:
+
+- **bitwise throughout** (`XORI;XORI`) — 98.77%, exact.
+- **carry-propagating writer** — ~15% whatever it consumes (`ADDI;ADDI` 17.07%,
+  `XORI;ADDI` 14.05%). A shift writer behaves the same way, relocating bits.
+- **bitwise writer on a carry-produced intermediate** (`ADDI;XORI`) — 47.78%.
+
+**`ADDI;ADDI` is algebraically the easiest of the four** — one addition of the
+input with the single literal `i1+i2` — and scores no better than `XORI;ADDI`,
+which genuinely needs two stages. The model does not take the algebraic
+shortcut; that is the non-collapse of task 2, and it is a component of this
+cell rather than the whole of it.
+
+**The contrast that localises it is depth 1, where `ADDI` is 99.9% exact.** Same
+operation, same literal, same output width; the only difference is that the
+addend arrives as a canonical input, handed to the head as explicit bits,
+instead of having to come through the essence. `XORI;XORI` is exact for the same
+reason — output bit *k* is `x_k ^ (i1^i2)_k`, so the head never needs the
+intermediate at all.
+
+**The cell is two sub-cases with different constraints, and they trade against
+each other.** Two interventions sharing no mechanism — a deeper readout, and
+RMSNorm on every value entering a slot — produce the same redistribution
+(EXPERIMENT_LOG finding 22):
+
+| arm | seed 0 | seed 7 | `--value-norm` | `--vp-head-depth 4` |
+|---|---|---|---|---|
+| `ADDI;ADD` | 64.71% | 72.50% | **89.16%** | **90.97%** |
+| `ADDI;ADDI` | 17.22% | 16.48% | **6.67%** | **2.52%** |
+
+All four columns are on the PRE-`_actually_modified` oracle (finding 24). The
+baseline arms are unchanged by that correction — the current checkpoint reads
+68.20% and 18.92%, inside the seed spread — so the comparison stands, but a new
+intervention has to be scored against the current baseline, not this table.
+
+- **One literal decoded and combined with values the head is handed as bits**
+  (`ADDI;ADD`) was **readout-limited**, and moves ~20 points — far outside the
+  7.8-point seed spread.
+- **Two literals folded into one** (`ADDI;ADDI`) is reached by nothing, and
+  every intervention that helps the first case drives it further down. That is
+  the subset equivalence collapse covers, and the only one it covers.
+
+So the residual is not "essence versus head": both bind, on different
+sub-cases. **An aggregate that does not move is not evidence that nothing
+happened** — score any composed-operand change on the arms of
+`probes/vp_compose_control.py`, which is where both interventions showed 15-25
+point effects while the aggregate and the depth-2 bucket stayed flat.
+
 **Untested levers that remain:**
 
 - **Supervising the intermediate value**, which the SSA oracle computes and the
-  RVT batch does not ship. Lower prior than it was — a readout can already
-  recover the intermediate from the essence.
-- **The op-cell's own composition step.** A depth-2 slot is
-  `op_cell(content, op_cell(content', a, b), c)`, and every refuted lever above
-  targeted what the slot is *made of* rather than the second application itself.
-  Nothing yet measures whether the immediate is present in the intermediate and
-  lost by the second application, or absent from the intermediate to begin
-  with — which is the first thing to localise, on frozen checkpoints.
+  RVT batch does not ship. Lower prior than it was: the intermediate slot's own
+  vp is already 99.99%+, so there is nothing there to supervise into existence.
+- **Re-test finding 17's refutations against the corrected target.**
+  `--value-norm`, `--content-skip` and `--vp-depth-weight` were each measured at
+  `d_out` 256 / 250k on the syntactic-frame target, which had a materially
+  different error composition. `--value-norm` in particular targets the
+  leaf-versus-composed operand scale gap in exactly the operation now
+  implicated — the op-cell reading its own previous output.
 
 ### 2. Collapse computed equivalences (milestone 2 — required for MVP)
 
@@ -218,15 +365,43 @@ essence describes only the composite, the intermediate having been overwritten:
 
 | family | fusion | different | separation |
 |---|---|---|---|
-| `ADDI/ADDI`, same total offset | 0.4634 | 0.3901 | **0.8x** |
-| `XORI/XORI`, same composite mask | 0.5722 | 0.3727 | **0.7x** |
+| `ADDI/ADDI`, same total offset | 0.4143 | 0.3727 | **0.9x** |
+| `XORI/XORI`, same composite mask | 0.4966 | 0.3677 | **0.7x** |
 
-The same chunk with its registers relabelled sits at 0.0057, so the encoder is
+The same chunk with its registers relabelled sits at 0.0008, so the encoder is
 intact and the measurement is sound.
+
+**Collapse would also close milestone 1's remaining cell** (see task 1): the
+composed-immediate vp error exists because the head is handed two literals and
+must compute their composite. An essence that collapses `i1,i2` onto `i1+i2`
+hands it the composite instead, reducing the job to the single-literal case it
+already does at 99.9%.
 `probes/additive_fusion.py` builds the chunks directly and takes a distance —
 no fitted readout — and asserts through the emulator that each `fusion` pair is
 behaviorally identical and each `different` pair is not. Extend it with a new
 family by adding a `combine`/`resplit`/`perturb` triple to `FAMILIES`.
+
+**It is not a T2 deficit — T1 fails the same class.** Single-instruction
+essences on `runs/t1_writers_250k`, each pair with an identical binding (one
+live input, same register, same destination), so the whole difference is in the
+essence:
+
+| pair | same function | essence L2 |
+|---|---|---|
+| `ADD x5,x3,x3` vs `SLLI x5,x3,1` | yes | **0.6963** |
+| `ADDI x5,x3,0` vs `ORI x5,x3,0` | yes | 0.4448 |
+| `ADD x5,x3,x4` vs `ADD x5,x4,x3` | yes | **0.0024** |
+| `SLLI x5,x3,1` vs `SLLI x5,x3,2` | **no** | 0.6055 |
+
+Doubling a register and shifting it left by one sit *further* apart than two
+shifts computing different functions. The pair that does collapse is the
+commutative swap, which the architecture makes free — the pool is a multiset
+over register slots. **At both tiers, an equivalence collapses when the
+architecture cannot represent the difference and otherwise does not.** Any fix
+has to be designed for T1 and T2 together; they are one class (`compressor/`),
+so a mechanism that works at T1 applies at T2 unchanged. It also means task 3's
+production T1 should not be minted before this is settled, or it will be minted
+without it.
 
 **Nothing in the project covers this class.** Equivalences are enumerated in
 one place — the manifest in `datagen/generate.py` — and all 15 of its classes
@@ -240,6 +415,28 @@ Accordingly, every checkpoint spanning the current architecture fails it, the
 oldest worst at 0.5x, with equivalent chunks further apart than inequivalent
 ones.
 
+The manifest's coverage is the limit, not the arithmetic: exchanging one no-op
+for another is a single-instruction rewrite needing no computation on operands,
+is absent from the manifest, and reaches only 5.9x. Any objective built here
+should be scored on that class too, because it isolates "untrained" from
+"cannot compute".
+
+**Identity recognition is one capability and it surfaces in three places** —
+start here, because it is the best-defined target in either task:
+
+- collapse: exchanging one no-op for another reaches only 5.9x (above);
+- T1's geometry: `ADDI x,y,0` and `ORI x,y,0` compute the same function and sit
+  0.4448 apart; `ADD x,y,y` and `SLLI x,y,1` sit 0.6963 apart, further than two
+  shifts computing *different* functions (0.6055);
+- T1's binding, and hence T2's vp: **every** `dest` misprediction measured is an
+  instruction the oracle says modifies nothing, i.e. T1 predicting a write for
+  `ADD x5,x5,x0`. That is 6.2% of T2's remaining vp error, arriving through
+  task 3's tier interface rather than through anything T2 does.
+
+So this spans tasks 2 and 3, and it is not a weighting problem — T1's binding is
+otherwise accurate against the oracle. It is a missing capability: knowing that
+`+x0`, `+0`, `|0`, `^0` and `<<0` are the identity.
+
 **vp cannot deliver it.** Two chunks computing the same function have the same
 vp target, and two distinct points can both predict it correctly. Nothing in the
 loss is pairwise — that was a deliberate design choice, and undoing it is the
@@ -249,8 +446,13 @@ Open questions, in order:
 
 - **How wide is the class?** Both families tested fail. Check whether any
   computed equivalence collapses, and whether the rewrite classes that DO
-  collapse (commutative swap, 0.0309 at 42x separation) do so because they are
+  collapse (commutative swap, 0.0290 at 24x separation) do so because they are
   trained on or because the architecture makes them free.
+- **Does collapse have to happen in the essence, or in the op-cell?** The
+  distances above are essence distances, but the composite is formed one step
+  earlier, when the second instruction's op-cell reads the slot the first wrote.
+  A cell that computed `i1+i2` there would collapse the pair before any pooling
+  — and would fix task 1, which the essence-level distance alone would not.
 - **What is the objective?** A pairwise term over generated equivalent pairs is
   the obvious candidate. `--inject-equiv` is a recorded failure at buying
   collapse with data alone — it adds correlated rows without
@@ -268,6 +470,30 @@ Every T1 in use is a diagnostic trained on a clean corpus (`--inject-invalid 0`)
 so it has no validity task and cannot reject invalid input. Needed before
 anything leaves the happy path. Fold in the `rd==x0` immediate mask.
 
+Scrutinise when reminting:
+
+- **The binding heads are weighted 0.1 against vp's 1.0.** `in_slot_weight`,
+  `live_in_weight`, `live_out_weight` and `out_slot_weight` are all 0.1 while
+  `value_predict_weight` is 1.0 (`runs/t1_writers_250k/hparams.json`). T2
+  consumes the binding as its WIRING, so the tier interface is optimised at a
+  tenth of the priority of the essence. The current T1 is nonetheless accurate
+  against the oracle's binding — 3.4% of len=2 chunks mismatch and 92.6% of
+  T2's residual error is on rows with no mismatch at all — so this is a thing to
+  check, not a known deficit.
+- **T1 trains at the equivariant core's constructor DEFAULTS**, because
+  `scripts/train_encoder.py` exposes none of those flags: `read_time_mode='stamp'`,
+  `seed_mode='tags'`, one pool head, `op_cell_depth=1`, while T2 runs
+  `rank`/`rank`/`write_time`/16 heads/depth 4. Plumbing them through is a
+  prerequisite for reminting, and overlaps task 5's flag cleanup.
+- **Re-verify the claim that T1's single-instruction vp is exactly 0.000.** It
+  predates the behavioral-frame and `_actually_modified` corrections, both of
+  which moved the target.
+- **T1 is frozen against a stale oracle.** Both corrections landed after it
+  trained, so 0.046% of instructions now carry a different `live_out` target
+  than T1 learned. That puts a floor under any measurement attributing error to
+  T1, and is a reason to remint sooner rather than at the "beyond the happy
+  path" boundary.
+
 ### 4. No-write instructions are invisible to the essence
 
 Blocks milestone 3 (~⅓ of the ISA). Content reaches the essence only through a
@@ -284,6 +510,24 @@ single slot last-write or an accumulation across instructions; whether routing
 the result makes equivalent x0-write no-ops spuriously distinct across
 immediates; and whether branches also need a real PC-effect vp target (the SSA
 oracle already computes `SELECT_PC` but does not ship it).
+
+**Decide first whether PC advance is part of the behavior**, because it is not
+only a branch question and it gates work in two other tasks. A true register
+no-op — `ADD x5,x5,x0`, `ADDI x5,x5,0` — changes nothing but the PC, and the
+oracle correctly gives it no supervised slot, so vp is silent about it while the
+essence still moves (0.1041, milestone 2's table). Two readings, and nothing
+currently distinguishes them:
+
+- **PC advance counts.** Then a chunk with a no-op and one without genuinely
+  differ, the essence is right to separate them, and vp is *incomplete* — it has
+  no PC target at all. `out_pcs` is computed and only a `pc_writes` boolean is
+  shipped, so this would mean widening the RVT batch.
+- **PC advance does not count.** Then those chunks are equivalent and the 0.1041
+  is a collapse failure, which puts it in task 2.
+
+Deferred deliberately: it is a definition, not an experiment, and it should be
+settled before either task 2 builds a collapse objective or this task ships a
+PC-effect target — each would bake in an answer.
 
 ### 5. Flag cleanup
 
@@ -539,11 +783,22 @@ wall-clock on every len=2 run.
     and bit position, each bucket reported as a rate AND as its share of total
     error. Takes a corpus config, so the same splits can be scored on the
     population a past claim was measured on;
+  `vp_depth2.py` — splits the depth-2 error by WHICH of the two instructions
+    carries the immediate (producer, writer, both) and by opcode class, which a
+    chunk-level "has an immediate" axis cannot show;
+  `vp_compose_control.py` — the same question built rather than found: one
+    depth-2 shape, six arms, only the literals moving, plus the producer's own
+    slot scored beside the consumer's so a literal lost on consumption is
+    distinguishable from one never encoded;
   `vp_frame.py` — whether the essence and the vp target describe the SAME chunk.
     Splits vp by how T1's emitted wiring differs from the tokens' (a dropped
-    read, an added one, a swap, a repeat T1 cannot express) and by whether the
-    behavioral and syntactic canonical frames coincide. Reach for it when a cell
-    resists every capacity lever, which is what a mismatch looks like;
+    read, an added one, a swap, a wrong destination) and by whether the
+    behavioral and syntactic canonical frames coincide. **The reference is the
+    ORACLE's per-instruction binding, not the tokens'** — both it and T1 are
+    behavioral, and comparing against syntactic token wiring counts T1
+    *agreeing* with the oracle as an error (it inflated T1's apparent share of
+    the residual from 7% to 37%). Reach for it when a cell resists every
+    capacity lever, which is what a mismatch looks like;
   `vp_drop_control.py` — the same question answered causally: the second
     instruction held identical while only the first varies, so a difference
     cannot be explained by the chunks being harder. Use this shape whenever a

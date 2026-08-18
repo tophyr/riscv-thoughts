@@ -500,17 +500,33 @@ def _output_magnitudes(out_regs, in_states, output_regs):
     return {r: float(m) for r, m in zip(output_regs, mags)}
 
 
-def _actually_modified(out_regs, in_states, ssa_candidates):
-    """Filter SSA's candidate output regs to those whose value
-    actually differs from the initial state in at least one anchor
-    state. SSA over-claims when intra-chunk control flow drops some
-    writes; execution truth drives the matched-output set."""
+def _actually_modified(ssa, out_regs, in_states, ssa_candidates):
+    """Filter SSA's candidate output regs to those the chunk really modifies.
+    SSA over-claims when intra-chunk control flow drops some writes; execution
+    truth drives the matched-output set.
+
+    A register the chunk never READ is modified by any write to it. Comparing
+    its post-value against its pre-value asks whether the written value happens
+    to equal whatever the anchor state left in that register — a property of the
+    anchor state, not of the chunk. It has a systematic answer, too, because
+    canonical position i IS register x_i: a chunk that copies canonical input 1
+    into x1 writes exactly the value x1 already held. Deciding "no write
+    happened" from that made the emitted supervision depend on register NAMES,
+    so a chunk and its rename got different input and output slots.
+
+    A register the chunk DID read is different: there, "does the output equal
+    the input" is a real question about the chunk, and answering it yes is what
+    makes `ADD x5,x5,x0` a genuine no-op with no behavioral effect at all.
+    """
     if not ssa_candidates:
         return []
-    out_view = out_regs[:, ssa_candidates]
-    in_view = in_states[:, ssa_candidates]
-    any_diff = (out_view != in_view).any(axis=0)
-    return [r for r, d in zip(ssa_candidates, any_diff) if d]
+    keep = []
+    for r in ssa_candidates:
+        if r not in ssa.input_node_id:
+            keep.append(r)
+        elif bool((out_regs[:, r] != in_states[:, r]).any()):
+            keep.append(r)
+    return keep
 
 
 def _input_magnitudes(ssa, live, syntactic_inputs, anchor_states,
@@ -611,7 +627,7 @@ def precompute_chunk(chunk, anchor_states):
     input_mags = _input_magnitudes(
         ssa, live, inputs, anchor_states,
         probe_regs, probe_pcs, len(chunk),
-        _actually_modified(probe_regs, probe_state, sorted(reg_out.keys())),
+        _actually_modified(ssa, probe_regs, probe_state, sorted(reg_out.keys())),
         pc_explicit)
     behavioral_inputs = [r for r in inputs
                          if input_mags[r] > BEHAVIORAL_RELEVANCE_THRESHOLD]
@@ -637,7 +653,7 @@ def precompute_chunk(chunk, anchor_states):
         out_regs, out_pcs = _eval_ssa_numpy(ssa, len(chunk), canon_state, live)
 
     ssa_reg_outs = sorted(reg_out.keys())
-    actual_reg_outs = _actually_modified(out_regs, canon_state, ssa_reg_outs)
+    actual_reg_outs = _actually_modified(ssa, out_regs, canon_state, ssa_reg_outs)
     out_mags = _output_magnitudes(out_regs, canon_state, actual_reg_outs)
 
     # Aux targets: live-in/out masks + per-slot register IDs.

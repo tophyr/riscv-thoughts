@@ -6,24 +6,34 @@ than as a chronology of what was believed when.
 
 **Headline.** Four fixes — per-slot write step into the pool, canonical read
 position as the input registers' leaf identity, per-head pool value projections,
-and building the vp target in the behavioral rather than the syntactic canonical
-frame — take len=2 exact 32-bit match of the predicted output value to
-**99.744%**, from 99.738% on the rows where the last of those leaves the target
-unchanged. Adopted config: `--d-out 512 --pool-extra write_time
---read-time-mode rank --seed-mode rank`; best model
-`runs/t2_len2_d512_s1000000_dep4_vp1_pool16_pma_pewrite_time_rtrank_seedrank_behavframe_writers`,
-replicated at `…_behavframe_s7_writers`.
+and two corrections to the oracle's supervision (findings 14 and 24) — take
+len=2 exact 32-bit match of the predicted output value to **99.850%**. Adopted
+config: `--d-out 512 --pool-extra write_time --read-time-mode rank --seed-mode
+rank`; best model
+`runs/t2_len2_d512_s1000000_dep4_vp1_pool16_pma_pewrite_time_rtrank_seedrank_oraclefix_writers`,
+the first both trained and scored on the corrected oracle.
 
-**Aggregates do not span the frame change** — a model is scored on the target it
-trained on, and the two targets differ on 12.5% of rows. Compare on the rows
-where they agree (finding 14).
+**Aggregates do not span either oracle change** — a model is scored on the
+target it trained on. For the canonical-frame change compare on the rows where
+the two agree (finding 14); the `_actually_modified` change moved the measured
+figure 0.10 points and the learned result not at all (finding 24).
 
 **What remains is one shape: a composed immediate.** The writing instruction
 takes an operand from another instruction's result *and* carries a 12-bit
-literal: 93.01% exact, 39.5% of all remaining error at 1.4% of the triples.
-Composition alone is at 99.957% and an immediate alone at 99.909%. Separately,
-the essence does not collapse computed equivalences at all: two chunks that
-compute the same function sit as far apart as two that do not (finding 18).
+literal: 93.72% exact, 58.2% of all remaining error at 1.4% of the triples.
+Composition alone is at 99.950% and an immediate alone at 99.930%. The literal
+reaches the producer's slot intact and is lost when that slot is read back, and
+what the head produces instead is `x + ŝ` for `ŝ` near the true composite
+(finding 21).
+
+**Neither tier collapses an equivalence it would have to compute to see.** Two
+chunks that compute the same function sit as far apart as two that do not
+(finding 18), and T1 holds `x+x` and `x<<1` further apart than two different
+shifts (finding 23). What collapses at either tier is what the architecture
+makes free, such as a commutative swap. Nothing in the objective asks for the
+rest, at any tier. That overlaps the composed immediate without explaining it:
+folding two literals into one fixes `ADDI;ADDI` and does nothing for
+`XORI;ADDI`, which scores no better and has no composite to fold (finding 21).
 
 ## The question
 
@@ -322,7 +332,8 @@ different tasks. On it, at the same config and budget (len=2, `d_out` 512, 1M):
 | `cross-instr \| no-imm \| depth 1` | 99.980% | 99.980% |
 
 37% less error, better in every cell that moved. The whole-corpus aggregate
-barely moves (99.757% on the old target against 99.744%/99.753% on the new,
+barely moves (99.757% on the syntactic-frame target against 99.744%/99.753%
+on the behavioral one, both measured before finding 24's correction,
 two seeds) because each model is scored on its own convention — the syntactic-
 frame model reads 96.97% against the corrected target. **Do not compare
 aggregates across this change**; compare the identical-target rows.
@@ -412,11 +423,19 @@ row is inside it or negative. For scale, four times the training budget buys
 
 **Width pays once and then stops.** `d_out 1024` was run at both budgets:
 +0.9 points at 250k and −0.7 at 1M, both inside the noise floor, with GVN
-separation slipping 42× → 36×. `d_out 512` remains the best configuration. More
-tellingly, the error cells of finding 20 do not move at all between 512 and 1024
-— the largest of them reads 97.11% and 97.10%. **The remaining error is not
-capacity-shaped**, and the 256 → 512 gain bought a specific fixed amount rather
-than relieving a general limit.
+separation slipping 42× → 36× against each other. `d_out 512` remains the best
+configuration. More tellingly, the error cells of finding 20 do not move at all
+between 512 and 1024 — the largest of them reads 97.11% and 97.10%. **The
+remaining error is not capacity-shaped**, and the 256 → 512 gain bought a
+specific fixed amount rather than relieving a general limit.
+
+Every figure in this finding is on the syntactic-frame target at `d_out` 256
+unless stated, and the behavioral-frame correction (finding 14) changed the
+error composition materially. The width conclusion is unaffected — it is a
+comparison of two configurations measured together — but the three refuted
+levers each deserve one re-test, `--value-norm` most of all: it targets the
+op-cell reading its own previous output, which finding 21 now implicates
+directly.
 
 **What the three refuted levers rule out.** Each targeted a mechanism that a
 measurement had identified, and each failure narrows the cause:
@@ -437,7 +456,15 @@ measurement had identified, and each failure narrows the cause:
   the slot it writes, so the content need not share the op-cell's first layer
   with decoding the operands. It lands inside the noise floor.
 
-**The decoder is not the constraint either.** Fine-tuning the trained vp head on
+**Fine-tuning the decoder is not a lever; its CAPACITY is** (finding 22, which
+supersedes the reading this paragraph originally carried). The arms below refit
+heads on frozen essences, and the two that vary head DEPTH are data-limited —
+depth-2 slots are 2.5% of the supervision, so a fresh head sees ~9k examples and
+neither reaches the trained head from scratch. They cannot answer the depth
+question, and trained end-to-end where the head sees the whole stream, depth 4
+moves individual cells by more than 20 points. What the arms do establish is
+that fine-tuning the trained head on frozen essences never beats it.
+Fine-tuning the trained vp head on
 the natural slot mix leaves depth-2 at 90.2%; fine-tuning it on depth-2 slots
 only drops it to 88.4% while destroying depth-1; fresh heads trained on depth-2
 only reach 82.8% (one hidden layer) and 78.8% (four). Every head-side arm lands
@@ -456,11 +483,11 @@ value-numbering encoder must map them to one point. On the best len=2 model
 
 | | essence distance |
 |---|---|
-| **fusion** — same total, different split (MUST be ~0) | **0.4634** |
-| **different** — totals differing by 1 (the denominator) | 0.3901 |
-| rename — the same chunk relabelled (~0 by construction) | 0.0057 |
+| **fusion** — same total, different split (MUST be ~0) | **0.4143** |
+| **different** — totals differing by 1 (the denominator) | 0.3727 |
+| rename — the same chunk relabelled (~0 by construction) | 0.0008 |
 
-Separation **0.8×**. The essence separates two chunks that compute the same
+Separation **0.9×**. The essence separates two chunks that compute the same
 function exactly as much as two that do not, while the rename row confirms the
 encoder is intact. `probes/additive_fusion.py` builds the chunks directly and
 takes the distance, so there is no fitted readout anywhere in it; it asserts the
@@ -473,18 +500,39 @@ multiset of operands unchanged; fusing two immediates into one requires
 computing with them. Nothing had tested the second class before, and the model
 fails it completely.
 
+**Arithmetic is not what separates the classes that collapse from the ones that
+do not.** Exchanging one true no-op for another (`ADD xa,xa,x0` against
+`ADDI xd,xd,0`, with the rest of the chunk held fixed) is a single-instruction
+rewrite requiring no computation on operands, and it reaches only **5.9×**
+(0.0901 against 0.5322 for a chunk computing a different function, 600 pairs,
+register-file equivalence verified through the emulator). The ordering across
+classes — rename 0.0008 free by construction, commutative swap 0.0292 at 24×,
+no-op exchange 0.0901 at 5.9×, additive fusion 0.4143 at 0.9× — tracks how much
+the architecture has to learn to see the equivalence, and **nothing trains any
+of it**. vp is doubly unable to here: a true no-op has no supervised output slot
+at all, so it emits no gradient about that instruction while still moving the
+essence by 0.1041.
+
+Whether that pair is equivalent at all depends on a question the project has not
+settled: the two chunks advance PC by the same amount only because both are two
+instructions long. If instruction count is part of the behavior, the essence is
+right to separate them. `out_pcs` is computed by the oracle and only a
+`pc_writes` boolean is shipped, so neither reading is currently testable.
+
 It is also consistent with the loss. vp is not a pairwise objective: two chunks
 computing the same function have the same vp target, but nothing pushes their
 essences together, and two distinct points can both predict correctly. The same
 reasoning is already recorded for why `--inject-equiv` failed. What is new is
-that the gap is total rather than partial — 0.8× separation, not a loose
+that the gap is total rather than partial — 0.9× separation, not a loose
 collapse.
 
 A composed slot keeps the two instructions' immediates separately rather than
 folding them into one composite, which is the same fact seen from the other
 side: an encoder that fused them could not tell these two chunks apart, and this
 one tells them apart as readily as it tells apart chunks computing different
-functions.
+functions. That is also the source of the composed-immediate vp error, since the
+head then has to form the composite itself (finding 21) — but the two are not
+the same defect: `XORI` chains are equally uncollapsed and predicted exactly.
 
 **19. A category verified on a corpus that excludes immediates says nothing
 about the corpus the model trains on.** Finding 11's shared-source fix was
@@ -543,14 +591,14 @@ points on every cell above 1k triples):
 
 | sources | immediate | depth | triples | exact | err mass |
 |---|---|---|---|---|---|
-| distinct | yes | **2** | 17.4k | **93.01%** | **39.5%** |
-| distinct | yes | 1 | 767k | 99.909% | 22.5% |
-| distinct | no | 1 | 290k | 99.879% | 11.4% |
-| **cross-instr** | yes | 1 | 42.2k | 99.228% | 10.6% |
-| **cross-instr** | yes | **2** | 888 | **81.08%** | 5.4% |
-| cross-instr | no | 2 | 1.5k | 98.24% | 0.8% |
-| cross-instr | no | 1 | 39.2k | 99.980% | 0.3% |
-| distinct | no | 2 | 9.4k | 99.957% | 0.1% |
+| distinct | yes | **2** | 16.8k | **93.72%** | **58.2%** |
+| distinct | yes | 1 | 790k | 99.930% | 30.4% |
+| **cross-instr** | yes | **2** | 752 | **80.59%** | 8.1% |
+| cross-instr | no | 2 | 1.5k | 97.79% | 1.8% |
+| distinct | no | 1 | 310k | 99.995% | 0.9% |
+| **cross-instr** | yes | 1 | 37.6k | 99.984% | 0.3% |
+| distinct | no | 2 | 10.0k | 99.950% | 0.3% |
+| cross-instr | no | 1 | 40.4k | 100.0000% | 0.0% |
 
 **Of the two conditions an immediate had to survive, one was a broken target and
 one is real.** Being placed in the canonical frame alongside a shared source was
@@ -565,6 +613,200 @@ Composition is not hard as such: all-R composed slots are at 99.957%. Composing
 an **immediate-carrying** instruction is, by three orders of magnitude in error
 rate. That is also why `d_out` helped in finding 17 — width in the value path is
 what a slot needs to carry an immediate *and* the structure it is combined with.
+
+**21. What fails at depth 2 is CARRY PROPAGATION over a composed operand.** Six
+arms of one depth-2 shape — two instructions, the
+second reading the first's result — with only the placement of the 12-bit
+literals varying, so any difference between them is the literal and not the
+composition (`probes/vp_compose_control.py`, 24k triples per arm). Both output
+slots are scored: the *intermediate* is the first instruction's own slot at
+depth 1, the *composed* slot the second's at depth 2.
+
+| arm | intermediate | composed |
+|---|---|---|
+| `ADD ; ADD` | 100.0000% | **100.0000%** |
+| `ADD ; ADDI` | 100.0000% | 96.375% |
+| `ADDI ; ADD` | 99.946% | **68.196%** |
+| `ADDI ; ADDI` | 99.875% | **18.917%** |
+| `SLT ; ADDI` | 100.0000% | 99.571% |
+| `ADDI ; SLT` | 100.0000% | 100.0000% |
+
+Composition with no literal anywhere is exact. The producer's own slot carries
+its literal at 99.99%+ in every arm, so the loss is not in writing the literal
+into a slot — it is in **reading that slot back**, which is the op-cell applied
+to its own previous output. Not the pool: both slots are pooled identically and
+only the composed one degrades. The corpus agrees — a literal in the producer
+carries 40.4% of depth-2 error against the writer's 30.0%, and a `cmp` producer,
+whose intermediate is one bit wide, is at ~99.7% for every writer
+(`probes/vp_depth2.py`).
+
+**The failure is a near-miss, not a dropout.** On `ADDI;ADDI`, 96.6% of
+predictions land within one immediate's width of the target and 0.13% drop a
+literal outright; 37% are off by ≤256. The head produces `x + ŝ` with
+`ŝ ≈ i1+i2`.
+
+**The full I-type matrix**, composed slot, all pairs of the same shape. The last
+row gives the mean number of output bits that are CONSTANT across the 8 anchors
+— bits the head gets without consulting the input — which is why the `ORI`,
+`ANDI` and `SLLI` columns cannot be read as successes:
+
+| producer ↓ / writer → | `ADDI` | `XORI` | `ORI` | `ANDI` | `SLLI` |
+|---|---|---|---|---|---|
+| `ADDI` | 17.07% | 47.78% | 93.58% | 91.78% | 12.37% |
+| `XORI` | 14.05% | **98.77%** | 99.90% | 99.66% | 15.43% |
+| `ORI` | 46.00% | 99.50% | 99.98% | 99.90% | 48.77% |
+| `ANDI` | 48.83% | 99.73% | 99.97% | 99.92% | 46.27% |
+| `SLLI` | 67.47% | 77.93% | 99.61% | 99.93% | 63.78% |
+| *free bits (`ADDI`/`XORI` producer)* | *0.2* | *0.1* | *16.7* | *15.5* | *16.4* |
+
+The four full-difficulty cells order by carries: bitwise throughout is exact
+(98.77%); a carry-propagating writer is ~15% whatever it consumes (17.07% /
+14.05%); a bitwise writer on a carry-produced intermediate is 47.78%. Shifts
+behave like carries, relocating every bit at once.
+
+**Fusibility does not order them.** `ADDI;ADDI` is fusible and scores 17.07%;
+`XORI;ADDI` is not fusible and scores 14.05%. `ADDI;XORI` is not fusible and
+scores 47.78%; `XORI;XORI` is fusible and scores 98.77%. What the fusible pair
+does show is that the algebraic shortcut is not taken: `ADDI;ADDI` is the
+easiest of the four to state — one addition of the input with the single literal
+`i1+i2` — and is no better than the pair that genuinely needs two stages.
+
+**Consequently collapse does not close this cell.** Folding `i1+i2` reduces
+`ADDI;ADDI` to the single-literal case the head predicts at 99.9%, and does
+nothing for `XORI;ADDI` or `ADDI;XORI`, which have no composite literal to fold
+and score no better. Finding 18's non-collapse is a component of this cell, not
+its cause. `XORI` chains are the clean demonstration: uncollapsed at 0.7x and
+predicted exactly.
+
+**Whether the residual is in the essence or in the head is open, and the two
+readings contradict.** Against the head: finding 17's refits, fine-tunes and
+deeper heads all scored below the trained head. For the head: the essence
+demonstrably contains the intermediate, since the producer's slot is predicted
+at 99.99% from the same essence in the same forward pass that fails on the
+composed slot. The decisive experiment is to feed the head the intermediate as
+explicit bit features, the way canonical inputs are fed, and retrain.
+`probes/depth_intermediate.py` is close to it and found no gain, but with a
+fitted readout on the syntactic-frame target at `d_out` 256, so it does not
+settle it.
+
+**22. Two unrelated interventions land on the same trade: whatever makes a
+composed operand easier to decode helps the case needing ONE literal out of the
+essence and costs the case needing TWO.** `--vp-head-depth 4` deepens the
+readout; `--value-norm` RMSNorms every value entering a register slot so a
+seeded leaf and the op-cell's own output sit on one shell. They share no
+mechanism. Both were trained end-to-end at the current config on the corrected
+target, and scored on the constructed arms with two seeds of the unmodified
+config giving the run-to-run floor:
+
+| arm | seed 0 | seed 7 | `--value-norm` | `--vp-head-depth 4` |
+|---|---|---|---|---|
+| `ADDI;ADD` | 64.71% | 72.50% | **89.16%** | **90.97%** |
+| `ADDI;ADDI` | 17.22% | 16.48% | **6.67%** | **2.52%** |
+| `ADD;ADDI` | 96.20% | 95.49% | 92.67% | 93.48% |
+| `ADD;ADD` | 100.0000% | 100.0000% | 100.0000% | 100.0000% |
+
+Neither moves the aggregate: 99.7474% and 99.7587% against 99.7443%/99.7530%,
+all inside the ±0.01-point floor, and `distinct | immediate | depth 2` is
+92.97%/92.74% against 93.01%/93.08%. Neither is adopted. Every figure in this
+finding is on the pre-`_actually_modified` oracle (finding 24); the baseline
+arms are unchanged by that correction, so the comparison stands, but a new
+intervention must be scored against the current checkpoint. The deep head also
+costs collapse (GVN separation 16.7× against 23.9%/24.7×); `--value-norm` does
+not (26.9×).
+
+**Head capacity is a real constraint for one of the two sub-cases**, which the
+frozen-essence arms of finding 17 could not see. `ADDI;ADD` — one literal
+decoded from the essence and combined with two values the head is handed as bits
+— gains ~20 points over the better seed, far outside a 7.8-point spread.
+
+**`ADDI;ADDI` is the sub-case nothing reaches.** It needs two literals folded
+into one composite, and every intervention that helps the first case drives it
+further down. That is the subset equivalence collapse covers, and the only
+subset it covers.
+
+Caveat on attribution: both runs retrain the encoder and the head together, so
+they show what the joint system does when one knob moves, not what the readout
+does with the encoder held fixed. The clean head-only test is still blocked by
+the data limit above.
+
+**23. T1 does not collapse cross-opcode equivalences either, and holds one pair
+further apart than two genuinely different functions.** Distances between
+single-instruction T1 essences on `runs/t1_writers_250k`, where each pair has an
+identical binding — one live input, the same register, the same destination — so
+the whole difference is in the essence:
+
+| pair | same function | essence L2 |
+|---|---|---|
+| `ADD x5,x3,x3` vs `SLLI x5,x3,1` | yes | **0.6963** |
+| `ADDI x5,x3,0` vs `ORI x5,x3,0` | yes | 0.4448 |
+| `ADDI x5,x3,0` vs `XORI x5,x3,0` | yes | 0.2738 |
+| `ADD x5,x3,x4` vs `ADD x5,x4,x3` | yes | **0.0024** |
+| `SLLI x5,x3,1` vs `SLLI x5,x3,2` | **no** | 0.6055 |
+
+Doubling a register and shifting it left by one compute the same function and
+sit 0.6963 apart, against 0.6055 for two shifts that compute different
+functions. Three spellings of the identity sit 0.27–0.44 apart. The one pair
+that collapses is the commutative swap, which the architecture makes free: the
+pool is a multiset over register slots, so exchanging two operands is invisible
+by construction.
+
+**The pattern across both tiers is the same.** An equivalence collapses when the
+architecture cannot represent the difference, and does not collapse when
+recognising it would require knowing that two different operations compute the
+same function. Nothing in the objective asks for the second kind at any tier —
+vp gives both members of a pair the same target without ever comparing them, and
+the equivalence manifest holds only rewrites. So this is not a T2 deficit being
+inherited from a clean T1; it is absent at T1 and absent at T2, for the same
+reason.
+
+**24. A structural question answered by value comparison made the oracle's
+supervision depend on register NAMES.** `_actually_modified` decided "did the
+chunk write this register?" by comparing the register's post-execution value
+against its pre-execution value. Canonical position *i* **is** register x*i*, so
+a canonicalized input value is bit-identical to some untouched register's own
+value, and a chunk that copies canonical input 1 into x1 writes exactly the
+value x1 already held. The value test then reported no write.
+
+That made a chunk and its rename disagree:
+
+```
+ADD x1, x7, x0    behavioral_inputs=[]     in_slots=[]    out_slots=[1]
+ADD x2, x9, x0    behavioral_inputs=[9]    in_slots=[9]   out_slots=[2]
+```
+
+The model is exactly equivariant, so it represents those two identically and is
+then graded against two different targets — the same defect shape as finding 14,
+one layer down. The consequence compounded: dropping the output emptied
+`output_regs`, which zeroed every `input_mags` entry, which emptied the
+behavioral set, which made the re-executed frame the RAW anchor state, which
+restored the output with a target no encoder can produce (the head is fed no
+inputs and asked for a specific register's raw value).
+
+**The fix distinguishes two cases the value test conflated.** A register the
+chunk never READ is modified by any write to it — whether its new value happens
+to equal its old one is a property of the anchor state, not of the chunk. A
+register the chunk DID read keeps the value test, because there "does the output
+equal the input" is a real question about the chunk, and answering it yes is
+what makes `ADD x5,x5,x0` a genuine no-op with no inputs and no outputs.
+
+Corpus impact is small and was verified rather than assumed: old and new rules
+disagree on 0.10% of len=2 chunks and 0.30% at len=4, and every disagreement is
+the predicted shape. It grows with chunk length.
+
+**The generalizable rule: never answer a structural question by comparing
+values, in a space where canonical values alias concrete ones.** The identity
+needed was already available and untouchable by any instruction —
+`SSAGraph.output_versions` and `input_node_id`, built by walking the instruction
+list before any value exists. Threading an identity tag through
+`_eval_ssa_numpy` would recompute the same answer; the two could only differ
+under intra-chunk control flow, which that evaluator does not model either.
+
+**Nothing checked that the oracle's output is rename-equivariant.** The project
+asserts `state_max_err = 0.00e+00` for the model and had no analogue for the
+targets, which is why this sat. `test_supervision_is_rename_equivariant` now
+asserts that `in_slot_regs`, `out_slot_regs` and the live masks permute under a
+register permutation while `out_regs` values come out EQUAL — the canonical
+frame's whole purpose. It was checked against the old rule and fails there.
 
 ## Decisions taken
 
@@ -609,6 +851,16 @@ what a slot needs to carry an immediate *and* the structure it is combined with.
   error, while composed slots with an immediate are at 93.01% and are 39.5% of
   it. `probes/vp_budget.py` reports both, crossed. Localise with probes on frozen checkpoints
   first; train only to test a specific mechanism.
+- **`--vp-head-depth 4` and `--value-norm` are both rejected at the current
+  config**, each leaving the aggregate inside the noise floor; the deep head
+  additionally costs GVN separation. Neither is a null result, though — both
+  move individual arms by 15–25 points in the same direction as each other
+  (finding 22), so the cell they target is a trade-off rather than a deficit.
+- **Score a composed-operand change on the constructed arms, not on the
+  aggregate or on the depth-2 bucket.** Depth-2 as a whole is 94.9% and both
+  interventions above leave it flat while moving `ADDI;ADD` by 20 points and
+  `ADDI;ADDI` by 14 in the opposite direction. An aggregate that does not move
+  is not evidence that nothing happened.
 - **Build the vp target in the behavioral canonical frame** — the same frame
   T1's emitted binding and T2's read ranks are in, so the target is a function
   of what the encoder is shown (finding 14). The syntactic frame is not an
@@ -735,6 +987,18 @@ lossless behavioral description once the corpus gets harder; strengthening it
 (more anchors, a held-out anchor set, or per-batch resampled anchors shipped in
 the RVT batch) is queued against TODO.md milestone 3.
 
+**It also measures the head's arithmetic, not only the essence's content, and
+finding 21 is where that starts to bind.** The head is asked to EVALUATE the
+chunk's function at the anchor points, so a function the essence describes
+perfectly can still score badly if evaluating it is hard for a shallow readout.
+Bitwise output bits are decidable independently; carry propagation is sequential
+in bit position and bit relocation moves everything at once, and those are
+exactly the cases that fail. The producer's slot being predicted at 99.99% from
+the same essence and the same forward pass that fails on the composed slot says
+the description is there. Until the essence-side and head-side readings are
+separated (finding 21's decisive experiment), a vp residual at depth 2 cannot be
+attributed to the encoder.
+
 **Acceptance criterion for "len=2 solved":** vp trains as a per-bit BCE, so the
 loss value is asymptotic and never literally 0. The output is discrete, so score
 it discretely — **100% exact 32-bit match on the `probes/vp_slot_b_split.py`
@@ -752,14 +1016,22 @@ evidence of its absence.
 
 ## Open threads
 
-1. **A composed immediate** — the whole of what is left at len=2, and not
-   capacity-shaped: `d_out` 512 → 1024 leaves it unchanged (finding 17), and the
-   head, the two-step arithmetic chain, the gradient share, the operand scale
-   mismatch and content crowding are each separately refuted. Composition alone
-   is at 99.957% and an immediate alone at 99.909%, so what fails is the pair.
-   The same question decides milestone 2, since a slot at depth *d* must
-   describe *d* instructions' worth of computation and len=4/8 chunks are mostly
-   deep.
+1. **Carry propagation over a composed operand** — the whole of what is left at
+   len=2, localised to the op-cell reading its own previous output (finding 21).
+   Not capacity-shaped: `d_out` 512 → 1024 leaves it unchanged (finding 17), and
+   the head, the two-step arithmetic chain, the gradient share, the operand
+   scale mismatch and content crowding are each separately refuted — though all
+   of those were measured against the syntactic-frame target at `d_out` 256, and
+   `--value-norm` targets exactly the operation now implicated, so it is worth
+   one re-test.
+
+   **First settle whether the residual is essence-side or head-side**
+   (finding 21). The two available readings contradict, and they call for
+   different work: a lossy essence is an encoder problem, while a readout that
+   cannot decode-and-compute in one pass is partly a statement about vp as a
+   metric — it would mean `vp = 0` is gated on the head's arithmetic rather than
+   on the essence being a faithful description, which is what the milestone
+   claims to measure.
 
 2. **Decoder + reconstruction loss** — the standing untried lever for goal 2.
 3. **Flag cleanup** — decided in principle: **options do not survive on their

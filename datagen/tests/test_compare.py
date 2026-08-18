@@ -85,6 +85,62 @@ class TestAuxTargets:
             # x9 = x5 + 100 with x5 sourced from canonical position 1
             assert (pre.out_regs[:, 9] == anchors[:, 1] + 100).all()
 
+    def test_supervision_is_rename_equivariant(self):
+        """Everything the oracle emits must permute with a register rename.
+
+        The model is exactly equivariant by construction, so a chunk and its
+        rename produce the same representation; if the oracle labels them
+        differently, one of the two is being graded against a target it cannot
+        distinguish. `state_max_err` checks this for the model and nothing
+        checked it for the targets.
+
+        `out_regs` is asserted EQUAL rather than permuted: canonicalization
+        re-sources inputs by read position, so the VALUES are register-name
+        free — that is the whole point of the canonical frame.
+        """
+        from datagen.generate import random_perm, relabel
+
+        anchors = make_anchor_states(8, seed=0)
+        rng = np.random.default_rng(0)
+        chunks = [
+            # regression anchor: canonical position 1 IS register x1, so this
+            # chunk writes x1 exactly the value x1 already held. Deciding
+            # "unmodified" from that made the emitted supervision depend on
+            # register names.
+            [Instruction('ADD', 1, 7, 0)],
+            [Instruction('ADD', 5, 3, 4), Instruction('ADDI', 6, 5, 100)],
+            [Instruction('SLTIU', 4, 9, -300), Instruction('ADDI', 8, 9, 12)],
+            [Instruction('ADD', 5, 5, 0)],            # true no-op
+            [Instruction('XORI', 2, 2, 0)],           # true no-op
+        ]
+        for chunk in chunks:
+            for _ in range(4):
+                perm = random_perm(rng)
+                a = precompute_chunk(chunk, anchors)
+                b = precompute_chunk(relabel(chunk, perm), anchors)
+
+                def permute(regs):
+                    return [int(perm[r]) for r in regs]
+
+                # behavioral_inputs is in first-read order, which a rename
+                # preserves. reg_outs is sorted by register NUMBER, so only
+                # its membership is meaningful — out_slot_regs below is the
+                # ordered one (SSA write order).
+                assert permute(a.behavioral_inputs) == b.behavioral_inputs, chunk
+                assert set(permute(a.reg_outs)) == set(b.reg_outs), chunk
+                for name in ('in_slot_regs', 'out_slot_regs'):
+                    fa, fb = getattr(a, name), getattr(b, name)
+                    filled = fa != AUX_CE_IGNORE
+                    assert ((fb != AUX_CE_IGNORE) == filled).all(), (chunk, name)
+                    assert (perm[fa[filled]] == fb[filled]).all(), (chunk, name)
+                for name in ('live_in_mask', 'live_out_mask'):
+                    ma, mb = getattr(a, name), getattr(b, name)
+                    assert (mb[perm] == ma).all(), (chunk, name)
+                # the canonical target VALUES carry no register identity
+                for ra in a.reg_outs:
+                    assert np.array_equal(
+                        a.out_regs[:, ra], b.out_regs[:, int(perm[ra])]), chunk
+
     def test_memory_op_raises(self):
         # Mem ops are out of V1 distance scope; precompute_chunk raises so
         # batch.py routes them to the None/empty-aux path.

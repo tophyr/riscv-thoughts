@@ -8,10 +8,12 @@ exactly two places the two descriptions can drift apart, and this probe measures
 both against the model's own trained head.
 
   wiring — T2's operand and destination slots come from the FROZEN T1's binding
-    predictions, never from the tokens (`_t1_predicted_wiring`). The vp target
-    comes from the tokens. When T1 mispredicts, the essence describes a
-    different chunk than the one that was executed to build the target, and the
-    row is unsatisfiable.
+    predictions, never from the tokens (`_t1_predicted_wiring`). When T1
+    mispredicts, the essence describes a different chunk than the one that was
+    executed to build the target, and the row is unsatisfiable. The reference
+    is the ORACLE's binding, not the tokens': both are behavioral, so a read
+    T1 omits because the output does not depend on it is agreement rather than
+    error.
 
   frame — a chunk input's identity in the encoder is its canonical READ
     POSITION, seeded on first read and counted causally over registers read
@@ -27,20 +29,17 @@ cells crossed here are the three that carry the len=2 error (`vp_budget.py`):
 sources shared across the two instructions, an immediate in the chunk, and a
 slot whose operand is the other instruction's result.
 
-A wiring mismatch is not automatically an error. T1's binding heads are
-BEHAVIORAL, so dropping a read the output does not depend on is correct by
-design, and the top-2 over in_score cannot emit a register twice, so an
-instruction reading one register in both operands (`ADD x3,x5,x5`) mismatches
-by construction. The mismatch is therefore reported by KIND, and vp is scored
-within each kind — a comparison that stays inside the mispredicted population
-and so cannot be explained by mispredicted chunks simply being harder:
+The mismatch is reported by KIND, and vp is scored within each kind — a
+comparison that stays inside the mispredicted population and so cannot be
+explained by mispredicted chunks simply being harder:
 
   dest       the destination register differs.
   wrong-src  a source register neither dropped nor added — a different register.
-  add-src    a source T1 read that the tokens do not.
-  drop-src   a source the tokens read and T1 did not.
-  swap       the same two sources in the other operand position.
-  repeat     the tokens read one register twice; T1 cannot express it.
+  add-src    a source T1 emits that the oracle does not list.
+  drop-src   a source the oracle lists and T1 omits.
+  swap       the same two sources in the other operand position. `in_slot_regs`
+             is in first-read order and the `in_slot` loss trains exactly that
+             order, so this is a genuine ranking error in `in_score`.
 
 Usage: vp_frame.py <t2_dir> <t1_path> [chunk_len] [n_batches] [config] [route]
 """
@@ -111,20 +110,49 @@ def encoder_ranks(i0, i1, o, n):
     return rank
 
 
-def wiring_kind(p0, p1, po, t0, t1_, to, n):
-    """How the wiring T2 ran on differs from the wiring the tokens specify.
-    Returns the most consequential kind over the chunk's instructions, or 'ok'.
+def oracle_wiring(instr, cache):
+    """The wiring the ORACLE describes for one instruction: its behavioral
+    inputs in first-read order, and the register it modifies.
+
+    This is the reference T1 is trying to emit, and comparing against the
+    TOKENS instead is wrong in two ways that both read as T1 errors when they
+    are T1 agreeing with the oracle. The tokens say `ADD x3,x5,x5` reads two
+    registers; the oracle lists one, because that is how many distinct values
+    the output depends on. The tokens say `SLTIU x10,x22,-k` reads x22; the
+    oracle lists none, because a sign-extended negative immediate makes the
+    comparison constant. T1's binding heads are behavioral and correctly emit
+    the oracle's answer in both cases.
     """
-    order = ('dest', 'wrong-src', 'add-src', 'drop-src', 'swap', 'repeat')
+    key = (instr.opcode, tuple(instr.args))
+    if key not in cache:
+        try:
+            pre = precompute_chunk([instr], anchors_np)
+            ins_regs = [int(x) for x in pre.in_slot_regs if x != AUX_CE_IGNORE]
+            out = pre.out_slot_regs[0]
+            cache[key] = (tuple(ins_regs[:2]) + (0, 0))[:2], (
+                int(out) if out != AUX_CE_IGNORE else 0)
+        except Exception:
+            cache[key] = ((0, 0), 0)
+    return cache[key]
+
+
+def wiring_kind(p0, p1, po, instrs, cache):
+    """How the wiring T2 ran on differs from the wiring the ORACLE describes.
+    Returns the most consequential kind over the chunk's instructions, or 'ok'.
+
+    `swap` is the one that survives this reference: `in_slot_regs` is in
+    first-read order and `_t1_predicted_wiring` takes a top-2 over `in_score`,
+    whose loss trains exactly that order, so a reversed pair is a genuine
+    misprediction rather than a convention mismatch.
+    """
+    order = ('dest', 'wrong-src', 'add-src', 'drop-src', 'swap')
     kinds, dropped = set(), []
-    for k in range(n):
-        pred, true = (int(p0[k]), int(p1[k])), (int(t0[k]), int(t1_[k]))
-        if int(po[k]) != int(to[k]):
+    for k, instr in enumerate(instrs):
+        (o0, o1), oout = oracle_wiring(instr, cache)
+        pred, true = (int(p0[k]), int(p1[k])), (o0, o1)
+        if int(po[k]) != oout:
             kinds.add('dest')
         if pred == true:
-            continue
-        if true[0] == true[1] != 0:
-            kinds.add('repeat')
             continue
         ps, ts = set(pred) - {0}, set(true) - {0}
         if ps == ts:
@@ -233,29 +261,13 @@ with open(CORPUS, 'rb') as f:
             if len(ins) != n:
                 continue
 
-            kind, dropped = wiring_kind(
-                p0[b], p1[b], po[b], t0[b], t1w[b], to[b], n)
+            # Compared against the ORACLE's per-instruction binding, not the
+            # tokens': every mismatch below is T1 disagreeing with the target,
+            # never a difference of convention.
+            kind, dropped = wiring_kind(p0[b], p1[b], po[b], ins, behav_cache)
             wiring_ok = kind == 'ok'
-            # T1 dropping a read is correct by design when the instruction's
-            # output does not depend on it. T1 sees ONE instruction, so the test
-            # has to be per-instruction: the chunk's behavioral input set would
-            # call a drop wrong whenever another instruction in the chunk reads
-            # the same register for real. Same oracle T1's own targets come
-            # from, run on the single instruction.
-            if kind == 'drop-src':
-                relevant = False
-                for k, r in dropped:
-                    key = (ins[k].opcode, tuple(ins[k].args), r)
-                    if key not in behav_cache:
-                        try:
-                            pc = precompute_chunk([ins[k]], anchors_np)
-                            behav_cache[key] = bool(pc.live_in_mask[r])
-                        except Exception:
-                            behav_cache[key] = False
-                    relevant |= behav_cache[key]
-                kind += ' (behavioral)' if relevant else ' (irrelevant)'
             # The encoder's frame comes from the wiring it ran on; the target's
-            # comes from the tokens. Comparing them is the whole question.
+            # comes from the oracle. Comparing them is the whole question.
             ranks = encoder_ranks(p0[b], p1[b], po[b], n)
             try:
                 g = to_ssa(ins)
