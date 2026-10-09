@@ -5,7 +5,6 @@ Drives compressor.eval. Reports the
 load-bearing properties:
 
   - equivariance: relabel -> state permutes EXACTLY, essence invariant (~0)
-  - tag-invariance: essence cosine across anonymous-tag resamples (~1)
   - binding accuracy: live_in/out, pc, in/out-slot order, dup rate
   - (T2 only) GVN collapse split by pair type: rename-twin (free) vs
     behavioral-non-rename (trained) vs distinct
@@ -67,9 +66,6 @@ def main():
         eq = E.equivariance_error(t1, batches[0], device=device)
         print(f'equivariance: state_max_err={eq["state_max_err"]:.2e} '
               f'essence_max_err={eq["essence_max_err"]:.2e}')
-        ti = E.tag_invariance(t1, batches[0], device=device)
-        print(f'tag-invariance: cos_mean={ti["tag_cos_mean"]:.4f} '
-              f'cos_min={ti["tag_cos_min"]:.4f}')
         b1 = E.t1_binding_accuracy(t1, batches, device=device,
                                    max_batches=args.max_batches)
         print(f'binding: live_in={b1["live_in_acc"]:.3f} '
@@ -97,8 +93,6 @@ def main():
         print(f'  rename     mean={g["rename_mean"]:.4f} '
               f'ratio={rr:.4f}' if rr is not None else
               f'  rename     mean={g["rename_mean"]:.4f}')
-        print(f'  tag-invar  mean={g["tag_mean"]:.4f}   '
-              f'(same chunk, different anonymous tags — learned, not free)')
         if g['behavioral_eq_mean'] is not None:
             print(f'  behavioral mean={g["behavioral_eq_mean"]:.4f}   '
                   f'(commutative swap, pairs that ARE equivalent; n='

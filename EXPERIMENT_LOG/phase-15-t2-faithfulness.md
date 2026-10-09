@@ -7,11 +7,16 @@ than as a chronology of what was believed when.
 **Headline.** Four fixes — per-slot write step into the pool, canonical read
 position as the input registers' leaf identity, per-head pool value projections,
 and two corrections to the oracle's supervision (findings 14 and 24) — take
-len=2 exact 32-bit match of the predicted output value to **99.850%**. Adopted
-config: `--d-out 512 --pool-extra write_time --read-time-mode rank --seed-mode
-rank`; best model
-`runs/t2_len2_d512_s1000000_dep4_vp1_pool16_pma_pewrite_time_rtrank_seedrank_oraclefix_writers`,
-the first both trained and scored on the corrected oracle.
+len=2 exact 32-bit match of the predicted output value to **99.828%**. Adopted
+T2 config: `--d-out 512`, over the frozen `runs/t1_writers_250k_rank`; the
+core's own settings are fixed rather than chosen (finding 25). Best model
+`runs/t2_len2_d512_s1000000_dep4_vp1_pool16_pma_pewrite_time_rtrank_seedrank_t1rank_writers`.
+
+**Quote the floor that matches the comparison.** Retraining the T2 alone over a
+fixed frozen T1 has spread 0.002 and 0.009 points of exact match on the two
+configurations where it was replicated; retraining the frozen T1 spreads 0.023
+(finding 25). Use ~0.01 for a T2-level claim unless the specific cell has been
+replicated, and 0.023 for anything comparing T1s.
 
 **Aggregates do not span either oracle change** — a model is scored on the
 target it trained on. For the canonical-frame change compare on the rows where
@@ -52,8 +57,9 @@ and each has a metric:
 Phase 15 asked whether the essence is good enough at either. The setup is a
 deliberately easy corpus (`configs/instr_alu_writers.json`: R/I-type ALU only,
 always valid, never writing x0) on a frozen, verified T1
-(`runs/t1_writers_250k` — single-instruction vp exactly 0.000). Nothing in this
-phase is a T1 problem.
+(`runs/t1_writers_250k_rank` — single-instruction vp is an exact 32-bit match on
+100.0000% of supervised triples, every opcode, by `probes/t1_scorecard.py`).
+Nothing in this phase is a T1 problem.
 
 **The starting symptom:** a single instruction is encoded perfectly, and
 quality falls off as chunks get longer — vp 0.34 / 0.60 / 0.68 at 2 / 4 / 8
@@ -239,8 +245,10 @@ over the same 4×) nor injecting commutative variants into the corpus closes the
 gap — the latter makes it worse. Accepted, for two reasons: the random-tag
 encoder maps chunks computing genuinely *different* functions to 0.0003, i.e. it
 cannot separate them at all, which is the same information loss this phase
-exists to remove; and 119× separation is above the 28× Phase 14 validated the
-architecture on.
+exists to remove; and equivalent pairs stay two orders of magnitude closer than
+unrelated ones, which is the property the metric exists to assert. (Phase 14's
+28× is not a usable floor to compare against: it predates the rename-row fix of
+finding 12, which makes every earlier GVN number incomparable.)
 
 **12. `gvn_collapse`'s rename row was measuring tag-invariance.** `enc()` drew
 fresh random tags per call, so base and twin got independent tags while the
@@ -338,9 +346,12 @@ two seeds) because each model is scored on its own convention — the syntactic-
 frame model reads 96.97% against the corrected target. **Do not compare
 aggregates across this change**; compare the identical-target rows.
 
-The two seeds also put the run-to-run noise floor at 1M steps at **±0.01 points
-of overall exact match**, and within 0.1 points on every cell above 1k triples —
-far tighter than the ±0.75 recorded at 250k in finding 17.
+Those two seeds put the **T2-level** run-to-run spread at 1M steps at 0.009
+points of overall exact match, and within 0.1 points on every cell above 1k
+triples — far tighter than the ±0.75 recorded at 250k in finding 17. It holds
+the frozen T1 fixed, so it is NOT the floor for a comparison between T1s
+(finding 25), and it is not a universal T2-level figure either: a second
+replicate pair, on the corrected oracle, spread 0.002.
 
 **15. A pooled commutative-swap distance is not interpretable.** Swapping a
 commutative op's operands changes first-read order, and therefore the canonical
@@ -391,8 +402,8 @@ projections invalidates this number and requires re-running it.
 The cost is looser equivalence collapse: the distance between commutatively
 equivalent chunks rises 0.0102 → 0.0287 against a `distinct` mean of 1.28, so
 separation falls 128× → 45× — the same direction as finding 11's tradeoff, a
-more discriminative essence collapsing equivalents less, and still above the 28×
-Phase 14 validated on. Operand binding is unchanged (`in_slot` 0.979 → 0.980;
+more discriminative essence collapsing equivalents less. Operand binding is
+unchanged (`in_slot` 0.979 → 0.980;
 the shared-source column of `vp_slot_b_split` 99.806% → 99.765%, within that
 probe's noise).
 
@@ -729,26 +740,31 @@ they show what the joint system does when one knob moves, not what the readout
 does with the encoder held fixed. The clean head-only test is still blocked by
 the data limit above.
 
-**23. T1 does not collapse cross-opcode equivalences either, and holds one pair
-further apart than two genuinely different functions.** Distances between
-single-instruction T1 essences on `runs/t1_writers_250k`, where each pair has an
-identical binding — one live input, the same register, the same destination — so
-the whole difference is in the essence:
+**23. T1 does not collapse cross-opcode equivalences either.** Distances between
+single-instruction T1 essences, where each pair has an identical binding — one
+live input, the same register, the same destination — so the whole difference is
+in the essence. Measured by `probes/t1_scorecard.py` on the frozen
+`runs/t1_writers_250k_rank`, 2000 pairs per row:
 
 | pair | same function | essence L2 |
 |---|---|---|
-| `ADD x5,x3,x3` vs `SLLI x5,x3,1` | yes | **0.6963** |
-| `ADDI x5,x3,0` vs `ORI x5,x3,0` | yes | 0.4448 |
-| `ADDI x5,x3,0` vs `XORI x5,x3,0` | yes | 0.2738 |
-| `ADD x5,x3,x4` vs `ADD x5,x4,x3` | yes | **0.0024** |
-| `SLLI x5,x3,1` vs `SLLI x5,x3,2` | **no** | 0.6055 |
+| `ADD x5,x3,x3` vs `SLLI x5,x3,1` | yes | **0.5696** |
+| `ADDI x5,x3,0` vs `{ORI,XORI,SLLI} x5,x3,0` | yes | 0.2794 |
+| `ADD x5,x3,x4` vs `ADD x5,x4,x3` | yes | **0.0083** |
+| `SLLI x5,x3,1` vs `SLLI x5,x3,2` | **no** | 0.6948 |
+| `ADD x5,x3,x4` vs `SUB x5,x3,x4` | **no** | 0.9675 |
 
-Doubling a register and shifting it left by one compute the same function and
-sit 0.6963 apart, against 0.6055 for two shifts that compute different
-functions. Three spellings of the identity sit 0.27–0.44 apart. The one pair
-that collapses is the commutative swap, which the architecture makes free: the
-pool is a multiset over register slots, so exchanging two operands is invisible
-by construction.
+Pairs computing the same function sit within a factor of 2 of pairs computing
+different ones. The one pair that does collapse is the commutative swap (0.0083,
+117× separation), which is free because the pool is a multiset over register
+slots, so exchanging two operands is invisible by construction.
+
+**Read the ratio, not the raw distance, and not from one checkpoint.** Across
+ten T1 checkpoints the `ADD x,y,y` vs `SLLI x,y,1` distance ranges 0.32–1.01 and
+its denominator 0.55–0.76, putting the ratio anywhere in 0.63–2.07× with no
+relation to the settings — on two of the ten the equivalent pair lands *further*
+apart than the inequivalent one. What holds on every checkpoint is that the
+ratio never approaches the commutative row's.
 
 **The pattern across both tiers is the same.** An equivalence collapses when the
 architecture cannot represent the difference, and does not collapse when
@@ -808,11 +824,59 @@ asserts that `in_slot_regs`, `out_slot_regs` and the live masks permute under a
 register permutation while `out_regs` values come out EQUAL — the canonical
 frame's whole purpose. It was checked against the old rule and fails there.
 
+**25. T1→T2 transfer varies by 0.023 points from the frozen T1 alone, and no
+core setting is distinguishable against that.** Retraining the T2 on a fresh
+corpus over the same frozen T1 moves len=2 exact match by **0.002–0.009** points
+(two configurations, each replicated). Retraining the frozen T1 moves it by
+**0.023** (σ over five same-config T1s, 0.0553 range), and depth-2 exact match
+by **0.24** (0.64 range). A comparison between T1s needs the larger figure — and
+the 4.5× gap between the two T2-level measurements is itself why a floor from
+one configuration cannot be reused on another: replicate the arm under test.
+
+Each row is a T2 at len=2 / `d_out` 512 / 1M steps, every hyperparameter
+identical, differing only in the frozen T1 beneath it; the T1's settings are
+given as read-position / seeding / pool-channel. `n` counts same-configuration
+T1s retrained on separately generated corpora:
+
+| T1 configuration | n | mean exact | range |
+|---|---|---|---|
+| **rank / tags / write_time** | **5** | 99.8264% | **99.7983 – 99.8536** |
+| rank / rank / none | 2 | 99.8285% | 99.8272 – 99.8298 |
+| rank / rank / write_time | 1 | 99.8283% | — |
+| stamp / tags / write_time | 1 | 99.8537% | — |
+| stamp / tags / none | 1 | 99.8570% | — |
+| stamp / tags / none, pre-correction oracle (findings 14, 24) | 1 | 99.8497% | — |
+
+Every row sits within **1.4σ** of the five-replicate distribution (z = +0.03 to
++1.32), as does the oracle correction of finding 24, whose apparent +0.0073
+exact and +0.42 depth-2 are both inside it.
+
+**T1's own metrics do not predict what T2 extracts.** All six T1s reach
+**100.0000%** exact 32-bit match on their own single-instruction value
+prediction (`probes/t1_scorecard.py`), while the T2s built on them span 0.059
+points — an order of magnitude beyond any T2-level spread measured. A tier can be perfect on its own objective and
+still be a measurably different input to the next one. Operationally: **a T1
+cannot be selected without training a T2 over it** (~2.4h at len=2);
+`t1_scorecard.py` verifies a T1 is intact, it cannot rank T1s.
+
+**Two structural facts about the core:**
+
+- **`read_time` is absent from the essence computation.** Scaling it 100× leaves
+  T1's essence bit-identical (`0.000e+00`); it reaches only the event channels,
+  and hence the binding heads.
+- **T1's essence carries its instruction's content in full.** A fitted readout
+  recovers the opcode at 99.65–100% and the 12-bit immediate at 99.96–100%
+  exact, against base rates of 5.90% and 0.024%.
+
+The settings themselves are fixed on first principles rather than on this table
+— see RISCV_DESIGN.md, "Leaf identity for input registers".
+`runs/t1_writers_250k_rank` is the frozen T1; checkpoints trained at other
+values do not load.
+
 ## Decisions taken
 
-- **The pool reads each slot's write step (`pool_extra=write_time`).** NB the
-  constructor and CLI default is still `none`, which reproduces the
-  pre-ordering-fix model; new runs must pass the flag explicitly.
+- **The pool reads each slot's write step.** Unconditional: the core carries no
+  alternative.
 - **Feeding the pool the full event block is rejected** on the equivalence-
   collapse cost (finding 9), despite its vp gain. Any future fix must keep
   read-order out of the invariant essence.
@@ -828,11 +892,15 @@ frame's whole purpose. It was checked against the old rule and fails there.
   concentration was the pathology.
 - **Seed register slots from canonical read position, count read positions as
   ranks over registers read before written, and give the pool each slot's write
-  step** (`--seed-mode rank --read-time-mode rank --pool-extra write_time`).
-  Feeding the positions to the per-instruction cell as extra inputs
-  (`--op-cell-rank`) is a second route to the same binding result and redundant
-  with seeding. The 5× commutative-collapse cost is accepted on the evidence in
-  finding 11, not waived.
+  step — at every tier, with no option to do otherwise.** Settled on first
+  principles rather than on measurement, which cannot resolve differences this
+  small (finding 25): the compressor must be a deterministic function of its
+  input, the rank *is* the canonical position the target is expressed in, and a
+  symmetric pool is structurally blind to write order. RISCV_DESIGN.md, "Leaf
+  identity for input registers", carries the argument. Feeding the positions to
+  the per-instruction cell as extra inputs (`--op-cell-rank`) is a redundant
+  second route to the same binding result. The commutative-collapse cost
+  recorded in finding 11 is accepted, though its size is not established.
 - **Report vp discretely.** `probes/vp_slot_b_split.py` prints exact 32-bit match
   alongside per-bit; 81% per-bit on the overlap column was 21% exact, so per-bit
   alone made a mostly-broken subset look nearly solved.
@@ -845,6 +913,16 @@ frame's whole purpose. It was checked against the old rule and fails there.
 - **Every sweep carries a null intervention** — the same configuration trained
   twice on separately generated corpora. Without it no row is interpretable; at
   these run lengths it costs ~35 minutes.
+- **Run the null on the arm under test — floors do not generalise between
+  cells.** Two configurations here differ 20× in their own run-to-run spread
+  (0.0026 against 0.0553, finding 25), so a floor borrowed from a quiet cell
+  inflates every significance claim made against it. Where the quantity is a
+  difference between frozen LOWER tiers, the lower tier is what needs
+  replicating.
+- **Rows sharing one setting but differing in another are not replicates.**
+  Neither are rows trained against different oracles. Pooling them to reach a
+  usable `n` manufactures confidence and can count the same quantity as signal
+  in one comparison and as noise in another.
 - **Report an error BUDGET, not an accuracy.** A bucket's rate and its share of
   total error are different facts and neither implies the other:
   immediate-carrying instructions at depth 1 are at 99.909% and are 22.5% of the
@@ -1034,18 +1112,16 @@ evidence of its absence.
    claims to measure.
 
 2. **Decoder + reconstruction loss** — the standing untried lever for goal 2.
-3. **Flag cleanup** — decided in principle: **options do not survive on their
-   own.** `read_time_mode` collapses to `rank` only (`stamp` is a known wrong
-   encoding — it equals the canonical position only when no register is read
-   twice); `seed_mode` collapses to `rank`; `op_cell_rank` is deleted, being a
-   redundant second route to the same read positions; `pool_extra` keeps `write_time` and drops the recorded
-   dead ends `order`/`event`; `pool_mode` drops `compete`.
-   The cost is real and must be paid, not skipped: `stamp` is baked into every
-   existing checkpoint including the frozen `runs/t1_writers_250k`, so deleting
-   it means reminting T1 and re-running the current-best len=2 config, then
-   comparing the new numbers against the recorded ones (vp, the
-   `vp_slot_b_split` columns, the GVN rows, `state_max_err`, binding
-   accuracies). Breaking changes are acceptable; unverified breaking changes are
-   not.
+3. **Flag cleanup, for the options no tier wants.** `op_cell_rank` is deleted,
+   being a redundant second route to the same read positions; `pool_extra` keeps
+   `write_time` and drops the recorded dead ends `order`/`event`; `pool_mode`
+   drops `compete`.
+
+   `read_time_mode` and `seed_mode` **keep both settings**: the tiers want
+   opposite ones, T2 `rank` and T1 the `stamp`/`tags` defaults, and forcing T1
+   onto T2's costs the T2 trained on it 0.030 points of exact match (finding
+   25). These are per-tier hyperparameters, which is what the shared core is
+   built to allow; the option survives because the right value genuinely
+   differs, not because deleting it was skipped.
 4. **Everything after the Round-1 sweep is len=2 only.** In particular,
    input-ordering recovery sits at chance (0.518) at len=8 and is unexplained.

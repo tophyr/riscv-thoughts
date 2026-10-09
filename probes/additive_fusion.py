@@ -74,21 +74,17 @@ def build(chunks):
 def encode(chunks, bs=512):
     """Chunk essences, unit-normalized (vp reads direction only).
 
-    Every set is encoded under the SAME per-row register tags. A tag-seeded
-    model has to learn tag-invariance, so drawing fresh tags per set would put
-    that model's tag noise into the fusion distance and score it for a different
-    failure. Tags are unused under `seed_mode=rank`."""
+    The encode is deterministic, so a distance between two sets reflects only
+    the chunks, never a resampling artifact."""
     out = []
     for i in range(0, len(chunks), bs):
         sub = chunks[i:i + bs]
         split = build(sub)
         mni = max(len(x) for x in sub)
-        g = torch.Generator(device='cpu').manual_seed(1000 + i)
-        tags = torch.randn(len(sub), t2.n_regs, generator=g).to(dev)
         with torch.no_grad():
             ct1, c0, c1, co, cact = _t2_assemble(
                 t1, split, len(sub), mni, dev, route='binding')
-            _, ess = t2.core(ct1, c0, c1, co, cact, tags)
+            _, ess = t2.core(ct1, c0, c1, co, cact)
         out.append(F.normalize(ess.float(), dim=-1))
     return torch.cat(out)
 

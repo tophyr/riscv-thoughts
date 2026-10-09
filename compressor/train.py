@@ -92,12 +92,11 @@ def _wiring_from_token_lists(token_lists):
     return in0, in1, out
 
 
-def encode_instrs(model, instrs, device, tags=None):
+def encode_instrs(model, instrs, device):
     """Tokenize, pad, and encode a list of Instructions to their essence
-    vectors. Registers enter as wiring (instruction_wiring); a SHARED per-
-    register tag (broadcast across the instrs) is used by default so the
-    essence comparison isolates the operator signal (equivalence / probe
-    geometry), matching how a trained model becomes tag-invariant."""
+    vectors. Registers enter as wiring (instruction_wiring) only — the essence
+    is a deterministic function of the instruction, so repeated calls on the
+    same input return the same point."""
     encoded = [encode_instruction(i) for i in instrs]
     max_len = max(len(e) for e in encoded)
     n = len(encoded)
@@ -107,17 +106,12 @@ def encode_instrs(model, instrs, device, tags=None):
         tok[i, :len(e)] = e
         pad[i, :len(e)] = False
     wiring = np.array([instruction_wiring(i) for i in instrs], dtype=np.int64)
-    if tags is None:
-        shared = np.random.standard_normal(model.n_regs).astype(np.float32)
-        shared[0] = 0.0
-        tags = np.broadcast_to(shared, (n, model.n_regs)).copy()
     return model.encode(
         torch.from_numpy(tok).to(device),
         torch.from_numpy(pad).to(device),
         torch.from_numpy(wiring[:, 0]).to(device),
         torch.from_numpy(wiring[:, 1]).to(device),
-        torch.from_numpy(wiring[:, 2]).to(device),
-        torch.as_tensor(tags, dtype=torch.float32, device=device))
+        torch.from_numpy(wiring[:, 2]).to(device))
 
 
 def prepare_decoder_targets(token_lists, device):
@@ -513,9 +507,8 @@ def _t1_wiring(batch):
 
 def train_compressor(batch_iter, *, ingest, lower_encoder=None,
                      d_out=128, d_event=16, op_cell_depth=1, vp_head_depth=4,
-                     n_pool_heads=1, pool_mode='pma', pool_extra='none',
-                     read_time_mode='stamp', op_cell_rank=False,
-                     seed_mode='tags', value_norm=False, content_skip=False,
+                     n_pool_heads=1, pool_mode='pma', op_cell_rank=False,
+                     value_norm=False, content_skip=False,
                      d_model=128, n_heads=4, n_layers=2, max_window=72,
                      route='binding',
                      lr=3e-4, n_steps=None, log_every=100, lr_min=1e-6,
@@ -575,8 +568,7 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
             d_content=lower_encoder.d_out, d_out=d_out, d_event=d_event,
             op_cell_depth=op_cell_depth, vp_head_depth=vp_head_depth,
             n_pool_heads=n_pool_heads, pool_mode=pool_mode,
-            pool_extra=pool_extra, read_time_mode=read_time_mode,
-            op_cell_rank=op_cell_rank, seed_mode=seed_mode,
+            op_cell_rank=op_cell_rank,
             value_norm=value_norm, content_skip=content_skip)
         model = comp.to(device)
         model_file = 't2.pt'
@@ -587,9 +579,7 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
             d_event=d_event, op_cell_depth=op_cell_depth,
             vp_head_depth=vp_head_depth, n_pool_heads=n_pool_heads,
             pool_mode=pool_mode,
-            pool_extra=pool_extra,
-            read_time_mode=read_time_mode,
-            op_cell_rank=op_cell_rank, seed_mode=seed_mode,
+            op_cell_rank=op_cell_rank,
             value_norm=value_norm, content_skip=content_skip).to(device)
         comp = model.compressor
         model_file = 'encoder.pt'
@@ -659,7 +649,7 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
     model.train()
     _dummy = torch.zeros(1, device=device)
 
-    def _content(tok, pad, w0, w1, wo, active, t1_tags):
+    def _content(tok, pad, w0, w1, wo, active):
         """Tier front-end (the one tier-specific path): a (B, MNI) dense
         token grid -> (content_seq (B,MNI,d_content), in0,in1,out (B,MNI)).
         tokens: embed with the trained model (grad flows). vectors: frozen
@@ -674,7 +664,7 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
         with torch.no_grad():
             T1s, ess = lower_encoder.encode_state(
                 tok.reshape(flat, Ltok), pad.reshape(flat, Ltok),
-                w0.reshape(flat), w1.reshape(flat), wo.reshape(flat), t1_tags)
+                w0.reshape(flat), w1.reshape(flat), wo.reshape(flat))
             if route_binding:
                 r0, r1, ro = _t1_predicted_wiring(lower_encoder, T1s)
             else:
@@ -684,11 +674,11 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
 
     # ONE compiled CUDA-graph step (the one-graph fold): front-end + core + losses, all
     # at a fixed-padded instruction count (B*MNI). Host-sync-free, static-shape.
-    def _fwd_loss(tok, pad, w0, w1, wo, active, t1_tags, t2_tags,
+    def _fwd_loss(tok, pad, w0, w1, wo, active,
                   li, lo, pc, in_slot, out_slot, out_regs, vp_mask, valid_f,
                   ike, oke, imm_target, imm_mask):
-        content_seq, c0, c1, co = _content(tok, pad, w0, w1, wo, active, t1_tags)
-        T, essence = comp.encode_state(content_seq, c0, c1, co, active, t2_tags)
+        content_seq, c0, c1, co = _content(tok, pad, w0, w1, wo, active)
+        T, essence = comp.encode_state(content_seq, c0, c1, co, active)
         valid_loss = (((essence.norm(dim=-1) - valid_f) ** 2).mean()
                       if valid_active else essence.new_zeros(()))
         bl = binding_losses(
@@ -745,8 +735,6 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
             return None
         tok, pad, gi0, gi1, go, active = _dense_chunk_grid(
             split_outputs, N_CHUNKS, MAX_NI)
-        t1_tags = torch.randn(N_CHUNKS * MAX_NI, model.n_regs, device=device)
-        t2_tags = torch.randn(N_CHUNKS, model.n_regs, device=device)
         valid_f = (_h2d(batch.valid, device, dtype=torch.float32)
                    if valid_active else _dummy)
         if out_regs_active:
@@ -766,7 +754,6 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
                 _h2d(gi1, device, dtype=torch.long),
                 _h2d(go, device, dtype=torch.long),
                 _h2d(active, device, dtype=torch.float32),
-                t1_tags, t2_tags,
                 _h2d(batch.live_in_mask, device, dtype=torch.float32),
                 _h2d(batch.live_out_mask, device, dtype=torch.float32),
                 _h2d(batch.pc_writes, device, dtype=torch.float32),
@@ -789,6 +776,8 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
 def train_encoder(batch_iter, *,
                   d_model=128, n_heads=4, n_layers=2, d_out=128,
                   max_window=72,
+                  d_event=16, op_cell_depth=1, vp_head_depth=4,
+                  n_pool_heads=1, pool_mode='pma',
                   lr=3e-4, n_steps=None, log_every=100, lr_min=1e-6,
                   valid_weight=0.1,
                   live_in_weight=0.1, live_out_weight=0.1,
@@ -805,6 +794,11 @@ def train_encoder(batch_iter, *,
     prediction. There is no equivalence-collapse loss — equivalence is
     an emergent property of the consistent per-instruction targets, not a
     separate objective that would fight register identity.
+
+    d_event..pool_mode:  the equivariant core's own settings, forwarded
+                         unchanged to train_compressor — T1 and T2 share one
+                         core, so the tiers must be able to run the same
+                         configuration of it. See RegisterStateMachine.
 
     valid_weight:        weight on (||v_c|| - (1 if valid else 0))**2.
     live_in/out_weight:  BCE on the behavioral input/output register masks.
@@ -831,6 +825,9 @@ def train_encoder(batch_iter, *,
     return train_compressor(
         batch_iter, ingest='tokens', d_out=d_out, d_model=d_model,
         n_heads=n_heads, n_layers=n_layers, max_window=max_window,
+        d_event=d_event, op_cell_depth=op_cell_depth,
+        vp_head_depth=vp_head_depth, n_pool_heads=n_pool_heads,
+        pool_mode=pool_mode,
         lr=lr, n_steps=n_steps, log_every=log_every, lr_min=lr_min,
         valid_weight=valid_weight, live_in_weight=live_in_weight,
         live_out_weight=live_out_weight, pc_writes_weight=pc_writes_weight,
@@ -1048,11 +1045,10 @@ def _t2_assemble(t1, split_outputs, n_chunks, max_n_instrs, device,
     t1_in0 = torch.from_numpy(in0).to(device)
     t1_in1 = torch.from_numpy(in1).to(device)
     t1_out = torch.from_numpy(out).to(device)
-    t1_tags = torch.randn(it.shape[0], t1.n_regs, device=device)
     with torch.no_grad():
         # T1 runs on its OWN token-derived wiring (ingestion); it emits state
         # T and essence.
-        T1_state, t1_ess = enc(it, ip, t1_in0, t1_in1, t1_out, t1_tags)
+        T1_state, t1_ess = enc(it, ip, t1_in0, t1_in1, t1_out)
     if route == 'binding':
         r_in0, r_in1, r_out = _t1_predicted_wiring(t1, T1_state)
     else:                                    # 'tokens' diagnostic
@@ -1074,7 +1070,7 @@ def _t2_assemble(t1, split_outputs, n_chunks, max_n_instrs, device,
 
 
 def t2_chunk_forward(t1, t2, split_outputs, n_chunks, max_n_instrs, device,
-                     t2_tags=None, route='binding'):
+                     route='binding'):
     """Frozen-T1 per-instruction essence → T2 register-state machine over the
     chunk → essence. The whole forward, for eval / non-compiled callers (the
     trainer splits the eager assemble from the compiled core). Returns the
@@ -1083,9 +1079,7 @@ def t2_chunk_forward(t1, t2, split_outputs, n_chunks, max_n_instrs, device,
         return None
     chunk_t1, in0, in1, out, active = _t2_assemble(
         t1, split_outputs, n_chunks, max_n_instrs, device, route=route)
-    if t2_tags is None:
-        t2_tags = torch.randn(n_chunks, t2.n_regs, device=device)
-    return t2.encode(chunk_t1, in0, in1, out, active, t2_tags)
+    return t2.encode(chunk_t1, in0, in1, out, active)
 
 
 def slot_dataflow_depth(in0, in1, out, active, n_regs):
@@ -1566,9 +1560,8 @@ class TrainBatchPrefetcher:
 
 def train_t2_encoder(batch_iter, t1_encoder, *,
                      d_out=256, d_event=16, op_cell_depth=1, vp_head_depth=4,
-                     n_pool_heads=1, pool_mode='pma', pool_extra='none',
-                     read_time_mode='stamp', op_cell_rank=False,
-                     seed_mode='tags', value_norm=False, content_skip=False,
+                     n_pool_heads=1, pool_mode='pma', op_cell_rank=False,
+                     value_norm=False, content_skip=False,
                      lr=3e-4, n_steps=None, log_every=100, lr_min=1e-6,
                      warmup_steps=0,
                      valid_weight=0.0,
@@ -1590,9 +1583,7 @@ def train_t2_encoder(batch_iter, t1_encoder, *,
         batch_iter, ingest='vectors', lower_encoder=t1_encoder,
         d_out=d_out, d_event=d_event, op_cell_depth=op_cell_depth,
         vp_head_depth=vp_head_depth, n_pool_heads=n_pool_heads,
-        pool_mode=pool_mode, pool_extra=pool_extra,
-        read_time_mode=read_time_mode, op_cell_rank=op_cell_rank,
-        seed_mode=seed_mode, value_norm=value_norm,
+        pool_mode=pool_mode, op_cell_rank=op_cell_rank, value_norm=value_norm,
         content_skip=content_skip, route=t2_route,
         lr=lr, n_steps=n_steps, log_every=log_every, lr_min=lr_min,
         warmup_steps=warmup_steps,

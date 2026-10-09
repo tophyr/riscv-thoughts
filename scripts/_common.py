@@ -66,13 +66,6 @@ def open_run_dir(args, model_name, *, suffix=''):
 # Model loading — same pattern across train_*, eval suites, etc.
 # ---------------------------------------------------------------------------
 
-def _pool_extra(hp):
-    """pool_extra from hparams, mapping the older boolean
-    `pool_reads_order: true`, which fed write_time only."""
-    if 'pool_extra' in hp:
-        return hp['pool_extra']
-    return 'write_time' if hp.get('pool_reads_order', False) else 'none'
-
 
 def _tile_shared_pool_v(state, model):
     """Widen a checkpoint's single shared pool value projection into the
@@ -120,10 +113,7 @@ def load_frozen_encoder(model_path, device):
         vp_head_depth=hp.get('vp_head_depth', 4),
         n_pool_heads=hp.get('n_pool_heads', 1),
         pool_mode=hp.get('pool_mode', 'pma'),
-        pool_extra=_pool_extra(hp),
-        read_time_mode=hp.get('read_time_mode', 'stamp'),
         op_cell_rank=hp.get('op_cell_rank', False),
-        seed_mode=hp.get('seed_mode', 'tags'),
         value_norm=hp.get('value_norm', False),
         content_skip=hp.get('content_skip', False),
     ).to(device)
@@ -146,10 +136,7 @@ def load_t2(t2_dir, t1, device):
         vp_head_depth=hp.get('vp_head_depth', 4),
         n_pool_heads=hp.get('n_pool_heads', 1),
         pool_mode=hp.get('pool_mode', 'pma'),
-        pool_extra=_pool_extra(hp),
-        read_time_mode=hp.get('read_time_mode', 'stamp'),
         op_cell_rank=hp.get('op_cell_rank', False),
-        seed_mode=hp.get('seed_mode', 'tags'),
         value_norm=hp.get('value_norm', False),
         content_skip=hp.get('content_skip', False),
     ).to(device)

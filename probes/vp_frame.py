@@ -17,7 +17,7 @@ both against the model's own trained head.
 
   frame — a chunk input's identity in the encoder is its canonical READ
     POSITION, seeded on first read and counted causally over registers read
-    before they are written (`seed_mode='rank'`). The target's canonical frame
+    before they are written. The target's canonical frame
     is assigned over the chunk's LIVE syntactic inputs (`live_input_regs`), and
     the head is fed the values at those positions. A dead input is read by the
     encoder and skipped by the oracle, so every later input's position shifts
@@ -43,6 +43,7 @@ explained by mispredicted chunks simply being harder:
 
 Usage: vp_frame.py <t2_dir> <t1_path> [chunk_len] [n_batches] [config] [route]
 """
+import os
 import subprocess
 import sys
 from collections import defaultdict
@@ -78,7 +79,7 @@ dev = resolve_device('auto')
 t1 = load_frozen_encoder(T1_PATH, dev)
 t2, _ = load_t2(T2_DIR, t1, dev)
 
-CORPUS = f'/tmp/vp_frame_len{LEN}_{CONFIG.split("/")[-1][:-5]}.rvt'
+CORPUS = f'/tmp/vp_frame_len{LEN}_{CONFIG.split("/")[-1][:-5]}_{os.getpid()}.rvt'
 subprocess.run(
     f'python -m datagen --rule "cap={LEN}" --twins 0 --batch-size 128 '
     f'--n-states {N_ANCHORS} --anchor-seed {ANCHOR_SEED} '
@@ -95,7 +96,7 @@ ANCH_IN = anchors[:, canon_pos].to(torch.int64)
 def encoder_ranks(i0, i1, o, n):
     """The canonical read position the encoder seeds each register with.
 
-    Replays `Compressor._stamp_reads` under read_time_mode='rank': operand 0
+    Replays `Compressor._stamp_reads`: operand 0
     then operand 1 of each instruction, a register numbered on its first read
     and only if it has not already been written here. Returns reg -> position.
     """
@@ -202,8 +203,7 @@ with open(CORPUS, 'rb') as f:
                 t1, split, nch, mni, dev, route='binding')
             ct1, e0, e1, eo, cact = _t2_assemble(
                 t1, split, nch, mni, dev, route=ROUTE)
-            ess = t2.encode(ct1, e0, e1, eo, cact,
-                            torch.randn(nch, t2.n_regs, device=dev))
+            ess = t2.encode(ct1, e0, e1, eo, cact)
 
         # The wiring T2 actually ran on (T1's predictions) beside the wiring the
         # tokens specify and the target was executed from.

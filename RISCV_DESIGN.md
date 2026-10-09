@@ -397,40 +397,61 @@ to be constant to be equivariant, which destroys distinctness. A seed satisfying
 both must therefore distinguish inputs *from each other* without naming any of
 them.
 
-Two seeds satisfy that, and the difference between them matters.
-
-The first is the random-node-feature trick from graph learning: give each
-live-in register a random tag, sampled fresh per chunk, that permutes with π.
-Nothing about the tag is tied to a register name, so equivariance holds, and two
-distinct inputs almost surely receive different tags. Its weakness is that
-invariance to the tag is *learned*: the network must discover that a tag means
-only "these two inputs differ" and never "this is register 5". Nothing in the
-architecture enforces it, so it is the one property a change can silently
-regress, and it must be measured rather than assumed.
-
-The second is the **canonical read rank** — the position of a register in the
-chunk's first-read order, counting only registers read before they are written.
-Two distinct inputs receive ranks 1 and 2; a register read twice receives one
-rank twice; so distinguishability is preserved exactly. Rank is assigned by read
+A register's **canonical read rank** satisfies both: its position in the
+chunk's first-read order, counting only registers read before they are written,
+written into the slot on first read. Two distinct inputs receive ranks 1 and 2; a
+register read twice receives one rank twice, which is correct because it is one
+input; so distinguishability is preserved exactly. Rank is assigned by read
 *order*, not by register name, so a rename permutes it along with the slots and
 equivariance remains exact — the torsion argument above does not apply, because
-rank is not a function of the register. Unlike a random tag there is nothing to
-be invariant to, so the learned-invariance burden disappears rather than being
-trained away. Rank is also the coordinate system the value-prediction target is
-already expressed in (see "Training"), which is why it doubles as the signal that
-lets a chunk's operands be bound to their canonical positions.
+rank is not a function of the register. Rank is also the coordinate system the
+value-prediction target is already expressed in (see "Training"), which is why it
+doubles as the signal that binds a chunk's operands to their canonical positions.
 
-Rank is the seeding used. The cost is a shift in *which* invariances come free.
-A state that records no read-order cannot move under a commutative operand swap,
-since nothing in it distinguishes `a+b` from `b+a` — that invariance is
-structural. A state that records read-order can represent the difference, so the
-same invariance becomes something the training signal has to supply per opcode,
-and it does so imperfectly: behaviorally-equivalent chunks sit measurably further
-apart than under a read-order-free state. The exchange is accepted because a
-read-order-free state earns its tighter equivalence collapse by also being unable
-to separate chunks that genuinely compute different functions — which is the
-worse failure for a representation whose purpose is to be a lossless behavioral
-description of its chunk.
+**There is a third requirement, and it is what selects rank: the seed must be
+DETERMINISTIC.** The obvious alternative — the random-node-feature trick from
+graph learning, giving each live-in register a tag sampled fresh per chunk —
+satisfies distinguishability and carries no register identity, but a tag is
+redrawn on every forward pass, so the same instruction compresses to a slightly
+different point each time it is seen (max |Δ| 1.8e-2, minimum cosine 0.9992 over
+four draws of one trained encoder). That contradicts the framework's
+foundational claim: a compressor is a deterministic function, and "two token
+sequences mean the same thing iff they compress to the same point" is the
+equivalence criterion built on it (WHAT_IS_A_THOUGHT.md). It also leaves
+invariance to the seed as a *learned* property the architecture does not
+enforce, and therefore one a change can silently regress. A rank carries nothing
+to be invariant to, so the property holds by construction and the same
+measurement reads bit-exactly zero — the same move as building the rename
+symmetry into the representation rather than training a flat vector to respect
+it, applied one level down to the leaf symbols.
+
+The cost is a shift in *which* invariances come free. A state that records no
+read-order cannot move under a commutative operand swap, since nothing in it
+distinguishes `a+b` from `b+a` — that invariance is structural. A state that
+records read-order can represent the difference. Whether the invariance then
+still holds structurally — a swap moves the ranks *between* the two registers,
+leaving the pool's multiset of leaf vectors unchanged — or has to be supplied per
+opcode by training is UNSETTLED. The exchange is accepted
+regardless, because a read-order-free state earns its tighter equivalence
+collapse by also being unable to separate chunks that genuinely compute
+different functions — the worse failure for a representation whose purpose is to
+be a lossless behavioral description of its chunk.
+
+**The other two settings follow from what each consumer can see.** Read positions
+are counted as ranks over registers read before written, which *is* the canonical
+position; the alternative encoding (`2(k+1)+role`, indexed by step and operand
+slot) coincides with it only when every read is fresh and no operand is x0, and
+so mis-states the position on ~1.6% of single instructions and on any repeated
+read. And the pool — a symmetric sum, structurally blind to which register was
+written first — is additionally fed each slot's **write step**, because the
+essence must encode an ordered function ("output 1 is this, output 2 is that").
+That channel is register-indexed, so invariance stays exact, and a commutative
+swap changes neither which slot was written nor when, so equivalence collapse is
+not put at risk. Read-order must *not* reach the pool for exactly that reason
+(see "Read-order must be consumed conditionally").
+
+**None of the three is a configuration option.** They are the only values any
+tier uses, and the code carries no branch for an alternative.
 
 ### The tier contract — never re-embed tokens
 

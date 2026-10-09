@@ -25,6 +25,7 @@ stays near (1), f2 itself was never represented.
 
 Usage: depth_intermediate.py <t2_dir> <t1_path> [n_batches] [steps]
 """
+import os
 import subprocess
 import sys
 
@@ -51,7 +52,7 @@ dev = resolve_device('auto')
 t1 = load_frozen_encoder(T1_PATH, dev)
 t2, _ = load_t2(T2_DIR, t1, dev)
 
-CORPUS = f'/tmp/depth_inter_len{LEN}.rvt'
+CORPUS = f'/tmp/depth_inter_len{LEN}_{os.getpid()}.rvt'
 subprocess.run(
     f'python -m datagen --rule "cap={LEN}" --twins 0 --batch-size 128 '
     f'--n-states {N_ANCHORS} --anchor-seed {ANCHOR_SEED} '
@@ -85,8 +86,7 @@ with open(CORPUS, 'rb') as f:
         with torch.no_grad():
             ct1, c0, c1, co, cact = _t2_assemble(
                 t1, split, nch, mni, dev, route='binding')
-            ess = t2.encode(ct1, c0, c1, co, cact,
-                            torch.randn(nch, t2.n_regs, device=dev)).float()
+            ess = t2.encode(ct1, c0, c1, co, cact).float()
 
         in_slot = torch.from_numpy(batch.in_slot_regs.astype(np.int64)).to(dev)
         out_slot = torch.from_numpy(batch.out_slot_regs.astype(np.int64)).to(dev)

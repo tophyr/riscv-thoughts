@@ -26,10 +26,18 @@ between inequivalent ones (`separation`, larger is better):
 
 | equivalence class | distance | separation |
 |---|---|---|
-| register rename — free by construction | 0.0008 | — |
-| commutative operand swap — the pool nearly gives it away | 0.0292 | 24.0× |
+| register rename — free by construction | 0.0000 | — |
+| commutative operand swap — the pool nearly gives it away | 0.0270 | 46.6× |
 | one no-op exchanged for another (`ADD xa,xa,x0` vs `ADDI xd,xd,0`) | 0.0901 | 5.9× |
-| additive chains with the same total offset | 0.4143 | 0.9× |
+| additive chains with the same total offset | 0.4288 | 0.8× |
+
+Measured on the len=2 model of milestone 1 unless noted; the rename and
+commutative rows come from `scripts/eval.py`'s split `behavioral` row (the
+pooled row is not interpretable, EXPERIMENT_LOG finding 15), additive chains
+from `probes/additive_fusion.py`, and the no-op row from a 600-pair measurement
+on an earlier checkpoint. **A separation gap under ~10× is noise** at these pair
+counts: independent samples disagree on the sign of differences that size
+(finding 25), so the rows are ordered by magnitude, not finely ranked.
 
 **Nothing trains collapse**, which is the common cause: seeing that `+x0` is the
 identity needs no arithmetic at all and still only reaches 5.9×, so "the encoder
@@ -47,20 +55,17 @@ rows on a fixed corpus, not to de-bias vp.)
 ## Milestones
 
 1. **[CURRENT] vp = 0.0 at len=2 — not reached.** Current best:
-   `--d-out 512 --pool-extra write_time --read-time-mode rank --seed-mode rank`
-   at 1M
-   (`runs/t2_len2_d512_s1000000_dep4_vp1_pool16_pma_pewrite_time_rtrank_seedrank_oraclefix_writers`),
-   on the criterion — exact 32-bit match of the predicted output value —
-   **99.850%**. The run-to-run noise floor at 1M steps is **±0.01 points**
-   overall and 0.1 points on any cell above 1k triples — measured from two seeds
-   of this config on the previous oracle, and a variance estimate rather than a
-   figure the oracle change would move.
+   `--d-out 512` at 1M over the frozen `runs/t1_writers_250k_rank`
+   (`runs/t2_len2_d512_s1000000_dep4_vp1_pool16_pma_pewrite_time_rtrank_seedrank_t1rank_writers`), on the
+   criterion — exact 32-bit match of the predicted output value — **99.828%**.
 
-   This is the first checkpoint both TRAINED and SCORED on the corrected oracle.
-   The `_actually_modified` correction (finding 24) was worth 0.10 points of
-   measurement and nothing of learning: the previous checkpoint reads 99.846%
-   against the corrected target and a model trained on it reaches 99.850%. The
-   old target was charging the model for rows nobody could answer.
+   **Two noise floors, and the larger one governs any T1 comparison.** Retraining
+   the T2 on a fresh corpus moves this 0.002–0.009 points across the two
+   configurations where it was replicated; retraining the frozen T1 beneath it
+   moves it **0.023 points** (σ over five same-config T1s), and depth-2 by
+   **0.24**. Use ~0.01 for a T2-level claim unless that cell has been
+   replicated, and 0.023 for anything comparing T1s. No T1 configuration
+   measured is distinguishable from any other (EXPERIMENT_LOG finding 25).
 
    **Numbers from before the vp target was moved into the behavioral canonical
    frame are not comparable to these** (EXPERIMENT_LOG finding 14). A model is
@@ -120,9 +125,9 @@ rows on a fixed corpus, not to de-bias vp.)
 2. **Computed equivalents collapse at len=2.** Two chunks that compute
    the same function must land on the same point. They currently land as far
    apart as two chunks computing different functions: additive chains with the
-   same total offset sit **0.4143** apart against **0.3727** for chains whose
-   totals differ by 1 — separation **0.9x** — while a register rename sits at
-   0.0008. XOR chains are 0.7x. Measured directly, with no fitted readout, by
+   same total offset sit **0.4288** apart against **0.3588** for chains whose
+   totals differ by 1 — separation **0.8x** — while a register rename sits at
+   0.0122. XOR chains are 0.7x. Measured directly, with no fitted readout, by
    `probes/additive_fusion.py`.
 
    **It overlaps milestone 1 but does not contain it.** Collapsing two literals
@@ -365,11 +370,11 @@ essence describes only the composite, the intermediate having been overwritten:
 
 | family | fusion | different | separation |
 |---|---|---|---|
-| `ADDI/ADDI`, same total offset | 0.4143 | 0.3727 | **0.9x** |
-| `XORI/XORI`, same composite mask | 0.4966 | 0.3677 | **0.7x** |
+| `ADDI/ADDI`, same total offset | 0.4288 | 0.3588 | **0.8x** |
+| `XORI/XORI`, same composite mask | 0.5112 | 0.3612 | **0.7x** |
 
-The same chunk with its registers relabelled sits at 0.0008, so the encoder is
-intact and the measurement is sound.
+The same chunk with its registers relabelled sits at 0.0122 (median 0.0001), so
+the encoder is intact and the measurement is sound.
 
 **Collapse would also close milestone 1's remaining cell** (see task 1): the
 composed-immediate vp error exists because the head is handed two literals and
@@ -382,26 +387,28 @@ behaviorally identical and each `different` pair is not. Extend it with a new
 family by adding a `combine`/`resplit`/`perturb` triple to `FAMILIES`.
 
 **It is not a T2 deficit — T1 fails the same class.** Single-instruction
-essences on `runs/t1_writers_250k`, each pair with an identical binding (one
-live input, same register, same destination), so the whole difference is in the
-essence:
+essences on the frozen `runs/t1_writers_250k_rank`, each pair with an identical
+binding (one live input, same register, same destination), so the whole
+difference is in the essence (`probes/t1_scorecard.py`, 2000 pairs per row):
 
 | pair | same function | essence L2 |
 |---|---|---|
-| `ADD x5,x3,x3` vs `SLLI x5,x3,1` | yes | **0.6963** |
-| `ADDI x5,x3,0` vs `ORI x5,x3,0` | yes | 0.4448 |
-| `ADD x5,x3,x4` vs `ADD x5,x4,x3` | yes | **0.0024** |
-| `SLLI x5,x3,1` vs `SLLI x5,x3,2` | **no** | 0.6055 |
+| `ADD x5,x3,x3` vs `SLLI x5,x3,1` | yes | **0.5696** |
+| `ADDI x5,x3,0` vs `{ORI,XORI,SLLI} x5,x3,0` | yes | 0.2794 |
+| `ADD x5,x3,x4` vs `ADD x5,x4,x3` | yes | **0.0083** |
+| `SLLI x5,x3,1` vs `SLLI x5,x3,2` | **no** | 0.6948 |
+| `ADD x5,x3,x4` vs `SUB x5,x3,x4` | **no** | 0.9675 |
 
-Doubling a register and shifting it left by one sit *further* apart than two
-shifts computing different functions. The pair that does collapse is the
-commutative swap, which the architecture makes free — the pool is a multiset
-over register slots. **At both tiers, an equivalence collapses when the
+Pairs computing the same function sit within a factor of 2 of pairs computing
+different ones; the commutative swap, which the architecture makes free because
+the pool is a multiset over register slots, sits at 117×. Read the ratio and not
+the raw distances — those move 3× across checkpoints with no relation to the
+settings (EXPERIMENT_LOG finding 23). **At both tiers, an equivalence collapses when the
 architecture cannot represent the difference and otherwise does not.** Any fix
 has to be designed for T1 and T2 together; they are one class (`compressor/`),
-so a mechanism that works at T1 applies at T2 unchanged. It also means task 3's
-production T1 should not be minted before this is settled, or it will be minted
-without it.
+so a mechanism that works at T1 applies at T2 unchanged. It also means the
+validity remint of task 3 should not happen before this is settled, or T1 will
+be reminted without it.
 
 **Nothing in the project covers this class.** Equivalences are enumerated in
 one place — the manifest in `datagen/generate.py` — and all 15 of its classes
@@ -425,9 +432,10 @@ should be scored on that class too, because it isolates "untrained" from
 start here, because it is the best-defined target in either task:
 
 - collapse: exchanging one no-op for another reaches only 5.9x (above);
-- T1's geometry: `ADDI x,y,0` and `ORI x,y,0` compute the same function and sit
-  0.4448 apart; `ADD x,y,y` and `SLLI x,y,1` sit 0.6963 apart, further than two
-  shifts computing *different* functions (0.6055);
+- T1's geometry: three spellings of the identity (`ADDI x,y,0` against
+  `ORI`/`XORI`/`SLLI x,y,0`) sit 0.2794 apart and `ADD x,y,y` against
+  `SLLI x,y,1` sits 0.5696 apart, both within 2× of the 0.6948–0.9675 between
+  instructions computing *different* functions;
 - T1's binding, and hence T2's vp: **every** `dest` misprediction measured is an
   instruction the oracle says modifies nothing, i.e. T1 predicting a write for
   `ADD x5,x5,x0`. That is 6.2% of T2's remaining vp error, arriving through
@@ -464,35 +472,32 @@ Open questions, in order:
   together can pull inequivalents together too. `behav-diff` — pairs the
   transformation did NOT leave equivalent — is the guard, and must stay large.
 
-### 3. Mint a production T1
+### 3. Give T1 a validity task
 
-Every T1 in use is a diagnostic trained on a clean corpus (`--inject-invalid 0`),
-so it has no validity task and cannot reject invalid input. Needed before
-anything leaves the happy path. Fold in the `rd==x0` immediate mask.
+The frozen T1 (`runs/t1_writers_250k_rank`) is a diagnostic trained on a clean
+corpus (`--inject-invalid 0`), so it has no validity task and cannot reject
+invalid input. That is the only remaining gap between it and a production T1:
+it trains against the corrected oracle, at the core's settled settings, with the
+`rd==x0` immediate mask applied (`compressor/train.py:281`), and its
+single-instruction vp is a 100.0000% exact 32-bit match
+(`probes/t1_scorecard.py`). Needed before anything leaves the happy path.
+
+**A candidate T1 can only be judged by training a T2 over it** (~2.4h at
+len=2). T1-side metrics do not predict what T2 extracts: six T1s all scoring
+100.0000% on their own single-instruction vp yielded T2s spanning 0.059 points,
+with their binding accuracies ranked *anti*-correlated to their T2s
+(EXPERIMENT_LOG finding 25). Budget for that before proposing a T1 sweep, and
+replicate — retraining one T1 moves its T2 by 0.023 points on its own.
 
 Scrutinise when reminting:
 
 - **The binding heads are weighted 0.1 against vp's 1.0.** `in_slot_weight`,
   `live_in_weight`, `live_out_weight` and `out_slot_weight` are all 0.1 while
-  `value_predict_weight` is 1.0 (`runs/t1_writers_250k/hparams.json`). T2
-  consumes the binding as its WIRING, so the tier interface is optimised at a
-  tenth of the priority of the essence. The current T1 is nonetheless accurate
-  against the oracle's binding — 3.4% of len=2 chunks mismatch and 92.6% of
-  T2's residual error is on rows with no mismatch at all — so this is a thing to
-  check, not a known deficit.
-- **T1 trains at the equivariant core's constructor DEFAULTS**, because
-  `scripts/train_encoder.py` exposes none of those flags: `read_time_mode='stamp'`,
-  `seed_mode='tags'`, one pool head, `op_cell_depth=1`, while T2 runs
-  `rank`/`rank`/`write_time`/16 heads/depth 4. Plumbing them through is a
-  prerequisite for reminting, and overlaps task 5's flag cleanup.
-- **Re-verify the claim that T1's single-instruction vp is exactly 0.000.** It
-  predates the behavioral-frame and `_actually_modified` corrections, both of
-  which moved the target.
-- **T1 is frozen against a stale oracle.** Both corrections landed after it
-  trained, so 0.046% of instructions now carry a different `live_out` target
-  than T1 learned. That puts a floor under any measurement attributing error to
-  T1, and is a reason to remint sooner rather than at the "beyond the happy
-  path" boundary.
+  `value_predict_weight` is 1.0. T2 consumes the binding as its WIRING, so the
+  tier interface is optimised at a tenth of the priority of the essence. T1 is
+  nonetheless accurate against the oracle's binding — 3.4% of len=2 chunks
+  mismatch and 92.6% of T2's residual error is on rows with no mismatch at all —
+  so this is a thing to check, not a known deficit.
 
 ### 4. No-write instructions are invisible to the essence
 
@@ -538,29 +543,19 @@ one-time reshaping cost instead. Breaking changes — including reminting the
 frozen T1 — are acceptable **on the one condition that new and old can be
 compared and shown not to have regressed.**
 
-**Refuted this session, and due for deletion** — kept for now only so the
-evidence can be re-checked against the code that produced it, since each was
-tested once. Delete them deliberately rather than letting them become vestigial:
-`--vp-depth-weight` (and `slot_dataflow_depth`, which exists only to serve it),
-`--value-norm`, `--content-skip`. Each is refuted at len=2/250k against a
-measured noise floor; see task 1 and EXPERIMENT_LOG finding 17.
+**Refuted, and due for deletion** — kept only so the evidence can be re-checked
+against the code that produced it, since each was tested once. Delete them
+deliberately rather than letting them become vestigial: `--vp-depth-weight`
+(and `slot_dataflow_depth`, which exists only to serve it), `--value-norm`,
+`--content-skip`. Each is refuted at len=2/250k against a measured noise floor;
+see task 1 and EXPERIMENT_LOG finding 17.
 
 Standing candidates:
 
-- **`seed_mode`: delete the option, keep `rank` only**, and **delete
-  `op_cell_rank` outright** — it feeds the op-cell each operand's canonical read
-  position as extra scalars, which `seed_mode=rank` already supplies through the
-  operand values it reads, and enabling both scores worse than seeding alone.
-- **`read_time_mode`: delete the option, keep `rank` only.** The no-regression
-  comparison is satisfied — at the current-best len=2 config on one shared eval
-  corpus, `rank` vs `stamp` is vp 0.0415/0.0405, in_slot 0.973/0.976, out_slot
-  0.999 both, GVN rename 0.0014/0.0013, behavioral 0.0083/0.0084
-  (`runs/t2_len2_d256_s250000_dep4_vp1_pool16_pma_pewrite_time_rtrank_rankfix_writers`).
-  Remaining cost is reminting the frozen T1, which needs CLI plumbing first:
-  `scripts/train_encoder.py` exposes none of the equivariant-core flags, so T1
-  can only be trained at their defaults.
-- **`pool_extra`**: `order` and `event` are both recorded dead ends. Keep
-  `write_time`, delete the rest.
+- **`op_cell_rank`: delete outright** — it feeds the op-cell each operand's
+  canonical read position as extra scalars, which the rank-seeded slots already
+  supply through the operand values the cell reads, and enabling both scores
+  worse than seeding alone.
 - **`pool_mode`**: `compete` is a recorded dead end.
 
 ### 6. Overlap the trainer's host-side work with the GPU step
@@ -583,11 +578,7 @@ wall-clock on every len=2 run.
   relabeled, encoding the relabeled copy with its anonymous tags permuted to
   match. Equivariance is exact by construction, so this reads ~0 for any model at
   all; it is an assertion that the core is intact, not a measure of training
-  quality. **tag-invariance** compares a chunk against itself under a different
-  draw of the anonymous per-chunk tags — a property the model must learn, and
-  therefore one a change can regress. It is vacuous when the encoder seeds from
-  canonical read rank rather than random tags, since then there are no tags.
-  **behavioral** compares a chunk against a variant with a commutative
+  quality. **behavioral** compares a chunk against a variant with a commutative
   instruction's operands swapped. **distinct** is the separation denominator: the
   distance between unrelated chunks.
 
@@ -603,17 +594,24 @@ wall-clock on every len=2 run.
   distinguish different functions. `behav-mixed` pools both and exists only for
   continuity with older records.
 
-  Measured at `--gvn-chunk-len 2`, on genuinely-equivalent pairs. Seeding from
-  canonical read rank: 0.0110, separation 119×, and non-equivalent pairs held
-  apart at 0.88. Seeding from random tags with no read-order in the value
-  channels: 0.0021, separation 579× — tighter, but it collapses the
-  non-equivalent pairs to 0.0003, i.e. it cannot tell those functions apart at
-  all. For scale, the architecture was validated in Phase 14 at 0.0238 and 28×.
+  Measured at `--gvn-chunk-len 2`, on genuinely-equivalent pairs, with T2 seeded
+  from canonical read rank: 0.0110, separation 119×, and non-equivalent pairs
+  held apart at 0.88. Seeding T2 from random tags with no read-order in the
+  value channels instead: 0.0021, separation 579× — tighter, but it collapses
+  the non-equivalent pairs to 0.0003, i.e. it cannot tell those functions apart
+  at all.
 
-  The `rename` row encodes a chunk's relabeled copy with the SAME anonymous
-  per-chunk tags, permuted to match. Drawing independent tags for the two makes
-  that row report tag-invariance instead of equivariance, and inflates it —
-  recorded numbers only compare against each other when they share this.
+  **These ratios resolve large differences only.** The denominator is a mean
+  over a few hundred pairs of a near-zero quantity, so it is tail-dominated: two
+  corpus draws of one configuration give 46.6× and 41.2×, and `scripts/eval.py`
+  and `probes/t2_faithfulness.py` disagree on the SIGN of smaller gaps because
+  they build independent pair samples. **Treat a gap under ~10× as no
+  evidence**, and rank configurations on vp exact match instead, against the
+  floor that matches the comparison — ~0.01 between T2s, 0.023 between frozen
+  T1s (EXPERIMENT_LOG finding 25). Phase 14's 0.0238 / 28× is not a floor to
+  compare against either: it predates the rename-row fix of finding 12, which
+  makes every earlier GVN number incomparable.
+
 - **Magnitude-as-validity — a health check, not a live objective.** The writers
   corpus injects no invalid windows, so every row's validity target is 1 and vp
   consumes `F.normalize(vecs)` anyway; nothing we currently run should produce
@@ -653,11 +651,11 @@ wall-clock on every len=2 run.
   but closing it leaves depth-2 slightly worse (I-type 95.49% → 94.79%).
 - **`pool_mode=compete`.** No vp benefit, and with ordering enabled the essence
   becomes sensitive to the anonymous per-chunk register tags.
-- **Supplying more ordering information TO THE POOL.** Every `pool_extra` cell is
-  spent: `order` and `event` leave the shared-source deficit at ~83% and cost
-  equivalence collapse, and `order`+`rank` is the worst on vp (0.0434 vs the
-  `write_time` baseline's 0.0405) while paying that cost (behavioral 0.0084 →
-  0.0115, separation 310× → 224×). The pool cannot see `content`, so it must use
+- **Supplying the pool more ordering information than the per-slot write step.**
+  Feeding it read-order, or the whole event block, leaves the shared-source
+  deficit at ~83% and costs equivalence collapse; read-order plus canonical
+  ranks is the worst on vp (0.0434 against the write-step baseline's 0.0405)
+  while paying that cost (behavioral 0.0084 → 0.0115, separation 310× → 224×). The pool cannot see `content`, so it must use
   any channel unconditionally; that is the reason, and it does **not** extend to
   content-conditioned consumers. The op-cell is the one consumer this line does
   not cover — see open task 1.
@@ -673,8 +671,8 @@ wall-clock on every len=2 run.
   0.0426 → 0.0373, while an encoder seeded from random tags moves 0.0027 →
   0.0023 over the same 4×; the gap is untouched.
 - **Treating tag-sensitivity as the cause of the commutative-collapse
-  regression.** Removing the random tags entirely (`--seed-mode rank`) takes
-  tag-invariance to the architectural floor and leaves collapse unchanged (0.0426
+  regression.** Removing the random tags entirely takes
+  tag-sensitivity to the architectural floor and leaves collapse unchanged (0.0426
   against `op_cell_rank`'s 0.0366 and a 0.0027 baseline). Both are downstream of
   read-order reaching the essence.
 - **Treating the behavioral row as contaminated.** Commute pairs share the vp
@@ -697,27 +695,24 @@ wall-clock on every len=2 run.
   It gates the `distinct` pool, where unrelated chunks are almost never equivalent,
   so the effect there is small — but the predicate is wrong wherever else it is used.
 - **The test suite does not load any real checkpoint**, so it cannot catch a
-  state_dict incompatibility: adding an unconditional `rank_emb` passed all 283
+  state_dict incompatibility: adding an unconditional `rank_emb` passed all 285
   tests and failed at step 0 of the next run against the frozen T1.
 
 ## How to run
 
-- Frozen T1 `runs/t1_writers_250k/encoder.pt`; corpus
-  `configs/instr_alu_writers.json`.
+- Frozen T1 `runs/t1_writers_250k_rank/encoder.pt` (`run_t2.sh`'s default,
+  overridable with `T1=`); corpus `configs/instr_alu_writers.json`. Checkpoints
+  trained before the core's settings settled do not load.
 - Model knobs on `scripts/train_t2_encoder.py`: `--op-cell-depth`,
-  `--vp-head-depth`, `--n-pool-heads`, `--pool-mode`, `--pool-extra`,
-  `--read-time-mode`, `--op-cell-rank`, `--value-norm`, `--content-skip`, and
-  the loss knob `--vp-depth-weight`. `scripts/run_t2.sh` exposes each as an env
-  var (`DOUT`, `VALNORM`, `DEPTHW`, …) and names the run directory after them.
-  Current best on vp:
-  `d_out=512 op_cell=4 vp_head=1 n_pool_heads=16 pma pool_extra=write_time
-  read_time_mode=rank --seed-mode rank`, i.e. the pool reads each slot's write
-  step, read positions are counted as ranks over registers read before written,
-  and register slots are seeded from those positions rather than random tags.
-  Defaults reproduce pre-Phase-15 behaviour and old checkpoints load unchanged.
-  `--op-cell-rank` widens the op-cell input and `--seed-mode rank` swaps
-  `tag_proj` for `rank_emb`, so checkpoints are only interchangeable within a
-  setting.
+  `--vp-head-depth`, `--n-pool-heads`, `--pool-mode`, `--op-cell-rank`,
+  `--value-norm`, `--content-skip`, and the loss knob `--vp-depth-weight`.
+  `scripts/run_t2.sh` exposes each as an env var (`DOUT`, `VALNORM`, `DEPTHW`,
+  …) and names the run directory after them. Current best on vp:
+  `d_out=512 op_cell=4 vp_head=1 n_pool_heads=16 pma`.
+  **The core's own settings are not knobs** — read positions are canonical
+  ranks, slots are seeded from those ranks, and the pool reads each slot's write
+  step, identically at both tiers. `--op-cell-rank` widens the op-cell input, so
+  checkpoints are only interchangeable within that setting.
 - **Never edit `scripts/run_t2.sh` while a copy of it is running.** Bash reads a
   script incrementally, so an edit shifts the file offsets under the running
   shell. Doing this mid-sweep produced a spurious `syntax error near 'fi'` and
@@ -726,13 +721,15 @@ wall-clock on every len=2 run.
   every eval afterwards, GVN rows unaffected because they build their own pairs.
   Wait for the sweep, or edit a copy.
 - One training cell, generation offloaded to odin:
-  `LEN=2 STEPS=250000 MODES=pma NPOOL=16 PEXTRAS=write_time RTMODE=rank SEEDMODE=rank bash scripts/run_t2.sh`
+  `LEN=2 STEPS=250000 MODES=pma NPOOL=16 bash scripts/run_t2.sh`
 - **A replicate needs `GEN_SEED`.** Both datagen pools default to `--seed 0`, so
   re-running a cell otherwise redraws the same instruction stream and measures
   only initialization variance. `GEN_SEED=7 … TAG=s7 bash scripts/run_t2.sh`
   draws a different corpus from the same distribution. It is unrelated to
   `ANCHOR_SEED`, which must stay equal to the trainer's `--anchor-seed`
-  (INVARIANT 1). At len=2/1M the floor is ±0.01 points of overall exact match.
+  (INVARIANT 1). At len=2/1M, replicating the T2 alone spreads 0.002-0.009
+  points of overall exact match; replicating the frozen T1 beneath it spreads
+  0.023 (EXPERIMENT_LOG finding 25).
 - **A run's `t2.pt` appears long before the run ends** — the trainer checkpoints
   periodically. Wait on the trainer process exiting, or on `run_t2.sh` logging
   `final:`; scoring the file as soon as it exists reads a partial model.
@@ -809,6 +806,18 @@ wall-clock on every len=2 run.
     the same point. Builds the chunks directly and takes a distance, with no
     fitted readout, and asserts through the emulator that the pairs really are
     equivalent;
+  `t1_scorecard.py` — scores a T1 ALONE, which nothing else does (`eval.py`'s
+    GVN rows need a T2): exact 32-bit match of T1's own vp head split by operand
+    type, and the distance between single instructions computing the same
+    function against ones computing different functions, every pair sharing an
+    identical binding so the whole difference is in the essence. **It verifies a
+    T1 is intact; it cannot rank T1s** — every candidate scores 100.0000% on the
+    vp half, and the geometry half's raw distances move 3× across checkpoints
+    with no relation to the settings, so read its ratios and only against a
+    checkpoint's own numbers (findings 23, 25). Pass `n_batches=0` to run the
+    geometry half alone, which builds its instructions in-process and so does
+    not spawn a local `datagen` that would perturb a training run sharing the
+    box;
   `depth_composition.py` — whether a vp deficit is in the essence or the head,
     by refitting and fine-tuning heads on frozen essences; `depth_stage.py` —
     the same quantity recovered at each encoder stage (slot → pool view →

@@ -91,18 +91,16 @@ the whole worker pool.
 hard step cap. Training runs until stdin EOF (`scripts/_common.py:30-34`). Bound
 the batch count with `datagen --count N` (`datagen` has no per-worker `-n`).
 
-**Current T2 config** (writers-only happy path). Three flags are load-bearing
-and non-default: `--pool-extra write_time` and `--read-time-mode rank` /
-`--seed-mode rank` supply the ordering the essence needs — omitting any of them
-reproduces an earlier, worse model rather than erroring:
+**Current T2 config** (writers-only happy path). The equivariant core has no
+settings to pass: read positions are canonical ranks, register slots are seeded
+from those ranks, and the pool reads each slot's write step, at every tier.
 
 ```bash
 python -m datagen --rule "cap=$LEN" --twins 2 --batch-size 128 --n-states 8 \
     --anchor-seed 0 --config configs/instr_alu_writers.json --count "$STEPS" \
-  | python scripts/train_t2_encoder.py --t1-model runs/t1_writers_250k/encoder.pt \
+  | python scripts/train_t2_encoder.py --t1-model runs/t1_writers_250k_rank/encoder.pt \
     --d-out 512 --d-event 16 --op-cell-depth 4 --vp-head-depth 1 \
-    --n-pool-heads 16 --pool-mode pma --pool-extra write_time \
-    --read-time-mode rank --seed-mode rank --route binding \
+    --n-pool-heads 16 --pool-mode pma --route binding \
     --n-steps "$STEPS" --anchor-seed 0 --n-anchor-states 8 --out-dir "$OUT"
 ```
 
@@ -111,25 +109,38 @@ is a real gain and 512 → 1024 buys nothing at any training budget measured, at
 2.6x the step time (EXPERIMENT_LOG phase-15, finding 17).
 
 `scripts/run_t2.sh` runs exactly this cell with each knob as an env var
-(`DOUT`, `LEN`, `STEPS`, `NPOOL`, …), names the run directory after them,
-offloads generation to odin, and scores the result. Prefer it to typing the
-pipeline by hand — but never edit it while a copy is running, since bash reads a
-script incrementally and the running shell will misparse the shifted file.
+(`DOUT`, `LEN`, `STEPS`, `NPOOL`, …, and `T1` for the frozen lower tier), names
+the run directory after them, offloads generation to odin, and scores the
+result. Prefer it to typing the pipeline by hand — but never edit it while a
+copy is running, since bash reads a script incrementally and the running shell
+will misparse the shifted file.
 
-Trainer-CLI asymmetry to know before improvising: the equivariant-core
-architecture flags — `--op-cell-depth`, `--vp-head-depth`, `--n-pool-heads`,
-`--pool-mode {pma,compete}`, `--pool-extra {none,write_time,order,event}`,
-`--read-time-mode {stamp,rank}` — exist **only on `scripts/train_t2_encoder.py`**
-(`scripts/train_t2_encoder.py:39-72`). `scripts/train_encoder.py` does not expose
-them even though `train_compressor` accepts them (`compressor/train.py:514-517`),
-so T1 always trains at their defaults. Passing one to `train_encoder.py` is an
-argparse error, not a silent no-op. (`--pool-extra` replaced the old boolean
-`--pool-reads-order`; old checkpoints are remapped on load by
-`scripts/_common.py:69-74`, `pool_reads_order: true` → `pool_extra:
-'write_time'`. A checkpoint trained when all pool heads shared one value
-projection is likewise remapped on load — `_tile_shared_pool_v` repeats those
-weights once per head, which reproduces the old computation exactly, so old
-multi-head checkpoints still score as they did.)
+**T1 config** (the writers-only corpus T2 is trained against). T1 and T2 run
+the same core at the same settings, so the command below differs from the T2
+cell only in its ingestion front-end and its hparams. The frozen T1 is
+`runs/t1_writers_250k_rank`.
+
+```bash
+python -m datagen --rule single --twins 2 --batch-size 128 --n-states 8 \
+    --anchor-seed 0 --config configs/instr_alu_writers.json --count 250000 \
+  | python scripts/train_encoder.py --d-model 128 --n-heads 4 --n-layers 2 \
+    --d-out 64 --max-window 32 --imm-weight 0.3 \
+    --n-steps 250000 --anchor-seed 0 --n-anchor-states 8 --out-dir "$OUT"
+```
+
+Both trainers expose the same model hparams — `--d-event`, `--op-cell-depth`,
+`--vp-head-depth`, `--n-pool-heads`, `--pool-mode` — since T1 and T2 run the
+same core (`scripts/train_encoder.py`, `scripts/train_t2_encoder.py`).
+`train_t2_encoder.py` additionally carries the three knobs T1 has no use for
+(`--op-cell-rank`, `--value-norm`, `--content-skip`).
+**A checkpoint predating the core's settling will not load.** The core no longer
+has the `read_time_mode` / `seed_mode` / `pool_extra` branches, so a checkpoint
+carrying `tag_proj` instead of `rank_emb`, or a pool sized without the write-step
+channel, fails at `load_state_dict`. Only checkpoints trained at the settled
+configuration are usable; `runs/t1_writers_250k_rank` is the frozen T1.
+(A checkpoint trained when all pool heads shared one value projection is still
+remapped on load — `_tile_shared_pool_v` repeats those weights once per head,
+reproducing the old computation exactly.)
 
 ## INVARIANTS
 
@@ -321,6 +332,12 @@ fail to bind, the second reaps the first's healthy worker pool, and whichever
 exits first tears down the other's pool and `rm -rf`s its shipped sources. The
 shipped `REMOTE_DIR` is already unique (`mktemp`). Halve `REMOTE_GEN` per run so
 the pools do not oversubscribe odin's 128 cores.
+
+The scoring probes `run_t2.sh` invokes each generate their own corpus under
+`/tmp`, keyed by PID so two concurrent cells cannot overwrite each other's. A
+probe added without that key will fail the *other* run's scoring with
+`Bad magic` while its own training completes normally — so a `/tmp` corpus path
+in a new probe needs `os.getpid()` in it.
 
 Worth doing when a single trainer leaves the GPU idle: two concurrent len=2 runs
 hold it at 84–99% util against ~50% for one, at 11 ms/step each against 7 solo —

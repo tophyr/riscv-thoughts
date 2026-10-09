@@ -4,10 +4,14 @@
 #
 #   LEN=2 STEPS=250000 DEPTHW=8 TAG=depthw8 bash scripts/run_t2.sh
 #
+# The equivariant core's settings are no longer knobs: read positions are
+# canonical ranks, register slots are seeded from those ranks, and the pool
+# reads each slot's write step. Those are the only values any tier uses.
+#
 # The run directory encodes the knobs, so two cells that differ in any of them
 # cannot overwrite each other; TAG separates a re-run of an already-recorded
-# cell from the record itself. MODES/PEXTRAS accept several values and the
-# script iterates their product.
+# cell from the record itself. MODES accepts several values and the script
+# iterates them.
 #
 # Scored on vp (encode-upward fidelity), the binding heads, the GVN collapse
 # rows, and the vp error crossed with dataflow depth — a vp win that craters
@@ -16,7 +20,9 @@ set -u
 cd /home/tophy/Projects/riscv-thoughts
 source .venv/bin/activate
 D=/home/tophy/Projects/riscv-thoughts/logs
-T1=runs/t1_writers_250k/encoder.pt
+# The frozen lower tier. A T2 checkpoint is only interchangeable with others
+# trained on the SAME T1, so a cell that changes this must be named for it.
+T1=${T1:-runs/t1_writers_250k_rank/encoder.pt}
 # VP = vp-head hidden layers. The head must EVALUATE the chunk's function at the
 # anchor points, so its capacity is a confound in every vp number; refitting it
 # on frozen essences cannot test that, because depth-2 slots are 2.5% of the
@@ -25,10 +31,7 @@ LEN=${LEN:-2} DOUT=${DOUT:-256} STEPS=${STEPS:-250000} OC=${OC:-4} VP=${VP:-1}
 NPOOL=${NPOOL:-16}
 # compete is only meaningful for k>1 (k=1 degenerates to a uniform mean).
 MODES=${MODES:-"pma compete"}
-PEXTRAS=${PEXTRAS:-"write_time"}
-RTMODE=${RTMODE:-stamp}
 OCRANK=${OCRANK:-0}   # feed the op-cell each operand's canonical read position
-SEEDMODE=${SEEDMODE:-tags}  # leaf identity: random tag, or canonical read rank
 # Weight an output slot at dataflow depth d by DEPTHW^(d-1). 1 = uniform.
 DEPTHW=${DEPTHW:-1}
 # RMSNorm every value entering a register slot (leaf and computed alike).
@@ -39,10 +42,10 @@ SKIP=${SKIP:-0}
 # pure function of the knobs, so it would silently overwrite it).
 TAG=${TAG:-}
 
-cell() {  # MODE POOL_EXTRA
-  local MODE=$1 PE=$2
-  local OUT=t2_len${LEN}_d${DOUT}_s${STEPS}_dep${OC}_vp${VP}_pool${NPOOL}_${MODE}_pe${PE}_rt${RTMODE}${OCRANK:+$([ "$OCRANK" = 1 ] && echo _ocrank)}$([ "$SEEDMODE" != tags ] && echo _seed$SEEDMODE)$([ "$DEPTHW" != 1 ] && echo _dw$DEPTHW)$([ "$VALNORM" = 1 ] && echo _vnorm)$([ "$SKIP" = 1 ] && echo _cskip)${TAG:+_$TAG}_writers
-  echo "######## $(date '+%m-%d %H:%M:%S')  mode=$MODE  pool_extra=$PE  -> $OUT"
+cell() {  # MODE
+  local MODE=$1
+  local OUT=t2_len${LEN}_d${DOUT}_s${STEPS}_dep${OC}_vp${VP}_pool${NPOOL}_${MODE}${OCRANK:+$([ "$OCRANK" = 1 ] && echo _ocrank)}$([ "$DEPTHW" != 1 ] && echo _dw$DEPTHW)$([ "$VALNORM" = 1 ] && echo _vnorm)$([ "$SKIP" = 1 ] && echo _cskip)${TAG:+_$TAG}_writers
+  echo "######## $(date '+%m-%d %H:%M:%S')  mode=$MODE  -> $OUT"
   # Generation runs on odin (multinode_gen.sh, LOCAL_GEN=0) so local cores stay
   # free for the trainer's per-step host work. ANCHOR_SEED must equal the
   # trainer's --anchor-seed (INVARIANT 1). The config carries no invalidity
@@ -52,9 +55,9 @@ cell() {  # MODE POOL_EXTRA
     ./multinode_gen.sh "$STEPS" \
     | python scripts/train_t2_encoder.py --t1-model "$T1" \
       --d-out "$DOUT" --d-event 16 --op-cell-depth "$OC" --vp-head-depth "$VP" \
-      --n-pool-heads "$NPOOL" --pool-mode "$MODE" --pool-extra "$PE" \
-      --read-time-mode "$RTMODE" $([ "$OCRANK" = 1 ] && echo --op-cell-rank) \
-      --seed-mode "$SEEDMODE" --vp-depth-weight "$DEPTHW" \
+      --n-pool-heads "$NPOOL" --pool-mode "$MODE" \
+      $([ "$OCRANK" = 1 ] && echo --op-cell-rank) \
+      --vp-depth-weight "$DEPTHW" \
       $([ "$VALNORM" = 1 ] && echo --value-norm) \
       $([ "$SKIP" = 1 ] && echo --content-skip) --route binding \
       --n-steps "$STEPS" --anchor-seed 0 --n-anchor-states 8 --out-dir "$OUT" \
@@ -91,5 +94,5 @@ if [ ! -f "/tmp/t2_eval_${LEN}.rvt" ]; then
       > "/tmp/t2_eval_${LEN}.rvt" 2>/dev/null
 fi
 
-for MODE in $MODES; do for PE in $PEXTRAS; do cell "$MODE" "$PE"; done; done
-echo "######## 2x2 COMPLETE $(date '+%m-%d %H:%M:%S') ########"
+for MODE in $MODES; do cell "$MODE"; done
+echo "######## COMPLETE $(date '+%m-%d %H:%M:%S') ########"

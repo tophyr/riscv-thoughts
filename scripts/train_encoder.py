@@ -34,6 +34,28 @@ def main():
                    help='Position-embedding table size. Must accommodate '
                         'the longest chunk (9 tokens × max instructions).')
 
+    # The equivariant core's settings. T1 and T2 run the SAME core, so these
+    # have to be reachable from both entry points; defaults reproduce the
+    # pre-Phase-15 T1 exactly. See scripts/train_t2_encoder.py for the
+    # counterparts.
+    p.add_argument('--d-event', type=int, default=16,
+                   help='Per-slot event-channel width (read/write trace).')
+    p.add_argument('--op-cell-depth', type=int, default=1,
+                   help='Number of op-cell blocks (1 = shallow baseline; '
+                        '>1 stacks residual FFN blocks for deeper composition).')
+    p.add_argument('--vp-head-depth', type=int, default=4,
+                   help='vp value-prediction head hidden layers (4 = default; '
+                        '0 = linear — weakens the head to force the essence to '
+                        'expose value structure geometrically).')
+    p.add_argument('--n-pool-heads', type=int, default=1,
+                   help='essence pool seed queries (1 = single-query sum; '
+                        '>1 = multi-head, keeps multiple outputs separable). '
+                        'Must divide d_out.')
+    p.add_argument('--pool-mode', choices=('pma', 'compete'), default='pma',
+                   help='pma = each head independently pools slots (heads can '
+                        'collapse); compete = Slot-Attention, slots divide among '
+                        'heads so they cover the register file (needs >1 head).')
+
     add_common_train_args(p)
 
     p.add_argument('--valid-weight', type=float, default=0.1)
@@ -91,6 +113,9 @@ def main():
         reader,
         d_model=args.d_model, n_heads=args.n_heads, n_layers=args.n_layers,
         d_out=args.d_out, max_window=args.max_window,
+        d_event=args.d_event, op_cell_depth=args.op_cell_depth,
+        vp_head_depth=args.vp_head_depth, n_pool_heads=args.n_pool_heads,
+        pool_mode=args.pool_mode,
         lr=args.lr, n_steps=args.n_steps, log_every=args.log_every,
         valid_weight=args.valid_weight,
         live_in_weight=args.live_in_weight,

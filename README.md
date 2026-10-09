@@ -78,12 +78,17 @@ next tier to build on? T1 (one instruction) is a foundation, not evidence. T2
 can answer it.
 
 **The architecture under test.** A tier is a register-indexed state machine
-(one `Compressor` class, `compressor/model.py`): it seeds 32 register slots,
-then per instruction reads its operand slots, applies a shared op-cell, and
+(one `Compressor` class, `compressor/model.py`): 32 register slots start empty,
+then per instruction it reads its operand slots, applies a shared op-cell, and
 writes the destination slot, emitting the final register-indexed state. Reads
 and writes are pure one-hot operations and no parameter is indexed by register,
 so renaming registers **permutes the slots exactly** — equivariance holds by
-construction, not by training. The essence is a permutation-invariant pool over
+construction, not by training. A slot acquires its identity on first read, from
+the register's position in the chunk's read order, which is what distinguishes
+one input from another without naming either; because that position is a
+property of the instruction rather than of a random draw, a tier's output is a
+deterministic function of its input, which is what the equivalence criterion
+below requires. The essence is a permutation-invariant pool over
 that state; the per-slot remainder is the binding. T1 is literally T2 with
 `seq_len=1`; the only tier-specific piece is what supplies content — T1 embeds
 one instruction's tokens, T2 is fed a frozen T1's per-instruction essence.

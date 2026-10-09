@@ -371,9 +371,8 @@ def test_t1_compressor_uses_t2_binding_heads():
     toks = encode_instruction(instr)
     tok = torch.tensor([toks]); pad = torch.zeros(1, len(toks), dtype=torch.bool)
     i0, i1, o = instruction_wiring(instr)
-    tags = torch.randn(1, enc.n_regs); tags[:, 0] = 0.0
     T, ess = enc.encode_state(
-        tok, pad, torch.tensor([i0]), torch.tensor([i1]), torch.tensor([o]), tags)
+        tok, pad, torch.tensor([i0]), torch.tensor([i1]), torch.tensor([o]))
 
     n = enc.n_regs
     live_in = torch.zeros(1, n); live_in[0, [1, 2]] = 1.0
@@ -481,11 +480,10 @@ def test_t2compressor_forward_shape_and_padding_contract():
     out = torch.randint(1, R, (B, N))
     # row 2 is a 1-instruction chunk (rest padded -> active=0, no-op).
     active = torch.ones(B, N); active[2, 1:] = 0.0
-    tags = torch.randn(B, R)
 
-    T, essence = t2.encode_state(seq, in0, in1, out, active, tags)
+    T, essence = t2.encode_state(seq, in0, in1, out, active)
     assert T.shape == (B, R, 12 + 16)
     assert essence.shape == (B, 12)
     assert not torch.isnan(T).any() and not torch.isnan(essence).any()
     # encode() returns just the essence.
-    assert torch.allclose(t2.encode(seq, in0, in1, out, active, tags), essence)
+    assert torch.allclose(t2.encode(seq, in0, in1, out, active), essence)

@@ -4,7 +4,6 @@ Pure functions, no CLI (driven by scripts/eval.py and the test suite);
 each returns a flat dict of metrics. Coverage:
 
   equivariance_error   — relabel -> state permutes EXACTLY, essence invariant
-  tag_invariance       — essence stable across anonymous-tag resamples (~1 cos)
   t1_binding_accuracy  — live_in/out, pc, in/out-slot order, dup rate (T1)
   t2_binding_accuracy  — same, routing off T1's predicted binding (T2)
   gvn_collapse         — essence distance split by pair type: rename-twin
@@ -66,13 +65,10 @@ def decoder_accuracy(encoder, decoder, batches, *,
         tok = torch.from_numpy(batch.tokens).to(device).long()
         pad = torch.from_numpy(padding_mask(batch)).to(device)
         in0, in1, out = _t1_wiring(batch)
-        tags = np.random.standard_normal(
-            (batch.tokens.shape[0], encoder.n_regs)).astype(np.float32)
         vecs_all = encoder.encode(
             tok, pad,
             torch.from_numpy(in0).to(device), torch.from_numpy(in1).to(device),
-            torch.from_numpy(out).to(device),
-            torch.from_numpy(tags).to(device))
+            torch.from_numpy(out).to(device))
         valid_idx = np.flatnonzero(valid)
         vecs = vecs_all[valid_idx]
         token_lists = []
@@ -134,15 +130,15 @@ def _chunks_to_split(chunks):
 
 
 @torch.no_grad()
-def encode_chunks_t2(t1, t2, chunks, device, *, route='binding', tags=None):
+def encode_chunks_t2(t1, t2, chunks, device, *, route='binding'):
     """Essence (n_chunks, d_out) for a list of Instruction-list chunks, run
-    through frozen T1 -> T2 with the given routing. Deterministic tags can be
-    passed to remove tag noise from a comparison."""
+    through frozen T1 -> T2 with the given routing. Deterministic: the same
+    chunks always give the same essences."""
     split = _chunks_to_split(chunks)
     n_chunks = len(chunks)
     max_ni = max((len(c) for c in chunks), default=1)
     return t2_chunk_forward(t1, t2, split, n_chunks, max_ni, device,
-                            t2_tags=tags, route=route)
+                            route=route)
 
 
 # ===========================================================================
@@ -152,10 +148,10 @@ def encode_chunks_t2(t1, t2, chunks, device, *, route='binding', tags=None):
 @torch.no_grad()
 def equivariance_error(encoder, batch, *, device, seed=0):
     """Exact-equivariance check on a trained T1: relabel registers (permute
-    the wiring + per-slot tags; content is register-invariant by construction)
-    and confirm the emitted state permutes identically and the essence is
-    invariant. Both ~0 by construction — this verifies it on the *trained*
-    weights. Returns {'state_max_err', 'essence_max_err'}."""
+    the wiring; content is register-invariant by construction) and confirm the
+    emitted state permutes identically and the essence is invariant. Both ~0 by
+    construction — this verifies it on the *trained* weights. Returns
+    {'state_max_err', 'essence_max_err'}."""
     encoder.eval()
     R = encoder.n_regs
     tok = torch.from_numpy(batch.tokens).to(device).long()
@@ -165,19 +161,14 @@ def equivariance_error(encoder, batch, *, device, seed=0):
     rng = np.random.default_rng(seed)
     perm = np.arange(R)
     perm[1:] = rng.permutation(R - 1) + 1            # fix slot 0 (x0)
-    tags = rng.standard_normal((B, R)).astype(np.float32)
-    tags[:, X0_SLOT] = 0.0
-    tags_p = np.empty_like(tags)
-    tags_p[:, perm] = tags
-
-    def enc(i0, i1, o, tg):
+    def enc(i0, i1, o):
         return encoder.encode_state(
             tok, pad,
             torch.from_numpy(i0).to(device), torch.from_numpy(i1).to(device),
-            torch.from_numpy(o).to(device), torch.from_numpy(tg).to(device))
+            torch.from_numpy(o).to(device))
 
-    T, ess = enc(in0, in1, out, tags)
-    T_p, ess_p = enc(perm[in0], perm[in1], perm[out], tags_p)
+    T, ess = enc(in0, in1, out)
+    T_p, ess_p = enc(perm[in0], perm[in1], perm[out])
     perm_t = torch.from_numpy(perm).to(device)
     T_exp = torch.empty_like(T)
     T_exp[:, perm_t] = T
@@ -185,34 +176,6 @@ def equivariance_error(encoder, batch, *, device, seed=0):
         'state_max_err': float((T_p - T_exp).abs().max()),
         'essence_max_err': float((ess_p - ess).abs().max()),
     }
-
-
-@torch.no_grad()
-def tag_invariance(encoder, batch, *, device, n=4, seed=0):
-    """Essence stability across anonymous-tag resamples: a trained encoder
-    learns the tags are 'these inputs differ', not identities, so the essence
-    is ~constant in the tag. Returns mean/min pairwise cosine across n
-    resamples. T1 only (essence path)."""
-    encoder.eval()
-    R = encoder.n_regs
-    tok = torch.from_numpy(batch.tokens).to(device).long()
-    pad = torch.from_numpy(padding_mask(batch)).to(device)
-    in0, in1, out = (torch.from_numpy(a).to(device) for a in _t1_wiring(batch))
-    B = tok.shape[0]
-    rng = np.random.default_rng(seed)
-    essences = []
-    for _ in range(n):
-        tags = rng.standard_normal((B, R)).astype(np.float32)
-        tags[:, X0_SLOT] = 0.0
-        v = encoder.encode(tok, pad, in0, in1, out,
-                           torch.from_numpy(tags).to(device))
-        essences.append(F.normalize(v, dim=-1))
-    cosines = []
-    for i in range(n):
-        for j in range(i + 1, n):
-            cosines.append((essences[i] * essences[j]).sum(-1))   # (B,)
-    cos = torch.cat(cosines)
-    return {'tag_cos_mean': float(cos.mean()), 'tag_cos_min': float(cos.min())}
 
 
 # ===========================================================================
@@ -321,9 +284,7 @@ def t1_binding_accuracy(encoder, batches, *, device, max_batches=20):
         tok = torch.from_numpy(batch.tokens).to(device).long()
         pad = torch.from_numpy(padding_mask(batch)).to(device)
         in0, in1, out = (torch.from_numpy(a).to(device) for a in _t1_wiring(batch))
-        tags = torch.randn(tok.shape[0], encoder.n_regs, device=device)
-        tags[:, X0_SLOT] = 0.0
-        T, ess = encoder.encode_state(tok, pad, in0, in1, out, tags)
+        T, ess = encoder.encode_state(tok, pad, in0, in1, out)
         li, lo, pc, in_slot, out_slot, active = _targets(batch, device)
         _accumulate(acc, _binding_metrics(
             encoder, T, ess, live_in=li, live_out=lo, pc_writes=pc,
@@ -346,10 +307,10 @@ def t2_binding_accuracy(t1, t2, batches, *, device, route='binding',
         if split[0].shape[0] == 0:
             continue
         n_chunks, max_ni = batch.instr_lens.shape
-        tags = torch.randn(n_chunks, t2.n_regs, device=device)
+
         chunk_t1, c0, c1, co, cact = _t2_assemble(
             t1, split, n_chunks, max_ni, device, route=route)
-        T, ess = t2.encode_state(chunk_t1, c0, c1, co, cact, tags)
+        T, ess = t2.encode_state(chunk_t1, c0, c1, co, cact)
         li, lo, pc, in_slot, out_slot, active = _targets(batch, device)
         _accumulate(acc, _binding_metrics(
             t2, T, ess, live_in=li, live_out=lo, pc_writes=pc,
@@ -406,12 +367,9 @@ def gvn_collapse(t1, t2, *, device, route='binding', n=200, chunk_len=4,
                  seed=0):
     """Essence-distance GVN collapse, SPLIT by pair type:
 
-      rename     — chunk vs a random register-relabeling, with the twin's TAGS
-                   permuted by the same relabeling. Equivariance is exact by
-                   construction, so this must read ~0 for ANY model: it is an
-                   architecture assertion, not a quality signal. (Drawing
-                   INDEPENDENT tags here instead makes it report tag-invariance,
-                   which is a different property — reported separately below.)
+      rename     — chunk vs a random register-relabeling. Equivariance is
+                   exact by construction, so this must read ~0 for ANY model:
+                   it is an architecture assertion, not a quality signal.
       behavioral — chunk vs a commutative-operand-swap variant (a+b==b+a),
                    reported SPLIT by whether the swap actually preserved the
                    chunk's function. Collapsing the equivalent ones is TRAINED
@@ -429,7 +387,7 @@ def gvn_collapse(t1, t2, *, device, route='binding', n=200, chunk_len=4,
     anchors = make_anchor_states(8, 0)
     table = build_opcode_table(DEFAULT_DISTRIBUTION)
 
-    bases, twins, commutes, perms = [], [], [], []
+    bases, twins, commutes = [], [], []
     while len(bases) < n:
         chunk = [random_instruction(rng, opcode_table=table)
                  for _ in range(chunk_len)]
@@ -444,33 +402,12 @@ def gvn_collapse(t1, t2, *, device, route='binding', n=200, chunk_len=4,
         bases.append(chunk)
         twins.append(relabel(chunk, perm))
         commutes.append(cv)
-        perms.append(perm)
 
-    # ONE tag draw shared by base / twin / commute, so each row isolates the
-    # distinction it names instead of also measuring tag noise. The twin's tags
-    # are PERMUTED by its own relabeling (a rename moves the register AND the
-    # anonymous tag riding on it); the commute variant keeps the same registers,
-    # so it keeps the same tags.
-    R = t2.n_regs
-    base_tags = torch.from_numpy(
-        rng.standard_normal((len(bases), R)).astype(np.float32)).to(device)
-    twin_tags = torch.empty_like(base_tags)
-    for i, perm in enumerate(perms):
-        twin_tags[i, torch.from_numpy(perm.astype(np.int64)).to(device)] = \
-            base_tags[i]
-    alt_tags = torch.from_numpy(
-        rng.standard_normal((len(bases), R)).astype(np.float32)).to(device)
+    def enc(chunks):
+        return F.normalize(
+            encode_chunks_t2(t1, t2, chunks, device, route=route), dim=-1)
 
-    def enc(chunks, tags):
-        v = encode_chunks_t2(t1, t2, chunks, device, route=route, tags=tags)
-        return F.normalize(v, dim=-1)
-
-    eb, et, ec = (enc(bases, base_tags), enc(twins, twin_tags),
-                  enc(commutes, base_tags))
-    # tag-invariance: the SAME chunk under a different anonymous tag draw. Not
-    # architectural — the model must learn to use tags only as "these inputs
-    # differ", never as identity — so it belongs on its own row.
-    d_tag = (eb - enc(bases, alt_tags)).norm(dim=-1)
+    eb, et, ec = enc(bases), enc(twins), enc(commutes)
     d_rename = (eb - et).norm(dim=-1)
     d_behav = (eb - ec).norm(dim=-1)
     # Swapping a commutative op's operands changes the chunk's first-read order.
@@ -499,7 +436,6 @@ def gvn_collapse(t1, t2, *, device, route='binding', n=200, chunk_len=4,
                   float(d_distinct.mean()))
     return {
         'rename_mean': rn, 'behavioral_mean': bh, 'distinct_mean': ds,
-        'tag_mean': float(d_tag.mean()),
         'behavioral_eq_mean': float(d_behav_eq.mean()) if d_behav_eq.numel() else None,
         'behavioral_ne_mean': float(d_behav_ne.mean()) if d_behav_ne.numel() else None,
         'n_behavioral_eq': int(eq_flag.sum()), 'n_behavioral_ne': int((~eq_flag).sum()),

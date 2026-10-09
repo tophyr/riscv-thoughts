@@ -25,6 +25,7 @@ achieve; it cannot show the op-cell would learn to use it.
 
 Usage: opcell_rank_sufficiency.py <t2_dir> <t1_path> [n_batches]
 """
+import os
 import subprocess
 import sys
 
@@ -55,7 +56,7 @@ t1 = load_frozen_encoder(T1_PATH, dev)
 t2, _ = load_t2(T2_DIR, t1, dev)
 core = t2.core
 
-CORPUS = '/tmp/opcell_rank.rvt'
+CORPUS = f'/tmp/opcell_rank_{os.getpid()}.rvt'
 subprocess.run(
     f'python -m datagen --rule "cap=2" --twins 0 --batch-size 128 '
     f'--n-states {N_ANCHORS} --anchor-seed {ANCHOR_SEED} '
@@ -78,11 +79,10 @@ with open(CORPUS, 'rb') as f:
         nch, mni = batch.instr_lens.shape
         if mni < 2:
             continue
-        tags = torch.randn(nch, t2.n_regs, device=dev)
         ct1, c0, c1, co, cact = _t2_assemble(
             t1, split, nch, mni, dev, route='binding')
         with torch.no_grad():
-            T, _ = core(ct1, c0, c1, co, cact, tags)
+            T, _ = core(ct1, c0, c1, co, cact)
 
         in_slot = batch.in_slot_regs.astype(np.int64)
         out_regs_t = torch.from_numpy(batch.out_regs.astype(np.int64)).to(dev)

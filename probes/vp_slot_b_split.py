@@ -75,11 +75,10 @@ with open(CORPUS, 'rb') as f:
         nch, mni = batch.instr_lens.shape
         if mni < 2:
             continue
-        tags = torch.randn(nch, t2.n_regs, device=dev)
         ct1, c0, c1, co, cact = _t2_assemble(
             t1, split, nch, mni, dev, route='binding')
         with torch.no_grad():
-            _, ess = core(ct1, c0, c1, co, cact, tags)
+            _, ess = core(ct1, c0, c1, co, cact)
 
         in_slot = batch.in_slot_regs.astype(np.int64)      # canonical read order
         out_slot_t = torch.from_numpy(

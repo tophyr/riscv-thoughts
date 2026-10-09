@@ -80,7 +80,6 @@ def vp_exact(head, ess, in_slot, out_slot, out_regs):
     return hit.all(-1)[:, :, 0].float().mean(1)          # slot 0 = the writer
 
 
-assert t2.core.pool_extra == 'write_time', t2.core.pool_extra
 ess1, ess2, slot2, pv2, imm, is_i, ok1, ok2 = [], [], [], [], [], [], [], []
 with open(CORPUS, 'rb') as f:
     for batch in RVT_FORMAT.reader(f, Batch):
@@ -94,12 +93,10 @@ with open(CORPUS, 'rb') as f:
                 torch.from_numpy(itok).to(dev).long(),
                 torch.from_numpy(ipad).to(dev),
                 torch.from_numpy(w0).to(dev), torch.from_numpy(w1).to(dev),
-                torch.from_numpy(wo).to(dev),
-                torch.randn(itok.shape[0], t1.n_regs, device=dev))
+                torch.from_numpy(wo).to(dev))
             ct1, c0, c1, co, cact = _t2_assemble(t1, split, nch, mni, dev,
                                                  route='binding')
-            T2_state, e2 = t2.core(ct1, c0, c1, co, cact,
-                                   torch.randn(nch, t2.n_regs, device=dev))
+            T2_state, e2 = t2.core(ct1, c0, c1, co, cact)
             # the one slot this chunk writes, before the pool sees it
             w2 = T2_state.gather(
                 1, co[:, :1].unsqueeze(-1).expand(-1, -1, T2_state.shape[-1])

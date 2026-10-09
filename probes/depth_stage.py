@@ -23,6 +23,7 @@ is measuring its own budget rather than the stage.
 
 Usage: depth_stage.py <t2_dir> <t1_path> [n_batches] [steps]
 """
+import os
 import subprocess
 import sys
 
@@ -50,9 +51,8 @@ dev = resolve_device('auto')
 t1 = load_frozen_encoder(T1_PATH, dev)
 t2, _ = load_t2(T2_DIR, t1, dev)
 core = t2.core
-assert core.pool_extra == 'write_time', core.pool_extra
 
-CORPUS = f'/tmp/depth_stage_len{LEN}.rvt'
+CORPUS = f'/tmp/depth_stage_len{LEN}_{os.getpid()}.rvt'
 subprocess.run(
     f'python -m datagen --rule "cap={LEN}" --twins 0 --batch-size 128 '
     f'--n-states {N_ANCHORS} --anchor-seed {ANCHOR_SEED} '
@@ -87,8 +87,7 @@ with open(CORPUS, 'rb') as f:
         with torch.no_grad():
             ct1, c0, c1, co, cact = _t2_assemble(
                 t1, split, nch, mni, dev, route='binding')
-            T, ess = core(ct1, c0, c1, co, cact,
-                          torch.randn(nch, core.n_regs, device=dev))
+            T, ess = core(ct1, c0, c1, co, cact)
             # The pool's whole view of every slot. write_time is REPLAYED from
             # the wiring rather than read off the state: event channel 1 holds
             # write_time plus the accumulated write/read pulses, so it is not

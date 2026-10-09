@@ -87,8 +87,7 @@ def score(chunks, target_reg, bs=256):
         with torch.no_grad():
             ct1, c0, c1, co, cact = _t2_assemble(
                 t1, split, n, max(len(x) for x in sub), dev, route='binding')
-            ess = t2.encode(ct1, c0, c1, co, cact,
-                            torch.randn(n, t2.n_regs, device=dev))
+            ess = t2.encode(ct1, c0, c1, co, cact)
         pre = [precompute_chunk(c, anchors_np) for c in sub]
         in_slot = torch.from_numpy(
             np.stack([p.in_slot_regs for p in pre]).astype(np.int64)).to(dev)

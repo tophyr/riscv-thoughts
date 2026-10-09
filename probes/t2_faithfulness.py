@@ -41,10 +41,8 @@ while len(bases) < N:
         continue
     bases.append(chunk); twins.append(random_relabel(chunk, rng)); commutes.append(cv)
 
-R = t2.n_regs
 def enc(chunks):
-    tags = torch.from_numpy(rng.standard_normal((len(chunks), R)).astype(np.float32)).to(dev)
-    return encode_chunks_t2(t1, t2, chunks, dev, route='binding', tags=tags)
+    return encode_chunks_t2(t1, t2, chunks, dev, route='binding')
 
 eb_raw = enc(bases)
 norm = eb_raw.norm(dim=-1).cpu().numpy()
@@ -52,7 +50,18 @@ eb = F.normalize(eb_raw, dim=-1)
 et = F.normalize(enc(twins), dim=-1)
 ec = F.normalize(enc(commutes), dim=-1)
 d_rename = (eb - et).norm(dim=-1).mean().item()
-d_behav = (eb - ec).norm(dim=-1).mean().item()
+# Split the commutative pairs by whether the swap actually PRESERVED the
+# function. Swapping a commutative op's operands reorders the chunk's first
+# reads, so if a later instruction reads one of them the two chunks compute
+# different canonical functions; those ~2% sit at the `distinct` scale and
+# inflate a pooled mean several-fold.
+d_all = (eb - ec).norm(dim=-1)
+eq = [i for i in range(len(bases))
+      if _behaviorally_equal(bases[i], commutes[i], anchors) is True]
+ne = [i for i in range(len(bases))
+      if _behaviorally_equal(bases[i], commutes[i], anchors) is False]
+d_behav = d_all[eq].mean().item() if eq else float('nan')
+d_behav_ne = d_all[ne].mean().item() if ne else float('nan')
 
 perm = rng.permutation(len(bases))
 d_distinct = []
@@ -65,7 +74,11 @@ d_distinct = float(np.mean(d_distinct)) if d_distinct else float('nan')
 
 print(f"on-sphere: T2 essence norm median={np.median(norm):.3f} p1={np.percentile(norm,1):.3f} min={norm.min():.3f} frac<0.9={100*(norm<0.9).mean():.1f}%")
 print(f"rename      mean dist={d_rename:.4f}   (equivariance -> ~0)")
-print(f"commutative mean dist={d_behav:.4f}   (trained GVN collapse -> small)")
-print(f"distinct    mean dist={d_distinct:.4f}   (must be >> the above)")
+print(f"commutative mean dist={d_behav:.4f}   (swap PRESERVED the function; "
+      f"n={len(eq)} — trained GVN collapse -> small) <- judge collapse on this")
+print(f"commut-diff mean dist={d_behav_ne:.4f}   (swap CHANGED the function; "
+      f"n={len(ne)} — SHOULD be large)")
+print(f"distinct    mean dist={d_distinct:.4f}   (must be >> the collapse row)")
 ratio = d_distinct / max(d_behav, 1e-6)
-print(f"separation ratio distinct/commutative = {ratio:.1f}x")
+print(f"separation ratio distinct/commutative = {ratio:.1f}x   "
+      f"(equivalent pairs only)")

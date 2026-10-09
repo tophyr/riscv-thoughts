@@ -5,7 +5,7 @@ sharing the essence?
 Corpus: len=2, R-type only (no immediates), filtered to DATA-INDEPENDENT pairs
 (instr 2 neither reads instr 1's destination nor writes the same register).
 
-Each chunk is encoded TWICE with IDENTICAL tags:
+Each chunk is encoded TWICE:
   both  - active=[1,1], so the essence must hold TWO outputs
   solo  - active=[1,0], instruction 2 masked off; ONE output in the essence
 
@@ -23,6 +23,7 @@ the head is the bottleneck.
 
 Usage: vp_superposition.py <t2_dir> <t1_path> [n_batches]
 """
+import os
 import subprocess
 import sys
 
@@ -53,7 +54,7 @@ t1 = load_frozen_encoder(T1_PATH, dev)
 t2, _ = load_t2(T2_DIR, t1, dev)
 core = t2.core
 
-CORPUS = '/tmp/vp_super_r2.rvt'
+CORPUS = f'/tmp/vp_super_r2_{os.getpid()}.rvt'
 subprocess.run(
     f'python -m datagen --rule "cap=2" --twins 0 --batch-size 128 '
     f'--n-states {N_ANCHORS} --anchor-seed {ANCHOR_SEED} '
@@ -117,16 +118,14 @@ with open(CORPUS, 'rb') as f:
         if not keep.any():
             continue
         n_indep += int(keep.sum())
-
-        tags = torch.randn(nch, t2.n_regs, device=dev)
         ct1, c0, c1, co, cact = _t2_assemble(
             t1, split, nch, mni, dev, route='binding')
         # isolate ONLY the instruction that wrote the analysed slot
         solo_active = torch.zeros_like(cact)
         solo_active[:, SLOT] = cact[:, SLOT]
         with torch.no_grad():
-            T_b, ess_b = core(ct1, c0, c1, co, cact, tags)          # both
-            T_s, ess_s = core(ct1, c0, c1, co, solo_active, tags)   # solo
+            T_b, ess_b = core(ct1, c0, c1, co, cact)          # both
+            T_s, ess_s = core(ct1, c0, c1, co, solo_active)   # solo
 
         in_slot = torch.from_numpy(batch.in_slot_regs.astype(np.int64)).to(dev)
         out_slot = torch.from_numpy(batch.out_slot_regs.astype(np.int64)).to(dev)

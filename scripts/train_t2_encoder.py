@@ -52,24 +52,7 @@ def main():
                         'collapse); compete = Slot-Attention, slots divide among '
                         'heads so they cover the register file (needs >1 head).')
 
-    p.add_argument('--pool-extra',
-                   choices=('none', 'write_time', 'order', 'event'),
-                   default='none',
-                   help='what the essence pool reads per slot beyond the '
-                        'value channels: write_time = output order; order = '
-                        '+read_time (canonical input positions); event = the '
-                        'whole slot state. All register-indexed, so the pool '
-                        'stays exactly rename-invariant.')
 
-    p.add_argument('--read-time-mode', choices=('stamp', 'rank'),
-                   default='stamp',
-                   help="how a slot's first-read is stamped. 'stamp' (legacy) "
-                        'writes 2(k+1)+role, which equals the canonical input '
-                        'position only while every read is fresh — a repeated '
-                        'source register leaves a hole and every later operand '
-                        "overshoots. 'rank' stamps the running count of "
-                        'DISTINCT registers read, so read_time IS the canonical '
-                        'position.')
 
     p.add_argument('--op-cell-rank', action='store_true',
                    help="feed the op-cell each operand's canonical read "
@@ -77,17 +60,9 @@ def main():
                         'sees content, so it must apply it unconditionally, '
                         'which breaks commutative collapse); the op-cell can, '
                         'since it sees the opcode and both operands together. '
-                        'Requires --read-time-mode rank; widens op_cell, so '
+                        'Widens op_cell, so '
                         'checkpoints trained with it are not interchangeable.')
 
-    p.add_argument('--seed-mode', choices=('tags', 'rank'), default='tags',
-                   help="how an input register's leaf identity enters the "
-                        "state. 'tags' = a per-chunk random tag "
-                        '(distinguishable but anonymous; invariance to it is '
-                        "LEARNED). 'rank' = its canonical read position, "
-                        'written on first read — the same distinguishability '
-                        'deterministically, so there is no tag to be invariant '
-                        'to. Requires --read-time-mode rank.')
 
     p.add_argument('--value-norm', action='store_true',
                    help='RMSNorm every value as it enters a register slot. A '
@@ -190,9 +165,7 @@ def main():
         reader, t1,
         d_out=args.d_out, d_event=args.d_event, op_cell_depth=args.op_cell_depth,
         vp_head_depth=args.vp_head_depth, n_pool_heads=args.n_pool_heads,
-        pool_mode=args.pool_mode, pool_extra=args.pool_extra,
-        read_time_mode=args.read_time_mode, op_cell_rank=args.op_cell_rank,
-        seed_mode=args.seed_mode,
+        pool_mode=args.pool_mode, op_cell_rank=args.op_cell_rank,
         value_norm=args.value_norm,
         content_skip=args.content_skip,
         lr=args.lr, n_steps=args.n_steps, log_every=args.log_every,

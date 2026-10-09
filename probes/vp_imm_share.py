@@ -18,6 +18,7 @@ penalty independent of operand type.
 Model's own trained head, forward passes only.
 Usage: vp_imm_share.py <t2_dir> <t1_path> [chunk_len] [n_batches]
 """
+import os
 import subprocess
 import sys
 
@@ -45,7 +46,7 @@ t1 = load_frozen_encoder(T1_PATH, dev)
 t2, _ = load_t2(T2_DIR, t1, dev)
 core = t2.core
 
-CORPUS = f'/tmp/vp_imm_len{LEN}.rvt'
+CORPUS = f'/tmp/vp_imm_len{LEN}_{os.getpid()}.rvt'
 subprocess.run(
     f'python -m datagen --rule "cap={LEN}" --twins 0 --batch-size 128 '
     f'--n-states {N_ANCHORS} --anchor-seed {ANCHOR_SEED} '
@@ -83,11 +84,10 @@ with open(CORPUS, 'rb') as f:
             continue
         (_, _, chunk_idx, slot_idx, n_per_chunk, w0, w1, wo) = split
         nch, mni = batch.instr_lens.shape
-        tags = torch.randn(nch, t2.n_regs, device=dev)
         ct1, c0, c1, co, cact = _t2_assemble(
             t1, split, nch, mni, dev, route='binding')
         with torch.no_grad():
-            _, ess = core(ct1, c0, c1, co, cact, tags)
+            _, ess = core(ct1, c0, c1, co, cact)
 
         in_slot = torch.from_numpy(batch.in_slot_regs.astype(np.int64)).to(dev)
         out_slot = torch.from_numpy(batch.out_slot_regs.astype(np.int64)).to(dev)

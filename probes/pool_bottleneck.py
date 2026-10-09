@@ -78,8 +78,7 @@ with open(CORPUS, 'rb') as f:
         with torch.no_grad():
             ct1, c0, c1, co, cact = _t2_assemble(t1, split, nch, mni, dev,
                                                  route='binding')
-            T2_state, _ = t2.core(ct1, c0, c1, co, cact,
-                                  torch.randn(nch, t2.n_regs, device=dev))
+            T2_state, _ = t2.core(ct1, c0, c1, co, cact)
             w2 = T2_state.gather(
                 1, co[:, :1].unsqueeze(-1).expand(-1, -1, T2_state.shape[-1])
             ).squeeze(1)[:, :D_VALUE]

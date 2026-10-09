@@ -31,10 +31,10 @@ k = core.n_pool_heads
 for batch in batches:
     split = _split_to_per_instruction(batch)
     if split[0].shape[0] == 0: continue
-    nch, mni = batch.instr_lens.shape; tags = torch.randn(nch, t2.n_regs, device=dev)
+    nch, mni = batch.instr_lens.shape
     ct1, c0, c1, co, cact = _t2_assemble(t1, split, nch, mni, dev, route='binding')
     with torch.no_grad():
-        T, ess = core(ct1, c0, c1, co, cact, tags)
+        T, ess = core(ct1, c0, c1, co, cact)
         if COVER:
             value = T[..., :core.d_value]; q = core.pool_q.view(k, -1)
             d = 2 if core.pool_mode == 'compete' else 2

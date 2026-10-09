@@ -3,7 +3,7 @@
 Runs each diagnostic against an untrained model on a small fixture, verifying
 it executes end-to-end and returns the documented keys/shapes (no metric-value
 assertions — an untrained model means nothing about the numbers). The
-equivariant measures (equivariance_error / tag_invariance / binding accuracy /
+equivariant measures (equivariance_error / binding accuracy /
 gvn_collapse) are exercised end-to-end by scripts/tests/test_pipeline.py via
 the scripts/eval.py CLI.
 """
