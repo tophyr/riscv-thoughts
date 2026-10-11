@@ -342,17 +342,40 @@ happened** — score any composed-operand change on the arms of
 `probes/vp_compose_control.py`, which is where both interventions showed 15-25
 point effects while the aggregate and the depth-2 bucket stayed flat.
 
-**Untested levers that remain:**
+**Settle first whether the residual is essence-side or head-side.** vp asks the
+head to EVALUATE the chunk's function at the anchor points, so a function the
+essence describes perfectly can still score badly if evaluating it is hard for a
+shallow readout — and the two available readings contradict (EXPERIMENT_LOG
+finding 21). Against the head: every refit and fine-tune on frozen essences
+scores below the trained head. For the head: the producer's slot is predicted at
+99.99% from the same essence in the same forward pass that fails on the composed
+slot, so the description is there, and a head trained end-to-end at depth 4
+moves one of the two sub-cases 20 points (finding 22).
+
+The experiment that separates them is to feed the head the intermediate value as
+explicit bit features, the way the canonical inputs already are, and retrain.
+**It is a diagnostic, not a change to adopt** — handing the head a value the
+essence is supposed to carry makes vp stop certifying what milestone 1 claims —
+so what it produces is a decision about the acceptance criterion rather than a
+fix. `probes/depth_intermediate.py` is the nearest thing already built and found
+no gain, but with a fitted readout on the syntactic-frame target at `d_out` 256,
+so it does not settle it.
+
+**Other untested levers:**
 
 - **Supervising the intermediate value**, which the SSA oracle computes and the
-  RVT batch does not ship. Lower prior than it was: the intermediate slot's own
-  vp is already 99.99%+, so there is nothing there to supervise into existence.
-- **Re-test finding 17's refutations against the corrected target.**
-  `--value-norm`, `--content-skip` and `--vp-depth-weight` were each measured at
-  `d_out` 256 / 250k on the syntactic-frame target, which had a materially
-  different error composition. `--value-norm` in particular targets the
-  leaf-versus-composed operand scale gap in exactly the operation now
-  implicated — the op-cell reading its own previous output.
+  RVT batch does not ship. Distinct from feeding it to the head: the intermediate
+  slot's own vp is already 99.99%+, so there is nothing there to supervise into
+  existence.
+- **Two refuted mechanisms scored only against the syntactic canonical frame**:
+  a direct linear path from an instruction's content to the slot it writes, and
+  weighting vp by dataflow depth. Both were measured at `d_out` 256 / 250k
+  against a target whose error composition differs materially from the
+  behavioral frame's, so neither refutation holds there. Recover either from git
+  history (`--content-skip`, `--vp-depth-weight`). Normalizing values into the
+  slot — the third of that group, and the one aimed squarely at the op-cell
+  reading its own previous output — is refuted at the current configuration too
+  (finding 22).
 
 ### 2. Collapse computed equivalences (milestone 2 — required for MVP)
 
@@ -534,31 +557,7 @@ Deferred deliberately: it is a definition, not an experiment, and it should be
 settled before either task 2 builds a collapse objective or this task ships a
 PC-effect target — each would bake in an answer.
 
-### 5. Flag cleanup
-
-**Project policy: options do not survive on their own.** Once a better way to do
-something is settled, the worse way gets deleted rather than kept behind a flag.
-Ongoing branching/versioning complexity is a cost we do not pay if we can pay a
-one-time reshaping cost instead. Breaking changes — including reminting the
-frozen T1 — are acceptable **on the one condition that new and old can be
-compared and shown not to have regressed.**
-
-**Refuted, and due for deletion** — kept only so the evidence can be re-checked
-against the code that produced it, since each was tested once. Delete them
-deliberately rather than letting them become vestigial: `--vp-depth-weight`
-(and `slot_dataflow_depth`, which exists only to serve it), `--value-norm`,
-`--content-skip`. Each is refuted at len=2/250k against a measured noise floor;
-see task 1 and EXPERIMENT_LOG finding 17.
-
-Standing candidates:
-
-- **`op_cell_rank`: delete outright** — it feeds the op-cell each operand's
-  canonical read position as extra scalars, which the rank-seeded slots already
-  supply through the operand values the cell reads, and enabling both scores
-  worse than seeding alone.
-- **`pool_mode`**: `compete` is a recorded dead end.
-
-### 6. Overlap the trainer's host-side work with the GPU step
+### 5. Overlap the trainer's host-side work with the GPU step
 
 The bottleneck is diagnosed and measured — see the "Throughput" bullet under
 "How to run" — and what is missing is the fix: prefetch the next batch's
@@ -567,6 +566,14 @@ wall-clock on every len=2 run.
 
 ## Constraints — do not regress
 
+- **Options do not survive on their own.** Once a better way to do something is
+  settled, the worse way gets deleted rather than kept behind a flag: ongoing
+  branching complexity is a cost we do not pay if we can pay a one-time
+  reshaping cost instead. Breaking changes — including reminting the frozen T1 —
+  are acceptable **on the one condition that new and old can be compared and
+  shown not to have regressed.** The equivariant core therefore has no settings
+  and the trainers expose only dimensions and loss weights; a refuted mechanism
+  is recoverable from git history, not from a flag.
 - **Exact equivariance.** `state_max_err` must stay `0.00e+00`. Anything fed to
   the pool must be register-indexed.
 - **Equivalence (GVN) collapse.** The requirement: two instruction sequences that
@@ -594,12 +601,12 @@ wall-clock on every len=2 run.
   distinguish different functions. `behav-mixed` pools both and exists only for
   continuity with older records.
 
-  Measured at `--gvn-chunk-len 2`, on genuinely-equivalent pairs, with T2 seeded
-  from canonical read rank: 0.0110, separation 119×, and non-equivalent pairs
-  held apart at 0.88. Seeding T2 from random tags with no read-order in the
-  value channels instead: 0.0021, separation 579× — tighter, but it collapses
-  the non-equivalent pairs to 0.0003, i.e. it cannot tell those functions apart
-  at all.
+  Measured on the len=2 model of milestone 1 at `--gvn-chunk-len 2`, over two
+  corpus draws of ~200 pairs each: genuinely-equivalent pairs 0.0270 and 0.0352
+  against a `distinct` mean of 1.26, so separation 47× and 36×, with
+  non-equivalent pairs held apart at 0.88 and 0.96. The spread between the two
+  draws is the measurement's own noise, not a difference between models — see
+  the paragraph below before reading any gap of that size as signal.
 
   **These ratios resolve large differences only.** The denominator is a mean
   over a few hundred pairs of a near-zero quantity, so it is tail-dominated: two
@@ -619,14 +626,21 @@ wall-clock on every len=2 run.
   regression in `frac<0.9` is a symptom worth chasing, not a semantic failure.
   Real validity supervision is deferred to open task 4.
 - **Decode-back / reconstruction is a NON-GOAL this phase.** Do not spend
-  effort improving it. Do check it has not regressed — currently 91.5% opcode /
-  95.4% immediate per instruction at len=8. (If anyone does pick it up later:
+  effort improving it; do check it has not regressed, with
+  `probes/t2_reconstruct.py` at the model's own chunk length. The figure is
+  per-instruction and scales with that length, so the two recorded points are
+  not comparable to each other: 96.7% opcode / 95.8% immediate at len=2 on the
+  model of milestone 1, and 91.5% / 95.4% at len=8 on the len=8 model of
+  EXPERIMENT_LOG phase-15 finding 5. (If anyone does pick it up later:
   `scripts/train_decoder.py` is stale and calls a pre-equivariant 2-arg
   `encode()`.)
 - **Supervise only behaviorally-live signals.** Dead values have no target; the
   `rd==x0` immediate mask is the existing instance.
 
 ## Dead ends — do not re-run
+
+No option exists for any mechanism below. A flag name identifies the arm that
+produced the number; recover it from git history to re-measure one.
 
 - **Capacity.** Scaling the model's dimensions and steps together leaves
   aggregate vp essentially unchanged at a fixed chunk length. `d_out` 256 → 512
@@ -649,8 +663,15 @@ wall-clock on every len=2 run.
   output share one scale). The scale gap is real and measured — a composed
   operand excites the op-cell's operand weights at 0.08–0.14× a leaf's energy —
   but closing it leaves depth-2 slightly worse (I-type 95.49% → 94.79%).
-- **`pool_mode=compete`.** No vp benefit, and with ordering enabled the essence
-  becomes sensitive to the anonymous per-chunk register tags.
+- **Slot-competition pooling** (`pool_mode=compete`, each register slot
+  softmax-assigning across the pooling heads so the heads divide the register
+  file instead of piling onto the salient few). No vp benefit, and with
+  read-order recorded in the slots it made the essence sensitive to the
+  per-chunk random leaf tags of the time.
+- **Feeding the op-cell each operand's canonical read position as extra
+  scalars** (`op_cell_rank`). A redundant second route to a position the
+  rank-seeded slots already supply through the operand values the cell reads,
+  and enabling both scores worse than seeding alone.
 - **Supplying the pool more ordering information than the per-slot write step.**
   Feeding it read-order, or the whole event block, leaves the shared-source
   deficit at ~83% and costs equivalence collapse; read-order plus canonical
@@ -703,16 +724,16 @@ wall-clock on every len=2 run.
 - Frozen T1 `runs/t1_writers_250k_rank/encoder.pt` (`run_t2.sh`'s default,
   overridable with `T1=`); corpus `configs/instr_alu_writers.json`. Checkpoints
   trained before the core's settings settled do not load.
-- Model knobs on `scripts/train_t2_encoder.py`: `--op-cell-depth`,
-  `--vp-head-depth`, `--n-pool-heads`, `--pool-mode`, `--op-cell-rank`,
-  `--value-norm`, `--content-skip`, and the loss knob `--vp-depth-weight`.
-  `scripts/run_t2.sh` exposes each as an env var (`DOUT`, `VALNORM`, `DEPTHW`,
-  …) and names the run directory after them. Current best on vp:
-  `d_out=512 op_cell=4 vp_head=1 n_pool_heads=16 pma`.
+- Model knobs on `scripts/train_t2_encoder.py` are dimensions only:
+  `--d-out`, `--d-event`, `--op-cell-depth`, `--vp-head-depth`,
+  `--n-pool-heads`. `scripts/run_t2.sh` exposes each as an env var (`DOUT`,
+  `OC`, `VP`, `NPOOL`) and names the run directory after them, so two cells
+  that differ in any of them cannot overwrite each other. The adopted
+  configuration, which is the script's default: `d_out=512 op_cell_depth=4
+  vp_head_depth=1 n_pool_heads=16`.
   **The core's own settings are not knobs** — read positions are canonical
   ranks, slots are seeded from those ranks, and the pool reads each slot's write
-  step, identically at both tiers. `--op-cell-rank` widens the op-cell input, so
-  checkpoints are only interchangeable within that setting.
+  step, identically at both tiers, with no branch for an alternative.
 - **Never edit `scripts/run_t2.sh` while a copy of it is running.** Bash reads a
   script incrementally, so an edit shifts the file offsets under the running
   shell. Doing this mid-sweep produced a spurious `syntax error near 'fi'` and
@@ -756,7 +777,7 @@ wall-clock on every len=2 run.
   step lowers utilisation further, so utilisation falling after an architecture
   change is not by itself evidence of a regression — and the converse holds:
   `--d-out 512` runs at ~60% against d256's ~40% because its GPU step is more
-  expensive, not because anything about the pipeline improved. Fix is overlap (task 6);
+  expensive, not because anything about the pipeline improved. Fix is overlap (task 5);
   costs ~2× wall-clock on every len=2 cell until then. A run comparing against a
   recorded baseline should keep the pipeline as-is so the corpus mix the FIFO mux
   delivers is unchanged.

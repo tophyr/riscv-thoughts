@@ -507,8 +507,7 @@ def _t1_wiring(batch):
 
 def train_compressor(batch_iter, *, ingest, lower_encoder=None,
                      d_out=128, d_event=16, op_cell_depth=1, vp_head_depth=4,
-                     n_pool_heads=1, pool_mode='pma', op_cell_rank=False,
-                     value_norm=False, content_skip=False,
+                     n_pool_heads=1,
                      d_model=128, n_heads=4, n_layers=2, max_window=72,
                      route='binding',
                      lr=3e-4, n_steps=None, log_every=100, lr_min=1e-6,
@@ -516,7 +515,7 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
                      valid_weight=0.1, live_in_weight=0.1, live_out_weight=0.1,
                      pc_writes_weight=0.1, in_slot_weight=0.1,
                      out_slot_weight=0.1, value_predict_weight=1.0,
-                     vp_smooth_weight=0.2, vp_depth_weight=1.0, imm_weight=1.0,
+                     vp_smooth_weight=0.2, imm_weight=1.0,
                      contrastive_weight=0.0, contrastive_loss='regression',
                      contrastive_s=0.0,
                      anchor_seed=0, n_anchor_states=8,
@@ -537,17 +536,6 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
     live_out, pc_writes, in_slot, out_slot, value_pred, contrastive, n_chunks,
     n_instrs.
 
-    content_skip:       add a direct linear path from an instruction's content
-        to the slot it writes, so the content does not have to share the
-        op-cell's first layer with decoding the operands. See
-        RegisterStateMachine.
-    value_norm:         RMSNorm every value as it enters a register slot, so a
-        seeded leaf and a computed op-cell output share one scale. See
-        RegisterStateMachine.
-    vp_depth_weight:    per-output-slot vp weight of vp_depth_weight^(depth-1),
-        where depth is the slot's dataflow depth in the chunk. 1.0 = uniform,
-        bit-identical to no weighting; >1 buys gradient for composed slots,
-        which are rare and much harder. See `slot_dataflow_depth`.
     contrastive_weight: weight on the behavioral-distance contrastive loss on
         the essence (contrastive_essence_loss). 0 = off. When > 0 the out_regs
         oracle ships even if value_predict_weight is 0 (vp demoted to diagnostic).
@@ -567,9 +555,7 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
         comp = Compressor(
             d_content=lower_encoder.d_out, d_out=d_out, d_event=d_event,
             op_cell_depth=op_cell_depth, vp_head_depth=vp_head_depth,
-            n_pool_heads=n_pool_heads, pool_mode=pool_mode,
-            op_cell_rank=op_cell_rank,
-            value_norm=value_norm, content_skip=content_skip)
+            n_pool_heads=n_pool_heads)
         model = comp.to(device)
         model_file = 't2.pt'
     else:
@@ -577,10 +563,8 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
             vocab_size=VOCAB_SIZE, d_model=d_model, n_heads=n_heads,
             n_layers=n_layers, max_window=max_window, d_out=d_out,
             d_event=d_event, op_cell_depth=op_cell_depth,
-            vp_head_depth=vp_head_depth, n_pool_heads=n_pool_heads,
-            pool_mode=pool_mode,
-            op_cell_rank=op_cell_rank,
-            value_norm=value_norm, content_skip=content_skip).to(device)
+            vp_head_depth=vp_head_depth,
+            n_pool_heads=n_pool_heads).to(device)
         comp = model.compressor
         model_file = 'encoder.pt'
     route_binding = (route == 'binding')
@@ -684,21 +668,9 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
         bl = binding_losses(
             comp, T, essence, live_in_t=li, live_out_t=lo, pc_writes_t=pc,
             in_slot_t=in_slot, out_slot_t=out_slot, in_k_eff=ike, out_k_eff=oke)
-        # Deeper output slots are rare (~2.5% at len=2) and carry an order of
-        # magnitude more vp error, so under a uniform mask they get ~2.5% of the
-        # gradient for the hardest thing the chunk asks. Weight a slot by
-        # vp_depth_weight^(depth-1) to buy that back. 1.0 = uniform, exactly the
-        # unweighted loss.
-        if vp_active and vp_depth_weight != 1.0:
-            sd = slot_dataflow_depth(c0, c1, co, active, comp.n_regs)
-            d = sd.gather(1, out_slot.clamp(min=0))         # (B, MAX_OUT)
-            sw = torch.pow(vp_depth_weight, (d - 1.0).clamp(min=0.0))
-        else:
-            sw = None
         vp = (t2_value_predict_loss(
                   comp, essence, anchor_states_t, in_slot, out_slot,
-                  out_regs, vp_mask, vp_smooth_weight=vp_smooth_weight,
-                  slot_weight=sw)
+                  out_regs, vp_mask, vp_smooth_weight=vp_smooth_weight)
               if vp_active else essence.new_zeros(()))
         contrastive = (contrastive_essence_loss(
                            essence, out_regs, lo, vp_mask,
@@ -777,7 +749,7 @@ def train_encoder(batch_iter, *,
                   d_model=128, n_heads=4, n_layers=2, d_out=128,
                   max_window=72,
                   d_event=16, op_cell_depth=1, vp_head_depth=4,
-                  n_pool_heads=1, pool_mode='pma',
+                  n_pool_heads=1,
                   lr=3e-4, n_steps=None, log_every=100, lr_min=1e-6,
                   valid_weight=0.1,
                   live_in_weight=0.1, live_out_weight=0.1,
@@ -795,7 +767,7 @@ def train_encoder(batch_iter, *,
     an emergent property of the consistent per-instruction targets, not a
     separate objective that would fight register identity.
 
-    d_event..pool_mode:  the equivariant core's own settings, forwarded
+    d_event..n_pool_heads: the equivariant core's own dimensions, forwarded
                          unchanged to train_compressor — T1 and T2 share one
                          core, so the tiers must be able to run the same
                          configuration of it. See RegisterStateMachine.
@@ -827,7 +799,6 @@ def train_encoder(batch_iter, *,
         n_heads=n_heads, n_layers=n_layers, max_window=max_window,
         d_event=d_event, op_cell_depth=op_cell_depth,
         vp_head_depth=vp_head_depth, n_pool_heads=n_pool_heads,
-        pool_mode=pool_mode,
         lr=lr, n_steps=n_steps, log_every=log_every, lr_min=lr_min,
         valid_weight=valid_weight, live_in_weight=live_in_weight,
         live_out_weight=live_out_weight, pc_writes_weight=pc_writes_weight,
@@ -1082,33 +1053,10 @@ def t2_chunk_forward(t1, t2, split_outputs, n_chunks, max_n_instrs, device,
     return t2.encode(chunk_t1, in0, in1, out, active)
 
 
-def slot_dataflow_depth(in0, in1, out, active, n_regs):
-    """Per-register-slot dataflow depth after the chunk: 1 for a slot written
-    from chunk inputs only, d+1 for one whose deepest operand was itself
-    written here. Unwritten slots stay 0.
-
-    Same shape of computation as the state machine's write_time — a static loop
-    of one-hot reads and a masked write — so it stays capturable in the
-    full-step CUDA graph. Register-independent values placed through the wiring
-    one-hots, so a rename permutes it identically.
-    """
-    depth = torch.zeros(active.shape[0], n_regs, device=in0.device)
-    not_x0 = torch.ones(n_regs, device=in0.device)
-    not_x0[0] = 0.0
-    for k in range(active.shape[1]):
-        oh0 = F.one_hot(in0[:, k], n_regs).to(depth.dtype)
-        oh1 = F.one_hot(in1[:, k], n_regs).to(depth.dtype)
-        nd = 1.0 + torch.maximum((oh0 * depth).sum(-1), (oh1 * depth).sum(-1))
-        w = (F.one_hot(out[:, k], n_regs).to(depth.dtype)
-             * not_x0 * active[:, k:k + 1])
-        depth = depth * (1.0 - w) + w * nd.unsqueeze(-1)
-    return depth
-
-
 def t2_value_predict_loss(t2, vecs, anchor_states_t,
                           in_slot_regs_t, out_slot_regs_t,
                           out_regs_t, mask_t, vp_smooth_weight=0.2,
-                          slot_weight=None, return_count=False):
+                          return_count=False):
     """Per-anchor, per-out-slot value-prediction loss (canonical).
 
     The head reads (vec, CANONICAL input-slot values) and predicts per-anchor
@@ -1132,10 +1080,6 @@ def t2_value_predict_loss(t2, vecs, anchor_states_t,
       out_regs_t:       (B, A, 32) int32 — register file per anchor AFTER
                         executing each chunk
       mask_t:           (B,) bool — rows to include (decoded successfully)
-      slot_weight:      (B, MAX_OUTPUT_SLOTS) float or None — per-(row, slot)
-                        weight multiplying the mask, so rarer slot populations
-                        can be given more than their share of the gradient
-                        (see `slot_dataflow_depth`). None = uniform.
 
     Returns a scalar loss (per-bit BCE + vp_smooth_weight · smooth-magnitude
     MSE) over (row, output-slot, anchor) triplets where out_slot_regs is not
@@ -1204,8 +1148,6 @@ def t2_value_predict_loss(t2, vecs, anchor_states_t,
     # clamp(min=1) returns 0.0 for an all-masked batch, matching the old
     # early-return.
     pm = pair_mask.float()
-    if slot_weight is not None:
-        pm = pm * slot_weight
     loss = (per_slot * pm).sum() / pm.sum().clamp(min=1)
     return (loss, int(pair_mask.sum())) if return_count else loss
 
@@ -1560,8 +1502,7 @@ class TrainBatchPrefetcher:
 
 def train_t2_encoder(batch_iter, t1_encoder, *,
                      d_out=256, d_event=16, op_cell_depth=1, vp_head_depth=4,
-                     n_pool_heads=1, pool_mode='pma', op_cell_rank=False,
-                     value_norm=False, content_skip=False,
+                     n_pool_heads=1,
                      lr=3e-4, n_steps=None, log_every=100, lr_min=1e-6,
                      warmup_steps=0,
                      valid_weight=0.0,
@@ -1569,7 +1510,6 @@ def train_t2_encoder(batch_iter, t1_encoder, *,
                      pc_writes_weight=0.1,
                      in_slot_weight=0.1, out_slot_weight=0.1,
                      value_predict_weight=0.0, vp_smooth_weight=0.2,
-                     vp_depth_weight=1.0,
                      contrastive_weight=0.0, contrastive_loss='regression',
                      contrastive_s=0.0,
                      anchor_seed=0, n_anchor_states=8,
@@ -1583,15 +1523,14 @@ def train_t2_encoder(batch_iter, t1_encoder, *,
         batch_iter, ingest='vectors', lower_encoder=t1_encoder,
         d_out=d_out, d_event=d_event, op_cell_depth=op_cell_depth,
         vp_head_depth=vp_head_depth, n_pool_heads=n_pool_heads,
-        pool_mode=pool_mode, op_cell_rank=op_cell_rank, value_norm=value_norm,
-        content_skip=content_skip, route=t2_route,
+        route=t2_route,
         lr=lr, n_steps=n_steps, log_every=log_every, lr_min=lr_min,
         warmup_steps=warmup_steps,
         valid_weight=valid_weight, live_in_weight=live_in_weight,
         live_out_weight=live_out_weight, pc_writes_weight=pc_writes_weight,
         in_slot_weight=in_slot_weight, out_slot_weight=out_slot_weight,
         value_predict_weight=value_predict_weight,
-        vp_smooth_weight=vp_smooth_weight, vp_depth_weight=vp_depth_weight,
+        vp_smooth_weight=vp_smooth_weight,
         contrastive_weight=contrastive_weight,
         contrastive_loss=contrastive_loss, contrastive_s=contrastive_s,
         anchor_seed=anchor_seed,

@@ -952,6 +952,9 @@ values do not load.
 
 ## Dead ends (do not re-run)
 
+No option exists for any mechanism below. A flag name identifies the arm that
+produced the number; recover it from git history to re-measure one.
+
 - **Capacity.** Scaling the model's dimensions and steps together left
   aggregate vp essentially unchanged at a given chunk length, and `d_out`
   512 → 1024 leaves even the specific error cells unchanged (finding 17). The
@@ -962,11 +965,17 @@ values do not load.
 - **Normalizing values into the register slot** (`--value-norm`), to put a
   seeded leaf and a computed op-cell output on one scale. The scale gap is real
   and measured, but closing it does not help depth-2 (finding 17).
-- **`pool_mode=compete`** (slot-competition pooling, an attempt to force the
-  pooling heads to divide the register file between them). Tested in both the
-  original and the current configuration: no vp benefit, and with ordering
-  enabled it makes the essence sensitive to the anonymous per-chunk register
-  tags — rename distance 0.0251 against 0.0014 — which it must not be.
+- **Slot-competition pooling** (`pool_mode=compete`), which made each register
+  slot softmax-assign across the pooling heads so the heads had to divide the
+  register file between them instead of piling onto the salient few. No vp
+  benefit in either the original or the current configuration, and with
+  read-order recorded in the slots it made the essence sensitive to the
+  per-chunk random leaf tags of the time — rename distance 0.0251 against
+  0.0014 — which it must not be.
+- **Feeding the op-cell each operand's canonical read position as extra scalars**
+  (`op_cell_rank`). A redundant second route to a position the rank-seeded slots
+  already supply through the operand values the cell reads, and enabling both
+  scores worse than seeding alone.
 
 ## A methodological note
 
@@ -1098,10 +1107,11 @@ evidence of its absence.
    len=2, localised to the op-cell reading its own previous output (finding 21).
    Not capacity-shaped: `d_out` 512 → 1024 leaves it unchanged (finding 17), and
    the head, the two-step arithmetic chain, the gradient share, the operand
-   scale mismatch and content crowding are each separately refuted — though all
-   of those were measured against the syntactic-frame target at `d_out` 256, and
-   `--value-norm` targets exactly the operation now implicated, so it is worth
-   one re-test.
+   scale mismatch and content crowding are each separately refuted. Normalizing
+   every value entering a register slot — putting a seeded leaf and the
+   op-cell's own output on one shell — leaves the aggregate inside the noise
+   floor at `d_out` 512 on the behavioral-frame target, and trades the two
+   sub-cases against each other rather than closing either (finding 22).
 
    **First settle whether the residual is essence-side or head-side**
    (finding 21). The two available readings contradict, and they call for
@@ -1112,16 +1122,5 @@ evidence of its absence.
    claims to measure.
 
 2. **Decoder + reconstruction loss** — the standing untried lever for goal 2.
-3. **Flag cleanup, for the options no tier wants.** `op_cell_rank` is deleted,
-   being a redundant second route to the same read positions; `pool_extra` keeps
-   `write_time` and drops the recorded dead ends `order`/`event`; `pool_mode`
-   drops `compete`.
-
-   `read_time_mode` and `seed_mode` **keep both settings**: the tiers want
-   opposite ones, T2 `rank` and T1 the `stamp`/`tags` defaults, and forcing T1
-   onto T2's costs the T2 trained on it 0.030 points of exact match (finding
-   25). These are per-tier hyperparameters, which is what the shared core is
-   built to allow; the option survives because the right value genuinely
-   differs, not because deleting it was skipped.
-4. **Everything after the Round-1 sweep is len=2 only.** In particular,
+3. **Everything after the Round-1 sweep is len=2 only.** In particular,
    input-ordering recovery sits at chance (0.518) at len=8 and is unexplained.

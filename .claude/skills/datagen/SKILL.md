@@ -100,7 +100,7 @@ python -m datagen --rule "cap=$LEN" --twins 2 --batch-size 128 --n-states 8 \
     --anchor-seed 0 --config configs/instr_alu_writers.json --count "$STEPS" \
   | python scripts/train_t2_encoder.py --t1-model runs/t1_writers_250k_rank/encoder.pt \
     --d-out 512 --d-event 16 --op-cell-depth 4 --vp-head-depth 1 \
-    --n-pool-heads 16 --pool-mode pma --route binding \
+    --n-pool-heads 16 --route binding \
     --n-steps "$STEPS" --anchor-seed 0 --n-anchor-states 8 --out-dir "$OUT"
 ```
 
@@ -129,15 +129,17 @@ python -m datagen --rule single --twins 2 --batch-size 128 --n-states 8 \
 ```
 
 Both trainers expose the same model hparams — `--d-event`, `--op-cell-depth`,
-`--vp-head-depth`, `--n-pool-heads`, `--pool-mode` — since T1 and T2 run the
-same core (`scripts/train_encoder.py`, `scripts/train_t2_encoder.py`).
-`train_t2_encoder.py` additionally carries the three knobs T1 has no use for
-(`--op-cell-rank`, `--value-norm`, `--content-skip`).
-**A checkpoint predating the core's settling will not load.** The core no longer
-has the `read_time_mode` / `seed_mode` / `pool_extra` branches, so a checkpoint
-carrying `tag_proj` instead of `rank_emb`, or a pool sized without the write-step
-channel, fails at `load_state_dict`. Only checkpoints trained at the settled
-configuration are usable; `runs/t1_writers_250k_rank` is the frozen T1.
+`--vp-head-depth`, `--n-pool-heads` — since T1 and T2 run the same core
+(`scripts/train_encoder.py`, `scripts/train_t2_encoder.py`). Those are
+dimensions; the core's behaviour is not configurable from either trainer, so
+there is no way to run the two tiers on different versions of it.
+
+**A checkpoint predating the core's settling will not load.** The core has no
+branch for an alternative read position, slot seeding or pool channel, so a
+checkpoint carrying `tag_proj` instead of `rank_emb`, or a pool sized without
+the write-step channel, fails at `load_state_dict`. Only checkpoints trained at
+the settled configuration are usable; `runs/t1_writers_250k_rank` is the frozen
+T1.
 (A checkpoint trained when all pool heads shared one value projection is still
 remapped on load — `_tile_shared_pool_v` repeats those weights once per head,
 reproducing the old computation exactly.)

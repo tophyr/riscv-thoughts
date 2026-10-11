@@ -125,8 +125,8 @@ not know you need.
 1. **anchor-seed AND n-states must match gen↔train.** value_predict supervision
    is computed against anchor states reconstructed from `--anchor-seed` +
    `--n-anchor-states` (`scripts/train_encoder.py:71-76`,
-   `scripts/train_t2_encoder.py:118-121`, both funnelled into
-   `make_anchor_states` at `compressor/train.py:603`).
+   `scripts/train_t2_encoder.py:70-74`, both funnelled into
+   `make_anchor_states` at `compressor/train.py:593`).
    `datagen`'s `--anchor-seed`/`--n-states` must equal the trainer's
    `--anchor-seed`/`--n-anchor-states`. Mismatch → wrong targets, no error.
    `make_anchor_states` is `datagen/compare.py:319`. (Anchor seed only needs to
@@ -154,9 +154,9 @@ not know you need.
    relocates the chunk's i-th **behavioral** input to canonical position i+1
    (`_canonical_state`, `datagen/compare.py:331`, positions
    `_CANON_POSITIONS = range(1, 32)` at `datagen/compare.py:84`; applied at
-   `datagen/compare.py:635`) and executes there, so `out_regs[:, r]` depends only
+   `datagen/compare.py:651`) and executes there, so `out_regs[:, r]` depends only
    on operand structure. The vp loss (`t2_value_predict_loss`,
-   `compressor/train.py:1063`, used by BOTH T1 and T2) therefore feeds the head
+   `compressor/train.py:1056`, used by BOTH T1 and T2) therefore feeds the head
    the canonical-position values `anchor[:, k+1]` for input slot k — never the raw
    value at the slot's actual register. Feeding raw input values against the
    canonical target is mathematically inconsistent — the head must see canonical
@@ -183,7 +183,7 @@ not know you need.
    (`datagen/batch.py:528`) drops chunks containing LOAD/STORE from twin+aux
    construction because their `Precomputed` is
    unavailable — `precompute_chunk` raises NotImplementedError on memory ops
-   (`datagen/compare.py:585,593`). The chunk's tokens are still shipped (so the
+   (`datagen/compare.py:606,609`). The chunk's tokens are still shipped (so the
    encoder sees them for magnitude/validity), but its aux row is zero-mask /
    `AUX_CE_IGNORE` and its value-prediction row is masked off via
    `out_regs_valid=False` (`_out_regs_from_precomputeds`, `datagen/batch.py:363`).

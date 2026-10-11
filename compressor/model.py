@@ -17,7 +17,7 @@ The tier-specific piece is only what produces those content vectors:
 
 The emitted object is one register-indexed state T (B, n_regs, d). A register
 rename permutes the slots exactly (no per-register parameters — the only
-register-indexed input is an anonymous per-chunk tag), so:
+register-indexed input is each input's canonical read position), so:
 
   - essence = a permutation-invariant attention pool over the register axis
     (the operator axis; value_predict / pc_writes read it),
@@ -37,25 +37,6 @@ from datagen import N_REGS, MAX_INPUT_SLOTS, MAX_OUTPUT_SLOTS
 # x0 is the hardwired-zero, non-renameable slot. Register renames permute
 # slots 1..n_regs-1 only; slot 0 seeds to zero, reads as zero, never written.
 X0_SLOT = 0
-
-
-# What the essence pool reads per slot, beyond the `value` channels. The pool is
-# a symmetric sum over slots, so it is blind to anything not fed to it — and
-# every ORDER channel withheld so far has turned out to cost real accuracy:
-#   'write_time' — which step wrote the slot. Without it the essence sees an
-#       unordered bag and cannot tell output 1 from output 2 (measured: pooled
-#       bit accuracy 80.0 -> 98.6 at len=2).
-#   'order'      — write_time + read_time. read_time IS the canonical input
-#       position (operand r at step k is stamped 2(k+1)+r, so sorting recovers
-#       first-read order). Without it the essence cannot place an operand in the
-#       canonical frame when two instructions share a source register — measured
-#       82.96% vs 99.999% on overlapping- vs disjoint-source pairs.
-#   'event'      — the whole event block, i.e. pool_src == T. RISCV_DESIGN's
-#       position: the essence/binding split is emergent, and the vector must NOT
-#       be hand-partitioned into "these dims = operator, those = binding".
-# 'none' reproduces the pre-ordering-fix model bit-for-bit, and is still the
-# constructor/CLI default; 'write_time' is the adopted setting for new runs.
-POOL_EXTRA = ('none', 'write_time', 'order', 'event')
 
 
 def instruction_wiring(instr):
@@ -107,29 +88,21 @@ class RegisterStateMachine(nn.Module):
       event[in0],[in1] += read_pulse(content, r)   (content-dependent)
       event[out]       += write_pulse
 
-    No per-register parameters: slots are seeded only with an anonymous
-    per-chunk tag. Reads/writes are pure one-hot tensor ops, so a register
-    rename permutes the state exactly (equivariant by construction) and any
-    pool over the register axis is invariant. Vectorized (no per-slot Python
-    loop) so the step captures into the compiled CUDA-graph train step.
+    No per-register parameters: a slot is seeded only with the canonical read
+    position of the input it holds. Reads/writes are pure one-hot tensor ops,
+    so a register rename permutes the state exactly (equivariant by
+    construction) and any pool over the register axis is invariant.
+    Vectorized (no per-slot Python loop) so the step captures into the
+    compiled CUDA-graph train step.
     """
 
     def __init__(self, d_value, d_event, d_content, n_regs=32, op_cell_depth=1,
-                 n_pool_heads=1, pool_mode='pma',
-                 op_cell_rank=False, value_norm=False, content_skip=False):
+                 n_pool_heads=1):
         super().__init__()
         self.d_value = d_value
         self.d_event = d_event
         self.n_regs = n_regs
         self.n_pool_heads = n_pool_heads
-        self.pool_mode = pool_mode
-        # Give the op-cell each operand's canonical read position. The pool
-        # cannot use read-order (it never sees content, so it must apply it
-        # unconditionally, which breaks commutative collapse); the op-cell can,
-        # because it sees the opcode and both operands together and can
-        # symmetrize per opcode. Widens op_cell's input, so old checkpoints only
-        # load with this off.
-        self.op_cell_rank = op_cell_rank
         # An input register's leaf identity IS its canonical read position,
         # written to its slot on first read. That is what distinguishes two
         # inputs from each other without naming either — a per-register
@@ -140,20 +113,8 @@ class RegisterStateMachine(nn.Module):
         # instruction; and it is the frame the value-prediction target is
         # already expressed in.
         self.rank_emb = nn.Embedding(n_regs, d_value)
-        # A value slot holds one of two very different populations: a freshly
-        # seeded LEAF (a chunk input) or the op-cell's own OUTPUT (a computed
-        # value). Both are read back through the same operand weights of the
-        # cell, and left free they drift apart — measured on the len=2
-        # best-of-config, a composed value excites those weights at 0.08-0.14x
-        # a leaf's energy, and composed slots are where the vp error is.
-        # Normalizing every value AS IT ENTERS A SLOT puts the two populations
-        # on one shell, so the cell reads one code instead of two. Per-slot over
-        # the value axis, so a rename permutes it identically. Off by default:
-        # it adds parameters, so checkpoints are not interchangeable.
-        self.value_norm = nn.RMSNorm(d_value) if value_norm else None
         self.op_cell = nn.Sequential(
-            nn.Linear(d_content + 2 * d_value + (2 if op_cell_rank else 0),
-                      4 * d_value), nn.ReLU(),
+            nn.Linear(d_content + 2 * d_value, 4 * d_value), nn.ReLU(),
             nn.Linear(4 * d_value, d_value))
         # Extra RESIDUAL FFN blocks on op_cell's output (op_cell_depth > 1). The
         # op-cell is reused RECURRENTLY once per instruction, so a naive deep
@@ -163,18 +124,6 @@ class RegisterStateMachine(nn.Module):
         # shallow baseline and its state_dict is UNCHANGED, so depth-1
         # checkpoints (incl. the frozen T1) still load. Static ModuleList loop
         # -> unrolls at trace time, no graph break under torch.compile.
-        # A direct path from the instruction's own content to the slot it
-        # writes. Without it the content reaches the slot only through the
-        # cell's first linear, sharing that layer with whatever decoding the
-        # operands need — and when an operand is the cell's own previous output
-        # rather than a seeded leaf, that decoding is much more work. Measured
-        # on the len=2 best-of-config: a composed instruction's 12-bit immediate
-        # is recoverable from the slot it wrote at 35% against 87% for an
-        # independent one, on the opcodes where the immediate cannot be folded
-        # into the operand. Adds parameters, so checkpoints are not
-        # interchangeable.
-        self.content_skip = (nn.Linear(d_content, d_value)
-                             if content_skip else None)
         self.op_cell_blocks = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(d_value, 4 * d_value), nn.ReLU(),
@@ -254,8 +203,7 @@ class RegisterStateMachine(nn.Module):
             oh0e = oh0 * not_x0_row
             oh1e = oh1 * not_x0_row
             # Read-order is stamped BEFORE the operands are read, so this
-            # step's own inputs can be seeded from their positions and
-            # op_cell_rank can see them.
+            # step's own inputs can be seeded from their positions.
             read_time, n_read, firsts, ranks = self._stamp_reads(
                 read_time, n_read, write_time, oh0e, oh1e, a)
             # An input's leaf identity IS its canonical position, written on
@@ -264,27 +212,13 @@ class RegisterStateMachine(nn.Module):
             for fr, rk in zip(firsts, ranks):
                 e = self.rank_emb(
                     rk.clamp(max=self.n_regs - 1).long()).squeeze(1)
-                if self.value_norm is not None:
-                    e = self.value_norm(e)
                 fr = fr.unsqueeze(-1)
                 value = value * (1.0 - fr) + fr * e.unsqueeze(1)
             r0 = torch.bmm(oh0.unsqueeze(1), value).squeeze(1)   # (B,d_value)
             r1 = torch.bmm(oh1.unsqueeze(1), value).squeeze(1)
-            cell_in = [c, r0, r1]
-            if self.op_cell_rank:
-                # the position of the register each operand reads, normalized;
-                # 0 for an x0 operand (not an input). Per-chunk scalars placed
-                # by the wiring, so no register index enters — equivariance holds.
-                scale = float(self.n_regs)
-                cell_in += [((oh0e * read_time).sum(-1, keepdim=True) / scale),
-                            ((oh1e * read_time).sum(-1, keepdim=True) / scale)]
-            res = self.op_cell(torch.cat(cell_in, dim=-1))       # (B,d_value)
+            res = self.op_cell(torch.cat([c, r0, r1], dim=-1))   # (B,d_value)
             for blk in self.op_cell_blocks:                      # residual depth
                 res = res + blk(res)
-            if self.content_skip is not None:
-                res = res + self.content_skip(c)
-            if self.value_norm is not None:
-                res = self.value_norm(res)
             # write value at dest (x0 write = nop), active rows only.
             oh_out = F.one_hot(out[:, k], self.n_regs).to(value.dtype) \
                 * not_x0_row
@@ -306,32 +240,19 @@ class RegisterStateMachine(nn.Module):
         event = event + F.pad(order, (0, self.d_event - 2))
         T = torch.cat([value, event], dim=-1)
 
-        # Essence pool. k seed queries; heads concatenate to width d_value.
-        # pool_src carries the per-slot write ORDER when enabled (see __init__):
-        # register-indexed, so it permutes with a rename and the pool stays
-        # exactly invariant.
-        # Everything appended here is register-indexed, so a rename permutes it
-        # with the slots and the pool stays exactly invariant. 'event' feeds the
-        # whole slot state (pool_src == T); note its channels 0,1 carry the
-        # timestamps already mixed with the read/write pulses, whereas 'order'
-        # feeds the clean ramps.
+        # Essence pool. k seed queries; heads concatenate to width d_value. The
+        # pool reads each slot's value channels plus its write step — both
+        # register-indexed, so a rename permutes them with the slots and the
+        # pool stays exactly invariant. Read-order must NOT be added here: the
+        # pool never sees content, so it would apply read-order unconditionally
+        # and stop being blind to a commutative operand swap.
         pool_src = torch.cat([value, write_time.unsqueeze(-1)], dim=-1)
         q = self.pool_q.view(self.n_pool_heads, -1)          # (k, d_value)
         kk = self.pool_k(pool_src)                           # (B, n_regs, d_value)
         logits = kk @ q.t()                                  # (B, n_regs, k)
-        if self.pool_mode == 'compete':
-            # Slot-Attention competition: each register slot softmax-ASSIGNS
-            # across the k heads (dim=2), so slots divide among heads (no more
-            # than one head can 'own' a slot) -> heads are forced to COVER
-            # different slots instead of piling on the salient few. Then each
-            # head takes a weighted mean of ITS slots (per-head normalize over
-            # slots). The final per-head sum over slots is symmetric -> still
-            # rename-invariant. (k=1 would be a uniform mean, so this mode is
-            # for k>1 only; k=1 stays 'pma'.)
-            att = torch.softmax(logits, dim=2)
-            att = att / (att.sum(dim=1, keepdim=True) + 1e-8)
-        else:  # 'pma': each head independently softmaxes over slots (no competition)
-            att = torch.softmax(logits, dim=1)               # (B, n_regs, k) over slots
+        # Each head independently softmaxes over the slots; the per-head sum
+        # over slots is symmetric, hence exactly rename-invariant.
+        att = torch.softmax(logits, dim=1)                   # (B, n_regs, k)
         vv = self.pool_v(pool_src).view(                     # per-head slices
             value.shape[0], self.n_regs, self.n_pool_heads, -1)
         heads = torch.einsum('bsk,bskd->bkd', att, vv)       # (B, k, d_value//k)
@@ -467,8 +388,7 @@ class Compressor(nn.Module):
     """
 
     def __init__(self, *, d_content, d_out, d_event, op_cell_depth=1,
-                 vp_head_depth=_VP_HEAD_DEPTH, n_pool_heads=1, pool_mode='pma',
-                 op_cell_rank=False, value_norm=False, content_skip=False):
+                 vp_head_depth=_VP_HEAD_DEPTH, n_pool_heads=1):
         super().__init__()
         self.d_content = d_content
         self.d_out = d_out
@@ -479,9 +399,7 @@ class Compressor(nn.Module):
 
         self.core = RegisterStateMachine(
             d_value=d_out, d_event=d_event, d_content=d_content, n_regs=N_REGS,
-            op_cell_depth=op_cell_depth, n_pool_heads=n_pool_heads,
-            pool_mode=pool_mode, op_cell_rank=op_cell_rank,
-            value_norm=value_norm, content_skip=content_skip)
+            op_cell_depth=op_cell_depth, n_pool_heads=n_pool_heads)
 
         # Binding heads read the per-slot state T (d_out+d_event), one score per
         # register slot (equivariant); pc_writes + value_predict read the
@@ -540,8 +458,7 @@ class T1Compressor(nn.Module):
 
     def __init__(self, *, vocab_size, d_model, n_heads, n_layers, max_window,
                  d_out, d_event, op_cell_depth=1, vp_head_depth=_VP_HEAD_DEPTH,
-                 n_pool_heads=1, pool_mode='pma', op_cell_rank=False,
-                 value_norm=False, content_skip=False):
+                 n_pool_heads=1):
         super().__init__()
         self.embedder = TokenEmbedder(
             vocab_size=vocab_size, d_model=d_model, n_heads=n_heads,
@@ -549,9 +466,7 @@ class T1Compressor(nn.Module):
         self.compressor = Compressor(
             d_content=d_model, d_out=d_out, d_event=d_event,
             op_cell_depth=op_cell_depth, vp_head_depth=vp_head_depth,
-            n_pool_heads=n_pool_heads, pool_mode=pool_mode,
-            op_cell_rank=op_cell_rank, value_norm=value_norm,
-            content_skip=content_skip)
+            n_pool_heads=n_pool_heads)
         # dim interface (plain ints — delegated by value, not submodules)
         self.n_regs = self.compressor.n_regs
         self.d_out = self.compressor.d_out
@@ -581,14 +496,11 @@ class T1Compressor(nn.Module):
 
 
 def T2Compressor(*, d_t1, d_out, d_event, op_cell_depth=1,
-                 vp_head_depth=_VP_HEAD_DEPTH, n_pool_heads=1, pool_mode='pma',
-                 op_cell_rank=False, value_norm=False, content_skip=False):
+                 vp_head_depth=_VP_HEAD_DEPTH, n_pool_heads=1):
     """T2 preset: a Compressor fed a lower tier's essence (d_content=d_t1)."""
     return Compressor(d_content=d_t1, d_out=d_out, d_event=d_event,
                       op_cell_depth=op_cell_depth, vp_head_depth=vp_head_depth,
-                      n_pool_heads=n_pool_heads, pool_mode=pool_mode,
-                      op_cell_rank=op_cell_rank, value_norm=value_norm,
-                      content_skip=content_skip)
+                      n_pool_heads=n_pool_heads)
 
 
 class Decoder(nn.Module):

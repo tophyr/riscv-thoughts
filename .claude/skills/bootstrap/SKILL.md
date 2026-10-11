@@ -38,10 +38,15 @@ it describes. At minimum:
 - whichever loss or metric you are about to move (`compressor/train.py`);
 - the `hparams.json` of **every** run whose numbers you intend to cite.
 
-**A run's directory name is not its configuration.** Names encode intent at
-launch; `hparams.json` records what ran. Today's example: a run named `…rtrank…`
-had `pool_extra=write_time`, so the thing its name advertises never reached the
-essence — and it had been recorded in three documents as a failed experiment.
+**A run's directory name is not its configuration, and `hparams.json` is not
+the current code.** A name encodes intent at launch and can disagree with what
+ran: one run named for a read-position setting was trained with a different one,
+and was recorded in three documents as a failed experiment it never performed.
+The directories under `runs/` also carry suffixes for settings the core no
+longer has (`_pewrite_time_rtrank_seedrank`), and their `hparams.json` still
+records those keys. So read `hparams.json` rather than the name — then check
+that the keys it names still exist in the code before reading meaning into
+them.
 
 Cite `path:line` for any claim you make about what the code does. If you cannot
 cite it, you have not verified it — say so instead of asserting it.

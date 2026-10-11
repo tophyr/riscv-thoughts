@@ -51,11 +51,6 @@ def main():
                    help='essence pool seed queries (1 = single-query sum; '
                         '>1 = multi-head, keeps multiple outputs separable). '
                         'Must divide d_out.')
-    p.add_argument('--pool-mode', choices=('pma', 'compete'), default='pma',
-                   help='pma = each head independently pools slots (heads can '
-                        'collapse); compete = Slot-Attention, slots divide among '
-                        'heads so they cover the register file (needs >1 head).')
-
     add_common_train_args(p)
 
     p.add_argument('--valid-weight', type=float, default=0.1)
@@ -115,7 +110,6 @@ def main():
         d_out=args.d_out, max_window=args.max_window,
         d_event=args.d_event, op_cell_depth=args.op_cell_depth,
         vp_head_depth=args.vp_head_depth, n_pool_heads=args.n_pool_heads,
-        pool_mode=args.pool_mode,
         lr=args.lr, n_steps=args.n_steps, log_every=args.log_every,
         valid_weight=args.valid_weight,
         live_in_weight=args.live_in_weight,
