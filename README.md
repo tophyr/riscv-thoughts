@@ -193,10 +193,8 @@ invariants (the anchor seed and state count must match between generator and
 trainer, or the targets are silently wrong — `CLAUDE.md`). `scripts/run_t2.sh`
 runs one scored training cell end to end and is the normal entry point.
 
-`scripts/train_decoder.py` does not run: it predates the equivariant refactor
-and calls a two-argument `encoder.encode(tok, pad)` (`compressor/train.py:1619`)
-where the current signature also needs the per-instruction wiring, so it raises
-at step 1. Decode-back is a non-goal of the current work — see
-[DECODER_STRATEGY.md](DECODER_STRATEGY.md).
+There is no decoder in the tree. Decode-back is a non-goal of the current work;
+[DECODER_STRATEGY.md](DECODER_STRATEGY.md) carries the design and points at the
+tag holding one discarded attempt.
 
 

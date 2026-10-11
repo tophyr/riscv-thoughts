@@ -1,12 +1,11 @@
-"""Training loops for the T1 encoder, T2 encoder, and decoder.
+"""Training loops for the T1 and T2 encoders.
 
 Three public training functions — train_encoder, train_t2_encoder, and
-train_decoder — each a batch loop the CLI shells in scripts/ drive.
+each a batch loop the CLI shells in scripts/ drive.
 
 Shared helpers (used by trainers, eval, and the acceptance suite):
   load_checkpoint           — load a torch.compile-aware state_dict.
   encode_instrs             — tokenize + pad + encode an Instruction list.
-  prepare_decoder_targets   — build (input, target, padding) for CE.
   binding_losses            — rename-equivariant register-binding losses,
                               shared by the T1 and T2 encoder loops.
 """
@@ -32,7 +31,7 @@ from datagen import (
 )
 from emulator import Instruction, I_TYPE
 from .model import (
-    Compressor, T1Compressor, T2Compressor, Decoder, instruction_wiring,
+    Compressor, T1Compressor, T2Compressor, instruction_wiring,
     X0_SLOT)
 
 
@@ -71,27 +70,6 @@ def _split_t1_state(state):
     return out
 
 
-def _wiring_from_token_lists(token_lists):
-    """Per token sequence, the GP wiring (in0, in1, out) for the state
-    machine. Undecodable windows (partial / bogus) get (0, 0, 0). Three
-    (N,) int64 arrays."""
-    n = len(token_lists)
-    in0 = np.zeros(n, dtype=np.int64)
-    in1 = np.zeros(n, dtype=np.int64)
-    out = np.zeros(n, dtype=np.int64)
-    for i, toks in enumerate(token_lists):
-        try:
-            instr, _ = decode_instruction(list(toks), 0)
-        except Exception:
-            continue
-        in0[i], in1[i], out[i] = instruction_wiring(instr)
-    # decode_instruction doesn't validate token classes, so a malformed
-    # window can yield out-of-range register ids — clamp those to x0 (no-op).
-    for a in (in0, in1, out):
-        a[(a < 0) | (a >= N_REGS)] = 0
-    return in0, in1, out
-
-
 def encode_instrs(model, instrs, device):
     """Tokenize, pad, and encode a list of Instructions to their essence
     vectors. Registers enter as wiring (instruction_wiring) only — the essence
@@ -113,70 +91,6 @@ def encode_instrs(model, instrs, device):
         torch.from_numpy(wiring[:, 1]).to(device),
         torch.from_numpy(wiring[:, 2]).to(device))
 
-
-def prepare_decoder_targets(token_lists, device):
-    """Build decoder input/target tensors from lists of token IDs.
-
-    Each token list gets wrapped: [BOS] + tokens + [EOS].
-    Returns dec_input (shifted right), dec_target, dec_padding.
-    Returns (None, None, None) if token_lists is empty.
-    """
-    if not token_lists:
-        return None, None, None
-
-    seqs = [[BOS] + toks + [EOS] for toks in token_lists]
-    max_len = max(len(s) - 1 for s in seqs)
-    N = len(seqs)
-    dec_input = np.full((N, max_len), PAD, dtype=np.int64)
-    dec_target = np.full((N, max_len), PAD, dtype=np.int64)
-    dec_padding = np.ones((N, max_len), dtype=np.bool_)
-
-    for j, seq in enumerate(seqs):
-        L = len(seq) - 1
-        dec_input[j, :L] = seq[:-1]
-        dec_target[j, :L] = seq[1:]
-        dec_padding[j, :L] = False
-
-    return (torch.from_numpy(dec_input).to(device),
-            torch.from_numpy(dec_target).to(device),
-            torch.from_numpy(dec_padding).to(device))
-
-
-def decoder_targets_fixed(batch, max_dec_len):
-    """Fixed-shape (B, max_dec_len) teacher-forcing tensors over ALL rows —
-    the compile-able analog of prepare_decoder_targets (whose shape varies
-    with the valid-row count and per-batch max length, which would force a
-    CUDA-graph re-record every batch).
-
-    Valid rows: input=[BOS]+toks, target=toks+[EOS]. Invalid rows: target
-    all-PAD (CE ignore_index=PAD → they contribute nothing). Position 0 is
-    always BOS and never masked, so no row is fully-padded (an all-padding
-    row NaNs the decoder's attention softmax). max_dec_len must be >=
-    max token_len + 1; the caller derives it from the corpus-constant
-    batch.tokens width (max_tokens + 1)."""
-    B, max_tokens = batch.tokens.shape
-    valid = batch.valid
-    tl = batch.token_lens
-    dec_in = np.full((B, max_dec_len), PAD, dtype=np.int64)
-    dec_tgt = np.full((B, max_dec_len), PAD, dtype=np.int64)
-    dec_in[:, 0] = BOS
-    # input = [BOS] + toks (valid rows only; invalid rows stay [BOS, PAD…],
-    # fully masked below). target = toks + [EOS] for valid rows.
-    dec_in[valid, 1:1 + max_tokens] = batch.tokens[valid]
-    dec_tgt[valid, :max_tokens] = batch.tokens[valid]
-    rows = np.nonzero(valid)[0]
-    dec_tgt[rows, tl[rows]] = EOS              # EOS at each row's token_len
-    # padding mask: valid rows unmask token_len+1 positions ([BOS]+toks);
-    # invalid rows unmask only position 0 (BOS) so no row is fully padded.
-    lengths = np.where(valid, tl + 1, 1)
-    dec_pad = np.arange(max_dec_len)[None, :] >= lengths[:, None]
-    return dec_in, dec_tgt, dec_pad
-
-
-# ===========================================================================
-# train_encoder — magnitude-validity + rename-equivariant register binding
-# + value-prediction on RVT batches (the T2 loss set, single-instruction)
-# ===========================================================================
 
 def resolve_device(spec):
     if spec == 'auto':
@@ -425,7 +339,7 @@ def _peek(it):
 def run_train_loop(batch_source, *, model, opt, scheduler, log, device,
                    prep_fn, fwd_loss_fn, extra_fn=None, clip=1.0,
                    compile_step=True, capture_state=False, start_step=0):
-    """The shared compiled training loop for all trainers (T1/T2/decoder).
+    """The shared compiled training loop for both trainers (T1/T2).
 
     Owns the universal mechanics: process/device setup (TF32 matmul + disabling
     the fused-attention fast path that the compiled step can't capture),
@@ -447,14 +361,14 @@ def run_train_loop(batch_source, *, model, opt, scheduler, log, device,
           aux:     tensors a boundary-only extra_fn needs (or None).
           The torch.compile target — keep it fixed-shape + host-sync-free.
       extra_fn(item, aux) -> dict  boundary-only extra fields (probes, chunk
-          counts, decoder accuracy), or None.
+          counts), or None.
 
     `model` is the trainable module (its parameters are grad-clipped). Returns
     log.losses. start_step seeds the step counter (resume)."""
     if _is_cuda(device):
         # TF32 tensor cores for fp32 matmul (~2-4x, ~1 bit precision). Set
         # here so every trainer gets it uniformly (it had drifted to only
-        # T2/decoder, leaving T1 on slow fp32 matmuls).
+        # T2, leaving T1 on slow fp32 matmuls).
         torch.set_float32_matmul_precision('high')
     # Disable the fused attention fast path (_transformer_encoder_layer_fwd /
     # nested-tensor) — not torch.compile-able; it shatters the captured graph.
@@ -1537,98 +1451,3 @@ def train_t2_encoder(batch_iter, t1_encoder, *,
         n_anchor_states=n_anchor_states, resume=t2_checkpoint,
         device=device, on_log=on_log, compile_step=compile_step)
 
-
-def _decoder_accuracy(logits, dec_tgt, dec_pad):
-    """Per-token and per-instruction (whole-row exact-match) accuracy."""
-    with torch.no_grad():
-        pred = logits.argmax(dim=-1)
-        non_pad = ~dec_pad
-        tok_total = non_pad.sum().item()
-        tok_acc = (((pred == dec_tgt) & non_pad).sum().item() / tok_total
-                   if tok_total > 0 else 0.0)
-        B = dec_tgt.shape[0]
-        instr_correct = 0
-        for b in range(B):
-            n = non_pad[b].sum().item()
-            if n > 0 and (pred[b, :n] == dec_tgt[b, :n]).all():
-                instr_correct += 1
-        instr_acc = instr_correct / B if B > 0 else 0.0
-    return tok_acc, instr_acc
-
-
-def train_decoder(batch_iter, encoder, *, d_model, n_heads, n_layers,
-                  n_memory=1, lr=3e-4, n_steps=None, log_every=100,
-                  lr_min=1e-6, device='auto', on_log=None, compile_step=True):
-    """Train a decoder on a frozen encoder with teacher-forced CE.
-
-    Reconstructs each valid chunk's tokens from the frozen encoder's vector.
-    Processes ALL rows at a fixed shape (invalid rows get all-PAD targets,
-    ignored by CE) so the step is CUDA-graph-capturable like the encoders.
-    Returns (decoder, losses); losses[i] = {step, loss, tok_acc, instr_acc}.
-    """
-    device = resolve_device(device)
-    # TF32 + fused-attention-fastpath disable are handled in run_train_loop
-    # (shared across trainers). The decoder reconstructs straight from the
-    # batch each step (light prep), so it has no separate prefetcher.
-    encoder.eval()
-    for p in encoder.parameters():
-        p.requires_grad = False
-    encoder = encoder.to(device)
-
-    decoder = Decoder(
-        VOCAB_SIZE, d_model, n_heads, n_layers,
-        d_emb=encoder.d_out, n_memory_tokens=n_memory).to(device)
-    decoder.train()
-    opt, scheduler = build_optim_sched(
-        decoder.parameters(), lr, n_steps, lr_min=lr_min, device=device)
-
-    def _fmt(r, ms, eta, lr_now):
-        return (f'step {r["step"]:>5d}  loss {r["loss"]:.4f}  '
-                f'tok_acc {r["tok_acc"]:.1%}  instr_acc {r["instr_acc"]:.1%}  '
-                f'lr {lr_now:.1e}  {ms:.0f}ms/step  '
-                f'eta {timedelta(seconds=int(eta))}')
-
-    log = TrainLog(n_steps=n_steps, log_every=log_every, lr=lr,
-                   scheduler=scheduler, formatter=_fmt, on_log=on_log)
-
-    # max_dec_len from the corpus-constant token width (max_tokens + 1).
-    first, batch_iter = _peek(batch_iter)
-    if first is None:
-        return decoder, log.losses
-    max_dec_len = first.tokens.shape[1] + 1
-    autocast = _is_cuda(device)
-
-    def _fwd_loss(vecs, dec_in, dec_pad, dec_tgt):
-        if autocast:
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                logits = decoder(vecs, dec_in, dec_pad)
-                loss = F.cross_entropy(
-                    logits.reshape(-1, VOCAB_SIZE), dec_tgt.reshape(-1),
-                    ignore_index=PAD)
-        else:
-            logits = decoder(vecs, dec_in, dec_pad)
-            loss = F.cross_entropy(
-                logits.reshape(-1, VOCAB_SIZE), dec_tgt.reshape(-1),
-                ignore_index=PAD)
-        return loss, {'loss': loss}, (logits, dec_tgt, dec_pad)
-
-    def _prep(batch):
-        tok = _h2d(batch.tokens, device, dtype=torch.long)
-        pad = _h2d(padding_mask(batch), device)
-        with torch.no_grad():
-            vecs = encoder.encode(tok, pad)
-        di, dt, dp = decoder_targets_fixed(batch, max_dec_len)
-        return (vecs, _h2d(di, device, dtype=torch.long),
-                _h2d(dp, device), _h2d(dt, device, dtype=torch.long))
-
-    def _extra(batch, aux):
-        logits, dec_tgt, dec_pad = aux
-        tok_acc, instr_acc = _decoder_accuracy(logits, dec_tgt, dec_pad)
-        return {'tok_acc': tok_acc, 'instr_acc': instr_acc}
-
-    losses = run_train_loop(
-        batch_iter, model=decoder, opt=opt, scheduler=scheduler, log=log,
-        device=device,
-        prep_fn=_prep, fwd_loss_fn=_fwd_loss, extra_fn=_extra,
-        compile_step=compile_step)
-    return decoder, losses

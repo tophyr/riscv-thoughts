@@ -1,4 +1,4 @@
-"""Diagnostic functions for the equivariant compressor + decoder.
+"""Diagnostic functions for the equivariant compressor.
 
 Pure functions, no CLI (driven by scripts/eval.py and the test suite);
 each returns a flat dict of metrics. Coverage:
@@ -9,7 +9,6 @@ each returns a flat dict of metrics. Coverage:
   gvn_collapse         — essence distance split by pair type: rename-twin
                          (free/structural) vs behavioral-non-rename
                          (commutativity — TRAINED) vs distinct
-  decoder_accuracy     — teacher-forced decoder reconstruction
 """
 
 import numpy as np
@@ -28,79 +27,13 @@ from tokenizer import encode_instruction, PAD
 from .model import instruction_wiring, X0_SLOT
 from .train import (
     _t1_wiring, _split_to_per_instruction, _t2_assemble, t2_chunk_forward,
-    prepare_decoder_targets,
 )
 
 _MAX_INSTR_TOKENS = 9   # matches datagen.batch.MAX_INSTR_TOKENS
 _COMMUTATIVE = frozenset({'ADD', 'AND', 'OR', 'XOR'})
 
 
-# ===========================================================================
-# Decoder reconstruction
-# ===========================================================================
 @torch.no_grad()
-def decoder_accuracy(encoder, decoder, batches, *,
-                     device, max_batches=20):
-    """Teacher-forced reconstruction accuracy of the decoder on RVT
-    batches. Only valid rows contribute (invalid rows have no target).
-
-    Step 2 success criterion: instr_acc > 0.95.
-
-    Returns: {'tok_acc': float, 'instr_acc': float,
-              'n_tokens': int, 'n_instrs': int, 'n_batches': int}.
-    """
-    encoder.eval()
-    decoder.eval()
-    tok_correct = tok_total = 0
-    instr_correct = instr_total = 0
-    n_batches = 0
-
-    for batch in batches:
-        if n_batches >= max_batches:
-            break
-        n_batches += 1
-        valid = batch.valid
-        if not valid.any():
-            continue
-        tok = torch.from_numpy(batch.tokens).to(device).long()
-        pad = torch.from_numpy(padding_mask(batch)).to(device)
-        in0, in1, out = _t1_wiring(batch)
-        vecs_all = encoder.encode(
-            tok, pad,
-            torch.from_numpy(in0).to(device), torch.from_numpy(in1).to(device),
-            torch.from_numpy(out).to(device))
-        valid_idx = np.flatnonzero(valid)
-        vecs = vecs_all[valid_idx]
-        token_lists = []
-        for i in valid_idx:
-            n = int(batch.token_lens[i])
-            token_lists.append(batch.tokens[i, :n].tolist())
-        dec_in, dec_tgt, dec_pad = prepare_decoder_targets(token_lists, device)
-        if dec_in is None:
-            continue
-        logits = decoder(vecs, dec_in, dec_pad)
-        pred = logits.argmax(dim=-1)
-        non_pad = ~dec_pad
-        tok_correct += int(((pred == dec_tgt) & non_pad).sum())
-        tok_total += int(non_pad.sum())
-        for b in range(pred.shape[0]):
-            n = int(non_pad[b].sum())
-            instr_total += 1
-            if n > 0 and bool((pred[b, :n] == dec_tgt[b, :n]).all()):
-                instr_correct += 1
-
-    return {
-        'tok_acc': tok_correct / tok_total if tok_total else 0.0,
-        'instr_acc': instr_correct / instr_total if instr_total else 0.0,
-        'n_tokens': tok_total,
-        'n_instrs': instr_total,
-        'n_batches': n_batches,
-    }
-
-# ===========================================================================
-# Building per-chunk inputs from raw Instruction lists (for controlled evals)
-# ===========================================================================
-
 def _chunks_to_split(chunks):
     """Build the _split_to_per_instruction tuple directly from a list of
     chunks (each a list[Instruction]) — the controlled-eval analog of the

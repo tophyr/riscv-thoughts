@@ -3,7 +3,7 @@
 A Batch carries chunks (some valid, some invalid) plus their supervision
 targets. Losses see different views of the same batch:
 
-  - Reconstruction CE (decoder):
+  - Reconstruction CE:
         for c in chunks if c.valid:
             loss += CE(decode(encode(c.tokens)), c.tokens)
   - Validity magnitude:

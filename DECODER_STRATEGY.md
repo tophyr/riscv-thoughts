@@ -1,11 +1,21 @@
 # Decoder Strategy
 
 > **Status: unproven theory, and not the current objective.** Decode-back is
-> an explicit non-goal of the current phase — the live objective is `vp = 0.0`
+> an explicit non-goal of the current work — the live objective is `vp = 0`
 > (TODO.md). The encoder this document assumes has also been replaced: it is
-> now the rename-equivariant register-state machine in RISCV_DESIGN.md.
-> `scripts/train_decoder.py` does not run (`compressor/train.py:1632` calls a
-> 2-arg `encode()` that predates the refactor).
+> now the rename-equivariant register-state machine in RISCV_DESIGN.md. No
+> decoder exists in the tree.
+>
+> **There is history of ONE POSSIBLE decoder at the tag
+> `tombstones/transformer_based_decoder_example`** — an autoregressive
+> transformer trained with teacher-forced cross-entropy against a frozen
+> encoder. It is an example of *a* decoder, nothing more. Its architecture is
+> **not** correct, **not** validated, and **not** a goal direction: it was
+> never made to work against the equivariant encoder, and the proposer +
+> verifier search this document describes is a different shape entirely. Read
+> it to see what one attempt looked like; do not read it as a starting point.
+> `git show tombstones/transformer_based_decoder_example` is the commit that
+> removed it, so the diff carries the full code.
 
 ## The Problem
 
@@ -113,8 +123,8 @@ See EXPERIMENT_LOG.md for empirical results.
 **Size it larger than the compressor.** A rough rule from memorization theory
 (Zhang et al. 2017): decoder parameter count should be at least the total number
 of token predictions in the training set. Below that it plateaus short of full
-reconstruction however long it trains; far above it, it memorizes beyond what the
-encoder geometry actually preserves as structure.
+reconstruction however long it trains; far above it, it memorizes beyond what
+the encoder geometry actually preserves as structure.
 
 An autoregressive model conditioned on the target thought vector.
 At each step it outputs a distribution over the token vocabulary,

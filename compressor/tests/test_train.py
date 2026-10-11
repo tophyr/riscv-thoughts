@@ -25,7 +25,6 @@ from compressor.train import (
     _value_smooth,
     binding_losses,
     build_optim_sched,
-    prepare_decoder_targets,
     t2_value_predict_loss,
 )
 
@@ -434,33 +433,6 @@ def test_build_optim_sched_plain_cosine_when_no_warmup():
     assert math.isclose(lrs[0], 0.1, rel_tol=1e-9)
     assert lrs[0] > lrs[5] > lrs[9]
     assert lrs[9] < 0.01
-
-
-# ===========================================================================
-# prepare_decoder_targets
-# ===========================================================================
-
-def test_prepare_decoder_targets_wraps_and_shifts():
-    """dec_input = [BOS] + toks (drop last), dec_target = toks + [EOS]."""
-    di, dt, dp = prepare_decoder_targets([[10, 11]], 'cpu')
-    assert di.tolist() == [[BOS, 10, 11]]
-    assert dt.tolist() == [[10, 11, EOS]]
-    assert dp.tolist() == [[False, False, False]]
-
-
-def test_prepare_decoder_targets_padding():
-    """Unequal lengths pad to the longest; shorter row's tail is PAD and
-    masked True."""
-    di, dt, dp = prepare_decoder_targets([[10], [20, 21, 22]], 'cpu')
-    # Row 0: [BOS,10,EOS] -> input [BOS,10] target [10,EOS], padded to len 4.
-    assert di.tolist() == [[BOS, 10, PAD, PAD], [BOS, 20, 21, 22]]
-    assert dt.tolist() == [[10, EOS, PAD, PAD], [20, 21, 22, EOS]]
-    assert dp.tolist() == [[False, False, True, True],
-                           [False, False, False, False]]
-
-
-def test_prepare_decoder_targets_empty():
-    assert prepare_decoder_targets([], 'cpu') == (None, None, None)
 
 
 # ===========================================================================

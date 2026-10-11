@@ -1,4 +1,4 @@
-"""The equivariant Compressor, its token front-end, and the Decoder.
+"""The equivariant Compressor and its token front-end.
 
 ONE `Compressor` class serves every tier: a
 rename-equivariant register-indexed encoder built on the shared
@@ -502,41 +502,3 @@ def T2Compressor(*, d_t1, d_out, d_event, op_cell_depth=1,
                       op_cell_depth=op_cell_depth, vp_head_depth=vp_head_depth,
                       n_pool_heads=n_pool_heads)
 
-
-class Decoder(nn.Module):
-    """Autoregressive decoder conditioned on an emission vector."""
-
-    def __init__(self, vocab_size, d_model, n_heads, n_layers, d_emb,
-                 max_seq_len=64, dropout=0.0, n_memory_tokens=1):
-        super().__init__()
-        self.d_model = d_model
-        self.vocab_size = vocab_size
-        self.n_memory_tokens = n_memory_tokens
-        self.emission_proj = nn.Linear(d_emb, n_memory_tokens * d_model)
-        self.tok_emb = nn.Embedding(vocab_size, d_model)
-        self.pos_emb = nn.Embedding(max_seq_len, d_model)
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model, n_heads, dim_feedforward=d_model * 4,
-            dropout=dropout, batch_first=True)
-        self.decoder = nn.TransformerDecoder(decoder_layer, n_layers)
-        self.head = nn.Linear(d_model, vocab_size)
-
-    def forward(self, emission_vecs, target_tokens, target_padding_mask):
-        N, T = target_tokens.shape
-        device = target_tokens.device
-        memory = self.emission_proj(emission_vecs).view(
-            N, self.n_memory_tokens, self.d_model)
-        pos = torch.arange(T, device=device)
-        tgt = self.tok_emb(target_tokens) + self.pos_emb(pos)
-        causal_mask = torch.ones(
-            T, T, dtype=torch.bool, device=device).triu(diagonal=1)
-        out = self.decoder(
-            tgt, memory,
-            tgt_mask=causal_mask,
-            tgt_key_padding_mask=target_padding_mask,
-            tgt_is_causal=False)  # explicit (not None) → skips
-                                  # _detect_is_causal_mask's tensor->bool check
-                                  # (a graph break) while still applying the
-                                  # explicit causal mask. (True invokes a
-                                  # fast path that doesn't capture under compile.)
-        return self.head(out)
