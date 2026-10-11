@@ -1,6 +1,6 @@
 ---
 name: document
-description: Write or revise this project's prose documentation (README, RISCV_DESIGN, EXPERIMENT_LOG, TODO, skills) and its code comments so they read as current truth to someone who has never seen the repo. Load before any documentation pass, after a result changes what a document claims, and before a commit that touches a .md file. Covers routing content to the right document, correcting claims in place, and audits A-G — deictic references, undefined comparatives, jargon, structural placement, narrative markers, cross-references, and scope conditions on numbers.
+description: Write or revise this project's prose documentation (README, RISCV_DESIGN, EXPERIMENT_LOG, TODO, skills) and its code comments so they read as current truth to someone who has never seen the repo. Load before any documentation pass, after a result changes what a document claims, and before a commit that touches a .md file. Covers routing content to the right document, correcting claims in place, what a commit message owes its reader, and audits A-G — deictic references, undefined comparatives, jargon, structural placement, narrative markers, cross-references, and scope conditions on numbers.
 ---
 
 # Documenting
@@ -46,7 +46,7 @@ In this project:
 | `EXPERIMENT_LOG/` | findings and the evidence for them | forward plans |
 | `TODO.md` | the live mission, open tasks, dead ends, how to run | history of any kind |
 | `.claude/skills/` | procedures and reference for a task | findings |
-| commit messages | **the narrative** — sequence, refuted hypotheses, what settled it | — |
+| commit messages | the **differential** — what is true at this commit that was not true at its parent | the route taken between the two |
 
 A result that changes an architectural claim usually needs edits in two places:
 the finding in the experiment log, and the rationale in the design doc. Changing
@@ -172,21 +172,51 @@ depends on. If a change would invalidate it, say which change.
 Same standard, tighter budget. **1–2 lines, the WHY only.** No debugging
 journey, no symptom chain, no which-run-hit-it, no record that the code used to
 be different. If it will not compress to two lines, it belongs in the commit
+message — or, if it is a result rather than a reason, in `EXPERIMENT_LOG/`.
+
+## 6. Commit messages
+
+A commit is a **waypoint**. What the message owes its reader is the difference
+between this waypoint and the last one: what is true now that was not true
+before, stated as fact. The route between two waypoints is not the subject. If
+the work looped forty-seven times and chased its tail getting here, none of that
+changes the difference the commit records, and none of it belongs in the
 message.
 
-## 6. Verify what you cannot source
+**Storytelling about the differential is legitimate** — sometimes it is the
+clearest way to write one. A deletion that follows from a refutation, a number
+that moved because a target changed, a defect and the fix it forced: each is a
+story about *the difference between two states*, and each is fair game. Reach
+for the plain current-state description first, and keep the story only when it
+says something the flat description does not.
+
+**Cut the path taken.** No sequence of what was believed en route, no
+hypotheses raised and dropped along the way, no "X had been held pending Y", no
+"this turned out to be backwards", no tally of what was tried. The exception is
+narrow and real: keep a step of the route when the movement cannot be
+understood without it. A refuted hypothesis that is itself a durable result is
+such a case — but it is a *finding*, so it goes in `EXPERIMENT_LOG/`, and the
+commit message states the finding rather than the chase.
+
+The mechanical test: every sentence should be checkable against the tree at this
+commit or the tree at its parent. A sentence that can only be checked against
+something that existed transiently in between is the journey — cut it.
+
+Hard cap **250 words**. Evidence and tables go in `EXPERIMENT_LOG/` or
+`TODO.md`.
+
+## 7. Verify what you cannot source
 
 A pass will surface claims you cannot immediately support. Do not smooth the
 prose around them. Read the code, or measure — the same standard as any other
 assertion (`CLAUDE.md`, Verification Protocol). A documentation pass is a common
 way to discover that something in the repo is wrong.
 
-## 7. Finish
+## 8. Finish
 
 - **Shorter is the tell.** A good de-narrativizing pass usually removes more
   lines than it adds. If it added lines, check whether the additions are
   exposition or apology.
 - Re-read each changed document from its top, in the reading order the README
   gives, as someone who has never seen the project.
-- Put the narrative in the commit message, where it belongs: what was tried,
-  what was refuted, what settled it.
+- Write the commit message to section 6: the differential, not the route.
