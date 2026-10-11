@@ -425,7 +425,9 @@ Remote operational facts:
 - `runs/<name>/` — checkpoints + hparams.json + losses.json (gitignored).
 - Pipeline regression tests: `scripts/tests/test_pipeline.py` (covers rule
   parsing, format detect/validate, mux modes, the pdeathsig orphan guard, and
-  end-to-end 1-step train smokes). Run `python -m pytest scripts/tests`.
+  end-to-end 1-step train smokes). In the default `pytest` run; it is the slow
+  part of it, since every case drives a CLI through a subprocess. Narrow to it
+  with `python -m pytest scripts/tests`.
 - This guide is the `datagen` skill (`.claude/skills/datagen/SKILL.md`), tracked
   by the `!.claude/skills/` exception in `.gitignore`. It loads on demand —
   invoke it before touching the pipeline rather than working from memory.

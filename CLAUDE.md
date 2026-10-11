@@ -83,8 +83,8 @@ silently changed semantics — stop and flag, don't ship.
 
 **Verify against a real checkpoint, not just the test suite.** No
 test loads one, so the suite cannot catch a `state_dict`
-incompatibility: adding an unconditional `rank_emb` passed all 285
-tests and failed at step 0 of the next run against the frozen T1.
+incompatibility: adding an unconditional `rank_emb` passed the whole
+suite and failed at step 0 of the next run against the frozen T1.
 
 Breaking changes are acceptable — including reminting the frozen
 T1 — on the one condition that old and new can be compared and

@@ -1,5 +1,15 @@
 [tool.pytest.ini_options]
-testpaths = ["emulator/tests", "tokenizer/tests", "datagen/tests", "compressor/tests"]
+# scripts/tests drives the CLIs end to end through subprocesses, so it is
+# slower than the rest (~38s against ~7s) — but it holds the only guards for
+# the RVT header and for worker orphaning, and a guard pytest does not
+# collect is not guarding anything.
+testpaths = [
+    "emulator/tests",
+    "tokenizer/tests",
+    "datagen/tests",
+    "compressor/tests",
+    "scripts/tests",
+]
 filterwarnings = [
     "ignore:overflow:RuntimeWarning:tinyfive",
 ]
