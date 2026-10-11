@@ -188,8 +188,8 @@ to natural language. The order matters — you can't do Phase
   T2-composition coherence) made it the right change anyway.
 - **Heavy-handed unit definitions are appropriate during
   method validation.** The discomfort of "I'm prescribing
-  what a thought is" is the right discomfort for Phase 3
-  outputs and the wrong discomfort for Phase 1 design
-  choices.
+  what a thought is" belongs to the natural-language stage,
+  not to the prescribed-boundary design choices that exercise
+  the method (WHAT_IS_A_THOUGHT.md, "Method vs. Cognition").
 
 ---

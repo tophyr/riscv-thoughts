@@ -12,18 +12,24 @@ geometry — and whether search-based decoding can invert the compression.
 3. [RISCV_DESIGN.md](RISCV_DESIGN.md) — the testbed and the architecture, with
    the durable rationale for why it is shaped this way.
 4. [EXPERIMENT_LOG.md](EXPERIMENT_LOG.md) — an index over one file per phase in
-   `EXPERIMENT_LOG/`. Read the index, then **Phases 14 and 15 in full**; earlier
-   phases are superseded design kept for their dead ends — open one when you are
-   about to revisit the question it settled.
-5. [TODO.md](TODO.md) — the live mission, the open tasks, and the dead ends.
+   `EXPERIMENT_LOG/`. Read the index, then the two entries it marks as the live
+   record in full: the current architecture, and the open faithfulness problem.
+   Earlier entries are superseded design kept for their dead ends — open one
+   when you are about to revisit the question it settled.
+5. [METRICS.md](METRICS.md) — what each measurement means, what it certifies,
+   how far it moves when nothing changed, and the conditions a number from it is
+   only true under. Read before quoting any figure.
+6. [TODO.md](TODO.md) — the mission, the milestones, and the open tasks.
 
 [DECODER_STRATEGY.md](DECODER_STRATEGY.md) and
 [STREAMING_COMPRESSOR.md](STREAMING_COMPRESSOR.md) describe deferred, unbuilt
 layers — read their status banners and skip the rest unless you are working on
 them. [TRANSFERABLE_LESSONS.md](TRANSFERABLE_LESSONS.md) is background from the
-predecessor project. The data-generation pipeline is documented in the `datagen`
-skill (`.claude/skills/datagen/SKILL.md`); its silent-corruption invariants live
-in `CLAUDE.md`. Read both before touching data generation.
+predecessor project. [probes/README.md](probes/README.md) indexes the frozen-
+checkpoint diagnostics. The data-generation pipeline and the commands for
+running a training cell are documented in the `datagen` skill
+(`.claude/skills/datagen/SKILL.md`); its silent-corruption invariants live in
+`CLAUDE.md`. Read both before touching data generation.
 
 ## The Idea
 
@@ -162,6 +168,7 @@ datagen/        RVT batch format + chunk analysis: SSA, anchor
 compressor/     Equivariant Compressor (T1/T2), decoder, shared training
                 loop (train.py), held-out eval (eval.py)
 scripts/        Training and evaluation entry points
+probes/         Frozen-checkpoint diagnostics (see probes/README.md)
 ```
 
 ## Usage
@@ -169,40 +176,27 @@ scripts/        Training and evaluation entry points
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-
-# Train T1 (single-instruction encoder). datagen generates on all CPU
-# cores; --count bounds the run; the trainer reads until stdin EOF
-# (--n-steps only shapes the LR schedule).
-python -m datagen --rule single --twins 2 --batch-size 128 \
-    --n-states 8 --anchor-seed 0 --config configs/instr_default.json \
-    --count 250000 \
-  | python scripts/train_encoder.py --d-model 128 --n-heads 4 --n-layers 2 \
-    --d-out 64 --max-window 32 --n-steps 250000 --out-dir t1_run
-
-# Train T2 (chunk encoder on a frozen T1); --count bounds the run.
-# NOTE: on the GPU box, local datagen workers contend with the trainer's
-# per-step H2D prep and starve the GPU. For a real run, offload generation to
-# another machine with multinode_gen.sh (same flags via env vars). See the
-# `datagen` skill for what limits throughput once that is done.
-#   RULE="branch+cap=4" CONFIG=configs/instr_t2.json ./multinode_gen.sh 2000000 \
-#     | python scripts/train_t2_encoder.py --t1-model runs/t1_run/encoder.pt ...
-python -m datagen --rule "branch+cap=4" --twins 3 --batch-size 128 \
-    --n-states 8 --anchor-seed 0 --config configs/instr_t2.json \
-    --count 2000000 \
-  | python scripts/train_t2_encoder.py --t1-model runs/t1_run/encoder.pt \
-    --d-out 512 --d-event 16 --route binding \
-    --n-steps 2000000 --anchor-seed 0 --n-anchor-states 8 --out-dir t2_run
-
-# Train a decoder on a frozen encoder — CURRENTLY BROKEN, do not use.
-# train_decoder predates the equivariant refactor: compressor/train.py:1632
-# calls a 2-arg `encoder.encode(tok, pad)`, but the current encode() also
-# needs the wiring (in0, in1, out) and tags, so it raises TypeError at step 1.
-# Decode-back is a non-goal of the current phase; see DECODER_STRATEGY.md.
-#   python -m datagen --rule single --twins 0 --batch-size 128 \
-#       --config configs/instr_default.json --count 5000 \
-#     | python scripts/train_decoder.py --t1-model runs/t1_run/encoder.pt \
-#       --d-model 128 --n-heads 4 --n-layers 2 --n-steps 5000 --out-dir dec_run
-
-# Test
 python -m pytest
 ```
+
+Training is a streaming pipeline — `datagen` generates and analyzes chunks on
+CPU workers and writes RVT batches to stdout; a trainer reads them on stdin:
+
+```bash
+python -m datagen <corpus flags> | python scripts/train_t2_encoder.py <model flags>
+```
+
+**The canonical commands for T1 and T2, with the flags that are actually
+current, are in the `datagen` skill** (`.claude/skills/datagen/SKILL.md`).
+They are not repeated here: two copies drift, and the ones that matter carry
+invariants (the anchor seed and state count must match between generator and
+trainer, or the targets are silently wrong — `CLAUDE.md`). `scripts/run_t2.sh`
+runs one scored training cell end to end and is the normal entry point.
+
+`scripts/train_decoder.py` does not run: it predates the equivariant refactor
+and calls a two-argument `encoder.encode(tok, pad)` (`compressor/train.py:1619`)
+where the current signature also needs the per-instruction wiring, so it raises
+at step 1. Decode-back is a non-goal of the current work — see
+[DECODER_STRATEGY.md](DECODER_STRATEGY.md).
+
+

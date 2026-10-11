@@ -110,6 +110,10 @@ while input or window:
 advantage from decoder reconstruction quality. Gumbel-sigmoid does
 not work (zero gradient through Python control flow).
 
+**Emission granularity at T1 is one emission per instruction**, driven by a
+window-size-weighted reconstruction loss rather than prescribed. The
+granularity a T2-level segmenter should emit at is open.
+
 ---
 
 ## Applied to RISC-V
@@ -160,7 +164,7 @@ one. We pick it to test whether the recursive shift-reduce
 machinery works at level 2. Once that's validated, weaker boundary
 signals can be experimented with — we expect the encoder to
 continue working when boundaries are less prescribed (see the
-"Phase 1/2/3" framing in WHAT_IS_A_THOUGHT.md).
+staged framing in WHAT_IS_A_THOUGHT.md, "Method vs. Cognition").
 
 ### Inter-Level Streaming
 
@@ -229,26 +233,19 @@ longer in its window.
 
 ---
 
-## Execution Comparison for Sequences
+## Supervision for Sequences
 
-The single-instruction model extracts (data_val, pc_val) — one value
-written to one register, plus the PC. For sequences, the output is
-the full machine state delta:
+A segmenter needs a target for the windows it emits, and the one the project
+uses is the canonical `out_regs` oracle: the chunk's behavioral inputs are
+relocated to canonical read positions and executed there, so the target depends
+on operand structure rather than register names (RISCV_DESIGN.md, "Training";
+METRICS.md for what it certifies). Earlier designs here proposed a pairwise
+distance between machine-state deltas; that line is a recorded dead end, since a
+rename is a non-abelian permutation with no additive shadow.
 
-**State delta:** for each register, compute output[r] - input[r].
-Registers that didn't change contribute zero. Log-scale each register's
-delta independently. The distance between two sequences is the sum of
-per-register log-scaled deltas, plus the PC delta.
-
-This naturally handles:
-- Single instructions (one register changes, same as current)
-- Basic blocks (multiple registers change, each contributes)
-- Equivalent sequences (same delta → same point, regardless of internal
-  structure)
-
-Memory effects: for sequences with loads/stores, the state delta
-includes memory changes. The SparseMemory approach extends — track
-which addresses were written, compare the written values.
+What a segmenter adds on top is a target for the *boundary* decision, which the
+chunk oracle does not supply — that is this document's open problem, not a
+solved part of it.
 
 ---
 
@@ -307,11 +304,12 @@ emittable / decodable the window is.
 Joint training of gates + encoder + decoder was never reached. The staged
 version — gates supervised against a *frozen* encoder and decoder — plateaued at
 ~70% emit-transition accuracy across eight mechanism variants
-(EXPERIMENT_LOG.md Phase 9), and the diagnosis was representational, not
+(EXPERIMENT_LOG, "Gate training on a frozen encoder"), and the diagnosis was
+representational, not
 mechanical: the encoder of the day had been trained only on valid single
 instructions, so it structurally lacked the "is this window a complete
 instruction" feature the emit gate needed to read. That finding is what motivated
-the magnitude-as-validity retrain (Phase 10). `train_gates()` was removed from
+the magnitude-as-validity retrain. `train_gates()` was removed from
 the codebase; the architecture description above is retained as the design to
 resume from, and gate training resumes only once an encoder carries validity in
 its magnitude on a corpus that actually contains invalid windows (TODO.md open
@@ -338,71 +336,26 @@ match found." That criterion must be learned.
 
 ---
 
-## Open Questions
+## Open questions
 
-### Resolved
 
-1. **Gate architecture.** Resolved: GRU gate controller processes
-   T1 candidates causally. Three independent MLP heads read from
-   (T1 candidate, GRU hidden). Accept also sees next token embedding.
-   Gates use Bernoulli sampling + REINFORCE during training.
-
-2. **Emission granularity.** Resolved for T1: one emission per
-   instruction. The window-size-weighted reconstruction loss
-   naturally drives this. T2 granularity TBD.
-
-3. **Attention type within the window.** Resolved: bidirectional
-   self-attention within the window. The window is small (one
-   instruction ≈ 4-8 tokens), so homogenization is not an issue.
-
-4. **Training data.** Resolved: one self-describing RVT stream for
-   every tier (`datagen`,
-   cat-concatenable). See the `datagen` skill.
-
-5. **Gate training signal.** Resolved: per-iteration decoder
-   evaluation provides reconstruction quality at every step.
-   REINFORCE with per-iteration advantage (loss minus moving
-   average baseline). Gumbel-sigmoid doesn't work (zero gradient
-   through Python control flow).
-
-6. **Equivalence collapse.** Superseded: equivalence is now EMERGENT
-   from the behavioral loss set (no explicit equivalence loss, no
-   manifest injection) — rename-twins collapse structurally and
-   non-rename behavioral equivalents from the canonical vp target.
-   See RISCV_DESIGN.md and EXPERIMENT_LOG.md Phase 14.
-
-7. **Validity representation in T1.** Resolved: T1 lives in the
-   unit ball, not on the unit sphere — drop `F.normalize` on the
-   encoder output. Magnitude `||T1||` encodes validity/confidence
-   (1 = valid thought, 0 = not-a-thought at the origin); direction
-   `T1/||T1||` encodes semantics. Encoder trained with invalid-window
-   augmentation and a binary magnitude target. See Exp 31-33:
-   a linear probe of the pre-magnitude encoder for "is this a
-   complete instruction" barely beat the majority baseline,
-   because the encoder was trained only on valid single
-   instructions and had no supervision for the discrimination
-   task. Do *not* renormalize composed thoughts downstream —
-   magnitude carries compositional-coherence signal.
-
-### Open
-
-8. **Feedback loop stability.** T2 feedback into T1 creates
+1. **Feedback loop stability.** T2 feedback into T1 creates
    recurrence. Untested. The structural argument (eviction ensures
    fresh bottom-up signal) may be sufficient.
 
-9. **Feedback mechanism.** Cross-attention from T2 state is the
+2. **Feedback mechanism.** Cross-attention from T2 state is the
    planned approach. Alternatives (additive conditioning, gating
    modulation) exist. Empirical when T2 is built.
 
-10. **Output space per level.** d_out=128 on S^127 was the original
+3. **Output space per level.** d_out=128 on S^127 was the original
     choice, from before magnitude carried validity. The tiers that
     exist now are sized to information content instead — T1 at
-    d_out=64, T2 at 256–512 — and live in the open ball, not on a
+    d_out=64, T2 at d_out=512 — and live in the open ball, not on a
     sphere. Whether each level should keep its own dimensionality,
     and how to pick it, is still open (WHAT_IS_A_THOUGHT.md,
     "Level-Specific Dimensionality").
 
-11. **Memory in state delta.** Per-register deltas work for the
-    current instruction set. Memory effects (load/store) are
-    captured via shared SparseMemory across instructions in a
-    sequence, but not explicitly in the distance metric.
+4. **Memory.** The oracle raises on load/store rather than modelling them, so
+    a segmenter that spans memory ops has no supervision for them. Whether an
+    essence can capture value-dependent memory dataflow at all is the open
+    expressiveness risk (RISCV_DESIGN.md, "Open problems").

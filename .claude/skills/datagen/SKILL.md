@@ -54,7 +54,7 @@ skipped, so bare generation (and a generator run with `</dev/null` in a script)
 is unaffected. (To replay a pure corpus with no generation: `cat corpus.rvt |
 python -m datagen --gen-count 0`.)
 
-## Canonical commands (verified against README.md — copy these, don't improvise)
+## Canonical commands — this file is their only copy; copy these, don't improvise
 
 `datagen` defaults to all cores; bound the run with `--count N`.
 Generation flags are first-class — there is no `--` separator.
@@ -106,14 +106,31 @@ python -m datagen --rule "cap=$LEN" --twins 2 --batch-size 128 --n-states 8 \
 
 `--d-out 512` is the register-state width, and 512 is where it stays: 256 → 512
 is a real gain and 512 → 1024 buys nothing at any training budget measured, at
-2.6x the step time (EXPERIMENT_LOG phase-15, finding 17).
+2.6x the step time (EXPERIMENT_LOG, "T2 faithfulness", finding 17).
 
 `scripts/run_t2.sh` runs exactly this cell with each knob as an env var
 (`DOUT`, `LEN`, `STEPS`, `NPOOL`, …, and `T1` for the frozen lower tier), names
 the run directory after them, offloads generation to odin, and scores the
-result. Prefer it to typing the pipeline by hand — but never edit it while a
-copy is running, since bash reads a script incrementally and the running shell
-will misparse the shifted file.
+result. `TAG=<name>` suffixes the run directory so a re-run of an
+already-recorded cell does not overwrite it. Prefer it to typing the pipeline by
+hand — but **never edit it while a copy is running**: bash reads a script
+incrementally, so an edit shifts the file offsets under the running shell. Doing
+this mid-sweep produced a spurious `syntax error near 'fi'` and re-ran the
+eval-corpus block's redirect outside its `if`, truncating `/tmp/t2_eval_2.rvt`
+to 0 bytes — which surfaces as `binding: … rows=0` in every eval afterwards.
+Wait for the sweep, or edit a copy.
+
+**A replicate needs `GEN_SEED`.** Both generator pools default to `--seed 0`, so
+re-running a cell otherwise redraws the same instruction stream and measures
+only initialization variance. `GEN_SEED=7 … TAG=s7 bash scripts/run_t2.sh` draws
+a different corpus from the same distribution. It is unrelated to `ANCHOR_SEED`,
+which must stay equal to the trainer's `--anchor-seed` (INVARIANT 1). Replicating
+is not optional for a sweep — see METRICS.md on null interventions.
+
+**A run's `t2.pt` appears long before the run ends**, because the trainer
+checkpoints periodically. Wait on the trainer process exiting, or on
+`run_t2.sh` logging `final:`; scoring the file as soon as it exists reads a
+partial model.
 
 **T1 config** (the writers-only corpus T2 is trained against). T1 and T2 run
 the same core at the same settings, so the command below differs from the T2
@@ -250,7 +267,7 @@ Opcode-category mix (weights must sum to 1.0) + optional `equivalences`,
 `invalidity`, and `exclude_x0_dest`. Validation: `datagen/generate.py:160`
 `validate_distribution`; the accepted non-opcode keys are `_CONFIG_EXTRA_KEYS`
 (`datagen/generate.py:155`) and an unknown key is a hard error.
-- `instr_alu_writers.json` — **the corpus all current (Phase 15) work uses.**
+- `instr_alu_writers.json` — **the corpus all current work uses.**
   R/I-type ALU only (0.55 / 0.45) + `exclude_x0_dest: true`. No equivalences,
   no invalidity → a clean, all-valid, always-register-writing corpus. Every
   chunk is pure ALU, so `cap=N` and `branch+cap=N` behave identically here and

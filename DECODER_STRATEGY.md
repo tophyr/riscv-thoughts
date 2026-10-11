@@ -38,7 +38,7 @@ The proposer's job is to get close; the verifier's job is to confirm.
 
 ---
 
-## Phase 1: Gradient Decoder (Proof of Concept)
+## Stage 1: Gradient decoder (proof of concept)
 
 Validate that the T1 space is invertible -- that you can reliably
 recover instructions from their vectors.
@@ -82,26 +82,24 @@ distance landscape is smooth enough to navigate by gradient. If it
 fails, the geometry is the problem, not the search method, and no
 learned decoder will do better.
 
-### Preliminary Results
+### What it showed
 
-The gradient-decoder PoC was validated on an early T0→T1 model
-(EXPERIMENT_LOG.md Phase 5). The durable lessons: search recovers the original
-or an execution-equivalent instruction wherever the T1 geometry is smooth (it
-discovered commutative equivalents by navigation) and fails wherever the
-geometry is poor — so a decoding failure indicts the encoder geometry, not the
-search method. Discrete snapping to the nearest token sequence adds distance
-because the vocabulary is sparse in the continuous output space.
+Validated on an early T0→T1 model, with the measurements in EXPERIMENT_LOG
+("Gradient decoder"). The durable consequence for this design: **a decoding
+failure indicts the encoder geometry, not the search method** — search recovers
+the original or an execution-equivalent instruction wherever the geometry is
+smooth and fails wherever it is not.
 
 ---
 
-## Phase 2: Learned Decoder
+## Stage 2: Learned decoder
 
 Replace gradient search with a neural network that jumps to the
 answer in one forward pass. An autoregressive transformer decoder
 with cross-attention to the emission vector, trained with
 cross-entropy against the original tokens on a frozen encoder.
 
-The "compressor-as-loss" framing from Phase 1 turned out to be
+The "compressor-as-loss" framing from stage 1 is
 unnecessary in practice. Simple CE against the original tokens
 produces a decoder that generalizes to held-out instructions and
 emerges equivalence tolerance automatically — the encoder's
@@ -111,6 +109,12 @@ without needing the compressor as a verifier.
 See EXPERIMENT_LOG.md for empirical results.
 
 ### Architecture
+
+**Size it larger than the compressor.** A rough rule from memorization theory
+(Zhang et al. 2017): decoder parameter count should be at least the total number
+of token predictions in the training set. Below that it plateaus short of full
+reconstruction however long it trains; far above it, it memorizes beyond what the
+encoder geometry actually preserves as structure.
 
 An autoregressive model conditioned on the target thought vector.
 At each step it outputs a distribution over the token vocabulary,
@@ -173,7 +177,7 @@ controls quality.
 
 ---
 
-## Phase 3: Continuous Learning (Future)
+## Stage 3: Continuous learning
 
 Every real decoding attempt is a free training example.
 
@@ -243,22 +247,13 @@ signal, faster convergence.
    (explore), low temperature late (commit). How to anneal without
    getting stuck.
 
-3. **Decoder architecture size.** Empirically resolved: the decoder
-   needs to be substantially larger than the compressor. Rough rule
-   from memorization theory (Zhang et al. 2017): decoder parameter
-   count should be at least the total number of token predictions
-   in the training set. A too-small decoder plateaus below full
-   reconstruction even given unlimited training. A too-large decoder
-   wastes compute and memorizes beyond what the encoder geometry
-   actually preserves as structure.
-
-4. **Multi-sequence decoding.** For T2 targets, the decoder needs to
+3. **Multi-sequence decoding.** For T2 targets, the decoder needs to
    produce a sequence of instructions, not just one. Does it generate
    the whole sequence autoregressively, or does it first decide on
    a structure (how many instructions, what types) and then fill in
    details?
 
-5. **Equivalence class discovery.** High-temperature decoding with
+4. **Equivalence class discovery.** High-temperature decoding with
    multiple samples naturally discovers equivalence classes (different
    proposals that score equally well). How to systematically explore
    and catalog these?

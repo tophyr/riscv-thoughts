@@ -618,7 +618,11 @@ the syntactic-frame bug of finding 14; in the behavioral frame that cell is at
 writing instruction taking an operand from another instruction's result — is
 untouched by it, and is now the open problem: `distinct | immediate | depth 2`
 is at 93.01% with correct wiring and both frames agreeing, and carries 39.5% of
-all remaining error at 1.4% of the triples.
+all remaining error at 1.4% of the triples. Neither T1's binding prediction nor
+the canonical frame is what fails there (`probes/vp_frame.py`): restricting the
+cell to rows where T1's emitted wiring matches the tokens reads 93.43%, and
+restricting it to rows whose target is identical under either frame reads
+92.63%, both at the cell's own rate.
 
 Composition is not hard as such: all-R composed slots are at 99.957%. Composing
 an **immediate-carrying** instruction is, by three orders of magnitude in error
@@ -964,7 +968,9 @@ produced the number; recover it from git history to re-measure one.
   (finding 17).
 - **Normalizing values into the register slot** (`--value-norm`), to put a
   seeded leaf and a computed op-cell output on one scale. The scale gap is real
-  and measured, but closing it does not help depth-2 (finding 17).
+  and measured — a composed operand excites the op-cell's operand weights at
+  0.08-0.14x a leaf's energy — but closing it leaves depth-2 slightly worse
+  (I-type 95.49% -> 94.79%; finding 17).
 - **Slot-competition pooling** (`pool_mode=compete`), which made each register
   slot softmax-assign across the pooling heads so the heads had to divide the
   register file between them instead of piling onto the salient few. No vp
@@ -976,130 +982,46 @@ produced the number; recover it from git history to re-measure one.
   (`op_cell_rank`). A redundant second route to a position the rank-seeded slots
   already supply through the operand values the cell reads, and enabling both
   scores worse than seeding alone.
+- **A content bypass into the slot** (`--content-skip`, a direct linear path
+  from an instruction's content to the slot it writes, so the content does not
+  share the op-cell's first layer with decoding the operands). Inside the noise
+  floor. The composed instruction's content is not blocked on its way into the
+  slot — it is fused with the operand once there.
+- **Supplying the pool more ordering information than the per-slot write step.**
+  Feeding it read-order, or the whole event block, leaves the shared-source
+  deficit at ~83% and costs equivalence collapse; read-order plus canonical
+  ranks is the worst on vp (0.0434 against the write-step baseline's 0.0405)
+  while paying that cost (behavioral 0.0084 → 0.0115, separation 310× → 224×).
+  The pool cannot see `content`, so it must use any channel unconditionally;
+  that is the reason, and it does **not** extend to content-conditioned
+  consumers such as the op-cell.
+- **Injecting commutative equivalents (`--inject-equiv`) to train the
+  invariance.** Worse, not better: on genuinely-equivalent pairs 0.0110 →
+  0.0235 and separation 119× → 54×, with vp 0.0082 → 0.0252. Nothing in the loss
+  ties an injected variant's essence to its base, so it adds correlated rows
+  while reducing effective diversity. Partially confounded — the injected rows
+  displace others, so that run saw 545 instructions per batch against 768 — but
+  the direction is unambiguous.
+- **More training as a fix for commutative collapse.** 250k → 1M moves it 0.0426
+  → 0.0373, while an encoder seeded from random tags moves 0.0027 → 0.0023 over
+  the same 4×; the gap is untouched.
+- **Treating tag-sensitivity as the cause of the commutative-collapse
+  regression.** Removing the random tags entirely takes tag-sensitivity to the
+  architectural floor and leaves collapse unchanged (0.0426, against
+  `op_cell_rank`'s 0.0366 and a 0.0027 baseline). Both are downstream of
+  read-order reaching the essence.
+- **Treating the behavioral row as contaminated.** Commute pairs share the vp
+  target on 100% of len=1 and 97% of len=2 chunks, so the row measures what it
+  claims and the regression is not an artifact of it.
 
-## A methodological note
+## Where the methodology went
 
-Several conclusions in this phase were drawn from probes — small readouts
-trained on a frozen model to test what a representation contains — and several
-had to be withdrawn. Two failure modes recurred:
-
-- **A probe scoring below the model's own trained head is measuring the probe,
-  not the model.** Under-powered or data-starved probes were repeatedly read as
-  evidence of missing information.
-- **A probe scoring near the majority-class frequency has learned nothing.** On
-  a task where 88% of cases share one answer, an 88% score means the readout is
-  answering by default; the minority case must be trained or evaluated
-  separately.
-
-Both are cheap to guard against: calibrate every probe against a quantity
-already known independently, and check its score against the base rate before
-believing it.
-
-Two probe designs paid for themselves repeatedly, and are worth reaching for by
-default:
-
-- **To locate a loss, measure the SAME quantity at every stage of the pipeline
-  and find where it drops.** Exact recovery of the 12-bit immediate by a fitted
-  readout, stage by stage: T1's essence 100.000% → T2's written register slot
-  99.3% → the pool's view of that slot 79.2% → T2's essence 76.9%
-  (`probes/imm_ceiling.py`). The last two numbers agreeing is what rules out the
-  attention weights as the culprit and points at the projection underneath them.
-  A single end-to-end number cannot do this, and three separate hypotheses about
-  the cause were refuted for free by one measurement.
-- **To size a suspected bottleneck, refit it from scratch for one task and sweep
-  its width.** Reproducing the pool's projection as a trainable bottleneck of
-  varying width (`probes/pool_bottleneck.py`) gave 8→77.2%, 16→97.1%, 32→99.3%,
-  256→99.6% exact 32-bit match on I-type, R-type at 100% throughout. That
-  separates two explanations one number would have conflated: the deployed
-  16-wide projection is too narrow *and* it was performing below even its own
-  16-wide ceiling because it was multiplexing everything else. Both are answered
-  by widening; neither would have been answered by more supervision, which is
-  what the standing hypothesis (wire up T2's unused `imm_head`) proposed.
-
-Both probes are forward passes plus a small fit — minutes, against the hours a
-training run costs to test the same hypothesis wrongly.
-
-A third failure mode governs every question of the form "why is this *subset*
-worse": **a hard subset is a harder question, so scoring it lower proves
-nothing on its own.** Two of the confound-breakers work, one does not, and the
-fourth item is what says whether any of it is signal:
-
-- **Hand the readout the thing the hard case has to compute.** Giving it the
-  true intermediate value removes "this subset needs two arithmetic steps" as an
-  explanation. It changed nothing, which is what moved the diagnosis off the
-  decoder (finding 17).
-- **Prefer a measurement with no fitted readout at all.** Building the inputs
-  directly and taking a distance between essences has no capacity, no training
-  set and no sample-size asymmetry — findings 18 and 20 both rest on
-  measurements of that kind, and they are the two that held up.
-- **Asking a readout for a quantity whose difficulty does not vary with the
-  subset is NOT sufficient.** An instruction's opcode and immediate are the same
-  size of question whether or not its operand was computed, which looks like a
-  fair comparison. Asking a readout for one composed
-  instruction's 12-bit immediate returned **28.9%, 53.2%, 74.7% and 97.0%**
-  across four designs differing only in readout depth, whether the readout was
-  fit per group or on all rows pooled, and how many rows the rare group got. The
-  spread is the probe. Neither fitting choice is neutral: pooled underfits a
-  subpopulation that needs a different decoding function, per-group hands the
-  rare subset a fraction of the training rows, and both report the difference as
-  a property of the model. A probe of this kind has to report both fitting
-  modes, and a divergence between them is a fact about the probe.
-- **Run the null intervention.** The same configuration trained twice, on
-  separately generated corpora, is the only thing that says which differences in
-  a sweep are real. At these run lengths it costs ~35 minutes, and without it
-  none of finding 17's rows can be read.
-
-**Cross the axes, do not pair one-dimensional probes.** Findings 11, 16 and 17
-each verified a fix on its own axis with the others held at an easy setting, and
-the record even names the blind spot of each probe. The cell where two
-conditions hold at once appeared in none of them, and it is 90% of the error
-(findings 19, 20). `probes/vp_budget.py` crosses the splits and reports each
-bucket's rate alongside its share of total error, which is the shape of output
-that makes an interaction visible.
-
-## What `vp = 0` does and does not certify
-
-vp is supervised *and* scored against **8 fixed anchor states**
-(`make_anchor_states(8, seed=0)` — the same set in the generator, the trainer,
-`compressor/eval.py:410`, and every probe), and the head's input features are
-those same 8 vectors for every row (`in_vals_i`, `compressor/train.py`). So
-`vp = 0` certifies that the output values **at 8 fixed input points** are
-recoverable from the essence. That is weaker than "the essence encodes the
-chunk's I/O function": a model could in principle satisfy it by storing 8×32
-bits per output slot without representing operand binding at all.
-
-Accepted as the success metric for the happy path — it is cheap and it has so
-far tracked the mechanisms under investigation. It is not adequate to certify a
-lossless behavioral description once the corpus gets harder; strengthening it
-(more anchors, a held-out anchor set, or per-batch resampled anchors shipped in
-the RVT batch) is queued against TODO.md milestone 3.
-
-**It also measures the head's arithmetic, not only the essence's content, and
-finding 21 is where that starts to bind.** The head is asked to EVALUATE the
-chunk's function at the anchor points, so a function the essence describes
-perfectly can still score badly if evaluating it is hard for a shallow readout.
-Bitwise output bits are decidable independently; carry propagation is sequential
-in bit position and bit relocation moves everything at once, and those are
-exactly the cases that fail. The producer's slot being predicted at 99.99% from
-the same essence and the same forward pass that fails on the composed slot says
-the description is there. Until the essence-side and head-side readings are
-separated (finding 21's decisive experiment), a vp residual at depth 2 cannot be
-attributed to the encoder.
-
-**Acceptance criterion for "len=2 solved":** vp trains as a per-bit BCE, so the
-loss value is asymptotic and never literally 0. The output is discrete, so score
-it discretely — **100% exact 32-bit match on the `probes/vp_slot_b_split.py`
-subset, including its overlap column.** T1 reaches exactly that on both operand
-types, so the bar is demonstrated rather than aspirational.
-
-**That criterion covers operand binding only, and must be read alongside a
-mixed-corpus score.** `vp_slot_b_split` generates from `configs/instr_r_only.json`,
-so its chunks carry no immediates at all: it was at 99.8% on its overlap column
-throughout the period when the model was recovering I-type outputs at 65.9%, and
-it did not move when that was fixed. `probes/vp_imm_share.py` scores the mixed
-training corpus and splits the error by operand type, which is what makes an
-immediate-encoding failure visible. A metric that cannot see a failure is not
-evidence of its absence.
+The probe-design rules this phase produced — calibrate against a known
+quantity, check the base rate, a probe below the trained head is measuring
+itself, measure one quantity at every stage to locate a loss, and the
+confound-breakers that work — are durable rather than phase-specific, and are
+in METRICS.md ("Probe methodology"). So is what `vp = 0` does and does not
+certify, and the noise floors every comparison here is measured against.
 
 ## Open threads
 

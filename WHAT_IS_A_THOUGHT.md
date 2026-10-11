@@ -193,9 +193,10 @@ distances alone.
   vector. There is no corresponding operation on a binding — role
   assignments are discrete references, and the group that permutes
   them is non-abelian, so it has no additive shadow to exploit.
-  This was learned the hard way: see EXPERIMENT_LOG Phase 13, which
-  is why the symmetry was built into the architecture rather than
-  trained into a flat vector.
+  This was learned the hard way — an additive objective gave
+  held-out consistency at the random baseline (EXPERIMENT_LOG,
+  "Pairwise behavioral geometry") — which is why the symmetry was
+  built into the architecture rather than trained into a flat vector.
 
 - **The hierarchy carries a vector space plus a graph.** T_(n+1)
   cannot consume a bare essence; it needs the binding to know how
@@ -275,38 +276,38 @@ just how you exercise the algorithm. Once you know the algorithm
 works on a class of inputs, you can apply it to inputs you
 didn't pick.
 
-This implies a phased relationship between (B) and (A):
+This implies a staged relationship between (B) and (A):
 
-**Phase 1.** Pick concrete unit definitions at each level.
+**Stage 1 — prescribed boundaries.** Pick concrete unit definitions at each level.
 Test that the recursive shift-reduce / magnitude-as-validity
 machinery works at those levels. Heavy-handed unit definitions
 are appropriate here because we're benchmarking, not making
 ontological claims.
 
-**Phase 2.** Once the machinery works under prescribed
+**Stage 2 — loosened boundaries.** Once the machinery works under prescribed
 boundaries, run experiments where the boundary signal is
 weakened — train T2 with looser supervision and see what
 boundaries emerge. Closer to (A), still using contrived
 domains where we can verify what the system found.
 
-**Phase 3.** Apply the method to natural language, where
+**Stage 3 — natural language.** Apply the method to natural language, where
 sharp boundaries don't exist a priori, and see what shape
 "thoughts" the system finds without external definition.
 This is the regime where (A)'s question becomes empirically
 addressable through (B)'s machinery.
 
-The order matters. You can't run the Phase-3 experiment until
-you know the encoder is *capable* of building the right kind
-of representation, and you only learn that from Phase-1 work
-where you control the boundaries and can verify each piece
+The order matters. You can't run the natural-language experiment
+until you know the encoder is *capable* of building the right kind
+of representation, and you only learn that from the prescribed-boundary
+work where you control the boundaries and can verify each piece
 independently.
 
-The discomfort that comes from picking unit definitions in
-Phase 1 — the worry that we're prescribing what thoughts are —
+The discomfort that comes from picking unit definitions at the
+prescribed stage — the worry that we're prescribing what thoughts are —
 is the right discomfort to have, but the wrong place to act on
-it. It's the right thing to feel about Phase 3 outputs (where
+it. It's the right thing to feel about natural-language outputs (where
 the system's emergent definitions might not match human
-intuition) and the wrong thing to feel about Phase 1 design
+intuition) and the wrong thing to feel about the early design
 choices (where we're just exercising the algorithm).
 
 ---

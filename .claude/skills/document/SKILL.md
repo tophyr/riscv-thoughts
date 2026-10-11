@@ -43,9 +43,11 @@ In this project:
 | `README.md` | the map, the reading order, architectural intent | measurements, flag-level detail |
 | `WHAT_IS_A_THOUGHT.md` | the theory being tested | anything RISC-V-specific |
 | `RISCV_DESIGN.md` | the architecture and the **durable rationale** for its shape | run results, roadmap |
-| `EXPERIMENT_LOG/` | findings and the evidence for them | forward plans |
-| `TODO.md` | the live mission, open tasks, dead ends, how to run | history of any kind |
-| `.claude/skills/` | procedures and reference for a task | findings |
+| `EXPERIMENT_LOG/` | findings, the evidence for them, and dead ends | forward plans |
+| `METRICS.md` | what a measurement means and certifies, its noise floor, the scope conditions on a number from it | measured values |
+| `TODO.md` | the mission, the milestones, the open tasks and the decisions they need | history, evidence, metric semantics, how to run anything |
+| `probes/README.md` | which diagnostic answers which question | how to read one's output (that is its docstring) |
+| `.claude/skills/` | procedures, commands and operational hazards for a task | findings |
 | commit messages | the **differential** — what is true at this commit that was not true at its parent | the route taken between the two |
 
 A result that changes an architectural claim usually needs edits in two places:

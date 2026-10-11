@@ -64,30 +64,14 @@ hours.
 
 If I diagnosed a failure mode earlier in the same session, and the same
 symptoms reappear, it's the same bug. Apply the previous remediation.
-Don't re-diagnose from scratch and don't forget to clean up. (The
-canonical example — generation workers orphan-surviving their parent —
-is now fixed at the OS level; see the next section.)
+Don't re-diagnose from scratch and don't forget to clean up.
 
-### Formerly-recurring trap: orphan generation workers (now fixed)
-
-History: `gen_batches.py` workers spawned by `mux_batches.py` via
-`subprocess.Popen` did NOT die when their parent died — they reparented
-to init and ate CPU for hours. I left orphans running multiple times
-even after diagnosing the pattern.
-
-RESOLVED: both scripts are merged into the `datagen` package itself —
-the tool is now `python -m datagen` (`datagen/__main__.py`), whose
-generation workers are forked `multiprocessing.Process` children that
-arm `PR_SET_PDEATHSIG(SIGKILL)`. The kernel now SIGKILLs every worker
-the instant the parent dies — including on `kill -9` of the parent.
-The `test_no_orphan_workers_after_kill` regression guards it.
-
-So the manual pgrep→kill ritual is no longer required. Backstop only:
-if you ever suspect a straggler after killing a `datagen` / multinode
-pipeline, list workers by parentage (they share the parent's argv, so a
-cmdline scan won't find them):
-`pgrep -P <datagen_pid>`, then `kill -9 <pids>`. Check the remote (odin)
-too after killing a multinode run.
+Backstop for a suspected straggler worker after killing a `datagen` or
+multinode pipeline: workers share the parent's argv, so a cmdline scan
+will not find them — list them by parentage with `pgrep -P <datagen_pid>`,
+then `kill -9`. Check the remote (odin) too. They arm
+`PR_SET_PDEATHSIG(SIGKILL)` so this should never be needed (the `datagen`
+skill has the mechanism).
 
 ## When making a refactor or vectorize change
 
@@ -96,6 +80,17 @@ Old and new must agree on the math (see
 sample on the same inputs; confirm bit-equivalence or
 correlation = 1.0 for floats. If they don't match, the refactor
 silently changed semantics — stop and flag, don't ship.
+
+**Verify against a real checkpoint, not just the test suite.** No
+test loads one, so the suite cannot catch a `state_dict`
+incompatibility: adding an unconditional `rank_emb` passed all 285
+tests and failed at step 0 of the next run against the frozen T1.
+
+Breaking changes are acceptable — including reminting the frozen
+T1 — on the one condition that old and new can be compared and
+shown not to have regressed. That condition is what licenses
+deleting the worse way instead of keeping it behind a flag
+(`feedback_no_vestigial_options.md`).
 
 ## When choosing defaults / parameters
 

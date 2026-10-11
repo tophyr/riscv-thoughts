@@ -67,10 +67,11 @@ gen_seq_batches.py  →  chunk_t2.py  →  train_t2.py
 This decoupling let the chunker run in parallel with training and
 opened the door to multi-process generation via `mux_batches.py`.
 
-## Performance optimization journey (Exp 40)
+## Where the throughput went (Exp 40)
 
 The naive in-process chunker bottlenecked the training loop
-(~200ms/step at target=1024). The path to 99% GPU utilization:
+(~200ms/step at target=1024). What each change bought, to 99% GPU
+utilization:
 
 | stage | step time at target=4K | GPU util |
 |---|---|---|

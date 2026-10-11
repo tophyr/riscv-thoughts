@@ -77,44 +77,20 @@ scoring during search-based decoding.
 
 ---
 
-## Tokenization Strategy
+## Tokenization
 
-### Option A: Structural tokenization
+**Structural, one token per instruction field** (`tokenizer/`): an opcode
+token, register tokens, and an immediate spelled as hex digits — `add x5,x3,x7`
+→ `[ADD] [X5] [X3] [X7]`, and `addi x5,x3,42` → `[ADDI] [X5] [X3] [H0] [H2]
+[HA]`, with a `NEG` prefix for a negative literal. Field widths are per
+instruction type, so the longest instruction is a J-type at nine tokens.
 
-Each instruction becomes a fixed set of tokens:
-
-```
-[OPCODE] [RD] [RS1] [RS2/IMM]
-```
-
-Example: `add x5, x3, x7` → `[ADD] [X5] [X3] [X7]`
-Example: `addi x5, x3, 42` → `[ADDI] [X5] [X3] [IMM_42]`
-
-Vocabulary:
-- 40 opcode tokens (RV32I base)
-- 32 register tokens (x0-x31)
-- Immediate value tokens (strategy TBD — direct encoding, bucketed,
-  or digit-level tokenization)
-- Separator/formatting tokens
-
-Total vocabulary: ~100-200 tokens depending on immediate encoding.
-
-### Option B: Raw byte tokenization
-
-Each 32-bit instruction as 4 byte tokens (256 vocabulary). Simpler,
-more general, but loses structural information that Option A provides
-for free. The model must learn instruction boundaries and field
-structure from data.
-
-### Recommendation
-
-Option A. The structural tokenization gives the model instruction
-boundaries, field types, and opcode identity for free. There is no
-reason to make the model learn what the ISA specification already
-defines. Immediate value encoding is the main design choice — digit-
-level tokenization (each decimal/hex digit as a separate token) is
-likely best for enabling compositional understanding of numerical
-values.
+Structural beats raw bytes (four byte tokens per instruction) because it hands
+the model instruction boundaries, field types and opcode identity for free,
+and there is no reason to make it learn what the ISA specification already
+defines. Immediates are digit-level rather than one token per value so that
+numerically close literals share structure; a value-per-token vocabulary would
+make every immediate an unrelated symbol.
 
 ---
 
@@ -182,50 +158,35 @@ analogues:
 
 ### Data pipeline
 
-```
-1. Generate random valid RV32I instruction sequences (length 5-50)
-2. Execute on random input states → record output states
-3. Apply transformations → equivalent sequences
-4. Execute equivalents → verify identical output states
-5. Apply controlled modifications → near-equivalent sequences
-6. Execute modifications → record exact state distances
-7. Package: (sequence, output_state, equivalences, near_equivalences,
-   state_distances)
-```
-
-All execution can use a simple RISC-V emulator (riscv-emu, spike, or
-a minimal custom emulator for RV32I). No hardware required.
+Generation, SSA analysis, anchor execution and the canonical `out_regs` oracle
+all run in `datagen`, which streams self-describing RVT batches to a trainer on
+stdout. Execution uses this project's own RV32I emulator (`emulator/`); no
+hardware and no external simulator. The commands, flags, wire format and
+multinode operation are the `datagen` skill.
 
 ---
 
 ## Compressor Architecture
 
-### Bottom-up approach: T0→T1 first
+### The tiers, bottom-up
 
-Start at the bottom of the hierarchy:
+**T0 → T1** compresses one instruction's tokens to one vector. It is the
+atomic building block rather than a thought itself: two `ADD`s with different
+operands should be near each other and still distinguishable.
 
-**T0 → T1: Single-instruction compression.** A single instruction's
-tokens (4-7 of them, depending on type) compress to one T1 vector.
-This is the smallest unit of "thought" — not a thought itself, but
-the atomic building block. Two ADD instructions with different
-parameters should be nearby in T1 space but clearly distinguishable.
-The T1 space should exhibit the geometric properties the theory
-predicts: smoothness, factored structure, interpolation coherence.
+**T1 → T2** compresses a sequence of T1 vectors to one block vector. The block
+is a register-state transformation block — a maximal run of instructions where
+only the last may touch memory or control flow (see "Why RISC-V" for why the
+unit is defined there) — so inside a T2 thought only register state evolves,
+and the terminating instruction commits its effect. T2 is the first level
+corresponding to what the theory calls a thought: a compressed representation
+of a computation, where data flow and register dependencies are what must be
+captured.
 
-**T1 → T2: Sequence compression.** Once T1 works, sequences of T1
-instruction vectors compress to T2 block-level representations
-(register-state transformation blocks; see Premise above). Inside
-a T2 thought, only register state evolves — the terminating
-instruction commits the block's effect to memory or transfers
-control. This is where data flow, register dependencies, and
-computational structure emerge. T2 is the first level that
-corresponds to what the theory calls a "thought" — a compressed
-representation of a computation.
-
-The same compression-and-search mechanism applies at both levels. The
-same decoder architecture that lowers T1→T0 should lower T2→T1. The
-only difference at the T0 boundary is that the output must discretize
-into a finite token vocabulary.
+The same compression-and-search mechanism applies at both levels, and the same
+decoder architecture that lowers T1→T0 should lower T2→T1. The only difference
+at the T0 boundary is that the output must discretize into a finite token
+vocabulary.
 
 ### Encoder design
 
@@ -243,9 +204,9 @@ lesson 6).
 
 ## Rename-Equivariant Compressor
 
-The settled design. It is the architecture validated in EXPERIMENT_LOG.md
-Phase 14; this section is the durable rationale for *why* it is shaped the
-way it is.
+The settled design. It is the architecture validated in EXPERIMENT_LOG
+("Rename-equivariant T1/T2"); this section is the durable rationale for *why*
+it is shaped the way it is.
 
 ### The nuisance variable is register naming
 
@@ -275,7 +236,8 @@ torsion-free, but permutations are built from finite-order elements; a
 homomorphism into it kills all torsion → kills everything. This is not a
 training difficulty — it is a theorem, and it was confirmed empirically: an
 additive "consistent displacement" objective gave held-out-π displacement
-consistency at the random baseline (`R ≈ 0.09`; EXPERIMENT_LOG.md Phase 13).
+consistency at the random baseline (`R ≈ 0.09`; EXPERIMENT_LOG, "Pairwise
+behavioral geometry").
 
 The right structure is an **orthogonal / permutation representation**:
 `ρ(π) = R_π`, a permutation matrix acting on **register-indexed**
@@ -367,8 +329,9 @@ This is equivariant by construction: renaming registers permutes which slots
 are read and written, so `S` permutes and the symmetric-pool essence is
 invariant — *exactly*, with no training. Equivariance is exact precisely
 because there are **no per-register learned parameters**: the only
-register-indexed input is the anonymous tag, and reads/writes are pure one-hot
-tensor ops.
+register-indexed input is each input's canonical read position, and reads/writes
+are pure one-hot tensor ops. Anything added to the pool's input must likewise be
+register-indexed, or the invariance stops being exact.
 
 Two channel groups per slot, both equivariant: **value channels** (set on
 write, preserved on read — the dataflow state the op-cell threads, which makes
@@ -551,8 +514,8 @@ These are real work, each additive over a stable "register-indexed state; the
 
 ### Loss terms
 
-**Evolved through extensive experimentation** (see EXPERIMENT_LOG.md, esp.
-Phases 9–14). The settled approach is one **behavioral loss set shared by
+**Evolved through extensive experimentation** (EXPERIMENT_LOG, from "Gate
+training on a frozen encoder" through "Rename-equivariant T1/T2"). The settled approach is one **behavioral loss set shared by
 T1 and T2** (`compressor.train.binding_losses`) — T1 is the
 single-instruction special case. No pairwise distance-matching, no explicit
 equivalence loss, no syntactic CE heads: equivalence is **emergent**.
@@ -585,8 +548,8 @@ against a *canonical* target, making the task mathematically inconsistent.
 Single-instruction vp is exactly `0.000`, and the head is fed raw value *bits*,
 not log-compressed scalars. vp measures whether the essence is a lossless
 behavioral description of its chunk, which is precisely what a future T3 will
-consume — so it is the metric the current phase is driving to zero (TODO.md;
-EXPERIMENT_LOG.md Phase 15).
+consume — so it is the metric the current work is driving to zero (TODO.md;
+METRICS.md for what it certifies).
 
 The head reads the **unit-normalized** essence (`F.normalize(vecs)`,
 `t2_value_predict_loss`): magnitude is reserved for validity, so if vp's gradient
@@ -603,21 +566,28 @@ gain that craters the GVN rows is a regression, not a win.
 One scope caveat on the metric: vp is supervised and scored against a small
 fixed anchor set (8 states, seed 0, shared by generator, trainer, eval and every
 probe), so `vp = 0` certifies the I/O function *at those points*, not everywhere.
-Adequate for the current happy-path corpus; see TODO.md milestone 3 for when
-that has to get stronger.
+Adequate for the current happy-path corpus; METRICS.md states exactly what it
+certifies, and TODO.md milestone 4 is where it has to get stronger.
 
 **Emergent equivalence.** With the behavioral targets alone, provably
 equivalent instructions/chunks collapse without any equivalence loss:
 rename-twins collapse *structurally* (the equivariant core), and non-rename
 behavioral equivalents (commutativity, dead code) collapse from the canonical
-vp target. Measured as GVN collapse split by pair type (EXPERIMENT_LOG.md
-Phase 14) — note the measurement covers commutative operand swaps only
+vp target. Measured as GVN collapse split by pair type (EXPERIMENT_LOG,
+"Rename-equivariant T1/T2") — note the measurement covers commutative operand
+swaps only
 (`_commute_variant`), so treat the other types as expected-but-unmeasured.
 Instruction reordering is deliberately absent: it is not an essence-level
 equivalence at all (see the GVN section above). A design constraint this surfaces: a
 rename-*invariant* behavioral target (e.g. a GVN-bijection distance) is the
 WRONG objective here — it would weld apart the binding distinctions the
 equivariant representation deliberately keeps recoverable.
+
+**Supervise only behaviorally-live signals.** A dead value has no target, so
+giving it one asks for a gradient nothing can satisfy and fights the collapse
+the essence is supposed to perform. The existing instance is the `rd==x0`
+immediate mask: `ADDI x0,rs,k` is the same no-op for every `k`, so its immediate
+is not supervised.
 
 Dead-end objectives explored on the way here (collapse losses, pairwise
 distance-matching, additive king−queen equivariance, unit-sphere

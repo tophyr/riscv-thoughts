@@ -79,8 +79,6 @@ equivalence pair injection for problem 2.
 
 ## Experiment 17: Focused branch batches, 100K steps
 
-## Experiment 17: Focused branch batches, 100K steps
-
 Introduced produce_focused_batch(): batches of 256 instructions
 (half branches, half non-branches) with equality-rich register
 states (15-25 of 31 registers sharing a value in every state).
