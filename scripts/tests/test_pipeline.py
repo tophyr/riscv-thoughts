@@ -491,31 +491,6 @@ class TestTraining:
             t2_dir = _train_t2(tmp, t1_enc)
             assert (t2_dir / 't2.pt').exists()
 
-    @pytest.mark.parametrize('mode,s', [
-        ('regression', 0.0),    # exact-match indicator (binary control)
-        ('regression', 7.0),    # graded, knee at |Δ|~1e5-1e6
-        ('infonce', 7.0),       # soft-weighted NT-Xent fallback
-    ])
-    def test_t2_contrastive_train_smoke(self, mode, s):
-        """T2 with the behavioral-distance contrastive loss ON and vp demoted
-        to 0: exercises out_regs shipping under contrastive-only, the d_beh +
-        cosine matrices, and the regression/infonce heads (incl. s=0 indicator).
-        One step, exits 0, writes t2.pt — and the logged contrastive loss is a
-        finite number (no NaN from the masked softmax / empty-footprint guards)."""
-        with tempfile.TemporaryDirectory() as tmp:
-            t1_enc = _train_t1(tmp)
-            t2_dir = _train_t2(
-                tmp, t1_enc, name=f't2_co_{mode}_{s}',
-                extra_args=['--value-predict-weight', '0',
-                            '--contrastive-weight', '1.0',
-                            '--contrastive-loss', mode,
-                            '--contrastive-s', str(s)])
-            losses = json.loads((t2_dir / 'losses.json').read_text())
-            co = losses[-1]['contrastive']
-            assert co == co, 'contrastive loss is NaN'     # NaN != NaN
-            assert co >= 0.0
-
-
 class TestEval:
     """scripts/eval.py pulls many compressor internals that drift. Guard
     import + --help, then run end-to-end (T1 + T2, binding routing) on a

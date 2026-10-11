@@ -75,22 +75,6 @@ def main():
     p.add_argument('--vp-smooth-weight', type=float, default=0.2,
                    help='weight on the vp smooth-magnitude (ordering) term; the '
                         'per-bit target carries resolution.')
-    p.add_argument('--contrastive-weight', type=float, default=0.0,
-                   help='Weight on the behavioral-distance contrastive loss on '
-                        'the essence (0 = off). Pulls behaviorally-equivalent '
-                        'chunks together / pushes distinct ones apart using the '
-                        'canonical out_regs oracle as the pairwise target. When '
-                        '> 0, out_regs ships even with --value-predict-weight 0 '
-                        '(demote vp to a diagnostic).')
-    p.add_argument('--contrastive-loss', choices=('regression', 'infonce'),
-                   default='regression',
-                   help="Contrastive head: 'regression' (cosine→1−d_beh MSE, "
-                        "primary) or 'infonce' (soft-weighted NT-Xent, fallback).")
-    p.add_argument('--contrastive-s', type=float, default=0.0,
-                   help='φ saturation scale on the d_beh target (THE swept '
-                        'knob). 0 = exact-match indicator (binary, magnitude-'
-                        'agnostic control); rising s adds magnitude sensitivity '
-                        '(s≈7 ⇒ saturation knee at |Δ|~1e5–1e6).')
     p.add_argument('--anchor-seed', type=int, default=0,
                    help='Anchor-states seed (must match datagen).')
     p.add_argument('--n-anchor-states', type=int, default=8,
@@ -134,9 +118,6 @@ def main():
         out_slot_weight=args.out_slot_weight,
         value_predict_weight=args.value_predict_weight,
         vp_smooth_weight=args.vp_smooth_weight,
-        contrastive_weight=args.contrastive_weight,
-        contrastive_loss=args.contrastive_loss,
-        contrastive_s=args.contrastive_s,
         anchor_seed=args.anchor_seed,
         n_anchor_states=args.n_anchor_states,
         t2_checkpoint=args.resume,
