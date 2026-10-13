@@ -123,7 +123,7 @@ def main():
         anchor_seed=args.anchor_seed,
         n_anchor_states=args.n_anchor_states,
         device=device,
-        on_log=save,
+        on_log=save, save_every=args.save_every,
         compile_step=not args.no_compile,
     )
     print(f'\nDone: {losses[-1]["step"]} steps, '

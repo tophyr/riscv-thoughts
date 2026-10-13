@@ -892,7 +892,7 @@ exact and +0.42 depth-2 are both inside it.
 prediction (`probes/t1_scorecard.py`), while the T2s built on them span 0.059
 points — an order of magnitude beyond any T2-level spread measured. A tier can be perfect on its own objective and
 still be a measurably different input to the next one. Operationally: **a T1
-cannot be selected without training a T2 over it** (~2.4h at len=2);
+cannot be selected without training a T2 over it** (~65 min at len=2, 1M steps);
 `t1_scorecard.py` verifies a T1 is intact, it cannot rank T1s.
 
 **Two structural facts about the core:**
@@ -1221,8 +1221,8 @@ GVN rows is a regression).
   1's ten training runs did not.
 - **Every sweep carries a null intervention** — the same configuration trained
   twice on separately generated corpora. Without it no row is interpretable; a
-  len=2 cell at 1M steps costs ~2 hours of GPU time (7 ms/step solo, 11 ms/step
-  each when two cells share the device).
+  len=2 cell at 1M steps costs ~65 minutes of GPU time, scoring included (~3.9
+  ms/step; two cells sharing the GPU are slower in aggregate than one).
 - **Run the null on the arm under test — floors do not generalise between
   cells.** Two configurations here differ 20× in their own run-to-run spread
   (0.0026 against 0.0553, finding 25), so a floor borrowed from a quiet cell
@@ -1349,7 +1349,7 @@ certify, and the noise floors every comparison here is measured against.
 
 2. **Folding a chain's literals in the op-cell** is the one intervention the
    measurements point at, and it is the mechanism of the equivalence-collapse
-   task (TODO task 3) rather than a separate lever: handed the composite, a
+   task (TODO task 2) rather than a separate lever: handed the composite, a
    readout on the same essence goes from 79.80% to 99.95% (finding 21). What is
    unsettled is the objective that would produce the fold, and what it costs
    the discriminative rows.

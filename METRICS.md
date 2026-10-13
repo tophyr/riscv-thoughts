@@ -331,10 +331,13 @@ table is the operative copy, that is the evidence.
 | retraining the frozen T1 beneath it moves exact match | 0.023 points (σ) | five same-config T1s |
 | the same, on depth-2 exact match | 0.24 points | the same five |
 | spread between two configurations' own floors | 20× | the two above |
-| a null intervention's cost | ~2 h | one len=2 cell at 1M steps, 7 ms/step solo |
+| one T2 cell against another of the same config, chain rate 0.10 | 0.011 points (σ per cell) | nine cells, `vp_budget` on one shared corpus |
+| a null intervention's cost | ~65 min | one len=2 cell at 1M steps, ~3.9 ms/step, scoring included |
 
 So: use ~0.01 for a T2-level claim unless that specific cell has been
-replicated, and 0.023 for anything comparing one T1 against another. No T1
+replicated, and 0.023 for anything comparing one T1 against another. With a
+per-cell σ of 0.011, the mean of a two-cell pair moves by ~0.008, so two pairs
+cannot be told apart below ~0.02. No T1
 configuration measured is distinguishable from any other.
 
 **The error-budget axes are also len=2-specific.** `sources × immediate ×

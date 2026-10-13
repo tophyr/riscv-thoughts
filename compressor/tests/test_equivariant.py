@@ -119,6 +119,81 @@ def test_value_preserved_on_read():
     assert (T0[:, 5, :8] - T1[:, 5, :8]).abs().max().item() < 1e-6
 
 
+def test_pool_projects_touched_slots_like_all_slots():
+    """The pool projects only the slots a chunk read or wrote and fills the
+    rest with the projection's bias. That must be the dense projection's
+    function — essence and every parameter gradient — including chunks with
+    padding steps, repeated registers and x0 operands."""
+    torch.manual_seed(0)
+    core = RegisterStateMachine(d_value=16, d_event=4, d_content=6, n_regs=32,
+                                op_cell_depth=2, n_pool_heads=4)
+    B, K = 6, 3
+    content = torch.randn(B, K, 6)
+    in0 = torch.randint(0, 32, (B, K))
+    in1 = torch.randint(0, 32, (B, K))
+    out = torch.randint(0, 32, (B, K))
+    in1[0] = in0[0]                        # one register read twice
+    in0[1, 0] = 0                          # an x0 operand
+    active = torch.ones(B, K)
+    active[2, 2] = 0                       # a padding step
+
+    def dense(pool_src, touched, max_touched):
+        return core.pool_k(pool_src), core.pool_v(pool_src)
+
+    def run(project):
+        core.zero_grad()
+        orig = core._project_touched
+        core._project_touched = project
+        try:
+            T, ess = core(content, in0, in1, out, active)
+        finally:
+            core._project_touched = orig
+        ess.pow(2).sum().backward()
+        return ess.detach(), {n: p.grad.clone() for n, p in core.named_parameters()
+                              if p.grad is not None}
+
+    ess_t, g_t = run(core._project_touched)
+    ess_d, g_d = run(dense)
+    assert torch.allclose(ess_t, ess_d, atol=1e-6)
+    assert g_t.keys() == g_d.keys()
+    for n in g_d:
+        assert torch.allclose(g_t[n], g_d[n], atol=1e-5), n
+
+
+def test_head_on_touched_slots_matches_the_dense_head():
+    """apply_head_touched evaluates a per-slot head only on slots a chunk can
+    have touched and gives the rest head(0). On a real core state it must equal
+    the dense head — output and every gradient — and too small a bound must
+    not."""
+    from compressor.model import apply_head_touched
+    torch.manual_seed(0)
+    core = RegisterStateMachine(d_value=16, d_event=4, d_content=6, n_regs=32)
+    head = torch.nn.Sequential(torch.nn.Linear(20, 8), torch.nn.ReLU(),
+                               torch.nn.Linear(8, 1))
+    B, K = 5, 3
+    content = torch.randn(B, K, 6)
+    in0, in1, out = (torch.randint(0, 32, (B, K)) for _ in range(3))
+    active = torch.ones(B, K)
+    active[1, 2] = 0
+
+    def run(f):
+        core.zero_grad(); head.zero_grad()
+        T, _ = core(content, in0, in1, out, active)
+        y = f(T)
+        (y * torch.arange(32.0).view(1, -1, 1)).sum().backward()
+        params = list(core.parameters()) + list(head.parameters())
+        return y.detach(), [p.grad.clone() for p in params if p.grad is not None]
+
+    y_d, g_d = run(head)
+    y_t, g_t = run(lambda T: apply_head_touched(head, T, 3 * K))
+    assert torch.allclose(y_t, y_d, atol=1e-6)
+    assert len(g_t) == len(g_d)
+    for a, b in zip(g_t, g_d):
+        assert torch.allclose(a, b, atol=1e-5)
+    y_short, _ = run(lambda T: apply_head_touched(head, T, 1))
+    assert not torch.allclose(y_short, y_d, atol=1e-6)
+
+
 def test_head_shapes():
     m = _model()
     tok, pad, in0, in1, out = _tokenize([Instruction('ADD', 5, 3, 4)])

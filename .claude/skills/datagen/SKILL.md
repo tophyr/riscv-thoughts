@@ -113,9 +113,10 @@ which must stay equal to the trainer's `--anchor-seed` (INVARIANT 1). Replicatin
 is not optional for a sweep — see METRICS.md on null interventions.
 
 **A run's `t2.pt` appears long before the run ends**, because the trainer
-checkpoints periodically. Wait on the trainer process exiting, or on
-`run_t2.sh` logging `final:`; scoring the file as soon as it exists reads a
-partial model.
+checkpoints every `--save-every` steps (default 10000; a save stalls the GPU,
+so it is kept off the 100-step log cadence). Wait on the trainer process
+exiting, or on `run_t2.sh` logging `final:`; scoring the file as soon as it
+exists reads a partial model.
 
 **T1 config** (the writers-only corpus T2 is trained against). T1 and T2 run
 the same core at the same settings, so the command below differs from the T2
@@ -336,15 +337,18 @@ Two different scripts — do not confuse them:
   exactly `TOTAL_BATCHES` with `--count`, and on reaching it the BrokenPipe
   cascade (local→nc→remote) reaps every worker. `REMOTE=chrissarbora@odin`.
   Worker split is `REMOTE_GEN` (default 96) / `LOCAL_GEN` (default **0**):
-  local datagen contends with a local GPU trainer's per-step H2D prep and
-  starves the GPU — measured **~54% util / 16.6 ms/step with local gen**
-  against **96–97% util / 7 ms/step with every worker on odin**, at the adopted
-  len=2 cell (`--d-out 512`, op-cell depth 4, 16 pool heads). So the default
-  offloads EVERY worker to odin; bump `LOCAL_GEN>0` only for a pure on-disk
-  corpus with no local trainer. Judge saturation by GPU utilisation, with
-  ms/step against the same config's known-good figure as a floor check, and
-  re-measure both whenever the cell's configuration changes — a figure from one
-  configuration says nothing about another.
+  local datagen contends with a local GPU trainer's per-step host work, so the
+  default offloads EVERY worker to odin; bump `LOCAL_GEN>0` only for a pure
+  on-disk corpus with no local trainer. Odin's pool delivers ~600 batches/s on
+  its own, ~2.3x what the len=2 T2 cell consumes (`--d-out 512`, op-cell depth 4,
+  16 pool heads: ~3.9 ms/step, ~95% GPU util; EXPERIMENT_LOG, "Rename-
+  equivariant T1/T2", Throughput). Judge saturation by GPU utilisation sampled
+  finer than the step-log cadence — `nvidia-smi --query-gpu=utilization.gpu
+  --format=csv -lms 100` — because a stall at every log line beats against a
+  1 s sampler and reads as an occasional dip; use ms/step against the same
+  config's figure as a floor check, and re-measure both whenever the cell's
+  configuration changes — a figure from one configuration says nothing about
+  another.
 
   **Adding remote workers does not raise a rate the GPU is already setting.**
   At `REMOTE_GEN=120`, odin sat at a load average of ~11 out of its 128 cores
@@ -389,10 +393,10 @@ probe added without that key will fail the *other* run's scoring with
 `Bad magic` while its own training completes normally — so a `/tmp` corpus path
 in a new probe needs `os.getpid()` in it.
 
-Worth doing when a single trainer leaves the GPU idle: two concurrent len=2 runs
-hold it at 84–99% util against ~50% for one, at 11 ms/step each against 7 solo —
-**~1.3× aggregate**, not 2×, because the GPU becomes the binding constraint once
-host serialization is filled. Local cost is ~10 of 32 cores for two trainers.
+**Not worth doing for throughput while one trainer keeps the GPU busy:** two
+concurrent len=2 cells ran at 15.5 ms/step each against 6.0 ms for one alone,
+0.78× the aggregate, because the GPU time-slices between them. Run cells
+concurrently only when one alone leaves the GPU idle.
 
 ```bash
 PORT=6464 REMOTE_GEN=56 RULE="cap=2" CONFIG=configs/instr_alu_writers.json \

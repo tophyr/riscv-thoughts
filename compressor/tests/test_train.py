@@ -10,6 +10,8 @@ head so the *target side* of the loss is exercised deterministically.
 
 import math
 
+import pytest
+
 import numpy as np
 import torch
 
@@ -189,6 +191,58 @@ def test_gen_shipped_out_regs_matches_recompute():
     ref_out, ref_valid = _compute_chunk_out_regs(batch, anchors)
     assert np.array_equal(batch.out_regs, ref_out)
     assert np.array_equal(batch.out_regs_valid, ref_valid)
+
+
+def _small_batches(n):
+    import itertools
+    from datagen.batch import collect_into_batches, generate_chunks
+    from datagen.compare import make_anchor_states
+    from datagen.generate import length_cap
+    rng = np.random.default_rng(0)
+    chunks = generate_chunks(length_cap(2), rng)
+    return list(itertools.islice(collect_into_batches(
+        chunks, batch_size=8, twins=1, anchor_states=make_anchor_states(8, 0),
+        rng=rng, max_chunk_len=2), n))
+
+
+def test_prefetcher_keeps_stream_order_across_workers():
+    """The prefetcher spreads prep over several worker processes; the trainer
+    must still see every batch, in stream order — including a stream length
+    the worker count doesn't divide."""
+    from compressor.train import (TrainBatchPrefetcher, _pack_step_arrays,
+                                  _split_to_per_instruction)
+    pack = dict(vp=True, valid=True, imm=False)
+    batches = _small_batches(7)
+    got = list(TrainBatchPrefetcher(iter(batches), pack, maxsize=6,
+                                    n_workers=3))
+    assert len(got) == len(batches)
+    for want, item in zip(batches, got):
+        ref = _pack_step_arrays(want, _split_to_per_instruction(want), **pack)
+        assert np.array_equal(item[0], ref[0])
+        assert item[1:] == ref[1:]
+
+
+def test_packed_step_stages_to_the_arrays_it_packed():
+    """A packed step must stage to exactly the tensors the trainer feeds the
+    compiled step: each batch array cast to its dtype, in _prep's order."""
+    import torch
+    from compressor.train import (_H2DStager, _dense_chunk_grid,
+                                  _pack_step_arrays, _split_to_per_instruction)
+    for b in _small_batches(3):
+        split = _split_to_per_instruction(b)
+        packed, specs, _, shape = _pack_step_arrays(b, split, vp=True,
+                                                    valid=True, imm=True)
+        tok, pad, g0, g1, go, act = _dense_chunk_grid(split, *shape)
+        L, F = torch.long, torch.float32
+        want = [(tok, L), (pad, None), (g0, L), (g1, L), (go, L), (act, F),
+                (b.live_in_mask, F), (b.live_out_mask, F), (b.pc_writes, F),
+                (b.in_slot_regs, L), (b.out_slot_regs, L), (b.out_regs, None),
+                (b.out_regs_valid, None), (b.valid, F)]
+        got = _H2DStager('cpu')(packed, specs)
+        assert len(got) == len(want) + 2                    # + immediates
+        for g, (a, dt) in zip(got, want):
+            w = torch.from_numpy(a) if dt is None else torch.from_numpy(a).to(dt)
+            assert g.dtype == w.dtype and torch.equal(g, w)
 
 
 # ===========================================================================
@@ -419,6 +473,34 @@ def test_build_optim_sched_warmup_then_cosine():
     assert lrs[9] < 0.05
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='needs CUDA')
+def test_cuda_lr_clock_reproduces_the_float_schedule_and_resumes():
+    """On CUDA, Adam's lr is a device tensor driven by the float schedule
+    running on a stand-in. Adam must see exactly the CPU schedule's values
+    (to fp32), and a captured train state must resume onto the same sequence."""
+    from compressor.train import capture_train_state, restore_train_state
+    def run(device, n, state=None):
+        p = [torch.nn.Parameter(torch.zeros(2, device=device))]
+        opt, sched = build_optim_sched(p, 1e-3, 40, warmup_steps=5,
+                                       lr_min=1e-6, device=device)
+        if state is not None:
+            restore_train_state(state, opt, sched)
+        lrs = []
+        for _ in range(n):
+            lrs.append(float(opt.param_groups[0]['lr']))
+            p[0].grad = torch.ones_like(p[0])
+            opt.step()
+            sched.step()
+        return lrs, capture_train_state(n, opt, sched)
+    want, _ = run('cpu', 40)
+    got, _ = run('cuda', 40)
+    assert all(math.isclose(a, b, rel_tol=1e-6) for a, b in zip(want, got))
+    first, state = run('cuda', 17)
+    rest, _ = run('cuda', 23, state)
+    assert all(math.isclose(a, b, rel_tol=1e-6)
+               for a, b in zip(want, first + rest))
+
+
 def test_build_optim_sched_plain_cosine_when_no_warmup():
     """warmup_steps==0: plain cosine — LR starts at lr, decays toward
     lr_min by the last step."""
@@ -484,6 +566,59 @@ def test_vp_head_predict_matches_the_raw_head():
     want = t2.vp_head(vp_head_inputs(vecs, iv)).reshape(2, 8, -1, 33)
     assert got.shape == (2, 8, MAX_OUTPUT_SLOTS, 33)
     assert torch.equal(got, want)
+
+
+def test_vp_head_live_matches_the_full_head():
+    """The trainer's loss evaluates the head through vp_head_live, which skips
+    the first layer's empty input slots and its per-anchor repeat of the
+    essence term. It must compute the same function as the full head, at every
+    head depth, up to float summation order."""
+    import torch
+    from compressor.model import T2Compressor
+    from compressor.train import (vp_head_live, vp_head_inputs,
+                                  vp_canonical_in_vals)
+    from datagen import AUX_CE_IGNORE, make_anchor_states
+    torch.manual_seed(0)
+    anchors = torch.from_numpy(make_anchor_states(8, 0))
+    in_slot = torch.full((3, 32), AUX_CE_IGNORE, dtype=torch.long)
+    in_slot[:, :3] = torch.tensor([5, 9, 2])
+    in_slot[1, 3] = 7
+    iv = vp_canonical_in_vals(anchors, in_slot)
+    vecs = torch.randn(3, 16)
+    for depth in (0, 1, 4):
+        t2 = T2Compressor(d_t1=8, d_out=16, d_event=4, vp_head_depth=depth)
+        want = t2.vp_head(vp_head_inputs(vecs, iv))[..., :3 * 33]
+        got = vp_head_live(t2.vp_head, vecs, iv, n_in=4, n_out=3)
+        assert got.shape == want.shape
+        assert torch.allclose(got, want, rtol=1e-5, atol=1e-5), depth
+
+
+def test_bounded_vp_loss_equals_the_full_loss():
+    """t2_value_predict_loss with n_in / n_out bounds (the trainer's path) must
+    give the full loss whenever the slots beyond the bounds are empty."""
+    import torch
+    from compressor.model import T2Compressor
+    from compressor.train import t2_value_predict_loss
+    from datagen import AUX_CE_IGNORE, make_anchor_states
+    torch.manual_seed(0)
+    t2 = T2Compressor(d_t1=8, d_out=16, d_event=4, vp_head_depth=1)
+    anchors = torch.from_numpy(make_anchor_states(8, 0))
+    B = 4
+    in_slot = torch.full((B, 32), AUX_CE_IGNORE, dtype=torch.long)
+    in_slot[:, :3] = torch.tensor([5, 9, 2])
+    out_slot = torch.full((B, 16), AUX_CE_IGNORE, dtype=torch.long)
+    out_slot[:, 0] = 7
+    out_slot[1:, 1] = 11
+    out_regs = torch.randint(-2**31, 2**31 - 1, (B, 8, 32), dtype=torch.int32)
+    mask = torch.tensor([True, True, False, True])
+    vecs = torch.randn(B, 16)
+    full, n_full = t2_value_predict_loss(t2, vecs, anchors, in_slot, out_slot,
+                                         out_regs, mask, return_count=True)
+    bnd, n_bnd = t2_value_predict_loss(t2, vecs, anchors, in_slot, out_slot,
+                                       out_regs, mask, return_count=True,
+                                       n_in=4, n_out=2)
+    assert n_full == n_bnd
+    assert torch.allclose(full, bnd, rtol=1e-6, atol=1e-7)
 
 
 def test_out_slots_beyond_the_instruction_count_are_ignore():

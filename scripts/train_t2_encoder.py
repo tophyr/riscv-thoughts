@@ -123,7 +123,7 @@ def main():
         t2_checkpoint=args.resume,
         t2_route=args.route,
         device=device,
-        on_log=save,
+        on_log=save, save_every=args.save_every,
         compile_step=not args.no_compile,
     )
     print(f'\nDone: {losses[-1]["step"]} steps, '

@@ -133,15 +133,138 @@ provider), one canonical vp loss, one data mode. The standard met: **T1 and T2
 differ only in the ingestion front-end and the hparams** — in the code, not
 just the prose.
 
-## Throughput — the one-graph fold
+## Throughput
 
-The frozen-T1 encode + predicted-binding routing + T2 core + losses now fold
-into ONE compiled CUDA-graph step at a fixed-padded instruction count (a dense
-`(B, MAX_NI)` grid built host-side; padding gated via `active=0`). Verified
+The frozen-T1 encode + predicted-binding routing + T2 core + losses fold into
+ONE compiled CUDA-graph step at a fixed-padded instruction count (a dense
+`(B, MAX_NI)` grid built host-side; padding gated via `active=0`), verified
 bit-identical to the ragged path (active-slot essence max |Δ| 1.8e-7,
-padding-leak exactly 0). Result: **T2 at 8 ms/step @ 95–97% util** (was 11 ms
-@ 66% with the eager per-step dispatch). Recorded as a lesson: never leave a
-long run at low util — the fix is a pipeline/compile change, not a deferral.
+padding-leak exactly 0). That fold is what makes the step GPU-bound at all:
+eager per-step dispatch ran at 66% util.
+
+**Where the step time goes, and what was removed from it.** Measured on the
+len=2 cell T2 runs at (`--d-out 512`, op-cell depth 4, 16 pool heads, vp head
+depth 1, 384 rows per step, RTX 4090), fed from a fixed on-disk corpus so
+generation cannot be the limit; steady-state ms/step from step 1500 onwards.
+Each row adds one change to the row above it:
+
+| change | ms/step | GPU util |
+|---|---|---|
+| checkpoint written at every 100-step log line | 8.14 | 73% |
+| checkpoint every 10k steps (`--save-every`) | 6.02 | 96% |
+| compile with `max-autotune` (benchmarked GEMM kernels) | 5.50 | 95% |
+| vp head: essence term once per row, empty input slots skipped; pool projects only touched slots | 4.81 | 93% |
+| prefetch queue 4 → 128 batches | 4.66 | 95% |
+| in-slot score head on touched slots only | 4.47–4.56 | 95% |
+| vp head: unsupervised output slots skipped | 4.44–4.48 | 94% |
+| one pinned host→device copy per step instead of fourteen | 4.36 | 95% |
+| gradient-clip scaling and Adam compiled together | 3.92 | 95% |
+| prefetch workers pack each step into shared memory | 3.88 | 96% |
+| whole step (forward, backward, clip, Adam) captured as one CUDA graph | 3.67–3.88 | 98% |
+
+Two runs of one configuration differ by up to ~5% in ms/step, so the last rows
+are separated only by their direction. The same step replayed on fixed inputs,
+with no host work at all, runs at 3.75 ms: with the whole step captured, the
+host issues one launch per step and the GPU never waits on it. Fed live from
+odin the step runs at 3.96 ms and 97.6% GPU utilisation. Every change computes
+the same function of the same inputs up to float rounding — it skips work whose
+result is exactly known (a register slot no instruction touched is an exact
+zero row, so any linear map of it is its bias), moves host work to another
+process, or runs the same Adam update through different kernels. Seeded
+300-step runs against the original code agree at step 0 to ≤1.5e-5 relative on
+every loss and correlate at 0.9999999 over the run; on real checkpoints the
+essence is bit-identical and the vp loss agrees to 2e-7. The T1 trainer runs
+through the same captured step: from one initial state on one batch, its losses
+agree with the original code's to 1.4e-5 relative compiled and 2.6e-7 eager.
+Resuming the len=2 cell from a step-2000 checkpoint — one this code wrote, or
+one the original fused-Adam code wrote — trains on indistinguishably from an
+uninterrupted run: over the next 2000 steps, across one uninterrupted and three
+resumed runs, each run's loss sits 0.30–0.36% on average from their per-step
+median.
+
+Seeded runs are not bit-reproducible: the compiled Adam update is not
+order-stable, so two runs of identical code drift apart from the first few
+steps, by ~1e-4 in parameters after 300 steps, the same size as the
+difference from the original code. Without the compiled update (fused Adam)
+the same comparison is bit-exact (3.7e-9); the compiled update is worth ~0.5 ms
+of a ~4.3 ms step.
+
+End to end, 1M-step cells on `configs/instr_alu_writers_chain010.json` over
+the frozen `runs/t1_writers_250k_rank`, scored by `probes/vp_budget.py` on one
+shared 1200-batch corpus (exact match; each pair is generator seeds 0 and 7):
+
+| trainer | exact match |
+|---|---|
+| before these changes | 99.8969% (one cell) |
+| through the single host→device copy | 99.9069%, 99.9007% |
+| + compiled clip and Adam, shared-memory prefetch | 99.8731%, 99.8950% |
+| the same with fused Adam (the control) | 99.8932%, 99.8936% |
+| + whole step captured as one CUDA graph | 99.9020%, 99.8792% |
+
+Every row computes the same function up to rounding, and the batch stream
+differs between any two runs anyway (odin's pool interleaves its workers
+nondeterministically), so the nine cells are draws from one distribution: mean
+99.893%, standard deviation 0.011 points per cell. No row stands apart from
+it. Binding accuracy is identical across them and the commutative-swap collapse
+reads 0.038–0.041 throughout.
+
+**Where the GPU time goes.** Nsight Systems over ~1,570 captured fp32 steps
+puts the GPU at 3.63 ms of kernel time per step: matmuls 1.96 ms (54%), fused
+elementwise and reduction kernels 1.26 ms (35%) — of which the compiled clip
+and Adam is ~0.5 ms — the frozen T1's attention 0.24 ms (6.5%), the rest
+0.18 ms. Under bf16 the matmuls fall to 1.32 ms while the elementwise kernels
+barely move (1.16 ms); several halve exactly with their bytes, the signature of
+memory-bound work. The card's own ceilings, measured on it: 157 TFLOPS on a
+large bf16 matmul and 87 TFLOPS TF32, drawing ~420–465 W; 1.0 TB/s on a large
+copy, drawing ~250–335 W. The trainer's ~340 W at 98% utilisation sits at the
+memory-bound end of that range: the step is mostly data movement and matmuls
+too small to approach peak, which is a property of the model's shape —
+`d_out` 512, 384 rows, a 32-slot state rewritten every instruction — rather
+than of the trainer. Per-kernel hardware counters (Nsight Compute) need the
+Windows driver's "allow access to GPU performance counters" setting under WSL2.
+
+**What does not help.** Two cells sharing the GPU run at 15.5 ms/step each —
+129 steps/s together against 166 for one alone at the 6.02 ms configuration;
+time-slicing costs more than it hides. More rows per step barely raise the
+rate a row is trained at: with the whole step captured, 768 rows run at 7.07
+ms and 1536 at 13.80 against 3.88 for 384 — 10% and 12% more rows per second —
+so the GPU's time already scales almost with the work, and more rows would
+change the training (fewer optimizer steps per row) for little. Compiling Adam
+alone gains nothing (0.862 against 0.873 ms for fused Adam): the gain comes
+from fusing it with the clip scaling. Running the frozen T1's attention through
+plain matmuls instead of the memory-efficient kernel saves 2% and moves T1's
+essence by up to 2.6e-4 (TF32 matmuls against the kernel's fp32), a precision
+change for too little. Fewer intra-op threads is not free either way:
+one is slower (5.08 against 4.66 ms), while four — the trainer's setting —
+match sixteen file-fed and are faster live (below). Coordinate-descent kernel
+tuning changes nothing (5.275 against 5.272 ms), and neither Python's garbage
+collector nor its GIL switch interval costs anything measurable.
+
+**Feeding it.** At 3.88 ms the trainer consumes ~260 batches/s, ~120 MB/s of
+RVT. Generation is far from the limit — odin's pool delivers ~600 batches/s
+over the gigabit link at a load of ~14 of its 128 cores, and lz4 holds the wire
+to ~21 MB/s at 180 batches/s. The trainer's own per-instruction split is the
+CPU-bound stage: one prefetch worker delivers ~240 batches/s, so the prefetcher
+runs four (~540/s). The workers also build and pack each step's device inputs
+and hand them over through a ring of slots in a `/dev/shm` file, so the main
+thread only copies one buffer: sending the ~0.7 MB packed step through the
+queue instead cost the main thread more to unpickle than the packing saved. The
+queue holds 128 batches because the multinode stream has lulls of tens of
+milliseconds, which a 4-batch queue passes straight to the GPU as idle time.
+And the trainer caps its intra-op threads at four: with sixteen, their spinning
+contends with the stream's receive path (nc, lz4, the local mux) and the live
+step ran 7% slow.
+
+**bf16 autocast — measured, not adopted.** Running everything after the
+frozen-T1 front-end under bf16 autocast (T1 stays fp32, so T2 is fed the T1 it
+was validated with) brings the captured step to 3.00 ms file-fed and 3.07 live,
+against 3.88 / 3.96 in fp32/TF32 — 1.29x the rows per second — with its GPU
+floor at 2.94 ms. On the shared corpus two bf16 cells read 99.9053% and
+99.9074% exact against 99.9069% and 99.9007% for fp32 cells of the same code
+(depth-2: 99.09% / 99.11% against 99.08% / 99.06%), all inside the 0.011
+per-cell spread above; binding and the collapse rows are indistinguishable. It
+changes the computation, so adopting it is a decision rather than a
+measurement.
 
 ## Status and open problems
 

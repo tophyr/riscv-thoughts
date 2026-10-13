@@ -193,6 +193,9 @@ class RegisterStateMachine(nn.Module):
         read_time = torch.zeros(content.shape[0], self.n_regs, device=device)
         n_read = torch.zeros(content.shape[0], 1, device=device)
         write_time = torch.zeros(content.shape[0], self.n_regs, device=device)
+        # Slots any instruction read or wrote. Every other slot is exactly zero
+        # throughout, which lets the pool skip projecting it.
+        touched = torch.zeros(content.shape[0], self.n_regs, device=device)
 
         for k in range(K):
             a = active[:, k:k + 1]                          # (B,1)
@@ -234,6 +237,7 @@ class RegisterStateMachine(nn.Module):
                 * self.write_pulse.view(1, 1, -1)
             wr = oh_out * a
             write_time = write_time * (1.0 - wr) + wr * step_sig
+            touched = torch.clamp(touched + (oh0e + oh1e + oh_out) * a, max=1.0)
         # fold the order timestamps into event channels 0 (read) and 1 (write),
         # normalized to ~(0,1].
         order = torch.stack([read_time / (2.0 * K), write_time], dim=-1)
@@ -248,16 +252,32 @@ class RegisterStateMachine(nn.Module):
         # and stop being blind to a commutative operand swap.
         pool_src = torch.cat([value, write_time.unsqueeze(-1)], dim=-1)
         q = self.pool_q.view(self.n_pool_heads, -1)          # (k, d_value)
-        kk = self.pool_k(pool_src)                           # (B, n_regs, d_value)
+        kk, vv = self._project_touched(pool_src, touched, 3 * K)
         logits = kk @ q.t()                                  # (B, n_regs, k)
         # Each head independently softmaxes over the slots; the per-head sum
         # over slots is symmetric, hence exactly rename-invariant.
         att = torch.softmax(logits, dim=1)                   # (B, n_regs, k)
-        vv = self.pool_v(pool_src).view(                     # per-head slices
+        vv = vv.view(                                        # per-head slices
             value.shape[0], self.n_regs, self.n_pool_heads, -1)
         heads = torch.einsum('bsk,bskd->bkd', att, vv)       # (B, k, d_value//k)
         essence = heads.reshape(value.shape[0], -1)          # (B, d_value)
         return T, essence
+
+    def _project_touched(self, pool_src, touched, max_touched):
+        """(pool_k(pool_src), pool_v(pool_src)), projecting only the slots the
+        chunk touched. An untouched slot's pool_src row is exactly zero, so its
+        projection is exactly the bias; at most `max_touched` slots (two reads
+        and a write per instruction) carry anything else. Which untouched slots
+        fill a short row's spare picks does not matter — they project to bias."""
+        R = pool_src.shape[1]
+        n = min(max_touched, R)
+        # One-hot selection rather than gather/scatter, like the core's own
+        # reads and writes: same values, and a deterministic backward.
+        sel = F.one_hot(touched.topk(n, dim=1).indices, R).to(pool_src.dtype)
+        src = sel @ pool_src                                 # (B, n, d_in)
+        uncovered = (1.0 - sel.sum(1)).unsqueeze(-1)         # (B, R, 1)
+        return [sel.transpose(1, 2) @ proj(src) + uncovered * proj.bias
+                for proj in (self.pool_k, self.pool_v)]
 
     def _stamp_reads(self, read_time, n_read, write_time, oh0e, oh1e, a):
         """Stamp this step's operands with their canonical read POSITION: the
@@ -288,6 +308,22 @@ class RegisterStateMachine(nn.Module):
         (B, n_regs). Equivariant (a rename permutes the slots, permuting the
         scores identically)."""
         return head(T).squeeze(-1)
+
+
+def apply_head_touched(head, T, max_touched):
+    """head over T's register axis (B, R, d) -> (B, R, out), evaluated only on
+    the slots that can be nonzero. A slot the chunk never touched is an exact
+    zero row, so its output is head(0); at most `max_touched` slots differ."""
+    R = T.shape[1]
+    if max_touched >= R:
+        return head(T)
+    nonzero = (T != 0).any(-1).to(T.dtype)
+    sel = F.one_hot(nonzero.topk(max_touched, dim=1).indices, R).to(T.dtype)
+    uncovered = (1.0 - sel.sum(1)).unsqueeze(-1)             # (B, R, 1)
+    # head(0) is evaluated once per row, alongside the touched slots, so its
+    # gradient is an ordinary weight-gradient matmul and stays deterministic.
+    y = head(torch.cat([sel @ T, T.new_zeros(T.shape[0], 1, T.shape[-1])], 1))
+    return sel.transpose(1, 2) @ y[:, :-1] + uncovered @ y[:, -1:]
 
 
 class TokenEmbedder(nn.Module):

@@ -71,11 +71,11 @@ slot at all and therefore no gradient whatsoever.
    and training budget over the same frozen T1 scores 19.52% on a
    two-immediate composed chain at the corpus's natural composition and ~97%
    when such chains are common. What remains is the (rate, steps) choice
-   (task 2) and whatever sits below ~99.94%.
+   (task 1) and whatever sits below ~99.94%.
 
 2. **Computed equivalents collapse at len=2.** Chunks computing the same
    function land as far apart as chunks computing different ones (Mission's
-   table). Task 3. **Settle it before chunks get longer**: every added
+   table). Task 2. **Settle it before chunks get longer**: every added
    instruction multiplies the equivalences a chunk participates in, so a len=4
    model would learn the same wrong geometry at four times the scale.
 
@@ -85,7 +85,7 @@ slot at all and therefore no gradient whatsoever.
    counter can know — so the len=2 mechanism may not transfer intact.
 
 4. **Beyond the happy path.** Everything above is writers-only (R/I-type ALU,
-   valid, non-x0). Then: no-write instructions (task 6), PC/branches, memory,
+   valid, non-x0). Then: no-write instructions (task 5), PC/branches, memory,
    longer and looser chunks. The vp metric itself needs strengthening here too —
    8 fixed anchors are not enough to certify a lossless description on a harder
    corpus (METRICS.md).
@@ -97,38 +97,10 @@ slot at all and therefore no gradient whatsoever.
 
 ## Open tasks
 
-Task 1 is housekeeping the rest rests on: the throughput figures every plan
-budgets against need re-measuring. Task 2 then settles the faithfulness
-milestone and task 3 is required for the MVP. The rest are queued, not parallel
-work.
+Task 1 settles the faithfulness milestone and task 2 is required for the MVP.
+The rest are queued, not parallel work.
 
-### 1. Get more throughput out of the hardware
-
-**A single training cell already saturates the GPU: 96–97% utilisation at
-7 ms/step** at the adopted len=2 configuration (`--d-out 512`, op-cell depth 4,
-16 pool heads) with generation offloaded to the remote worker pool. Host-side
-per-step preparation — RVT parse, the per-instruction split, the frozen-T1
-assembly — does not bound the step at this configuration, so there is no idle
-GPU to reclaim.
-
-That makes the available levers different ones, and none is measured:
-
-- **More cells at once.** Two concurrent len=2 runs were measured at 11 ms/step
-  each against 7 ms solo — ~1.3x aggregate, not 2x, because the GPU becomes the
-  binding constraint once host serialisation is filled. Worth confirming at the
-  current configuration, since the solo figure moved.
-- **A cheaper GPU step.** 7 ms/step at `--d-out 512` with a 4-deep op-cell is
-  the floor to attack. Reduced precision, a cheaper op-cell, or a larger batch
-  per step all trade against the measurements every recorded result was taken
-  at, so each needs the null intervention of METRICS.md.
-- **A second device.** Generation already spans two machines; training does not.
-
-**Measure before changing anything.** A utilisation or ms/step figure belongs
-to the cell configuration it was taken on and says nothing about another, so
-re-measure the solo and concurrent rates at the configuration about to be used
-and state them with that configuration (METRICS.md, scope conditions).
-
-### 2. Settle the composed-chain density and the step budget together
+### 1. Settle the composed-chain density and the step budget together
 
 **The len=2 residual is a corpus-density problem and the fix is measured; what
 is left is choosing the operating point.** Chunks where one instruction consumes
@@ -168,7 +140,7 @@ is a rate of 0.10 at 2M steps.
 0.021 points, against effects of 0.05–0.11. Any candidate pair needs its own
 draw-to-draw null, not one borrowed from another pair (METRICS.md).
 
-### 3. Collapse computed equivalences (milestone 2 — required for MVP)
+### 2. Collapse computed equivalences (milestone 2 — required for MVP)
 
 
 Two chunks computing the same function must land on the same point. They do not,
@@ -188,7 +160,7 @@ commutative swap — free because the pool is a multiset over register slots —
 sits at 117x. **At both tiers, an equivalence collapses when the architecture
 cannot represent the difference and otherwise does not.** Any fix has to be
 designed for T1 and T2 together: they are one class (`compressor/`), so a
-mechanism that works at T1 applies at T2 unchanged. It also means task 4's
+mechanism that works at T1 applies at T2 unchanged. It also means task 3's
 validity remint should not happen before this is settled, or T1 will be
 reminted without it.
 
@@ -213,7 +185,7 @@ three places:
 - T1's binding, and hence T2's vp: every `dest` misprediction measured is an
   instruction the oracle says modifies nothing, i.e. T1 predicting a write for
   `ADD x5,x5,x0`. That is 6.2% of T2's remaining vp error, arriving through
-  task 4's tier interface rather than through anything T2 does.
+  task 3's tier interface rather than through anything T2 does.
 
 It is not a weighting problem — T1's binding is otherwise accurate against the
 oracle. It is a missing capability: knowing that `+x0`, `+0`, `|0`, `^0` and
@@ -228,7 +200,7 @@ Decisions to make before building, in order:
 - **Essence or op-cell?** The measured distances are essence distances, but the
   composite is formed one step earlier, when the second instruction's op-cell
   reads the slot the first wrote. A cell that computed `i1+i2` there would
-  collapse the pair before any pooling — and would fix task 2, which an
+  collapse the pair before any pooling — and would fix task 1, which an
   essence-level term alone would not.
 - **What is the objective?** A pairwise term over generated equivalent pairs is
   the obvious candidate, and nothing in the loss is pairwise today — that was a
@@ -241,19 +213,20 @@ Decisions to make before building, in order:
   inequivalents together too. The guard is `behav-diff` (METRICS.md), which must
   stay large.
 
-### 4. Give T1 a validity task
+### 3. Give T1 a validity task
 
 
 The frozen T1 (`runs/t1_writers_250k_rank`) is a diagnostic trained on a clean
 corpus (`configs/instr_alu_writers.json`, which declares no `invalidity`
 block), so it has no validity task and cannot reject invalid input. That is the
 only remaining gap between it and a production T1: it trains against the
-corrected oracle, at the core's settled settings, with the
-`rd==x0` immediate mask applied (`compressor/train.py:275`), and its
+corrected oracle, at the core's settled settings, with the `rd==x0` immediate
+mask applied (`_t1_immediates` in `compressor/train.py`), and its
 single-instruction vp is a 100.0000% exact 32-bit match
 (`probes/t1_scorecard.py`). Needed before anything leaves the happy path.
 
-**A candidate T1 can only be judged by training a T2 over it** (~2.4h at len=2).
+**A candidate T1 can only be judged by training a T2 over it** (~65 min at
+len=2, 1M steps).
 T1-side metrics do not predict what T2 extracts: six T1s all scoring 100.0000%
 on their own single-instruction vp yielded T2s spanning 0.059 points, with their
 binding accuracies ranked *anti*-correlated to their T2s. Budget for that before
@@ -266,7 +239,7 @@ the binding as its WIRING, so the tier interface is optimised at a tenth of the
 priority of the essence. T1 is nonetheless accurate against the oracle's
 binding, so this is a thing to check, not a known deficit.
 
-### 5. The anchor states are unstructured, and branches will need them to be
+### 4. The anchor states are unstructured, and branches will need them to be
 
 
 `make_anchor_states` (`datagen/compare.py:319`) draws pure uniform int32 with
@@ -286,7 +259,7 @@ reminces the frozen T1 and invalidates every vp number measured against the old
 states (CLAUDE.md INVARIANT 1: the generator's and trainer's anchor seed and
 count must match).
 
-### 6. No-write instructions are invisible to the essence
+### 5. No-write instructions are invisible to the essence
 
 
 Blocks milestone 4 (~⅓ of the ISA). Content reaches the essence only through a
@@ -316,10 +289,10 @@ them:
   no PC target at all. `out_pcs` is computed and only a `pc_writes` boolean is
   shipped, so this would mean widening the RVT batch.
 - **PC advance does not count.** Then those chunks are equivalent and the 0.1041
-  is a collapse failure, which puts it in task 3.
+  is a collapse failure, which puts it in task 2.
 
 Deferred deliberately: it is a definition, not an experiment, and it should be
-settled before either task 3 builds a collapse objective or this task ships a
+settled before either task 2 builds a collapse objective or this task ships a
 PC-effect target — each would bake in an answer.
 
 ## Long horizon

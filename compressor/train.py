@@ -10,8 +10,11 @@ Shared helpers (used by trainers, eval, and the acceptance suite):
                               shared by the T1 and T2 encoder loops.
 """
 
+import ctypes
 import itertools
+import os
 import queue
+import signal
 import threading
 import time
 from datetime import timedelta
@@ -31,8 +34,8 @@ from datagen import (
 )
 from emulator import Instruction, I_TYPE
 from .model import (
-    Compressor, T1Compressor, T2Compressor, instruction_wiring,
-    X0_SLOT)
+    Compressor, T1Compressor, T2Compressor, apply_head_touched,
+    instruction_wiring, X0_SLOT)
 
 
 # ===========================================================================
@@ -102,21 +105,93 @@ def _is_cuda(device):
     return device == 'cuda' or getattr(device, 'type', None) == 'cuda'
 
 
-def _h2d(arr, device, dtype=None):
-    """Host->device copy for a batch array. On CUDA, route through pinned
-    memory + non_blocking so the 11 per-step copies don't each block the
-    CPU (they queue on the default stream and the CPU races ahead to launch
-    the compiled step) — this recovers most of the per-step H2D gap and
-    lifts GPU util ~81%->~92% with NO CUDA-graph hazard (the copy is on the
-    default stream, before/outside the captured region; unlike a side-stream
-    prefetcher, which collides with graph capture). dtype casts on the host
-    so the device sees the final dtype directly."""
-    t = torch.from_numpy(arr)
-    if dtype is not None:
-        t = t.to(dtype)
-    if _is_cuda(device):
-        return t.pin_memory().to(device, non_blocking=True)
-    return t.to(device)
+class _H2DStager:
+    """Host->device copy of a step's packed batch arrays (`_pack_step_arrays`):
+    one pinned buffer, one copy. Pinned + non_blocking lets the CPU race ahead
+    to launch the compiled step, and the copy sits on the default stream
+    outside the captured graph, so it cannot collide with capture. Pinned
+    buffers are reused round-robin once their copy has completed."""
+
+    def __init__(self, device, n_buffers=4):
+        self.device = device
+        self.bufs = [None] * n_buffers
+        self.done = [None] * n_buffers
+        self.k = 0
+        self.dev = None
+
+    def __call__(self, packed, specs):
+        """packed: uint8 ndarray; specs: [(offset, dtype, shape)] -> tensors."""
+        if _is_cuda(self.device):
+            k, self.k = self.k, (self.k + 1) % len(self.bufs)
+            if self.done[k] is not None:
+                self.done[k].synchronize()
+            if self.bufs[k] is None or self.bufs[k].numel() < packed.size:
+                self.bufs[k] = torch.empty(packed.size, dtype=torch.uint8,
+                                           pin_memory=True)
+            buf = self.bufs[k][:packed.size]
+            np.copyto(buf.numpy(), packed)
+            # One device buffer reused every step, so the inputs sit at fixed
+            # addresses a captured CUDA graph can read. The copy is ordered on
+            # the stream after the previous step's reads of it.
+            if self.dev is None or self.dev.numel() < packed.size:
+                self.dev = torch.empty(packed.size, dtype=torch.uint8,
+                                       device=self.device)
+            dev = self.dev[:packed.size]
+            dev.copy_(buf, non_blocking=True)
+            self.done[k] = torch.cuda.Event()
+            self.done[k].record()
+        else:
+            dev = torch.from_numpy(packed.copy())
+        return [dev[o:o + int(np.prod(shape)) * dt.itemsize]
+                .view(_TORCH_DTYPE[dt]).view(shape) for o, dt, shape in specs]
+
+
+_TORCH_DTYPE = {np.dtype(d): t for d, t in (
+    (np.int64, torch.long), (np.float32, torch.float32), (np.int32, torch.int32),
+    (np.bool_, torch.bool), (np.int8, torch.int8))}
+_PACK_ALIGN = 16
+
+
+def _pack_step_arrays(batch, split, *, vp, valid, imm):
+    """Everything one training step copies to the device, as one aligned uint8
+    buffer: the dense instruction grid, the binding and vp targets, and the
+    validity / immediate targets when those losses are on. Runs in the
+    prefetch workers so the trainer's main thread only stages a single buffer.
+    Returns (packed or None for an all-invalid batch, specs, n_instrs, shape),
+    specs listing (offset, dtype, shape) per array in _prep's order."""
+    shape = batch.instr_lens.shape
+    n_instrs = int(split[4].sum())
+    if split[0].shape[0] == 0:
+        return None, None, n_instrs, shape
+    n_chunks, max_ni = shape
+    tok, pad, gi0, gi1, go, active = _dense_chunk_grid(split, n_chunks, max_ni)
+    # vp_head_live skips input / output slots past these bounds; they must be
+    # empty (a chunk of K instructions reads at most 2K and writes at most K).
+    in_k, out_k = min(2 * max_ni, MAX_INPUT_SLOTS), min(max_ni, MAX_OUTPUT_SLOTS)
+    assert (batch.in_slot_regs[:, in_k:] == AUX_CE_IGNORE).all()
+    assert (batch.out_slot_regs[:, out_k:] == AUX_CE_IGNORE).all()
+    i64, f32 = np.int64, np.float32
+    arrays = [(tok, i64), (pad, None), (gi0, i64), (gi1, i64), (go, i64),
+              (active, f32), (batch.live_in_mask, f32),
+              (batch.live_out_mask, f32), (batch.pc_writes, f32),
+              (batch.in_slot_regs, i64), (batch.out_slot_regs, i64)]
+    if vp:
+        arrays += [(batch.out_regs, None), (batch.out_regs_valid, None)]
+    if valid:
+        arrays += [(batch.valid, f32)]
+    if imm:
+        imm_np, imm_mask_np = _t1_immediates(batch)
+        arrays += [(_immediate_rotary_np(imm_np), f32), (imm_mask_np, f32)]
+    arrays = [np.ascontiguousarray(a if dt is None else a.astype(dt))
+              for a, dt in arrays]
+    specs, n = [], 0
+    for a in arrays:
+        specs.append((n, a.dtype, a.shape))
+        n += -(-a.nbytes // _PACK_ALIGN) * _PACK_ALIGN
+    packed = np.zeros(n, dtype=np.uint8)
+    for (o, _, _), a in zip(specs, arrays):
+        packed[o:o + a.nbytes] = a.reshape(-1).view(np.uint8)
+    return packed, specs, n_instrs, shape
 
 
 _VP_VALUE_BITS = 32     # two's-complement width; must match model._VP_VALUE_BITS
@@ -197,6 +272,33 @@ def vp_head_inputs(vecs, in_vals_i):
     return torch.cat([vec_exp, in_feat], dim=-1)
 
 
+def vp_head_live(head, vecs, in_vals_i, n_in, n_out):
+    """The first n_out output slots of `head(vp_head_inputs(vecs, in_vals_i))`,
+    without its zero work, for when input slots >= n_in are all empty. The
+    first layer's essence term is the same for every anchor, the empty slots'
+    features are exact zeros, and output slots >= n_out are never supervised,
+    so those parts are skipped; only the float summation order changes.
+    Returns (B, A, n_out*(bits+1))."""
+    layers = list(head) if isinstance(head, nn.Sequential) else [head]
+    d = vecs.shape[-1]
+    B, A = in_vals_i.shape[:2]
+    rows = slice(None)
+    if len(layers) == 1:
+        rows = slice(0, n_out * (_VP_VALUE_BITS + 1))
+    first = layers[0]
+    w, b = first.weight[rows], first.bias[rows]
+    x = _value_feat(in_vals_i[..., :n_in]).reshape(B, A, -1)
+    h = (F.linear(x, w[:, d:d + x.shape[-1]], b)
+         + F.linear(F.normalize(vecs, dim=-1), w[:, :d]).unsqueeze(1))
+    if len(layers) == 1:
+        return h
+    for layer in layers[1:-1]:
+        h = layer(h)
+    last = layers[-1]
+    keep = n_out * (_VP_VALUE_BITS + 1)
+    return F.linear(h, last.weight[:keep], last.bias[:keep])
+
+
 # Rotary immediate encoding (T1). POWER-OF-2 periods 2,4,...,4096: each frequency
 # is `imm mod 2^k` = the low k bits, which are directly readable from the hex
 # tokens. This is bit-aligned and non-redundant across scales — unlike an
@@ -247,24 +349,70 @@ def _t1_immediates(batch):
     return imm, mask
 
 
-def build_optim_sched(params, lr, n_steps, *, warmup_steps=0,
-                      lr_min=1e-6, device='cuda'):
-    """Adam (fused on cuda) + an optional-warmup→cosine LR schedule, shared
-    by all trainers. Returns (opt, scheduler); scheduler is None when
-    n_steps is falsy (LR held constant, e.g. unbounded streaming)."""
-    opt = torch.optim.Adam(params, lr=lr, fused=(device == 'cuda'))
-    if not n_steps:
-        return opt, None
+class _LRClock:
+    """The float LR schedule driving an optimizer whose lr is a device tensor.
+    A tensor lr is what lets clip + Adam compile into one graph without a
+    recompile per step, but the schedulers do not compute the same sequence on
+    a tensor lr (up to 10% off by mid-run). So the schedule runs unchanged on a
+    stand-in optimizer and its value is copied into the tensor after each step.
+    Quacks like the scheduler it wraps, for the loop, the log and resume."""
+
+    def __init__(self, scheduler, clock, opt):
+        self.scheduler, self.clock, self.opt = scheduler, clock, opt
+        self.lr_t = opt.param_groups[0]['lr']
+
+    def sync(self):
+        for g in self.opt.param_groups:
+            g['lr'] = self.lr_t
+        self.lr_t.fill_(self.clock.param_groups[0]['lr'])
+
+    def step(self):
+        self.scheduler.step()
+        self.sync()
+
+    def get_last_lr(self):
+        return self.scheduler.get_last_lr()
+
+    def state_dict(self):
+        return self.scheduler.state_dict()
+
+    def load_state_dict(self, state):
+        self.scheduler.load_state_dict(state)
+        self.clock.param_groups[0]['lr'] = state['_last_lr'][0]
+        self.sync()
+
+
+def _lr_schedule(opt, n_steps, warmup_steps, lr_min):
     cosine_steps = max(1, n_steps - warmup_steps)
     cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=cosine_steps, eta_min=lr_min)
-    if warmup_steps > 0:
-        warmup = torch.optim.lr_scheduler.LinearLR(
-            opt, start_factor=1e-3, end_factor=1.0, total_iters=warmup_steps)
-        scheduler = torch.optim.lr_scheduler.SequentialLR(
-            opt, schedulers=[warmup, cosine], milestones=[warmup_steps])
-    else:
-        scheduler = cosine
+    if warmup_steps <= 0:
+        return cosine
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        opt, start_factor=1e-3, end_factor=1.0, total_iters=warmup_steps)
+    return torch.optim.lr_scheduler.SequentialLR(
+        opt, schedulers=[warmup, cosine], milestones=[warmup_steps])
+
+
+def build_optim_sched(params, lr, n_steps, *, warmup_steps=0,
+                      lr_min=1e-6, device='cuda'):
+    """Adam + an optional-warmup→cosine LR schedule, shared by all trainers.
+    Returns (opt, scheduler); scheduler is None when n_steps is falsy (LR held
+    constant, e.g. unbounded streaming). On CUDA the Adam is capturable with a
+    device-tensor lr, so run_train_loop can compile it together with gradient
+    clipping, and the scheduler is an _LRClock."""
+    if not _is_cuda(device):
+        opt = torch.optim.Adam(params, lr=lr)
+        return opt, (_lr_schedule(opt, n_steps, warmup_steps, lr_min)
+                     if n_steps else None)
+    clock = torch.optim.SGD([torch.zeros(1)], lr=lr)
+    opt = torch.optim.Adam(params, lr=torch.tensor(float(lr), device=device),
+                           foreach=True, capturable=True)
+    if not n_steps:
+        return opt, None
+    scheduler = _LRClock(_lr_schedule(clock, n_steps, warmup_steps, lr_min),
+                         clock, opt)
+    scheduler.sync()
     return opt, scheduler
 
 
@@ -307,6 +455,10 @@ def restore_train_state(state, opt, scheduler):
     """Inverse of capture_train_state: reload optimizer/scheduler/RNG and
     return the step to resume from. Shared by all trainers."""
     opt.load_state_dict(state['opt'])
+    if isinstance(scheduler, _LRClock):
+        # A checkpoint from a fused Adam carries its flags and a float lr.
+        for g in opt.param_groups:
+            g.update(fused=None, foreach=True, capturable=True)
     if scheduler is not None and state.get('scheduler'):
         scheduler.load_state_dict(state['scheduler'])
     torch_rng = state.get('torch_rng')
@@ -339,14 +491,19 @@ class TrainLog:
       extra_fn() -> dict                                (probes / counts;
                     called only at boundaries so its own GPU work/syncs are
                     likewise off the hot path)
-    on_log is always called (model, losses, train_state) — train_state is
-    None for trainers that don't checkpoint resume state.
+    on_log(model, losses, train_state) — train_state is None for trainers
+    that don't checkpoint resume state — fires at the first log boundary at
+    least `save_every` steps after the previous one. It writes the checkpoint,
+    which stalls the GPU for a fraction of a second — at every 100-step log
+    boundary that cost a quarter of the step rate.
     """
 
     def __init__(self, *, n_steps, log_every, lr, scheduler, formatter,
-                 on_log=None):
+                 on_log=None, save_every=10000):
         self.n_steps = n_steps
         self.log_every = log_every
+        self.save_every = save_every
+        self._next_save = save_every
         self.lr = lr
         self.scheduler = scheduler
         self.formatter = formatter
@@ -372,7 +529,8 @@ class TrainLog:
         lr_now = _current_lr(self.scheduler, self.lr)
         print(self.formatter(record, ms_per_step, eta, lr_now))
         self.losses.append(record)
-        if self.on_log is not None:
+        if self.on_log is not None and step >= self._next_save:
+            self._next_save = step + self.save_every
             train_state = state_fn() if state_fn is not None else None
             self.on_log(model, self.losses, train_state)
         return record
@@ -391,6 +549,10 @@ def _peek(it):
     return first, itertools.chain([first], it)
 
 
+def _graph_signature(inputs):
+    return [(t.data_ptr(), t.shape, t.dtype) for t in inputs if torch.is_tensor(t)]
+
+
 def run_train_loop(batch_source, *, model, opt, scheduler, log, device,
                    prep_fn, fwd_loss_fn, extra_fn=None, clip=1.0,
                    compile_step=True, capture_state=False, start_step=0):
@@ -398,18 +560,17 @@ def run_train_loop(batch_source, *, model, opt, scheduler, log, device,
 
     Owns the universal mechanics: process/device setup (TF32 matmul + disabling
     the fused-attention fast path that the compiled step can't capture),
-    torch.compile (CUDA-graph, reduce-overhead) of the forward+loss+backward,
-    the per-step backward / grad-clip / opt / scheduler, and logging via `log`
+    torch.compile (max-autotune) of the forward+loss, the whole step —
+    forward, backward, grad-clip, Adam — captured as one CUDA graph on CUDA,
+    the scheduler, and logging via `log`
     (TrainLog) — including the log-boundary sync discipline and optional
     resume-state capture. The two genuinely trainer-specific pieces are
     injected:
 
       prep_fn(item) -> tuple of GPU inputs for fwd_loss_fn, or None to skip
-          the item (empty batch). Does the H2D copies (via _h2d) plus any
-          eager, dynamic-shape precompute that must stay OUTSIDE the captured
-          graph (e.g. T2's frozen-T1 per-instruction encode + chunk assembly,
-          whose instruction count varies per batch). Every tensor it returns
-          must be fixed-shape so the graph records once.
+          the item (empty batch). Does the H2D copy (_H2DStager). Every
+          tensor it returns must keep one shape AND one address across steps:
+          the captured graph replays against the addresses it recorded.
       fwd_loss_fn(*inputs) -> (total, metrics, aux)
           total:   scalar loss to backward.
           metrics: dict[str, scalar tensor] logged at each boundary.
@@ -425,22 +586,79 @@ def run_train_loop(batch_source, *, model, opt, scheduler, log, device,
         # here so every trainer gets it uniformly (it had drifted to only
         # T2, leaving T1 on slow fp32 matmuls).
         torch.set_float32_matmul_precision('high')
+    # The host's per-step tensor work is small; more intra-op threads than this
+    # spin and contend with the stream's receive path, slowing the step ~7%.
+    torch.set_num_threads(min(4, torch.get_num_threads()))
     # Disable the fused attention fast path (_transformer_encoder_layer_fwd /
     # nested-tensor) — not torch.compile-able; it shatters the captured graph.
     # Global + numerically transparent; set once for all trainers.
     torch.backends.mha.set_fastpath_enabled(False)
-    step_fn = (torch.compile(fwd_loss_fn, mode='reduce-overhead')
+    # On CUDA the whole step — forward, backward, gradient clip, Adam — is
+    # captured as ONE CUDA graph and replayed, so the host issues one launch
+    # per step instead of hundreds. The forward therefore compiles without
+    # torch.compile's own CUDA graphs (those cannot nest in a capture);
+    # max-autotune still benchmarks its GEMM kernels, which is 9% faster per
+    # step than the default kernels and the same computation up to float
+    # summation order. The search costs minutes on a cold inductor cache, once.
+    graphed = compile_step and _is_cuda(device)
+    step_fn = (torch.compile(fwd_loss_fn, mode=('max-autotune-no-cudagraphs'
+                                               if graphed else 'max-autotune'))
                if compile_step else fwd_loss_fn)
+    params = list(model.parameters())
+
+    def _scale_and_step(norm):
+        grads = [p.grad for p in params if p.grad is not None]
+        torch._foreach_mul_(grads, torch.clamp(clip / (norm + 1e-6), max=1.0))
+        opt.step()
+    # Compiled, the clip scaling and Adam fuse into a few kernels: ~0.6 ms per
+    # step less GPU time inside the graph than the eager foreach kernels.
+    scale_and_step = (torch.compile(_scale_and_step) if graphed
+                      else _scale_and_step)
+
+    def train_step(*inputs):
+        """forward + backward + clip_grad_norm_(params, clip) + Adam."""
+        total, metrics, aux = step_fn(*inputs)
+        total.backward()
+        grads = [p.grad for p in params if p.grad is not None]
+        scale_and_step(torch.linalg.vector_norm(
+            torch.stack(torch._foreach_norm(grads))))
+        return metrics, aux
+
+    # Capture needs a few eager steps first (on a side stream) so the compiled
+    # kernels, the backward and the optimizer state all exist. They are real
+    # training steps on real batches, so nothing is trained twice.
+    WARMUP = 3
+    graph, captured, n_eager = None, None, 0
+    side = torch.cuda.Stream() if graphed else None
     step = start_step
     for item in batch_source:
         inputs = prep_fn(item)
         if inputs is None:
             continue
-        total, metrics, aux = step_fn(*inputs)
-        opt.zero_grad(set_to_none=True)
-        total.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
-        opt.step()
+        if not graphed:
+            opt.zero_grad(set_to_none=True)
+            metrics, aux = train_step(*inputs)
+        elif graph is None and n_eager < WARMUP:
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                opt.zero_grad(set_to_none=True)
+                metrics, aux = train_step(*inputs)
+            torch.cuda.current_stream().wait_stream(side)
+            n_eager += 1
+        elif graph is None:
+            # Gradients start as None, so the captured backward allocates them
+            # once in the graph's pool and every replay rewrites them in place.
+            opt.zero_grad(set_to_none=True)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                metrics, aux = train_step(*inputs)
+            captured = _graph_signature(inputs)
+            graph.replay()
+        else:
+            # A replay reads the captured addresses with the captured shapes,
+            # so both must hold or it silently computes on the wrong layout.
+            assert _graph_signature(inputs) == captured
+            graph.replay()
         if scheduler:
             scheduler.step()
         step += 1
@@ -486,7 +704,7 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
                      out_slot_weight=0.1, value_predict_weight=1.0,
                      vp_smooth_weight=0.2, imm_weight=1.0,
                      anchor_seed=0, n_anchor_states=8,
-                     resume=None, device='auto', on_log=None,
+                     resume=None, device='auto', on_log=None, save_every=10000,
                      compile_step=True):
     """The ONE trainer for the equivariant Compressor — T1 and T2 run the SAME
     execution path. The only tier-specific piece is the content
@@ -564,28 +782,30 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
             f'eta {timedelta(seconds=int(eta))}')
 
     log = TrainLog(n_steps=n_steps, log_every=log_every, lr=lr,
-                   scheduler=scheduler, formatter=_fmt, on_log=on_log)
+                   scheduler=scheduler, formatter=_fmt, on_log=on_log,
+                   save_every=save_every)
     step = 0
     if resume_train_state is not None:
         step = restore_train_state(resume_train_state, opt, scheduler)
         print(f'Resumed from step {step}')
 
-    # Prefetcher overlaps CPU-side split with GPU work — shared by both tiers.
-    batch_source = TrainBatchPrefetcher(batch_iter)
-    first, batch_source = _peek(batch_source)
-    if first is None:
-        return model, log.losses
-    N_CHUNKS, MAX_NI = first[0].instr_lens.shape
-    # CONSTANT ListMLE loop bounds (corpus-constant, so the compiled step never
-    # recompiles on a varying slot width). A K-instr chunk reads <=2K regs,
-    # writes <=K; iterating extra all-IGNORE columns is a no-op on the loss.
-    IN_K = min(2 * MAX_NI, MAX_INPUT_SLOTS)
-    OUT_K = min(MAX_NI, MAX_OUTPUT_SLOTS)
     vp_active = value_predict_weight > 0
     # immediate head is T1-only: one instruction = one unambiguous immediate.
     # (T2's chunk essence has no single immediate; its imm_head stays unused.)
     imm_active = imm_weight > 0 and ingest == 'tokens'
     valid_active = valid_weight > 0
+    # Prefetcher overlaps CPU-side prep with GPU work — shared by both tiers.
+    batch_source = TrainBatchPrefetcher(
+        batch_iter, pack=dict(vp=vp_active, valid=valid_active, imm=imm_active))
+    first, batch_source = _peek(batch_source)
+    if first is None:
+        return model, log.losses
+    N_CHUNKS, MAX_NI = first[3]
+    # CONSTANT ListMLE loop bounds (corpus-constant, so the compiled step never
+    # recompiles on a varying slot width). A K-instr chunk reads <=2K regs,
+    # writes <=K; iterating extra all-IGNORE columns is a no-op on the loss.
+    IN_K = min(2 * MAX_NI, MAX_INPUT_SLOTS)
+    OUT_K = min(MAX_NI, MAX_OUTPUT_SLOTS)
     model.train()
     _dummy = torch.zeros(1, device=device)
 
@@ -626,7 +846,8 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
             in_slot_t=in_slot, out_slot_t=out_slot, in_k_eff=ike, out_k_eff=oke)
         vp = (t2_value_predict_loss(
                   comp, essence, anchor_states_t, in_slot, out_slot,
-                  out_regs, vp_mask, vp_smooth_weight=vp_smooth_weight)
+                  out_regs, vp_mask, vp_smooth_weight=vp_smooth_weight,
+                  n_in=ike, n_out=oke)
               if vp_active else essence.new_zeros(()))
         # Immediate head (T1 only): linear readout of the essence must match the
         # rotary encoding of the instruction's immediate, masked to I-type rows.
@@ -653,42 +874,24 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
                    'imm': imm}
         return total, metrics, None
 
+    stage = _H2DStager(device)
+
     def _prep(item):
-        batch, split_outputs = item
-        if split_outputs[0].shape[0] == 0:        # all-invalid batch
+        packed, specs = item[0], item[1]
+        if packed is None:                        # all-invalid batch
             return None
-        tok, pad, gi0, gi1, go, active = _dense_chunk_grid(
-            split_outputs, N_CHUNKS, MAX_NI)
-        valid_f = (_h2d(batch.valid, device, dtype=torch.float32)
-                   if valid_active else _dummy)
-        if vp_active:
-            out_regs_t = _h2d(batch.out_regs, device)
-            vp_mask_t = _h2d(batch.out_regs_valid, device)
-        else:
-            out_regs_t = vp_mask_t = _dummy
-        if imm_active:
-            imm_np, imm_mask_np = _t1_immediates(batch)
-            imm_target_t = _h2d(_immediate_rotary_np(imm_np), device,
-                                dtype=torch.float32)
-            imm_mask_t = _h2d(imm_mask_np, device, dtype=torch.float32)
-        else:
-            imm_target_t = imm_mask_t = _dummy
-        return (_h2d(tok, device, dtype=torch.long), _h2d(pad, device),
-                _h2d(gi0, device, dtype=torch.long),
-                _h2d(gi1, device, dtype=torch.long),
-                _h2d(go, device, dtype=torch.long),
-                _h2d(active, device, dtype=torch.float32),
-                _h2d(batch.live_in_mask, device, dtype=torch.float32),
-                _h2d(batch.live_out_mask, device, dtype=torch.float32),
-                _h2d(batch.pc_writes, device, dtype=torch.float32),
-                _h2d(batch.in_slot_regs, device, dtype=torch.long),
-                _h2d(batch.out_slot_regs, device, dtype=torch.long),
-                out_regs_t, vp_mask_t, valid_f, IN_K, OUT_K,
+        staged = iter(stage(packed, specs))
+        fixed = [next(staged) for _ in range(11)]
+        out_regs_t, vp_mask_t = ((next(staged), next(staged)) if vp_active
+                                 else (_dummy, _dummy))
+        valid_f = next(staged) if valid_active else _dummy
+        imm_target_t, imm_mask_t = ((next(staged), next(staged)) if imm_active
+                                    else (_dummy, _dummy))
+        return (*fixed, out_regs_t, vp_mask_t, valid_f, IN_K, OUT_K,
                 imm_target_t, imm_mask_t)
 
     def _extra(item, aux):
-        n_per_chunk = item[1][4]
-        return {'n_chunks': N_CHUNKS, 'n_instrs': int(n_per_chunk.sum())}
+        return {'n_chunks': N_CHUNKS, 'n_instrs': item[2]}
 
     losses = run_train_loop(
         batch_source, model=model, opt=opt, scheduler=scheduler, log=log,
@@ -709,7 +912,8 @@ def train_encoder(batch_iter, *,
                   in_slot_weight=0.1, out_slot_weight=0.1,
                   value_predict_weight=1.0, vp_smooth_weight=0.2, imm_weight=1.0,
                   anchor_seed=0, n_anchor_states=8,
-                  device='auto', on_log=None, compile_step=True):
+                  device='auto', on_log=None, save_every=10000,
+                  compile_step=True):
     """Train a T1 encoder on RVT batches.
 
     T1 is the single-instruction special case of T2 and uses the same
@@ -730,10 +934,10 @@ def train_encoder(batch_iter, *,
     in/out_slot_weight:  ListMLE on the input/output slot orderings.
     value_predict_weight: MSE on per-anchor rd value prediction.
     on_log:              optional callable(model, losses, train_state=None)
-                         called after each log point (uniform across
-                         trainers; the encoder passes no train_state).
+                         called at the first log point at or after every
+                         `save_every` steps (uniform across trainers).
     compile_step:        torch.compile the forward+loss with CUDA graphs
-                         (mode='reduce-overhead'). The whole forward+loss+
+                         (mode='max-autotune'). The whole forward+loss+
                          backward is captured as one graph (~9 launches vs
                          ~485 eager), saturating the GPU (~99% vs ~50%) and
                          ~2.5x faster. The loss path is sync-free +
@@ -758,7 +962,8 @@ def train_encoder(batch_iter, *,
         value_predict_weight=value_predict_weight,
         vp_smooth_weight=vp_smooth_weight, imm_weight=imm_weight,
         anchor_seed=anchor_seed, n_anchor_states=n_anchor_states,
-        device=device, on_log=on_log, compile_step=compile_step)
+        device=device, on_log=on_log, save_every=save_every,
+        compile_step=compile_step)
 
 
 # ===========================================================================
@@ -1008,7 +1213,7 @@ def t2_chunk_forward(t1, t2, split_outputs, n_chunks, max_n_instrs, device,
 def t2_value_predict_loss(t2, vecs, anchor_states_t,
                           in_slot_regs_t, out_slot_regs_t,
                           out_regs_t, mask_t, vp_smooth_weight=0.2,
-                          return_count=False):
+                          return_count=False, n_in=None, n_out=None):
     """Per-anchor, per-out-slot value-prediction loss (canonical).
 
     The head reads (vec, CANONICAL input-slot values) and predicts per-anchor
@@ -1032,12 +1237,16 @@ def t2_value_predict_loss(t2, vecs, anchor_states_t,
       out_regs_t:       (B, A, 32) int32 — register file per anchor AFTER
                         executing each chunk
       mask_t:           (B,) bool — rows to include (decoded successfully)
+      n_in, n_out:      bounds on filled input / output slots; when given the
+                        head is evaluated by vp_head_live (same loss, less work)
 
     Returns a scalar loss (per-bit BCE + vp_smooth_weight · smooth-magnitude
     MSE) over (row, output-slot, anchor) triplets where out_slot_regs is not
     IGNORE.
     """
     n_anchors = anchor_states_t.shape[0]
+    if n_out is not None:
+        out_slot_regs_t = out_slot_regs_t[:, :n_out]
 
     # CANONICAL input values. `out_regs` is the canonical baseline:
     # precompute_chunk relocates the chunk's i-th BEHAVIORAL input to canonical
@@ -1068,7 +1277,9 @@ def t2_value_predict_loss(t2, vecs, anchor_states_t,
     # decompose from int; smooth floats it (magnitude — low bits moot there).
     B = vecs.shape[0]
     nbits = _VP_VALUE_BITS
-    pred = t2.vp_head(vp_head_inputs(vecs, in_vals_i)).reshape(
+    pred = (vp_head_live(t2.vp_head, vecs, in_vals_i, n_in, n_out)
+            if n_in is not None and n_out is not None
+            else t2.vp_head(vp_head_inputs(vecs, in_vals_i))).reshape(
         B, n_anchors, -1, nbits + 1)
     bit_loss = F.binary_cross_entropy_with_logits(
         pred[..., :nbits], _value_bits(target_i), reduction='none').mean(-1)
@@ -1216,7 +1427,11 @@ def binding_losses(model, T, essence, *, live_in_t, live_out_t, pc_writes_t,
         pc_logits, pc_writes_t, reduction='none')
     pc_loss = (pc_per * active_f).sum() / n_active
 
-    in_scores = model.in_score_head(T).squeeze(-1)       # (B, n_regs)
+    # An instruction reads two slots and writes one, so a chunk touches at most
+    # in_k_eff + out_k_eff of them; the in-score MLP need not see the rest.
+    in_scores = (apply_head_touched(model.in_score_head, T, in_k_eff + out_k_eff)
+                 if in_k_eff is not None and out_k_eff is not None
+                 else model.in_score_head(T)).squeeze(-1)   # (B, n_regs)
     out_scores = model.out_score_head(T).squeeze(-1)
     in_slot_loss = _listmle_loss(
         in_scores, in_slot_t, model.max_input_slots, active_f, k_eff=in_k_eff)
@@ -1255,87 +1470,143 @@ def _compute_chunk_out_regs(batch, anchor_states_np):
     return out, mask
 
 
-def _mp_worker_main(in_q, out_q):
+_PR_SET_PDEATHSIG = 1
+
+
+def _mp_worker_main(in_q, out_q, parent_pid, pack, n_slots):
     """Worker-process entry point. Re-imports needed modules (we're under
     spawn-context, so a fresh interpreter). Reads Batches from in_q,
     runs CPU-side prep (_split_to_per_instruction), sends results on
     out_q. EOF signaled by None.
     """
+    # `daemon=True` only reaps the worker on a CLEAN parent exit, so a killed
+    # trainer left it running forever. Have the kernel SIGKILL it with the
+    # parent instead, and bail if the parent is already gone.
+    try:
+        ctypes.CDLL(None, use_errno=True).prctl(_PR_SET_PDEATHSIG, signal.SIGKILL)
+    except Exception:
+        pass
+    if os.getppid() != parent_pid:
+        os._exit(0)
     # Imports must happen inside the worker (spawn context = fresh
     # interpreter, doesn't inherit parent's already-loaded modules).
-    from compressor.train import _split_to_per_instruction
+    from compressor.train import _pack_step_arrays, _split_to_per_instruction
+    # Packed steps go through a ring of slots in a /dev/shm file rather than
+    # through the queue: unpickling ~0.7 MB per step cost the trainer's main
+    # thread more than packing saved. The queue carries only the slot index.
+    ring, k = None, 0
     try:
         while True:
             batch = in_q.get()
             if batch is None:
                 break
-            out_q.put((batch, _split_to_per_instruction(batch)))
+            packed, specs, n_instrs, shape = _pack_step_arrays(
+                batch, _split_to_per_instruction(batch), **pack)
+            if packed is None:
+                out_q.put((None, None, specs, n_instrs, shape))
+                continue
+            if ring is None:
+                path = f'/dev/shm/rvt-prefetch-{os.getpid()}'
+                ring = np.memmap(path, dtype=np.uint8, mode='w+',
+                                 shape=(n_slots, packed.size))
+            ring[k] = packed
+            out_q.put(((path, ring.shape), k, specs, n_instrs, shape))
+            k = (k + 1) % n_slots
     finally:
         out_q.put(None)
 
 
+def _remove_orphan_rings():
+    """Delete prefetch ring files whose worker is gone. The consumer unlinks a
+    ring as soon as it maps it, so one survives only if the trainer died first."""
+    import glob
+    for path in glob.glob('/dev/shm/rvt-prefetch-*'):
+        try:
+            os.kill(int(path.rsplit('-', 1)[1]), 0)
+        except ProcessLookupError:
+            os.unlink(path)
+        except (ValueError, PermissionError, FileNotFoundError):
+            pass
+
+
 class TrainBatchPrefetcher:
-    """Multiprocessing prefetcher: spawn a worker *process* for CPU-side
-    prep so it runs in true parallel with the main loop's GPU work (no
-    GIL contention).
+    """Multiprocessing prefetcher: CPU-side prep — the per-instruction split and
+    packing a step's arrays for the device (`_pack_step_arrays`, configured by
+    `pack`) — runs in `n_workers` spawned worker *processes*, in true parallel
+    with the main loop's GPU work.
 
     Architecture:
-      - Worker process (spawn context, fresh Python interpreter):
-          pulls Batches from input queue, runs _split_to_per_instruction,
-          pushes results to the output queue.
-      - Reader thread (in main process, daemon):
-          pulls Batches from batch_iter (the RVT stream), pushes to
-          input queue. Decoupling main loop from stdin read.
-      - Main loop: consumes prepped tuples from output queue.
+      - Reader thread (main process, daemon): pulls Batches from batch_iter
+        (the RVT stream) and deals batch i to worker i % n_workers.
+      - Worker processes (spawn context, fresh interpreters): split and pack
+        each Batch and push the packed step to their own output queue.
+      - Main loop: reads the output queues in the same round-robin order, so
+        it sees exactly the stream's batch order whatever the worker count.
 
-    Why processes instead of threads: _split_to_per_instruction is
-    pure-Python numpy reshaping and entirely GIL-bound. Threading caused
-    net regression (worker fought main for GIL). Process boundary
-    eliminates GIL contention entirely; cost is pickling each batch across
-    the queue (numpy arrays in dataclass, ~1-2ms per batch).
-
-    Spawn context (not fork) avoids any CUDA-state contamination since
-    the worker is a fresh interpreter.
+    Processes, not threads: the split is GIL-bound Python, and a thread fought
+    the main loop for the GIL. One worker delivered ~240 batches/s, about what
+    the GPU step consumes; four deliver about twice that. Spawn (not fork)
+    keeps CUDA state out of the workers.
     """
 
     _EOF = None  # sentinel
 
-    def __init__(self, batch_iter, maxsize=4):
+    # Deep enough to ride out the multinode stream's lulls: at 4 batches, a gap
+    # of tens of ms in delivery idled the GPU; 128 does not.
+    def __init__(self, batch_iter, pack, maxsize=128, n_workers=4):
         import multiprocessing as mp
         ctx = mp.get_context('spawn')
-        self._in_q = ctx.Queue(maxsize=maxsize)
-        self._out_q = ctx.Queue(maxsize=maxsize)
-        self._worker = ctx.Process(
-            target=_mp_worker_main,
-            args=(self._in_q, self._out_q),
-            daemon=True,
-        )
-        self._worker.start()
-
-        # Reader thread feeds the worker's input queue from the batch
-        # iterator. Runs in the main process; minimal Python work
-        # (just reading from stdin and queue.put) so GIL contention
-        # with the main GPU loop is small.
+        depth = max(1, maxsize // n_workers)
+        # A worker can run at most `depth` queued items plus the two the
+        # consumer holds (a peeked first item and the one being prepped) ahead
+        # of the consumer, so a slot is never rewritten before it is copied.
+        n_slots = depth + 4
+        _remove_orphan_rings()
+        self._in_qs = [ctx.Queue(maxsize=depth) for _ in range(n_workers)]
+        self._out_qs = [ctx.Queue(maxsize=depth) for _ in range(n_workers)]
+        self._rings = [None] * n_workers
+        self._workers = [
+            ctx.Process(target=_mp_worker_main,
+                        args=(iq, oq, os.getpid(), pack, n_slots), daemon=True)
+            for iq, oq in zip(self._in_qs, self._out_qs)]
+        for w in self._workers:
+            w.start()
+        self._next = 0
         self._reader_thread = threading.Thread(
             target=self._read_loop, args=(batch_iter,), daemon=True)
         self._reader_thread.start()
 
     def _read_loop(self, batch_iter):
+        n = len(self._in_qs)
         try:
-            for batch in batch_iter:
-                self._in_q.put(batch)
+            for i, batch in enumerate(batch_iter):
+                self._in_qs[i % n].put(batch)
         finally:
-            self._in_q.put(self._EOF)
+            for q in self._in_qs:
+                q.put(self._EOF)
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        item = self._out_q.get()
+        """(packed step, specs, n_instrs, shape). The packed step is a view of
+        a worker's ring slot: copy it before fetching the next item."""
+        w = self._next
+        item = self._out_qs[w].get()
         if item is self._EOF:
-            self._worker.join(timeout=10)
+            for p in self._workers:
+                p.join(timeout=10)
             raise StopIteration
-        return item
+        self._next = (w + 1) % len(self._out_qs)
+        ring, slot, specs, n_instrs, shape = item
+        if ring is None:
+            return None, specs, n_instrs, shape
+        if self._rings[w] is None:
+            path, ring_shape = ring
+            self._rings[w] = np.memmap(path, dtype=np.uint8, mode='r',
+                                       shape=ring_shape)
+            os.unlink(path)            # both ends are mapped; no file can leak
+        return self._rings[w][slot], specs, n_instrs, shape
 
 
 def train_t2_encoder(batch_iter, t1_encoder, *,
@@ -1351,7 +1622,7 @@ def train_t2_encoder(batch_iter, t1_encoder, *,
                      anchor_seed=0, n_anchor_states=8,
                      t2_checkpoint=None, t2_route='binding',
                      device='auto',
-                     on_log=None, compile_step=True):
+                     on_log=None, save_every=10000, compile_step=True):
     """T2 preset over `train_compressor` — frozen-T1 vector front-end, wiring
     routed off T1's predicted binding (t2_route). Same execution path
     as T1; only the content provider + hparams differ."""
@@ -1369,5 +1640,6 @@ def train_t2_encoder(batch_iter, t1_encoder, *,
         vp_smooth_weight=vp_smooth_weight,
         anchor_seed=anchor_seed,
         n_anchor_states=n_anchor_states, resume=t2_checkpoint,
-        device=device, on_log=on_log, compile_step=compile_step)
+        device=device, on_log=on_log, save_every=save_every,
+        compile_step=compile_step)
 

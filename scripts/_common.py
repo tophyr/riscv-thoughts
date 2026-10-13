@@ -25,7 +25,8 @@ from tokenizer import VOCAB_SIZE
 # ---------------------------------------------------------------------------
 def add_common_train_args(p, *, lr=3e-4):
     """Add the training CLI spine shared by all trainers: --lr, --n-steps,
-    --log-every, --out-dir. Each trainer adds its own model/loss args."""
+    --log-every, --save-every, --out-dir. Each trainer adds its own model/loss
+    args."""
     p.add_argument('--lr', type=float, default=lr)
     p.add_argument('--n-steps', type=int, required=True,
                    help='Cosine-LR T_max and ETA display. NOT a hard cap on '
@@ -33,6 +34,11 @@ def add_common_train_args(p, *, lr=3e-4):
                         'pipeline upstream with `datagen --count N` to '
                         'control how many batches the trainer sees.')
     p.add_argument('--log-every', type=int, default=100)
+    p.add_argument('--save-every', type=int, default=10000,
+                   help='Checkpoint (model, losses.json, train_state) at the '
+                        'first log boundary at least this many steps after the '
+                        'last. A save stalls the GPU, so it is kept off the '
+                        'log cadence. The final model is always saved.')
     p.add_argument('--out-dir', type=str, default=None,
                    help='Run-directory NAME (created under runs/). Default: a '
                         'timestamp. Always saves; the run-dir structure '
