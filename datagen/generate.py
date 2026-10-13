@@ -152,8 +152,9 @@ _CATEGORY_OPS = {
     'JALR': ['JALR'],
 }
 
-_CONFIG_EXTRA_KEYS = {'equivalences', 'invalidity', 'exclude_x0_dest'}
+_CONFIG_EXTRA_KEYS = {'equivalences', 'invalidity', 'exclude_x0_dest', 'chain'}
 _EQUIVALENCES_KEYS = {'rate', 'max_per_class', 'min_per_class', 'boost'}
+_CHAIN_KEYS = {'rate'}
 _INVALIDITY_KEYS = {'rate', 'types'}
 
 
@@ -189,6 +190,16 @@ def validate_distribution(dist):
                 f"{eq['max_per_class']}")
         if 'boost' in eq and not isinstance(eq['boost'], dict):
             raise ValueError("equivalences.boost must be a dict")
+    if 'chain' in dist:
+        ch = dist['chain']
+        if not isinstance(ch, dict):
+            raise ValueError("'chain' must be a dict")
+        ch_unknown = set(ch.keys()) - _CHAIN_KEYS
+        if ch_unknown:
+            raise ValueError(f'Unknown chain keys: {ch_unknown}')
+        if 'rate' in ch and not (0 <= ch['rate'] <= 1):
+            raise ValueError(
+                f"chain.rate must be in [0,1], got {ch['rate']}")
     if 'invalidity' in dist:
         inv = dist['invalidity']
         if not isinstance(inv, dict):
@@ -726,6 +737,62 @@ def length_cap(n):
 def either(*rules):
     """Terminate when ANY of the given rules fires."""
     return _Either(*rules)
+
+
+def chain_group(group, rng):
+    """Rewrite a group so each instruction reads its predecessor's result.
+
+    Dataflow composition is what a chunk's register draw leaves to chance: with
+    sources drawn uniformly, only ~4.7% of two-instruction chunks have the
+    second reading the first's destination, and the sub-populations that
+    combine composition with an immediate are rarer still — the cells that
+    carry most of T2's value-prediction error (EXPERIMENT_LOG, "T2
+    faithfulness"). This makes composition explicit so that population can be
+    supervised at a usable density.
+
+    Only ONE source operand of each later instruction is rewritten, to its
+    predecessor's destination register. The opcode of every instruction is
+    untouched, so the opcode distribution the config asks for is preserved and
+    the only thing that changes is which register an operand reads. An
+    instruction writing x0 is skipped as a producer: its result is discarded,
+    so reading it composes nothing.
+    """
+    if len(group) < 2:
+        return group
+    out = [group[0]]
+    for instr in group[1:]:
+        prev_rd = out[-1].args[0] if out[-1].opcode not in _NO_DEST_OPS else 0
+        if prev_rd == 0 or len(instr.args) < 2:
+            out.append(instr)
+            continue
+        args = list(instr.args)
+        # which positions are source REGISTERS for this opcode
+        src_pos = _src_arg_positions(instr.opcode)
+        if not src_pos:
+            out.append(instr)
+            continue
+        args[src_pos[int(rng.integers(0, len(src_pos)))]] = prev_rd
+        out.append(Instruction(instr.opcode, *args))
+    return out
+
+
+def _src_arg_positions(opcode):
+    """Indices into Instruction.args that hold a SOURCE register, by opcode
+    type. Mirrors compressor.model.instruction_wiring's argument orders."""
+    if opcode in R_TYPE:
+        return (1, 2)
+    if opcode in I_TYPE or opcode == 'JALR':
+        return (1,)
+    if opcode in B_TYPE:
+        return (0, 1)
+    if opcode in LOAD_TYPE:
+        return (2,)
+    if opcode in STORE_TYPE:
+        return (0, 2)
+    return ()
+
+
+_NO_DEST_OPS = frozenset(B_TYPE) | frozenset(STORE_TYPE)
 
 
 def collect_groups(instr_iter, rule):

@@ -153,6 +153,9 @@ def _build_batches_iter(cfg, seed):
     eq_cfg = dist.get('equivalences', {})
     eq_rate = (cfg.inject_equiv if cfg.inject_equiv is not None
                else eq_cfg.get('rate', 0.0))
+    chain_cfg = dist.get('chain', {})
+    chain_rate = (cfg.chain_rate if cfg.chain_rate is not None
+                  else chain_cfg.get('rate', 0.0))
     inv_cfg = dist.get('invalidity', {})
     inv_rate = (cfg.inject_invalid if cfg.inject_invalid is not None
                 else inv_cfg.get('rate', 0.0))
@@ -175,6 +178,7 @@ def _build_batches_iter(cfg, seed):
         eq_max_per_class=eq_cfg.get('max_per_class', 8),
         eq_min_per_class=eq_cfg.get('min_per_class', 0),
         eq_boost=eq_cfg.get('boost', None),
+        chain_rate=chain_rate,
     )
     return collect_into_batches(
         chunks_iter,
@@ -476,7 +480,8 @@ class _GenCfg:
     """Plain container of generation params handed to each forked worker.
     (Picklable-irrelevant under fork, but kept simple and primitive anyway.)"""
     __slots__ = ('rule', 'batch_size', 'twins', 'n_states', 'anchor_seed',
-                 'inject_invalid', 'inject_equiv', 'max_invalid_window',
+                 'inject_invalid', 'inject_equiv', 'chain_rate',
+                 'max_invalid_window',
                  'config', 'worker_log_every')
 
     def __init__(self, args):
@@ -487,6 +492,7 @@ class _GenCfg:
         self.anchor_seed = args.anchor_seed
         self.inject_invalid = args.inject_invalid
         self.inject_equiv = args.inject_equiv
+        self.chain_rate = args.chain_rate
         self.max_invalid_window = args.max_invalid_window
         self.config = args.config
         self.worker_log_every = args.worker_log_every
@@ -513,6 +519,15 @@ def main():
                    help='Anchor-states RNG seed (must match the trainer).')
     g.add_argument('--inject-invalid', type=float, default=None,
                    help='Invalid-window injection rate. Overrides config.')
+    g.add_argument('--chain-rate', type=float, default=None,
+                   help='Override the config\'s chain.rate. Fraction of chunks '
+                        'rewritten so each instruction '
+                        'reads its predecessor\'s result. A uniform register '
+                        'draw composes only ~4.7%% of two-instruction chunks, '
+                        'and the cells pairing composition with an immediate '
+                        'carry most of T2\'s value-prediction error. Opcodes '
+                        'are untouched, so the config\'s opcode distribution '
+                        'is unchanged. 0 = draw registers freely.')
     g.add_argument('--inject-equiv', type=float, default=None,
                    help='Post-chunk MANIFEST equivalence rate. Overrides config.')
     g.add_argument('--max-invalid-window', type=int, default=32,

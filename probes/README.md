@@ -40,6 +40,7 @@ python probes/vp_budget.py runs/<t2_dir> runs/<t1_dir>/encoder.pt 2 300
 | `depth_composition.py` | whether a vp deficit is in the essence or the head, by refitting and fine-tuning heads on frozen essences |
 | `depth_stage.py` | the same quantity recovered at each encoder stage (slot → pool view → essence), split by dataflow depth |
 | `depth_intermediate.py` | removes the "composition is a harder function" confound by handing the readout the true intermediate value |
+| `compose_readback.py` | which PART of a composed slot's description is recoverable, and where — each literal of the chain and their sum, at the producer slot, the composed slot and the essence. Summands recoverable with the composite absent means the encoder carried both rather than folding them |
 
 ## Geometry and whole-model checks
 

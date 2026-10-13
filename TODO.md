@@ -18,9 +18,14 @@ instruction chunk AND two chunks that compute the same function land on the same
 point.** Both are required; neither implies the other, and a model can score
 perfectly on one while failing the other completely.
 
-**Faithfulness — vp = 0.** Can the chunk's output register values be recovered
-from the essence, given the input values? This is what a future T3 consumes: a
-next tier can only recover what T2 preserved.
+**Faithfulness — the essence determines the chunk's output values.** Can the
+chunk's output register values be recovered from the essence, given the input
+values? This is what a future T3 consumes: a next tier can only recover what T2
+preserved. `vp` is how it is scored, and it scores the essence composed with the
+vp head's ability to EVALUATE it — the encoder never sees a register value, so a
+slot holds a symbolic description of the function that produced it and the head
+is asked to evaluate that description at 8 anchor points. `vp = 0` is therefore
+sufficient for faithfulness and not necessary (METRICS.md).
 
 **Equivalence — computed equivalents collapse.** "Two token sequences mean the
 same thing if and only if they compress to the same point" is the framework's
@@ -56,11 +61,17 @@ slot at all and therefore no gradient whatsoever.
 
 ## Milestones
 
-1. **[CURRENT] vp = 0 at len=2 — not reached.** `--d-out 512` at 1M steps over
-   the frozen `runs/t1_writers_250k_rank` is at **99.828%** exact 32-bit match
-   (`runs/t2_len2_d512_s1000000_dep4_vp1_pool16_pma_pewrite_time_rtrank_seedrank_t1rank_writers`).
-   The whole residual is one shape — an immediate that does not survive being
-   composed with another instruction's result — which is task 1.
+1. **[CURRENT] vp = 0 at len=2 — not reached; 99.9364% exact.** Raising the
+   density of dataflow-composed chunks in generation and doubling the step
+   budget (a chain rate of 0.10 at 2M steps) takes overall exact 32-bit match
+   from 99.8270% to **99.9364%** on a naturally drawn corpus — 512 failing
+   (row, output-slot, anchor) triples out of 805,408, a 58% error reduction —
+   and improves every error bucket over the unmodified corpus simultaneously.
+   The deficit was never architectural: the same model at the same width, depth
+   and training budget over the same frozen T1 scores 19.52% on a
+   two-immediate composed chain at the corpus's natural composition and ~97%
+   when such chains are common. What remains is the (rate, steps) choice
+   (task 3) and whatever sits below ~99.94%.
 
 2. **Computed equivalents collapse at len=2.** Chunks computing the same
    function land as far apart as chunks computing different ones (Mission's
@@ -74,7 +85,7 @@ slot at all and therefore no gradient whatsoever.
    counter can know — so the len=2 mechanism may not transfer intact.
 
 4. **Beyond the happy path.** Everything above is writers-only (R/I-type ALU,
-   valid, non-x0). Then: no-write instructions (task 4), PC/branches, memory,
+   valid, non-x0). Then: no-write instructions (task 7), PC/branches, memory,
    longer and looser chunks. The vp metric itself needs strengthening here too —
    8 fixed anchors are not enough to certify a lossless description on a harder
    corpus (METRICS.md).
@@ -86,94 +97,128 @@ slot at all and therefore no gradient whatsoever.
 
 ## Open tasks
 
-Task 1 is the current focus. Task 2 is required for the MVP, overlaps task 1 on
-one subset without containing it, and is sequenced after it, before chunks get
-longer. The rest are queued, not parallel work.
+Tasks 1 and 2 come first and are both housekeeping: the corpus is about to
+become an experimental variable, so its definition and its provenance have to be
+sound before more of it is generated, and the throughput figures every plan
+rests on need re-measuring. Task 3 then settles the faithfulness milestone and
+task 4 is required for the MVP. The rest are queued, not parallel work.
 
-### 1. An immediate does not survive composition
+### 1. Fold the corpus knobs into config files and delete the flags
 
-**The single open cause of the len=2 vp residual.** The error lives where an
-immediate meets a **composed operand** — the writing instruction taking its
-operand from the other instruction's result rather than from a chunk input.
-That cell is 93.01% exact and carries 39.5% of all remaining error; adding a
-shared source on top takes it to 81.08%. Each condition **alone** is solved: an
-immediate alone 99.909%, a shared source alone 99.980%, composition alone
-99.957%, and every population carrying no immediate at all is at or above
-99.95%.
+**A corpus is currently defined partly by a config file and partly by env vars
+and CLI flags, and the two disagree.** Three separate problems:
 
-What is already known, with the evidence in EXPERIMENT_LOG:
+- **`--inject-equiv` is never passed in any default path.** Both generation
+  wrappers pass it only when `INJECT_EQUIV` is non-empty, and it defaults to
+  empty. Its only recorded use produced a refuted result (finding: injecting
+  equivalents made collapse worse). Delete the flag and its env plumbing.
+- **`--inject-invalid` is passed unconditionally, and silently overrides the
+  config.** Both wrappers set `INJECT_INVALID=${INJECT_INVALID:-0}` and always
+  pass it, so `configs/instr_default.json` declares `invalidity.rate: 0.2` and
+  the documented entry point delivers 0.0. Either make it opt-in — unset means
+  do not pass the flag, so the config is honoured — or move the clean-corpus
+  decision into the configs and drop the flag. As it stands a config file
+  misdescribes what it produces.
+- **`--chain-rate` should follow `exclude_x0_dest` and be config-only.** It
+  already reads `chain.rate` from the config; the CLI override exists only
+  because the other two augmentation rates have one, and both of those are
+  defects rather than precedent. A config per sweep arm is more friction and
+  strictly better provenance, since each arm becomes a reviewable file.
 
-- **The immediate is encoded perfectly and destroyed on consumption.** The
-  producer's own slot carries its literal at 99.99%+, so nothing is lost writing
-  it; it is lost when that slot is *read* by the second instruction, which is
-  the op-cell applied to its own previous output. Not the pool — both slots are
-  pooled identically and only the composed one degrades.
-- **What decides it is carry propagation, not fusibility.** Bitwise throughout
-  (`XORI;XORI`) is exact; a carry-propagating writer is ~15% whatever it
-  consumes; a bitwise writer on a carry-produced intermediate is 47.78%. Shifts
-  behave like carries. `ADDI;ADDI` is algebraically the easiest of the four and
-  scores no better than the pair that genuinely needs two stages, so the model
-  does not take the algebraic shortcut.
-- **It is a near-miss, not a dropout.** On `ADDI;ADDI`, 96.6% of predictions
-  land within one immediate's width of the target and 0.13% drop a literal
-  outright.
-- **The cell is two sub-cases that trade against each other.** One literal
-  decoded and combined with values the head is handed as bits (`ADDI;ADD`) is
-  readout-limited and moves ~20 points under two interventions sharing no
-  mechanism. Two literals folded into one (`ADDI;ADDI`) is reached by nothing,
-  and everything that helps the first drives it further down. The second subset
-  is what task 2 covers, and the only one it covers.
-- **Ruled out as aggregate levers:** the vp head (refits and fine-tunes on
-  frozen essences all score below the trained head; depth 4 trained end-to-end
-  leaves the aggregate inside the noise floor); the pool; gradient share; the
-  leaf-versus-composed operand scale mismatch; content crowded out of the
-  op-cell's first layer; and capacity (`d_out` 512 → 1024 leaves the error cells
-  unchanged to three decimals). Also not a description mismatch — restricting
-  the cell to rows where T1's wiring matches the tokens, or to rows whose target
-  is identical under either canonical frame, leaves it at its own 93.01%.
+**Then delete the configs nothing runs.** `instr_branch_heavy.json`,
+`instr_no_inject.json` and `instr_no_mem.json` are referenced only by the
+`datagen` skill's own catalogue of them — no script, probe or test uses any of
+the three. `instr_default.json` and `instr_t2.json` survive only as wrapper
+defaults that every real run overrides, so decide whether a default corpus
+should exist at all.
 
-**Do next: settle whether the residual is essence-side or head-side.** The two
-available readings contradict. Against the head: every refit and fine-tune on
-frozen essences scores below the trained head. For the head: the producer's slot
-is predicted at 99.99% from the same essence in the same forward pass that fails
-on the composed slot, so the description is there, and a head trained end-to-end
-at depth 4 moves one sub-case 20 points.
+**The reason this is first.** Corpus composition is now the main lever on the
+headline metric (task 3), so it is about to be varied deliberately and often.
+And a run records nothing about the corpus it trained on: `hparams.json` is
+`vars(args)` of the trainer, which never sees the generator's config, rule,
+twins or batch size. The seven T2 runs under `runs/` are identified by directory
+name alone — exactly the failure mode where a run's name and its configuration
+disagree. Decide where provenance lives before generating more corpora: a
+`corpus.json` written into the run directory by the launcher (cheap, bypassed by
+a hand-run pipeline), a trainer flag recording the config path (a label, not an
+observation), or the generator's effective configuration carried in the RVT
+stream so the trainer records what it actually received (heavier, and the only
+one that cannot lie).
+### 2. Get more throughput out of the hardware
 
-The experiment that separates them is to feed the head the intermediate value as
-explicit bit features, the way the canonical inputs already are, and retrain.
-**It is a diagnostic, not a change to adopt** — handing the head a value the
-essence is supposed to carry makes vp stop certifying what milestone 1 claims —
-so what it produces is a decision about the acceptance criterion rather than a
-fix. `probes/depth_intermediate.py` is the nearest thing already built and found
-no gain, but with a fitted readout on the superseded target at `d_out` 256, so
-it does not settle it.
+**A single training cell already saturates the GPU: 96–97% utilisation at
+7 ms/step** at the adopted len=2 configuration (`--d-out 512`, op-cell depth 4,
+16 pool heads) with generation offloaded to the remote worker pool. The
+host-side per-step preparation that once bound this — RVT parse, the
+per-instruction split, the frozen-T1 assembly — is no longer the constraint at
+this configuration, so there is no idle GPU to reclaim.
 
-Then, if still open:
+That makes the available levers different ones, and none is measured:
 
-- **Supervise the intermediate value**, which the SSA oracle computes and the
-  RVT batch does not ship. Distinct from feeding it to the head, and lower
-  prior: the intermediate slot's own vp is already 99.99%+, so there is nothing
-  there to supervise into existence.
-- **Re-test two mechanisms refuted only against the superseded target**: a
-  direct linear path from an instruction's content to the slot it writes, and
-  weighting vp by dataflow depth. Both were measured at `d_out` 256 / 250k
-  against a target whose error composition differs materially from the current
-  one. Recover either from git history (`--content-skip`, `--vp-depth-weight`).
+- **More cells at once.** Two concurrent len=2 runs were measured at 11 ms/step
+  each against 7 ms solo — ~1.3x aggregate, not 2x, because the GPU becomes the
+  binding constraint once host serialisation is filled. Worth confirming at the
+  current configuration, since the solo figure moved.
+- **A cheaper GPU step.** 7 ms/step at `--d-out 512` with a 4-deep op-cell is
+  the floor to attack. Reduced precision, a cheaper op-cell, or a larger batch
+  per step all trade against the measurements every recorded result was taken
+  at, so each needs the null intervention of METRICS.md.
+- **A second device.** Generation already spans two machines; training does not.
 
-Score any composed-operand change on the arms of
-`probes/vp_compose_control.py`, not on the aggregate or the depth-2 bucket —
-both interventions above moved those arms 15–25 points while the aggregate
-stayed flat.
+**Measure before changing anything.** The ~50% utilisation figure this task
+previously carried was true of an earlier configuration and is not true now, so
+re-measure the solo and concurrent rates at the configuration about to be used
+and state them with their configuration (METRICS.md, scope conditions).
+### 3. Settle the composed-chain density and the step budget together
 
-### 2. Collapse computed equivalences (milestone 2 — required for MVP)
+**The len=2 residual is a corpus-density problem and the fix is measured; what
+is left is choosing the operating point.** Chunks where one instruction consumes
+another's result are ~4.7% of a randomly drawn corpus. Raising that fraction via
+`chain.rate` carries overall exact 32-bit match from 99.8270% to 99.9364% on a
+naturally drawn corpus — 512 failing triples against 1044. Evidence, the
+per-bucket tables and the arm measurements are EXPERIMENT_LOG finding 30.
+
+**What is being chosen is a (rate, steps) pair, not a rate.** Depth-2 accuracy
+tracks the absolute number of composed rows seen, not their proportion; the
+proportion only sets how fast they accumulate and how much depth-1 exposure is
+surrendered per step. At a fixed 1M steps raising the rate trades depth-1 for
+depth-2 and the aggregate turns on bucket size; doubling the steps at a halved
+rate removes the trade and improves every bucket at once. The best pair measured
+is a rate of 0.10 at 2M steps.
+
+**Three decisions, in order:**
+
+- **Run R=0 at 2M.** Until it exists, "2M steps" and "a rate of 0.10 at 2M
+  steps" are not separated. A step budget alone has moved composed-slot
+  accuracy substantially before — quadrupling it did so at a narrower register
+  width, against the superseded syntactic-frame target, so that figure is not
+  comparable to current ones and indicates only a direction (finding 17). If
+  the budget alone reaches most of this, the rate is an efficiency knob rather
+  than a necessary one and nothing need be adopted.
+- **Then pick the pair**, on what the tier is FOR rather than on the headline
+  number: a higher rate buys the composed cells, which is what a future T3
+  consumes most of, at the cost of the common depth-1 cells and of aggregate
+  points. One cell per candidate.
+- **Then adopt it** as a corpus config and remint — which needs task 1 done
+  first. It does not obviously move the frozen T1, whose chunks are single
+  instructions so a chain rate is a no-op there; confirm rather than assume.
+
+**Replication standard for this task:** two corpus draws at one rate spread
+0.021 points, against effects of 0.05–0.11. Any candidate pair needs its own
+draw-to-draw null, not one borrowed from another pair (METRICS.md).
+
+### 4. Collapse computed equivalences (milestone 2 — required for MVP)
+
 
 Two chunks computing the same function must land on the same point. They do not,
 and the failure is total rather than partial (Mission's table).
 
-**Collapse would also close milestone 1's `ADDI;ADDI` sub-case**: that vp error
-exists because the head is handed two literals and must compute their composite,
-and an essence that collapsed `i1,i2` onto `i1+i2` would hand it the composite
-instead, reducing the job to the single-literal case it already does at 99.9%.
+**Collapse is also the only encoder-side lever left on milestone 1**, and the
+payoff is measured: the head fails on a two-literal chain because it must
+decode a literal out of the essence and carry-propagate in one pass, and handed
+the composite instead a readout on the same essence goes 79.80% → 99.95%
+(EXPERIMENT_LOG finding 21). An essence that folded `i1,i2` onto `i1+i2` would
+hand it that composite.
 
 **It is not a T2 deficit — T1 fails the same class.** Single-instruction pairs
 sharing an identical binding, so the whole difference is in the essence, sit
@@ -182,7 +227,7 @@ commutative swap — free because the pool is a multiset over register slots —
 sits at 117x. **At both tiers, an equivalence collapses when the architecture
 cannot represent the difference and otherwise does not.** Any fix has to be
 designed for T1 and T2 together: they are one class (`compressor/`), so a
-mechanism that works at T1 applies at T2 unchanged. It also means task 3's
+mechanism that works at T1 applies at T2 unchanged. It also means task 5's
 validity remint should not happen before this is settled, or T1 will be
 reminted without it.
 
@@ -207,7 +252,7 @@ three places:
 - T1's binding, and hence T2's vp: every `dest` misprediction measured is an
   instruction the oracle says modifies nothing, i.e. T1 predicting a write for
   `ADD x5,x5,x0`. That is 6.2% of T2's remaining vp error, arriving through
-  task 3's tier interface rather than through anything T2 does.
+  task 5's tier interface rather than through anything T2 does.
 
 It is not a weighting problem — T1's binding is otherwise accurate against the
 oracle. It is a missing capability: knowing that `+x0`, `+0`, `|0`, `^0` and
@@ -222,7 +267,7 @@ Decisions to make before building, in order:
 - **Essence or op-cell?** The measured distances are essence distances, but the
   composite is formed one step earlier, when the second instruction's op-cell
   reads the slot the first wrote. A cell that computed `i1+i2` there would
-  collapse the pair before any pooling — and would fix task 1, which an
+  collapse the pair before any pooling — and would fix task 3, which an
   essence-level term alone would not.
 - **What is the objective?** A pairwise term over generated equivalent pairs is
   the obvious candidate, and nothing in the loss is pairwise today — that was a
@@ -235,7 +280,8 @@ Decisions to make before building, in order:
   inequivalents together too. The guard is `behav-diff` (METRICS.md), which must
   stay large.
 
-### 3. Give T1 a validity task
+### 5. Give T1 a validity task
+
 
 The frozen T1 (`runs/t1_writers_250k_rank`) is a diagnostic trained on a clean
 corpus (`--inject-invalid 0`), so it has no validity task and cannot reject
@@ -258,7 +304,28 @@ the binding as its WIRING, so the tier interface is optimised at a tenth of the
 priority of the essence. T1 is nonetheless accurate against the oracle's
 binding, so this is a thing to check, not a known deficit.
 
-### 4. No-write instructions are invisible to the essence
+### 6. The anchor states are unstructured, and branches will need them to be
+
+
+`make_anchor_states` (`datagen/compare.py:319`) draws pure uniform int32 with
+only `x0 = 0`. Phase 4 established that this makes comparison and branch
+behaviour degenerate — with random int32, `P(rs1 == rs2) ~ 2^-32`, so BEQ never
+branches — and fixed it by structuring the states: occasional equal pairs, small
+values, extra zeros. That function still exists with its structuring intact
+(`emulator/cpu_emulator.py:344` `random_regs`) but nothing in the live pipeline
+calls it; only tests do.
+
+Latent, not active: on the writers-only ALU corpus no branches are generated and
+`SLT` still varies across the 8 anchors. But `pos1 == pos2` holds in 0 of the 8,
+so the moment branches enter (milestone 4) every BEQ is not-taken at every
+supervised point. Re-point `make_anchor_states` at the structured draw, or
+restate why pure random is right now — and note it changes every anchor, so it
+reminces the frozen T1 and invalidates every vp number measured against the old
+states (CLAUDE.md INVARIANT 1: the generator's and trainer's anchor seed and
+count must match).
+
+### 7. No-write instructions are invisible to the essence
+
 
 Blocks milestone 4 (~⅓ of the ISA). Content reaches the essence only through a
 register write (`value[out] = res` is gated on `out != 0`), so for branches,
@@ -287,30 +354,11 @@ them:
   no PC target at all. `out_pcs` is computed and only a `pc_writes` boolean is
   shipped, so this would mean widening the RVT batch.
 - **PC advance does not count.** Then those chunks are equivalent and the 0.1041
-  is a collapse failure, which puts it in task 2.
+  is a collapse failure, which puts it in task 4.
 
 Deferred deliberately: it is a definition, not an experiment, and it should be
-settled before either task 2 builds a collapse objective or this task ships a
+settled before either task 4 builds a collapse objective or this task ships a
 PC-effect target — each would bake in an answer.
-
-### 5. Fix `_behaviorally_equal`
-
-`compressor/eval.py`'s equivalence predicate compares the whole 32-register
-canonical file, including input registers that `_canonical_state` merely
-relocated, so it reports only 9.2% of genuine commutative equivalences as
-equivalent at len=1 — where the vp target is identical for 100% of them. vp
-supervises the written slots only, so the comparison should be `out_regs` at
-`out_slot_regs`. It currently gates the `distinct` pool, where unrelated chunks
-are almost never equivalent, so the effect there is small; the predicate is
-wrong wherever else it gets used.
-
-### 6. Overlap the trainer's host-side work with the GPU step
-
-len=2 cells run at ~50% GPU utilisation and the bottleneck is the trainer's
-host-side per-step preparation, not generation — diagnosed and measured in the
-`datagen` skill. What is missing is the fix: prefetch the next batch's
-preparation on a worker thread, or build the dense grid on-device. Worth ~2x
-wall-clock on every len=2 run.
 
 ## Long horizon
 

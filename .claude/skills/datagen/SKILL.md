@@ -188,7 +188,8 @@ parens, from the argparse block at `datagen/__main__.py:503-521`): `--rule`
 (`branch+cap=8`), `--twins T` (3 — relabeled equivalents per valid source
 chunk), `--batch-size B` (128 — source rows; twins extend the batch beyond B),
 `--n-states` (8 — anchor count), `--anchor-seed` (0), `--inject-invalid R`
-(unset → config), `--inject-equiv R` (unset → config), `--max-invalid-window`
+(unset → config), `--inject-equiv R` (unset → config), `--chain-rate R` (unset → config's
+`chain.rate`), `--max-invalid-window`
 (32), `--config PATH` (unset → `DEFAULT_DISTRIBUTION`), `--seed` (0; worker i
 gets seed+i). CLI flags override the JSON config's `equivalences.rate` /
 `invalidity.rate`. There is **no
@@ -264,7 +265,7 @@ cmdline).
 ## Configs (configs/*.json)
 
 Opcode-category mix (weights must sum to 1.0) + optional `equivalences`,
-`invalidity`, and `exclude_x0_dest`. Validation: `datagen/generate.py:160`
+`invalidity`, `chain`, and `exclude_x0_dest`. Validation: `datagen/generate.py:160`
 `validate_distribution`; the accepted non-opcode keys are `_CONFIG_EXTRA_KEYS`
 (`datagen/generate.py:155`) and an unknown key is a hard error.
 - `instr_alu_writers.json` — **the corpus all current work uses.**
@@ -272,6 +273,16 @@ Opcode-category mix (weights must sum to 1.0) + optional `equivalences`,
   no invalidity → a clean, all-valid, always-register-writing corpus. Every
   chunk is pure ALU, so `cap=N` and `branch+cap=N` behave identically here and
   the scripts use plain `cap=N`.
+- `instr_alu_writers_chained.json` — the same, plus `chain: {rate: 0.10}`.
+  A uniform register draw leaves only ~4.7% of two-instruction chunks with the
+  second reading the first's result, and that scarcity — not any architectural
+  limit — is what held the composed-slot value prediction down (EXPERIMENT_LOG,
+  "T2 faithfulness", finding 30). `chain.rate` rewrites that fraction of chunks
+  so each instruction reads its predecessor's result, leaving every opcode
+  untouched, which lifts composed chunks to roughly `rate + (1-rate)*0.047` of
+  rows. A no-op on single-instruction rules. Override per run with
+  `--chain-rate` / `CHAIN_RATE`, exactly as `--inject-equiv` overrides
+  `equivalences.rate`.
 - `instr_default.json` — T1 mix; equivalences rate 0.05; **invalidity rate 0.2**.
 - `instr_t2.json` — T2 mix (ALU-heavy, few branches/mem); equivalences only.
 - `instr_no_inject.json` — opcode mix only, no augmentation.

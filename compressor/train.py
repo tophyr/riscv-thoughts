@@ -142,6 +142,61 @@ def _value_smooth(x):
     return torch.tanh((torch.sign(x) * torch.log1p(x.abs())) / 8.0)
 
 
+def _value_feat(x_i):
+    """One value -> the (..., 33) feature the vp head reads it as: 32
+    two's-complement bits + one bounded smooth-magnitude scalar. `x_i` MUST be
+    an integer tensor (see _value_bits)."""
+    return torch.cat(
+        [_value_bits(x_i), _value_smooth(x_i.float()).unsqueeze(-1)], dim=-1)
+
+
+def vp_canonical_in_vals(anchor_states_t, in_slot_regs_t):
+    """The CANONICAL input values the vp head is fed: (B, A, MAX_IN) int64.
+
+    `out_regs` is the canonical baseline — precompute_chunk relocates the
+    chunk's i-th BEHAVIORAL input to canonical position i+1 and executes there
+    — so input slot k is exactly position k+1 and the head must see
+    anchor[:, k+1], NOT the raw value at the slot's actual register. Kept
+    INTEGER: float32 loses every bit above 2^24, which is exactly what the bit
+    features exist to supervise. Unfilled slots (AUX_CE_IGNORE) feed 0.
+
+    One definition, shared by the loss and every probe that scores the head —
+    a probe that rebuilds these features by hand can drift from the trainer
+    without any test noticing.
+    """
+    max_in = in_slot_regs_t.shape[1]
+    canon_pos = torch.arange(
+        1, max_in + 1, device=anchor_states_t.device).clamp(max=N_REGS - 1)
+    in_filled_i = (in_slot_regs_t != AUX_CE_IGNORE).to(torch.int64)
+    return (anchor_states_t[:, canon_pos].to(torch.int64).unsqueeze(0)
+            * in_filled_i.unsqueeze(1))
+
+
+def vp_head_predict(t2, vecs, in_vals_i):
+    """Run the vp head and return (B, A, MAX_OUTPUT_SLOTS, bits+1).
+
+    One definition for the trainer and every probe: a probe that rebuilds the
+    head's inputs by hand can drift from the trainer with no test noticing.
+    """
+    return t2.vp_head(vp_head_inputs(vecs, in_vals_i)).reshape(
+        vecs.shape[0], in_vals_i.shape[1], -1, _VP_VALUE_BITS + 1)
+
+
+def vp_head_inputs(vecs, in_vals_i):
+    """Feature vector for the SHARED vp head: (B, A, d_out + MAX_IN*33).
+
+    The essence enters unit-NORMALIZED: magnitude is reserved for validity, so
+    if vp's gradient reached ‖essence‖ then "produces register output" would
+    start proxying for "is valid" (only register-writers get vp shaping). The
+    operator identity vp needs lives in the direction.
+    """
+    n_anchors = in_vals_i.shape[1]
+    B = vecs.shape[0]
+    vec_exp = F.normalize(vecs, dim=-1).unsqueeze(1).expand(-1, n_anchors, -1)
+    in_feat = _value_feat(in_vals_i).reshape(B, n_anchors, -1)
+    return torch.cat([vec_exp, in_feat], dim=-1)
+
+
 # Rotary immediate encoding (T1). POWER-OF-2 periods 2,4,...,4096: each frequency
 # is `imm mod 2^k` = the low k bits, which are directly readable from the hex
 # tokens. This is bit-aligned and non-redundant across scales — unlike an
@@ -983,7 +1038,6 @@ def t2_value_predict_loss(t2, vecs, anchor_states_t,
     IGNORE.
     """
     n_anchors = anchor_states_t.shape[0]
-    max_in = in_slot_regs_t.shape[1]
 
     # CANONICAL input values. `out_regs` is the canonical baseline:
     # precompute_chunk relocates the chunk's i-th BEHAVIORAL input to canonical
@@ -996,16 +1050,7 @@ def t2_value_predict_loss(t2, vecs, anchor_states_t,
     # numbers). Canonical also leaks no register identity into vp, which is the
     # right choice for an equivariant encoder.
     # Unfilled slots (AUX_CE_IGNORE) feed 0 = "no input".
-    device = anchor_states_t.device
-    canon_pos = torch.arange(1, max_in + 1, device=device).clamp(max=N_REGS - 1)
-    in_filled = (in_slot_regs_t != AUX_CE_IGNORE).float()       # (B, max_in)
-    # (A, max_in) canonical values, broadcast over rows, zeroed at unfilled
-    # slots -> (B, A, max_in).
-    # INTEGER canonical input values (kept as int — float32 loses bits above
-    # 2^24, the bits the 'bits' path exists to supervise). Unfilled slots → 0.
-    in_filled_i = (in_slot_regs_t != AUX_CE_IGNORE).to(torch.int64)   # (B, max_in)
-    in_vals_i = (anchor_states_t[:, canon_pos].to(torch.int64).unsqueeze(0)
-                 * in_filled_i.unsqueeze(1))                 # (B, A, max_in) int64
+    in_vals_i = vp_canonical_in_vals(anchor_states_t, in_slot_regs_t)
 
     # Target[b, a, k] = out_regs[b, a, out_slot_regs[b, k]] (int, NOT floated).
     # Clamp IGNORE→0 for lookup; mask out via out_slot_valid below.
@@ -1016,12 +1061,6 @@ def t2_value_predict_loss(t2, vecs, anchor_states_t,
 
     out_valid = (out_slot_regs_t != AUX_CE_IGNORE)    # (B, MAX_OUT)
     pair_mask = out_valid & mask_t.unsqueeze(-1)        # (B, MAX_OUT)
-    # DIRECTION only: magnitude is reserved for validity (valid_loss), so the
-    # semantic heads consume the unit-normalized essence — otherwise vp's gradient
-    # flows into ‖essence‖ and "produces register output" ends up proxying for
-    # validity (only register-writers get vp shaping). The operator identity vp
-    # needs lives in the direction.
-    vec_exp = F.normalize(vecs, dim=-1).unsqueeze(1).expand(-1, n_anchors, -1)
 
     # Per-bit BCE (uniform resolution) + a bounded smooth-magnitude term. Inputs
     # fed as bits + smooth so the head can do the arithmetic; per-bit BCE on the
@@ -1029,16 +1068,12 @@ def t2_value_predict_loss(t2, vecs, anchor_states_t,
     # decompose from int; smooth floats it (magnitude — low bits moot there).
     B = vecs.shape[0]
     nbits = _VP_VALUE_BITS
-    in_feat = torch.cat(
-        [_value_bits(in_vals_i),
-         _value_smooth(in_vals_i.float()).unsqueeze(-1)],
-        dim=-1).reshape(B, n_anchors, max_in * (nbits + 1))
-    feat = torch.cat([vec_exp, in_feat], dim=-1)
-    pred = t2.vp_head(feat).reshape(B, n_anchors, -1, nbits + 1)
+    pred = t2.vp_head(vp_head_inputs(vecs, in_vals_i)).reshape(
+        B, n_anchors, -1, nbits + 1)
     bit_loss = F.binary_cross_entropy_with_logits(
         pred[..., :nbits], _value_bits(target_i), reduction='none').mean(-1)
     sm_loss = (pred[..., nbits] - _value_smooth(target_i.float())) ** 2
-    per_slot = (bit_loss + vp_smooth_weight * sm_loss).mean(dim=1)  # (B, MAX_OUT)
+    per_slot = (bit_loss + vp_smooth_weight * sm_loss).mean(dim=1)  # (B, n_slots)
 
     # Mask-multiply (not boolean index / early return) so the op stays
     # static-shape and host-sync-free — capturable in the full-step graph.

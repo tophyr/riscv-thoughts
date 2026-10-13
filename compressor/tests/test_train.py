@@ -459,3 +459,65 @@ def test_t2compressor_forward_shape_and_padding_contract():
     assert not torch.isnan(T).any() and not torch.isnan(essence).any()
     # encode() returns just the essence.
     assert torch.allclose(t2.encode(seq, in0, in1, out, active), essence)
+
+
+# ---------------------------------------------------------------------------
+# Per-slot vp head: the slot axis in the batch instead of the head's output
+# ---------------------------------------------------------------------------
+
+def test_vp_head_predict_matches_the_raw_head():
+    """The probe-facing helper must reproduce the head exactly — it is the one
+    definition both the trainer and the probes read."""
+    import torch
+    from compressor.model import T2Compressor
+    from compressor.train import (vp_head_predict, vp_head_inputs,
+                                  vp_canonical_in_vals)
+    from datagen import AUX_CE_IGNORE, MAX_OUTPUT_SLOTS, make_anchor_states
+    torch.manual_seed(0)
+    t2 = T2Compressor(d_t1=8, d_out=16, d_event=4)
+    anchors = torch.from_numpy(make_anchor_states(8, 0))
+    in_slot = torch.full((2, 32), AUX_CE_IGNORE, dtype=torch.long)
+    in_slot[:, 0] = 3
+    iv = vp_canonical_in_vals(anchors, in_slot)
+    vecs = torch.randn(2, 16)
+    got = vp_head_predict(t2, vecs, iv)
+    want = t2.vp_head(vp_head_inputs(vecs, iv)).reshape(2, 8, -1, 33)
+    assert got.shape == (2, 8, MAX_OUTPUT_SLOTS, 33)
+    assert torch.equal(got, want)
+
+
+def test_out_slots_beyond_the_instruction_count_are_ignore():
+    """`train_compressor` bounds its ListMLE loops at OUT_K = min(n_instrs, 16)
+    because a K-instruction chunk writes at most K registers, so every later
+    output slot is AUX_CE_IGNORE. Assert that on real oracle output rather than
+    trusting the arithmetic."""
+    import itertools
+    import numpy as np
+    from datagen import (AUX_CE_IGNORE, precompute_chunk, make_anchor_states,
+                         generate_chunks, length_cap)
+    anchors = make_anchor_states(8, 0)
+    rng = np.random.default_rng(0)
+    n_checked = 0
+    for chunk in itertools.islice(generate_chunks(length_cap(2), rng), 300):
+        try:
+            pre = precompute_chunk(chunk.instructions, anchors)
+        except NotImplementedError:
+            continue                      # memory ops carry no supervision
+        assert len(chunk.instructions) <= 2
+        assert (pre.out_slot_regs[2:] == AUX_CE_IGNORE).all(), chunk
+        n_checked += 1
+    assert n_checked > 50
+
+
+def test_every_probe_and_entry_script_compiles():
+    """A probe is never imported by the suite, so a syntax error in one passes
+    every test and only surfaces when someone runs it hours later. Compiling
+    them costs milliseconds."""
+    import py_compile
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    files = sorted(root.glob('probes/*.py')) + sorted(root.glob('scripts/*.py'))
+    assert len(files) > 15, files
+    for f in files:
+        py_compile.compile(str(f), doraise=True, cfile=str(f) + 'c')
+        Path(str(f) + 'c').unlink(missing_ok=True)

@@ -1,44 +1,45 @@
 # Phase 15 (IN PROGRESS): making the T2 chunk vector faithful to the instructions it encodes
 
-**Status: open. This is working state, not settled record.** Claims here are
-corrected in place as they are disproven, so read it as current belief rather
-than as a chronology of what was believed when.
+**Status: open.** Faithfulness at two instructions is largely settled;
+equivalence collapse is not, and nothing beyond two instructions or outside the
+R/I-type ALU subset has been attempted. Claims here are corrected in place, so
+read them as current belief rather than as a chronology.
 
-**Headline.** Four fixes — per-slot write step into the pool, canonical read
-position as the input registers' leaf identity, per-head pool value projections,
-and two corrections to the oracle's supervision (findings 14 and 24) — take
-len=2 exact 32-bit match of the predicted output value to **99.828%**. Adopted
-T2 config: `--d-out 512`, over the frozen `runs/t1_writers_250k_rank`; the
-core's own settings are fixed rather than chosen (finding 25). Best model
-`runs/t2_len2_d512_s1000000_dep4_vp1_pool16_pma_pewrite_time_rtrank_seedrank_t1rank_writers`.
+**Headline.** Two properties have to hold and each has its own state.
+
+*Faithfulness.* Exact 32-bit match of the predicted output value reaches
+**99.9364%** at two instructions — 512 failing (row, output-slot, anchor)
+triples out of 805,408 — on `configs/instr_alu_writers.json` at `cap=2` over the
+frozen `runs/t1_writers_250k_rank`, at `--d-out 512` with a one-hidden-layer
+value-prediction head. Four architecture fixes carried it to 99.83%: the
+per-slot write step fed into the essence pool, canonical read position as the
+input registers' leaf identity, per-head pool value projections, and two
+corrections to the oracle's supervision (findings 14 and 24). The remaining
+factor was not architectural at all but the training corpus: chunks where one
+instruction consumes another's result are ~4.7% of a randomly drawn corpus and
+the hardest shapes a fraction of a percent, and generating more of them
+accounts for the rest (finding 30). The core's own settings are fixed on first
+principles rather than chosen by measurement (finding 25).
+
+*Equivalence.* Unresolved, and untouched by any of the above. Two chunks that
+compute the same function sit as far apart as two that do not (finding 18), and
+T1 holds `x+x` and `x<<1` further apart than two different shifts (finding 23).
+What collapses at either tier is what the architecture makes free, such as a
+commutative operand swap; nothing in the objective asks for the rest.
 
 **Quote the floor that matches the comparison.** Retraining the T2 alone over a
 fixed frozen T1 has spread 0.002 and 0.009 points of exact match on the two
-configurations where it was replicated; retraining the frozen T1 spreads 0.023
-(finding 25). Use ~0.01 for a T2-level claim unless the specific cell has been
-replicated, and 0.023 for anything comparing T1s.
+configurations where it was replicated, and 0.021 on a third; retraining the
+frozen T1 spreads 0.023 (finding 25). Use ~0.01 for a T2-level claim unless the
+specific cell has been replicated, and 0.023 for anything comparing T1s.
+`probes/vp_budget.py` draws a fresh unseeded corpus per invocation, which moves
+its own aggregate by ~0.02 points between runs of one model — score every arm of
+a per-bucket comparison against ONE corpus file.
 
 **Aggregates do not span either oracle change** — a model is scored on the
 target it trained on. For the canonical-frame change compare on the rows where
 the two agree (finding 14); the `_actually_modified` change moved the measured
 figure 0.10 points and the learned result not at all (finding 24).
-
-**What remains is one shape: a composed immediate.** The writing instruction
-takes an operand from another instruction's result *and* carries a 12-bit
-literal: 93.72% exact, 58.2% of all remaining error at 1.4% of the triples.
-Composition alone is at 99.950% and an immediate alone at 99.930%. The literal
-reaches the producer's slot intact and is lost when that slot is read back, and
-what the head produces instead is `x + ŝ` for `ŝ` near the true composite
-(finding 21).
-
-**Neither tier collapses an equivalence it would have to compute to see.** Two
-chunks that compute the same function sit as far apart as two that do not
-(finding 18), and T1 holds `x+x` and `x<<1` further apart than two different
-shifts (finding 23). What collapses at either tier is what the architecture
-makes free, such as a commutative swap. Nothing in the objective asks for the
-rest, at any tier. That overlaps the composed immediate without explaining it:
-folding two literals into one fixes `ADDI;ADDI` and does nothing for
-`XORI;ADDI`, which scores no better and has no composite to fold (finding 21).
 
 ## The question
 
@@ -629,80 +630,111 @@ an **immediate-carrying** instruction is, by three orders of magnitude in error
 rate. That is also why `d_out` helped in finding 17 — width in the value path is
 what a slot needs to carry an immediate *and* the structure it is combined with.
 
-**21. What fails at depth 2 is CARRY PROPAGATION over a composed operand.** Six
-arms of one depth-2 shape — two instructions, the
-second reading the first's result — with only the placement of the 12-bit
-literals varying, so any difference between them is the literal and not the
-composition (`probes/vp_compose_control.py`, 24k triples per arm). Both output
-slots are scored: the *intermediate* is the first instruction's own slot at
-depth 1, the *composed* slot the second's at depth 2.
+**21. What fails at depth 2 is that the essence holds two literals and not
+their sum, and the vp head cannot decode a literal and add it in one pass.**
+Six arms of one depth-2 shape — two instructions, the second reading the first's
+result — with only the placement of the 12-bit literals varying, so any
+difference between them is the literal and not the composition
+(`probes/vp_compose_control.py`, 24k triples per arm). Both output slots are
+scored: the *intermediate* is the first instruction's own slot at depth 1, the
+*composed* slot the second's at depth 2.
 
 | arm | intermediate | composed |
 |---|---|---|
 | `ADD ; ADD` | 100.0000% | **100.0000%** |
-| `ADD ; ADDI` | 100.0000% | 96.375% |
-| `ADDI ; ADD` | 99.946% | **68.196%** |
-| `ADDI ; ADDI` | 99.875% | **18.917%** |
-| `SLT ; ADDI` | 100.0000% | 99.571% |
+| `ADD ; ADDI` | 100.0000% | 96.242% |
+| `ADDI ; ADD` | 99.913% | **68.175%** |
+| `ADDI ; ADDI` | 99.904% | **19.521%** |
+| `SLT ; ADDI` | 100.0000% | 99.550% |
 | `ADDI ; SLT` | 100.0000% | 100.0000% |
 
-Composition with no literal anywhere is exact. The producer's own slot carries
-its literal at 99.99%+ in every arm, so the loss is not in writing the literal
-into a slot — it is in **reading that slot back**, which is the op-cell applied
-to its own previous output. Not the pool: both slots are pooled identically and
-only the composed one degrades. The corpus agrees — a literal in the producer
-carries 40.4% of depth-2 error against the writer's 30.0%, and a `cmp` producer,
-whose intermediate is one bit wide, is at ~99.7% for every writer
-(`probes/vp_depth2.py`).
+**The encoder never sees a register value.** Its only inputs are each
+instruction's opcode and immediate — through the frozen T1's essence — and the
+wiring; the anchor states enter nowhere but the vp head's own features. A
+register slot therefore does not hold a number, it holds a symbolic description
+of the function that produced it, and vp asks the head to EVALUATE that
+description at the 8 anchor points. The arms above score the composition of
+those two things.
 
-**The failure is a near-miss, not a dropout.** On `ADDI;ADDI`, 96.6% of
-predictions land within one immediate's width of the target and 0.13% drop a
-literal outright; 37% are off by ≤256. The head produces `x + ŝ` with
-`ŝ ≈ i1+i2`.
+**Both of a composed chain's literals are in the essence; their sum is not.**
+On `ADDI rB,rA,i1 ; ADDI rC,rB,i2`, a readout fitted on the frozen essence
+recovers i1 at 100.0000% and i2 at 99.08% exact, against a 0.024% base rate for
+a 12-bit literal — and recovers `i1+i2` at only 84.48%
+(`probes/compose_readback.py`, 24k chunks, 12k fitting steps; every figure in
+this paragraph is from that one run). The gap is not pooling: the composed register
+slot itself reads 99.85% / 99.96% for the two literals and 91.25% for their sum,
+so the op-cell appends the writer's literal to the description it reads rather
+than folding it in. The sum is not hiding in phase form either — T1 is trained
+to carry an immediate as a rotary code with power-of-2 periods, and in such a
+code adding two numbers is adding their angles, but `rotary(i1+i2)` is linearly
+recoverable at R² 0.708 against 0.675 for i2 alone, i.e. no better than its less
+accessible summand. A fold would make the sum MORE available than either
+addend.
 
-**The full I-type matrix**, composed slot, all pairs of the same shape. The last
-row gives the mean number of output bits that are CONSTANT across the 8 anchors
-— bits the head gets without consulting the input — which is why the `ORI`,
-`ANDI` and `SLLI` columns cannot be read as successes:
+**What the head is short of is the sum, and nothing else.** Five readouts of one
+architecture and budget on the frozen essence, all targeting the same oracle
+value for the composed slot of `ADDI;ADDI` (24k chunks × 8 anchors, held-out
+fifth):
 
-| producer ↓ / writer → | `ADDI` | `XORI` | `ORI` | `ANDI` | `SLLI` |
-|---|---|---|---|---|---|
-| `ADDI` | 17.07% | 47.78% | 93.58% | 91.78% | 12.37% |
-| `XORI` | 14.05% | **98.77%** | 99.90% | 99.66% | 15.43% |
-| `ORI` | 46.00% | 99.50% | 99.98% | 99.90% | 48.77% |
-| `ANDI` | 48.83% | 99.73% | 99.97% | 99.92% | 46.27% |
-| `SLLI` | 67.47% | 77.93% | 99.61% | 99.93% | 63.78% |
-| *free bits (`ADDI`/`XORI` producer)* | *0.2* | *0.1* | *16.7* | *15.5* | *16.4* |
+| the readout is handed | exact 32-bit |
+|---|---|
+| essence + the canonical input — the head's own task | 79.80% |
+| essence + input + **the composite `i1+i2`** | **99.95%** |
+| essence + input + both literals separately | 92.79% |
+| essence + input + the intermediate `a+i1` | 79.52% |
+| input + both literals, NO essence — the arithmetic ceiling | 95.24% |
 
-The four full-difficulty cells order by carries: bitwise throughout is exact
-(98.77%); a carry-propagating writer is ~15% whatever it consumes (17.07% /
-14.05%); a bitwise writer on a carry-produced intermediate is 47.78%. Shifts
-behave like carries, relocating every bit at once.
+Handing over the composite beats handing over both summands and beats the
+no-essence ceiling, because it reduces the task to a single two-term addition;
+the same arm without the essence at all reads 99.9974%, so the composite makes
+the essence redundant for this cell. Handing over the *intermediate* instead
+buys nothing, which is why supervising or feeding the intermediate is not the
+lever it looks like.
 
-**Fusibility does not order them.** `ADDI;ADDI` is fusible and scores 17.07%;
-`XORI;ADDI` is not fusible and scores 14.05%. `ADDI;XORI` is not fusible and
-scores 47.78%; `XORI;XORI` is fusible and scores 98.77%. What the fusible pair
-does show is that the algebraic shortcut is not taken: `ADDI;ADDI` is the
-easiest of the four to state — one addition of the input with the single literal
-`i1+i2` — and is no better than the pair that genuinely needs two stages.
+**The cost is the WRITER's literal specifically.** i1 and i2 are identically
+distributed and the target is symmetric in them, so a gap between them is a fact
+about the essence. Over three readout seeds (per-arm spread ≤0.9 points):
 
-**Consequently collapse does not close this cell.** Folding `i1+i2` reduces
-`ADDI;ADDI` to the single-literal case the head predicts at 99.9%, and does
-nothing for `XORI;ADDI` or `ADDI;XORI`, which have no composite literal to fold
-and score no better. Finding 18's non-collapse is a component of this cell, not
-its cause. `XORI` chains are the clean demonstration: uncollapsed at 0.7x and
-predicted exactly.
+| the readout must decode | mean exact |
+|---|---|
+| neither literal | 92.785% |
+| i1 only — the producer's, which passed through a slot | 90.880% |
+| i2 only — the writer's, which arrived in content | 80.148% |
+| both | 80.050% |
 
-**Whether the residual is in the essence or in the head is open, and the two
-readings contradict.** Against the head: finding 17's refits, fine-tunes and
-deeper heads all scored below the trained head. For the head: the essence
-demonstrably contains the intermediate, since the producer's slot is predicted
-at 99.99% from the same essence in the same forward pass that fails on the
-composed slot. The decisive experiment is to feed the head the intermediate as
-explicit bit features, the way canonical inputs are fed, and retrain.
-`probes/depth_intermediate.py` is close to it and found no gain, but with a
-fitted readout on the syntactic-frame target at `d_out` 256, so it does not
-settle it.
+Decoding the producer's literal costs 1.9 points and decoding the writer's
+costs 12.6, and decoding both costs no more than the writer's alone. The
+producer's literal is also the more accessible one geometrically: a LINEAR map
+on the essence recovers it at 92.0% of bits (rotary R² 0.962) against 37.6%
+(R² 0.675) for the writer's. It appears in two register slots — its own and,
+transformed, the composed one — where the writer's appears in one.
+
+**Carries are necessary to the failure but not sufficient.** A readout of the
+same shape fed CLEAN bits of i1 and i2 is exact on `i1 XOR i2` and `i1 AND i2`
+at any depth, and reaches 96.2% on `i1 + i2`; a 32-bit three-term addition of
+values handed over as bits is exact (`ADD;ADD`, 100.0000%). So the architecture
+adds what it is given and fails on what it must first decode. The corpus orders
+the same way: `logic -> logic` depth-2 slots are at 99.38% while `add -> add`
+are at 82.4% and `shift -> shift` at 91.0% (`probes/vp_depth2.py`).
+
+**On the corpus, a literal in a depth-2 chain is 56% of all remaining error.**
+Crossed by which instruction is I-type, over 804,728 supervised triples of which
+1,430 fail:
+
+| producer → writer | triples | exact | share of all error |
+|---|---|---|---|
+| I-type → I-type | 2,432 | 84.09% | 27.1% |
+| I-type → R-type | 6,344 | 94.51% | 24.3% |
+| R-type → I-type | 2,864 | 97.73% | 4.5% |
+| R-type → R-type | 7,520 | 99.85% | 0.8% |
+
+**The constructed arms sample the hard tail of their bucket, by construction.**
+`vp_compose_control.py` draws both literals uniformly over the full 12-bit
+range, while the corpus gives shift opcodes a 5-bit shift amount, so the
+`add -> add` bucket's 82.4% is carried by narrow literals. Restricted to a
+producer literal needing 9–11 bits, the corpus reads 12.5% for that bucket —
+the constructed arm's 19.5%, not the bucket aggregate. Quote the arms for a
+mechanism and the budget for a share of the error.
 
 **22. Two unrelated interventions land on the same trade: whatever makes a
 composed operand easier to decode helps the case needing ONE literal out of the
@@ -877,6 +909,278 @@ The settings themselves are fixed on first principles rather than on this table
 `runs/t1_writers_250k_rank` is the frozen T1; checkpoints trained at other
 values do not load.
 
+**26. The adder works; the CONSTANT it adds is wrong.** The head's prediction
+for a composed ADD-family slot equals the known summands plus some plausible
+12-bit constant on 95.4–99.6% of triples, so the 32-bit arithmetic is intact and
+what fails is the scalar. Recovered by subtracting the known summands from the
+head's own output — no fitting, no execution (`probes/vp_compose_control.py`
+shapes; the subtraction is arithmetic on the head's prediction):
+
+| arm | target | exact | prediction = summands + a plausible constant | median miss |
+|---|---|---|---|---|
+| `ADD;ADDI` | a + x + i2 | 96.18% | 99.61% | 0 |
+| `ADDI;ADD` | a + i1 + y | 68.56% | 99.08% | 0 |
+| `ADDI;ADDI` | a + i1 + i2 | 19.48% | 95.42% | 144 |
+
+A median miss of 144 against ~1365 for a random 12-bit value says the head
+APPROXIMATES the constant rather than failing to produce one. The error sits at
+0.0% on bit 0 of that constant and climbs monotonically with bit position
+(1.8% / 6.7% / 16.1% … 29.7% at bit 8 for `ADDI;ADDI`), which is the carry
+signature of an addition: bit 0 needs no carry, every higher bit needs the carry
+from all below it.
+
+**The head behaves like a LINEAR readout of the constant it needs.** Per arm,
+against a linear readout of that constant from the same frozen essence:
+
+| arm | needs | head | linear | MLP |
+|---|---|---|---|---|
+| `ADD;ADDI` | `i2` | 96.28% | **96.31%** | 100.000% |
+| `ADDI;ADD` | `i1` | 68.45% | 95.31% | 100.000% |
+| `ADDI;ADDI` | `i1+i2` | 19.52% | **23.84%** | 77.84% |
+
+Two of three agree to within 4 points. So `ADDI;ADDI` fails because the quantity
+it needs is the SUM of two constants, which exists in no instruction and which
+the encoder never forms: only 23.8% linearly available, and the head gets
+19.5%. It is not an arithmetic deficit — the same head adds three given 32-bit
+values at 100.0000% (finding 29) and decodes-and-adds one constant at a single
+instruction at 100.0000%.
+
+**`ADDI;ADD` is the open anomaly.** It needs only `i1`, which is 95.3% linearly
+available, and the head gets 68.45% — while predicting the PRODUCER's slot in
+the same forward pass at 99.91%. The same constant, from the same essence, read
+correctly for one output slot and wrongly for another. That is not about how
+`i1` is stored. What distinguishes it from `ADD;ADDI` is that there the constant
+arrives in the composed slot's own instruction content, while here it must be
+inherited through the operand slot.
+
+**27. Feeding the vp head the composed slot's intermediate value changes
+nothing, and moving the slot axis into the head's batch is worse.** Two cells at
+the adopted config over the same frozen T1, 1M steps, identical but for where
+each composed slot's intermediate value comes from — its own row, or another
+row's register file read at the same register (same width, same distribution,
+same zero pattern, no information). Both run the vp head once per OUTPUT SLOT
+instead of once per row, which is what lets an intermediate be fed to the slot
+it belongs to without handing any slot its own answer.
+
+| | shared head (adopted) | per-slot, shuffled | per-slot, true |
+|---|---|---|---|
+| `ADDI;ADDI` composed slot | **19.52%** | 10.11% | 11.51% |
+| `ADDI;ADD` composed slot | **68.18%** | 60.13% | 49.53% |
+| `ADD;ADDI` composed slot | 96.24% | 96.47% | 96.14% |
+| `ADD;ADD` composed slot | 100.0000% | 100.0000% | 100.0000% |
+| corpus `distinct` exact | 99.8290% | 99.8278% | 99.8225% |
+| `distinct \| imm \| depth 2` | 93.11% | 92.70% | 92.46% |
+| GVN behavioral (equivalent pairs) | 0.0352 | 0.0392 | 0.0385 |
+| GVN behav-diff (must stay large) | 0.9584 | 0.9338 | 0.9411 |
+
+**The intermediate is null**, as a head-only readout on the frozen essence had
+already indicated (79.52% handed the intermediate against 79.80% without it,
+finding 21): the two cells differ by 0.005 points of corpus exact match, inside
+the floor, and the constructed arms move +1.4 and −10.6 points in opposite
+directions. Supervising the intermediate is a lower-prior version of the same
+idea and inherits the result.
+
+**The per-slot head is a regression on the population it targets.** Its corpus
+aggregate is inside the floor, which on its own would read as no change — the
+arms are what show the cost, and they halve the worst cell. All slots sharing
+the head's parameters and gradient does not help a rare slot population, which
+agrees with the other measurement of that idea: fine-tuning the trained shared
+head on a balanced mixture of the five depth-2 shapes, encoder frozen, moves
+`ADDI;ADDI` 19.68% → 22.02% while the natural corpus slips 99.797% → 99.619%.
+The head's deficit on these shapes is not a matter of how its capacity or its
+training signal is divided between them.
+
+
+**28. Census of the corpus: dataflow composition is scarce, and foldable
+composition is scarcer.** Counted over 15,744 rows of
+`configs/instr_alu_writers.json` at `cap=2` by decoding the tokens and taking
+chains where the second instruction reads the first's destination. A chain has a
+COMPOSITE — a single constant the two instructions' literals collapse into —
+only when both are in the same algebraic family: two additive ops fold to one
+offset, two of the same bitwise op to one mask, two shifts in the same direction
+to one amount.
+
+| | rows | share |
+|---|---|---|
+| composed chains, any opcode pair | 745 | 4.73% |
+| ...whose two ops are in the same family | 57 | 0.36% |
+| ...both additive | 15 | 0.095% |
+
+At a batch of 384 rows against vp's ~760 supervised slots, the same-family
+population is ~0.2 rows per family per batch. This scarcity is what the
+composed-slot deficit was (finding 30), and it bounds any objective supervised
+on the foldable subset specifically: such an objective would need the generator
+to produce those chains deliberately, since the equivalence manifest holds only
+single-instruction rewrites.
+
+**A fold also addresses only a minority of the error.** `ADDI;ADDI` has a
+composite; `ADDI;XORI` does not, and both fail. Against the per-opcode-class
+error shares of finding 21, the foldable pairs — add→add at 5.8% of all error,
+logic→logic at 0.8%, and the same-direction part of shift→shift's 12.2%, which
+is not measured separately — bound the reachable share at roughly 7–19%, against
+the ~56% of error sitting on a depth-2 chain that carries a literal.
+
+**29. The composed-chain deficit is RARITY, and what sorts the arms is a
+carry-propagating WRITER.** Head-only readouts on the frozen essence, one per
+(arm, depth), same data and step budget, predicting the composed slot's value
+from (essence, canonical inputs) — the vp head's own task:
+
+| arm | trained head | depth 1 | depth 2 | depth 4 |
+|---|---|---|---|---|
+| `ADDI;ADDI` — a composite exists | 19.25% | 47.25% | 69.31% | 80.28% |
+| `XORI;XORI` — a composite exists | 99.17% | 100.000% | 100.000% | 100.000% |
+| `ADDI;XORI` — no composite | 48.70% | 94.08% | 98.04% | 98.19% |
+| `XORI;ADDI` — no composite | 15.07% | 26.39% | 44.16% | 59.38% |
+
+**Depth helps every arm, so depth and folding do not address disjoint
+subsets.** What separates the arms is whether the WRITER carries a carry: an
+`ADDI` writer stays at 59–80% even at depth 4, a bitwise writer reaches
+98–100%. Whether the pair is foldable does not order them.
+
+**The trained head is below a specialised depth-1 readout on EVERY arm**, by 7
+to 45 points, on the same frozen essence it reads itself. Read that against the
+natural distribution, where a fitted readout LOSES to the trained head (76.6%
+exact on depth-2 slots against 94.69%, finding 17's staging arms): the head is
+near-optimal for the distribution it serves, and these arms are a measure-zero
+slice of it. The gap is the cost of one head serving the whole corpus, which is
+why rebalancing the head alone does not recover it — fine-tuning it on a
+balanced mixture of the five shapes with the encoder frozen moves `ADDI;ADDI`
+19.68% → 22.02% while the corpus slips 99.797% → 99.619% (finding 27).
+
+So the residual is a property of how rare these chains are in training, not of
+the essence's content (finding 26) or of available capacity (finding 17);
+generating more of them resolves it (finding 30). Weighting the loss by dataflow
+depth does NOT, and the distinction is the reason: `--vp-depth-weight` amplifies
+the gradient from the same rare rows, where generation supplies new ones.
+
+
+**30. The len=2 residual is a CORPUS DENSITY problem, and raising the density
+of dataflow-composed chunks cuts the error by a third to a half — replicated.**
+A uniform register draw composes only ~4.7% of two-instruction chunks, and the
+self-referential immediate chains that carry most of the error are ~0.1% of rows
+(finding 28). `--chain-rate R` rewrites that fraction of chunks so each
+instruction reads its predecessor's result, leaving every opcode untouched,
+which lifts composed chunks to 53% of rows at R=0.5 and both-additive chains
+14×. Cells at the adopted config over the same frozen T1, 1M steps, all graded
+on a NATURALLY drawn corpus so only the training mix differs:
+
+| training mix | overall exact | failing triples | `cross-instr \| imm \| depth 2` | GVN separation |
+|---|---|---|---|---|
+| adopted (~4.7%) | 99.8270% | 1044 | 76.79% | 35.5× |
+| R=0.25 | 99.8840% | 700 | 92.07% | 27.5× |
+| R=0.25, second corpus draw | **99.9045%** | **576** | 93.75% | 33.5× |
+| R=0.35 | 99.8774% | 740 | **96.25%** | 29.4× |
+| R=0.50 | 99.5518% | 2704 | 95.94% | 29.4× |
+
+The two R=0.25 draws spread 0.021 points and the effect is ~0.067, so it clears
+its own replicated floor rather than one borrowed from another configuration.
+
+And on the constructed arms, where the mechanism shows:
+
+| arm | adopted | R=0.25 | R=0.25 (s7) | R=0.35 | R=0.50 |
+|---|---|---|---|---|---|
+| `ADDI;ADDI` | **19.52%** | 93.20% | 93.61% | 96.16% | **97.75%** |
+| `ADDI;ADD` | 68.18% | 99.94% | 99.95% | 100.0000% | 100.0000% |
+| `ADD;ADDI` | 96.24% | 100.0000% | 99.996% | 100.0000% | 100.0000% |
+
+**At a FIXED step budget it is a trade, and the trade is decided by bucket
+size.** Scored per bucket with every model on ONE fixed corpus file, so the
+populations are identical and a difference is the model. `depth 1` is an output
+slot whose instruction read only chunk inputs; `depth 2` is one whose operand
+came from the other instruction's result:
+
+| bucket | triples | ~4.7% | R=0.10 | R=0.25 | R=0.35 | R=0.50 |
+|---|---|---|---|---|---|---|
+| depth 1 | 786,192 | **99.9349%** | 99.9183% | 99.9143% | 99.8775% | 99.5426% |
+| `distinct \| imm \| depth 1` | 521,440 | **99.9653%** | 99.9448% | 99.9381% | 99.8909% | 99.4112% |
+| `cross-instr \| imm \| depth 1` | 29,448 | **99.4329%** | 99.4125% | 99.3786% | 99.2937% | 98.8522% |
+| depth 2 | 19,216 | 96.3312% | 99.2558% | 99.7710% | 99.8439% | **99.8855%** |
+| `distinct \| imm \| depth 2` | 10,984 | 94.4556% | 99.1806% | 99.7815% | 99.8634% | **99.9272%** |
+| `cross-instr \| imm \| depth 2` | 640 | 86.5625% | 92.9688% | 97.1875% | 97.9688% | **98.1250%** |
+| OVERALL | 805,408 | 99.8489% | 99.9025% | **99.9109%** | 99.8767% | 99.5508% |
+
+Every depth-1 bucket declines monotonically with the rate and every depth-2
+bucket improves, so the aggregate is decided by their sizes: depth-1 is 97.6% of
+supervised triples and depth-2 is 2.4%. In failing triples against the
+unmodified corpus, R=0.25 is +163 on depth-1 against −661 on depth-2 while
+R=0.50 is +3085 against −683. The no-immediate buckets barely move at any rate
+(99.928% → 99.922%), so the exchange is confined to immediate-carrying chunks.
+
+**The trade is NOT intrinsic — it is an artifact of holding the step budget
+fixed.** Depth-2 accuracy tracks the absolute number of chained rows seen rather
+than their proportion; the proportion only sets how fast they accumulate and how
+much depth-1 exposure is surrendered per step. A cell at R=0.10 for 2M steps sees
+the same ~109M chained rows as R=0.25 for 1M:
+
+| bucket | ~4.7% @1M | R=0.10 @1M | **R=0.10 @2M** | R=0.25 @1M |
+|---|---|---|---|---|
+| OVERALL | 99.8489% | 99.9025% | **99.9364%** | 99.9109% |
+| depth 1 | 99.9349% | 99.9183% | **99.9411%** | 99.9143% |
+| `distinct \| imm \| depth 1` | 99.9653% | 99.9448% | **99.9724%** | 99.9381% |
+| `cross-instr \| imm \| depth 1` | 99.4329% | 99.4125% | **99.4499%** | 99.3786% |
+| depth 2 | 96.3312% | 99.2558% | 99.7450% | **99.7710%** |
+
+It reaches R=0.25's depth-2 accuracy and leaves EVERY depth-1 bucket better than
+the unmodified corpus: depth-1 failing triples 512 → 463 and depth-2 705 → 49.
+Both populations improve, so raising the rate does not displace depth-1 learning
+and the shared op-cell shows no interference between the two — it only slows
+depth-1 by giving it fewer examples per step, and buying the steps back recovers
+it. What is being chosen is therefore a (rate, steps) pair.
+
+**The control that is missing is R=0 at 2M**, without which the step budget and
+the rate are not separated. A budget increase alone has moved composed-slot
+accuracy substantially before, though only at `d_out` 256 and against the
+syntactic-frame target, which makes that figure incomparable to the ones here
+and indicative of a direction rather than a magnitude (finding 17). If the
+budget alone reaches most of this, the rate is an efficiency knob rather than a
+necessary one.
+
+**There is no established collapse cost.** One draw at R=0.25 reads separation
+27.5× and another 33.5×, against the adopted 35.5× — the row's draw-to-draw
+variation swamps the difference, which is what METRICS says to expect of a mean
+over a few hundred near-zero distances. `behav-diff` stays large throughout
+(0.86–0.94). An earlier reading of this as a small but real cost was a
+single-draw artifact.
+
+**This settles what the composed-chain deficit was.** The architecture was never
+short of anything: the same model, trained on the same objective at the same
+width and depth over the same frozen T1, reaches 97.75% on an arm that scores
+19.52% at the corpus's natural composition. The missing ingredient was examples. It also dissolves the
+`ADDI;ADD` anomaly of finding 26 — a constant that was linearly present but
+unread reaches 100.0000% once the shape is common — so that anomaly was a
+symptom of the same cause rather than a separate defect.
+
+**And FOLDING is not the mechanism.** A same-family chain has a composite the
+encoder can collapse (`ADDI;ADDI` to one offset); a mixed-family chain has none
+— `ADDI;XORI` is `(x+i1)^i2`, `ADDI;SLLI` is `(x+i1)<<s`, neither reducible to
+"input plus a constant". Density lifts both kinds by comparable amounts:
+
+| composed slot | foldable | adopted | R=0.25 | R=0.50 |
+|---|---|---|---|---|
+| `ADDI;ADDI` | yes | 19.18% | 93.03% | 97.64% |
+| `XORI;XORI` | yes | 99.13% | 100.00% | 100.0000% |
+| `ADDI;XORI` | **no** | 48.73% | 98.58% | 99.71% |
+| `XORI;ADDI` | **no** | 14.49% | 85.27% | 95.39% |
+| `SLLI;ADDI` | **no** | 71.80% | 97.44% | 99.34% |
+| `ADDI;SLLI` | **no** | 16.23% | 70.19% | 89.97% |
+
+So the encoder learns whatever multi-step structure it is shown enough of. That
+`i1+i2` becomes linearly recoverable (23.8% → 86.8%) is what it happens to learn
+where a fold exists, not the reason density works — which supersedes the reading
+of finding 28 that a fold objective was the one encoder-side lever. Arm
+difficulty tracks how much structure the function has rather than whether it
+collapses: `ADDI;SLLI`, a shift applied to a composed sum, is the worst arm at
+every density and the only one still below 95% at R=0.50.
+
+**Not yet established:** a replicate. The aggregate gain is 0.053 points against
+a T2-level run-to-run floor of ~0.01 (finding 25), so ~5×; the hard-cell gain
+(+16 points) and the arm gain (+74) are far outside any floor measured here, but
+the aggregate figure wants the null before R=0.25 is adopted. The collapse cost
+is real and small — separation 35.5× → 27.5×, with `behav-diff` holding at 0.89
+— and has to be watched rather than ignored (METRICS: a vp gain that craters the
+GVN rows is a regression).
+
+
 ## Decisions taken
 
 - **The pool reads each slot's write step.** Unconditional: the core carries no
@@ -959,6 +1263,13 @@ values do not load.
 No option exists for any mechanism below. A flag name identifies the arm that
 produced the number; recover it from git history to re-measure one.
 
+- **Feeding the vp head a composed slot's intermediate value**
+  (`--vp-per-slot`, which runs the head once per output slot, with
+  `--vp-inter-shuffle` as the paired control). Null, and the per-slot head it
+  requires is itself a regression on the arms it targets (finding 27).
+- **Supervising the intermediate value** in the RVT batch. Not run, and ruled
+  out by the above: handing the head the intermediate outright is already null,
+  so supervising it into a slot whose own vp is 99.99%+ has nothing to add.
 - **Capacity.** Scaling the model's dimensions and steps together left
   aggregate vp essentially unchanged at a given chunk length, and `d_out`
   512 → 1024 leaves even the specific error cells unchanged (finding 17). The
@@ -1025,24 +1336,20 @@ certify, and the noise floors every comparison here is measured against.
 
 ## Open threads
 
-1. **Carry propagation over a composed operand** — the whole of what is left at
-   len=2, localised to the op-cell reading its own previous output (finding 21).
-   Not capacity-shaped: `d_out` 512 → 1024 leaves it unchanged (finding 17), and
-   the head, the two-step arithmetic chain, the gradient share, the operand
-   scale mismatch and content crowding are each separately refuted. Normalizing
-   every value entering a register slot — putting a seeded leaf and the
-   op-cell's own output on one shell — leaves the aggregate inside the noise
-   floor at `d_out` 512 on the behavioral-frame target, and trades the two
-   sub-cases against each other rather than closing either (finding 22).
+1. **The acceptance criterion for milestone 1.** On the cell carrying the whole
+   len=2 residual the essence is a faithful description and the vp head cannot
+   evaluate it (finding 26), so `vp = 0` is a stronger demand than "the essence
+   preserves the chunk's behavior". Either the criterion has to say that it
+   scores the essence composed with an evaluator, or it has to be replaced by
+   something that reads the description rather than the evaluation. That is a
+   definition, and it gates whether the milestone is reachable at all.
 
-   **First settle whether the residual is essence-side or head-side**
-   (finding 21). The two available readings contradict, and they call for
-   different work: a lossy essence is an encoder problem, while a readout that
-   cannot decode-and-compute in one pass is partly a statement about vp as a
-   metric — it would mean `vp = 0` is gated on the head's arithmetic rather than
-   on the essence being a faithful description, which is what the milestone
-   claims to measure.
+2. **Folding a chain's literals in the op-cell** is the one intervention the
+   measurements point at, and it is TODO task 2's mechanism rather than a
+   separate lever: handed the composite, a readout on the same essence goes
+   from 79.80% to 99.95% (finding 21). What is unsettled is the objective that
+   would produce the fold, and what it costs the discriminative rows.
 
-2. **Decoder + reconstruction loss** — the standing untried lever for goal 2.
-3. **Everything after the Round-1 sweep is len=2 only.** In particular,
+3. **Decoder + reconstruction loss** — the standing untried lever for goal 2.
+4. **Everything after the Round-1 sweep is len=2 only.** In particular,
    input-ordering recovery sits at chance (0.518) at len=8 and is unexplained.

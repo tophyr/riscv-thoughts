@@ -147,3 +147,126 @@ class TestAuxTargets:
         anchors = make_anchor_states(4, seed=0)
         with pytest.raises(NotImplementedError):
             precompute_chunk([Instruction('LW', 5, 0, 1)], anchors)
+
+
+# ---------------------------------------------------------------------------
+# chain_group: raising the density of dataflow-composed chunks
+# ---------------------------------------------------------------------------
+
+def test_chain_group_makes_each_instruction_read_its_predecessor():
+    import numpy as np
+    from datagen.generate import chain_group
+    from emulator import Instruction
+    rng = np.random.default_rng(0)
+    g = [Instruction('ADDI', 6, 3, 100), Instruction('ADDI', 9, 4, 25)]
+    out = chain_group(g, rng)
+    assert out[0] == g[0]                      # the producer is untouched
+    assert out[1].opcode == 'ADDI'             # the opcode is untouched
+    assert out[1].args[0] == 9                 # so is the destination
+    assert out[1].args[1] == 6                 # the source now reads x6
+    assert out[1].args[2] == 25                # so is the immediate
+
+
+def test_chain_group_rewrites_one_source_of_an_r_type():
+    import numpy as np
+    from datagen.generate import chain_group
+    from emulator import Instruction
+    for seed in range(8):
+        rng = np.random.default_rng(seed)
+        g = [Instruction('ADD', 6, 3, 4), Instruction('SUB', 9, 7, 8)]
+        out = chain_group(g, rng)
+        assert out[1].opcode == 'SUB' and out[1].args[0] == 9
+        assert 6 in (out[1].args[1], out[1].args[2]), out[1]
+        # exactly ONE source is rewritten, the other keeps its draw
+        assert {out[1].args[1], out[1].args[2]} & {7, 8}
+
+
+def test_chain_group_skips_a_producer_that_writes_x0():
+    """An x0 write discards its result, so reading it composes nothing."""
+    import numpy as np
+    from datagen.generate import chain_group
+    from emulator import Instruction
+    rng = np.random.default_rng(0)
+    g = [Instruction('ADDI', 0, 3, 100), Instruction('ADDI', 9, 4, 25)]
+    out = chain_group(g, rng)
+    assert out[1] == g[1]
+
+
+def test_chain_group_leaves_a_single_instruction_alone():
+    import numpy as np
+    from datagen.generate import chain_group
+    from emulator import Instruction
+    rng = np.random.default_rng(0)
+    g = [Instruction('ADDI', 6, 3, 100)]
+    assert chain_group(g, rng) == g
+
+
+def test_chain_rate_raises_composed_density_without_moving_opcodes():
+    """The point of the knob: more dataflow composition, same opcode mix."""
+    import itertools
+    from collections import Counter
+    import numpy as np
+    from datagen import length_cap
+    from datagen.batch import generate_chunks
+    from datagen.generate import build_opcode_table, load_distribution
+
+    dist = load_distribution('configs/instr_alu_writers.json')
+    table = build_opcode_table(dist)
+
+    def measure(chain_rate, n=3000):
+        rng = np.random.default_rng(0)
+        it = generate_chunks(length_cap(2), rng, opcode_table=table,
+                             dest_regs=list(range(1, 32)),
+                             chain_rate=chain_rate)
+        composed = total = 0
+        ops = Counter()
+        for ch in itertools.islice(it, n):
+            ins = ch.instructions
+            ops.update(i.opcode for i in ins)
+            total += 1
+            if len(ins) != 2:
+                continue
+            rd = ins[0].args[0]
+            reads = ((ins[1].args[1],) if ins[1].opcode.endswith('I')
+                     else (ins[1].args[1], ins[1].args[2]))
+            composed += int(rd != 0 and rd in reads)
+        return composed / total, ops
+
+    base_rate, base_ops = measure(0.0)
+    hi_rate, hi_ops = measure(1.0)
+    assert base_rate < 0.15, base_rate
+    assert hi_rate > 0.85, hi_rate
+    # the opcode distribution must be unchanged: same support, similar mass
+    assert set(base_ops) == set(hi_ops)
+    nb, nh = sum(base_ops.values()), sum(hi_ops.values())
+    for op in base_ops:
+        assert abs(base_ops[op] / nb - hi_ops[op] / nh) < 0.02, op
+
+
+def test_chain_rate_comes_from_the_config_and_cli_overrides_it():
+    """`chain.rate` follows the pattern `equivalences.rate` and
+    `invalidity.rate` already set: the config carries the corpus's own value
+    and the CLI flag overrides it for a sweep."""
+    from datagen.generate import load_distribution, validate_distribution
+    d = load_distribution('configs/instr_alu_writers_chained.json')
+    assert d['chain']['rate'] == 0.10
+    # the resolution the worker performs
+    for cli, want in ((None, 0.10), (0.5, 0.5), (0.0, 0.0)):
+        eff = cli if cli is not None else d.get('chain', {}).get('rate', 0.0)
+        assert eff == want
+    # a corpus with no chain block chains nothing
+    plain = load_distribution('configs/instr_alu_writers.json')
+    assert plain.get('chain', {}).get('rate', 0.0) == 0.0
+    validate_distribution(dict(d))
+
+
+def test_chain_config_block_is_validated():
+    from datagen.generate import validate_distribution
+    import pytest
+    for bad in ({'R_ALU': 1.0, 'chain': {'rate': 1.5}},
+                {'R_ALU': 1.0, 'chain': {'rate': -0.1}},
+                {'R_ALU': 1.0, 'chain': {'rat': 0.1}},
+                {'R_ALU': 1.0, 'chain': 0.1}):
+        with pytest.raises(ValueError):
+            validate_distribution(dict(bad))
+    validate_distribution({'R_ALU': 1.0, 'chain': {'rate': 0.25}})

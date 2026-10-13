@@ -40,6 +40,8 @@
 #                    so the corpus is clean by default. Set to e.g. 0.2
 #                    to re-enable validity-training augmentation.)
 #   INJECT_EQUIV    (default unset — uses config's equivalences.rate)
+#   CHAIN_RATE      (default unset — fraction of chunks rewritten so each
+#                   instruction reads its predecessor's result)
 #   ANCHOR_SEED     (default 0 — passed to BOTH pools; MUST equal the
 #                    trainer's --anchor-seed, else value_predict targets
 #                    silently mismatch, INVARIANT 1.)
@@ -65,6 +67,7 @@ RULE=${RULE:-single}
 CONFIG=${CONFIG:-configs/instr_default.json}
 INJECT_INVALID=${INJECT_INVALID:-0}
 INJECT_EQUIV=${INJECT_EQUIV:-}
+CHAIN_RATE=${CHAIN_RATE:-}
 ANCHOR_SEED=${ANCHOR_SEED:-0}
 GEN_SEED=${GEN_SEED:-0}
 REMOTE_GEN=${REMOTE_GEN:-96}
@@ -110,6 +113,9 @@ tar -czf - --exclude='__pycache__' --exclude='*.pyc' --exclude='tests' \
 EXTRA_ARGS="--inject-invalid ${INJECT_INVALID}"
 if [ -n "${INJECT_EQUIV}" ]; then
   EXTRA_ARGS="${EXTRA_ARGS} --inject-equiv ${INJECT_EQUIV}"
+fi
+if [ -n "${CHAIN_RATE}" ]; then
+  EXTRA_ARGS="${EXTRA_ARGS} --chain-rate ${CHAIN_RATE}"
 fi
 
 ssh ${REMOTE} "bash ${REMOTE_DIR}/scripts/multinode_remote.sh \

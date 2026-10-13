@@ -109,12 +109,18 @@ assumed: nothing reaches T2 except what T1 emitted.
 
 **What is open.** Two properties, and the framework needs both.
 
-*Faithfulness.* T2's essence is not yet a lossless behavioral description of its
+*Faithfulness.* Whether T2's essence is a lossless behavioral description of its
 chunk, measured by whether the chunk's output register values can be recovered
-from the essence and scored discretely rather than as a loss value. It is
-lossless at one instruction and within a fraction of a percent at two; four and
-eight are open, as is everything outside the R/I-type ALU subset the work
-currently runs on.
+from it and scored discretely rather than as a loss value. It is lossless at one
+instruction and within a fraction of a percent at two; four and eight are open,
+as is everything outside the R/I-type ALU subset the work currently runs on. The
+score is the essence composed with a readout that has to EVALUATE it — nothing
+in the encoder ever sees a register value, so a slot describes a function rather
+than holding a number. At two instructions the limit is the training corpus
+rather than the architecture: chunks where one instruction consumes another's
+result are ~5% of a randomly drawn corpus and the hardest shapes a fraction of a
+percent, so generating more of them carries overall exact match from 99.83% to
+99.90% with nothing about the model changed.
 
 *Equivalence.* Two instruction sequences that compute the same function must
 compress to the same point — that is the framework's definition of meaning, and

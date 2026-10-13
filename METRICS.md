@@ -19,6 +19,16 @@ input-slot values)` and predicts each output register's canonical value. It is
 the metric that matters because the essence is what a future T3 consumes: a next
 tier can only recover what this one preserved.
 
+**The head's depth is part of the criterion, so quote it with the number.**
+vp scores the essence composed with a readout, and that readout is the only
+consumer a T2 essence has — T3 does not exist yet — so its capacity is an
+implicit claim about what the next tier will be able to read. `vp = 0` at a
+deeper head is a strictly weaker statement than at a shallow one, because
+capacity granted to the head is structure the representation is no longer
+required to expose, and that compounds at every tier of a hierarchy whose
+premise is cheap coarse checks. The adopted cell uses one hidden layer of 1024
+(`run_t2.sh` VP=1); depth 4 was measured and trades rather than gains.
+
 **Score it as exact 32-bit match of the predicted output value, never
 per-bit.** The output is discrete, and per-bit flatters a broken subset badly:
 96% per-bit has been 74% exact, and 81% per-bit on one probe column was 21%
@@ -27,14 +37,13 @@ never reaches 0 however good the model is, so it is a training signal and not an
 acceptance criterion.
 
 **What counts as solved.** The loss is asymptotic, so "solved" at a given chunk
-length means **100% exact 32-bit match on `probes/vp_slot_b_split.py`, including
-its overlap column** — the bar T1 already clears on both operand types, so it is
-demonstrated rather than aspirational. That probe covers operand binding only
-and generates from an R-only corpus, so it must be read alongside a
-mixed-corpus score: it sat at 99.8% on its overlap column throughout a period
-when the model was recovering I-type outputs at 65.9%, and it did not move when
-that was fixed. `probes/vp_budget.py` on the training corpus is what sees the
-rest.
+length means **100% exact 32-bit match on `probes/vp_budget.py`**, which scores
+the model's own head over the training corpus and crosses the three properties
+that decide a slot. `probes/vp_slot_b_split.py` is a second, narrower bar on
+operand binding alone: it generates from an R-type-only corpus, so it cannot see
+an immediate failure at all — it sat at 99.8% on its overlap column while the
+model was recovering I-type outputs at 65.9%, and did not move when that was
+fixed. Read it as a binding check beside the budget, not as the criterion.
 
 **A vp number in a training log is already held out.** `datagen` generates every
 batch fresh and the trainer never revisits one, so there is no train/test split
@@ -60,13 +69,31 @@ means more anchors, a held-out anchor set the head never trained on, or anchors
 resampled per batch — the last requires shipping them in the RVT batch, i.e. a
 change to CLAUDE.md's INVARIANT 1.
 
-**It measures the head's arithmetic, not only the essence's content.** The head
-is asked to EVALUATE the chunk's function at the anchor points, so a function
-the essence describes perfectly can still score badly if evaluating it is hard
-for a shallow readout. Bitwise output bits are decidable independently; carry
-propagation is sequential in bit position and bit relocation moves everything at
-once. Until the essence-side and head-side readings are separated, a vp residual
-on composed operands cannot be attributed to the encoder.
+**It measures the head's arithmetic as well as the essence's content, and the
+head's arithmetic is not the limit.** The encoder never sees a register value —
+its inputs are each instruction's opcode and immediate and the wiring — so a
+register slot holds a symbolic description of the function that produced it and
+the head must EVALUATE that description at the anchor points. vp scores the
+composition.
+
+What the composition costs is measured, and it is small where the quantity the
+head needs is actually present. The head adds three given 32-bit values at
+100.0000% and decodes-and-adds one constant at a single instruction at
+100.0000%; on a composed chunk its prediction equals the known summands plus
+some plausible 12-bit constant on 95–99.6% of triples, so the arithmetic holds
+and only the scalar is wrong. Across the composed ADD-family arms its accuracy
+tracks a LINEAR readout of the constant it needs, to within 4 points on two of
+three arms. So a vp residual on composed operands points at a quantity the
+essence does not carry linearly, not at a weak readout — and **the way to
+attribute one is to identify the quantity the head needs and measure how
+accessible it is**, with `probes/compose_readback.py` for which part of a
+composed slot's description is present.
+
+Do NOT attribute a residual by reconstructing the instructions and executing
+them. That measures instruction reconstruction, which the project already does
+better elsewhere (`probes/t2_reconstruct.py`), and then answers the question
+with an emulator — if re-executing the chunk is allowed, the compressed vector
+is not being tested at all.
 
 **vp scores T1∘T2, not T2.** T2's operand and destination slots come from T1's
 emitted binding (`_t1_predicted_wiring`), never from the tokens, while the

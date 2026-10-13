@@ -39,8 +39,9 @@ import torch.nn.functional as F
 sys.path.insert(0, '/home/tophy/Projects/riscv-thoughts')
 
 from compressor.model import instruction_wiring
-from compressor.train import _t2_assemble, _value_bits, _value_smooth
-from datagen import AUX_CE_IGNORE, MAX_INPUT_SLOTS, MAX_OUTPUT_SLOTS, N_REGS
+from compressor.train import (_t2_assemble, _value_bits, vp_head_predict,
+                              vp_canonical_in_vals)
+from datagen import AUX_CE_IGNORE, MAX_OUTPUT_SLOTS
 from datagen.compare import make_anchor_states, precompute_chunk
 from emulator import Instruction
 from scripts._common import resolve_device, load_frozen_encoder, load_t2
@@ -58,8 +59,6 @@ t2, _ = load_t2(T2_DIR, t1, dev)
 
 anchors_np = np.asarray(make_anchor_states(N_ANCHORS, ANCHOR_SEED))
 anchors = torch.from_numpy(anchors_np).to(dev)
-canon_pos = torch.arange(1, MAX_INPUT_SLOTS + 1, device=dev).clamp(max=N_REGS - 1)
-ANCH_IN = anchors[:, canon_pos].to(torch.int64)
 
 
 def build(chunks):
@@ -99,14 +98,8 @@ def score(chunks, target_reg, bs=256):
         tgt = out_regs.gather(
             -1, sel.view(-1, 1, 1).expand(-1, N_ANCHORS, 1)).squeeze(-1)
         with torch.no_grad():
-            iv = (ANCH_IN.unsqueeze(0)
-                  * (in_slot != AUX_CE_IGNORE).to(torch.int64).unsqueeze(1))
-            ifeat = torch.cat(
-                [_value_bits(iv), _value_smooth(iv.float()).unsqueeze(-1)],
-                dim=-1).reshape(n, N_ANCHORS, -1)
-            v = F.normalize(ess, dim=-1).unsqueeze(1).expand(-1, N_ANCHORS, -1)
-            pred = t2.vp_head(torch.cat([v, ifeat], dim=-1)).reshape(
-                n, N_ANCHORS, MAX_OUTPUT_SLOTS, NBITS + 1)
+            iv = vp_canonical_in_vals(anchors, in_slot)
+            pred = vp_head_predict(t2, ess, iv)
         idx = (oslot == sel.unsqueeze(-1)).float().argmax(-1)
         ar = torch.arange(n, device=dev)
         p = pred[ar.unsqueeze(1), torch.arange(N_ANCHORS, device=dev).unsqueeze(0),

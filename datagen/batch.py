@@ -33,7 +33,7 @@ from .compare import (
     precompute_chunk,
 )
 from .generate import (
-    collect_groups, random_instruction, random_relabel,
+    chain_group, collect_groups, random_instruction, random_relabel,
     sample_injection_tuples,
 )
 
@@ -591,7 +591,7 @@ def _yield_random_instructions(rng, opcode_table=None, dest_regs=None):
 
 def generate_chunks(rule, rng, *, opcode_table=None, dest_regs=None,
                     eq_rate=0.0, eq_max_per_class=8, eq_min_per_class=0,
-                    eq_boost=None):
+                    eq_boost=None, chain_rate=0.0):
     """Yield Chunk objects (all valid) from a random-instruction stream
     grouped by `rule`.
 
@@ -599,10 +599,18 @@ def generate_chunks(rule, rng, *, opcode_table=None, dest_regs=None,
     eq_rate, also emit a fresh tuple of MANIFEST-equivalent instructions
     as additional chunks. This biases the stream toward chunks that the
     encoder must learn to collapse together.
+
+    If chain_rate > 0, that fraction of groups is rewritten so each
+    instruction reads its predecessor's result (`chain_group`), raising the
+    density of dataflow-composed chunks above the ~4.7% a uniform register
+    draw gives. Opcodes are untouched, so the config's opcode distribution
+    holds either way.
     """
     instr_iter = _yield_random_instructions(rng, opcode_table=opcode_table,
                                             dest_regs=dest_regs)
     for group in collect_groups(instr_iter, rule):
+        if chain_rate > 0 and rng.random() < chain_rate:
+            group = chain_group(group, rng)
         yield _make_valid_chunk(group)
         if eq_rate > 0 and rng.random() < eq_rate:
             tuple_instrs = sample_injection_tuples(

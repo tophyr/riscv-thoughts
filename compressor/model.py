@@ -343,10 +343,11 @@ class TokenEmbedder(nn.Module):
 
 
 # Head hidden capacities. Never tuned, so they live here as named constants
-# rather than constructor params. vp_head is large and fixed (does not scale
-# with d_out): the capacity is "don't be the bottleneck" rather than a fitted
-# size — vp is the training objective, not a diagnostic, so the head must not
-# be what limits it.
+# rather than constructor params. vp_head's DEPTH is not an implementation
+# detail: it is the only consumer a T2 essence has, so its capacity is an
+# implicit claim about what the next tier will be able to read, and `vp = 0` at
+# a deeper head is a strictly weaker statement than at a shallow one. Quote the
+# depth with the number. Adopted: one hidden layer (`run_t2.sh` VP=1).
 def _build_vp_head(vp_in, vp_out, depth):
     """vp value-prediction head with `depth` hidden layers of _VP_HIDDEN.
     depth=0 -> a single linear readout. depth=4 reproduces the historical
@@ -363,10 +364,13 @@ def _build_vp_head(vp_in, vp_out, depth):
 
 _IN_SCORE_HIDDEN = 256
 _VP_HIDDEN = 1024
-_VP_HEAD_DEPTH = 4     # vp_head hidden layers (default). 0 = linear readout —
-                       # weakening the head forces the essence to expose value
-                       # structure geometrically instead of the head untangling
-                       # it (the essence cone-collapse / dim-underuse fix).
+_VP_HEAD_DEPTH = 4     # vp_head hidden layers. Entry scripts pass their own;
+                       # the adopted T2 cell uses 1. Capacity here is work the
+                       # representation is NOT required to do, so deeper trades
+                       # rather than gains: depth 4 end-to-end moved one
+                       # composed arm +20 points and another -14, left the
+                       # aggregate inside the noise floor and cost GVN
+                       # separation (EXPERIMENT_LOG finding 22).
 _VP_VALUE_BITS = 32    # two's-complement bit width of the vp value target (RV32)
 _IMM_N_FREQ = 12       # rotary immediate: power-of-2 periods 2..4096 (2*this = target dim)
 

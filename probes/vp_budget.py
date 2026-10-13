@@ -35,9 +35,10 @@ import torch.nn.functional as F
 sys.path.insert(0, '/home/tophy/Projects/riscv-thoughts')
 
 from compressor.train import (_split_to_per_instruction, _t2_assemble,
-                              _value_bits, _value_smooth)
-from datagen import (RVT_FORMAT, Batch, AUX_CE_IGNORE, MAX_INPUT_SLOTS,
-                     MAX_OUTPUT_SLOTS, N_REGS, make_anchor_states)
+                              _value_bits, vp_head_predict,
+                              vp_canonical_in_vals)
+from datagen import (RVT_FORMAT, Batch, AUX_CE_IGNORE, MAX_OUTPUT_SLOTS,
+                     N_REGS, make_anchor_states)
 from emulator import I_TYPE
 from scripts._common import resolve_device, load_frozen_encoder, load_t2
 from tokenizer import decode_instruction
@@ -65,8 +66,6 @@ subprocess.run(
 
 anchors = torch.from_numpy(
     np.asarray(make_anchor_states(N_ANCHORS, ANCHOR_SEED))).to(dev)
-canon_pos = torch.arange(1, MAX_INPUT_SLOTS + 1, device=dev).clamp(max=N_REGS - 1)
-ANCH_IN = anchors[:, canon_pos].to(torch.int64)
 
 
 def slot_depth(in0, in1, out, n):
@@ -108,14 +107,8 @@ with open(CORPUS, 'rb') as f:
         valid = (out_slot != AUX_CE_IGNORE) & vp_mask.unsqueeze(-1)
 
         with torch.no_grad():
-            iv = (ANCH_IN.unsqueeze(0)
-                  * (in_slot != AUX_CE_IGNORE).to(torch.int64).unsqueeze(1))
-            ifeat = torch.cat(
-                [_value_bits(iv), _value_smooth(iv.float()).unsqueeze(-1)],
-                dim=-1).reshape(nch, N_ANCHORS, -1)
-            v = F.normalize(ess, dim=-1).unsqueeze(1).expand(-1, N_ANCHORS, -1)
-            pred = t2.vp_head(torch.cat([v, ifeat], dim=-1)).reshape(
-                nch, N_ANCHORS, MAX_OUTPUT_SLOTS, NBITS + 1)
+            iv = vp_canonical_in_vals(anchors, in_slot)
+            pred = vp_head_predict(t2, ess, iv)
             tgt = out_regs.gather(-1, out_slot.clamp(min=0).unsqueeze(1)
                                   .expand(-1, N_ANCHORS, -1))
             hit = ((pred[..., :NBITS] > 0).float()

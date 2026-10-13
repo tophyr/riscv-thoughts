@@ -305,25 +305,31 @@ identity is a choice among ten opcodes and survives a narrow channel; a 12-bit
 immediate does not, which is why a shared projection showed up as an I-type-only
 deficit.
 
-**An immediate is the field a slot drops first, and width is not what it is
-short of.** An instruction carries an opcode — a choice among ten — and, if it
-is I-type, a 12-bit literal. The literal is by far the higher-entropy field, and
-it is the one that fails when a slot has to hold anything else alongside it.
+**A slot describes a function, it does not hold a value.** Nothing in the
+encoder ever sees a register's contents: the per-step content is the
+instruction's opcode and immediate, and the wiring says which slots are read and
+written. So a slot's state is a symbolic description of the computation that
+produced it, and every consumer — the pool, the binding heads, the
+value-prediction head — reads a description rather than a number. The
+value-prediction head is therefore an *evaluator*: it is handed the chunk's
+input values separately and asked to apply the described function to them.
 
-Two conditions make a slot hold something else. One is that the chunk's two
-instructions read a common register, which forces both operations to be
-described against the same input. The other is that the slot's operand is
-another instruction's result rather than a chunk input, so the slot describes a
-composition. Measured on two-instruction chunks, every population carrying no
-immediate predicts its output values at 99.91% or better under either
-condition, and immediate-carrying instructions read in isolation reach 99.986%.
-An immediate under the first condition falls to 97.1%, under the second to
-92.5%, and under both to 80.9%.
+**The op-cell appends a literal to the description it reads rather than folding
+it in, and width is not what it is short of.** When a slot's operand is another
+instruction's result, the description it builds has to combine two operations
+that each carry a 12-bit literal. Both literals survive — each is recoverable
+from the emitted essence at 99.08% or better — while their SUM is not, at 84.48%,
+so the chain is described as two separate offsets instead of one. An evaluator
+handed the sum predicts the chunk's output at 99.95%; handed the two addends
+instead it reaches 79.80%, because decoding a literal out of a continuous code
+and carry-propagating it are operations that do not compose in one readout pass.
 
 Doubling `d_value` from 256 to 512 improves those cells once; doubling again to
-1024 leaves the worst of them unchanged to three decimal places. Whatever a slot
-is short of when it must carry an immediate and a relationship at the same time,
-it is not room.
+1024 leaves the worst of them unchanged to three decimal places. What the
+description is short of is the fold, not room. That makes folding a chain's
+literals an encoder-side property worth having for its own sake, and not only
+for the equivalence collapse that motivates it (see "GVN" below): it is what
+would let a description be evaluated in one step.
 
 This is equivariant by construction: renaming registers permutes which slots
 are read and written, so `S` permutes and the symmetric-pool essence is
@@ -452,6 +458,24 @@ what escapes to outside.
 T1 is therefore literally T2 with `seq_len=1`: the only legitimate difference
 between the tiers is the ingestion front-end and the hparams.
 
+**The lower tier's loss set IS the contract, and it is under-specified.** A tier
+is frozen before the next one trains, so whatever its own losses shaped into its
+emission is exactly what the next tier receives — `value_predict` defines the
+essence's content, the binding losses define the interface, and the next tier
+gets no vote. Two consequences follow, and both are load-bearing:
+
+- The binding losses carry weight 0.1 against `value_predict`'s 1.0, yet the
+  binding is what the next tier routes its wiring on. The interface is optimised
+  at a tenth of the priority of the content it carries.
+- Satisfying the contract does not determine downstream usability. Six T1s each
+  scoring 100.0000% on their own single-instruction value prediction yielded T2s
+  spanning 0.059 points of exact match — an order of magnitude beyond T2-level
+  run-to-run spread — with their binding accuracies ranked ANTI-correlated to
+  their T2s (EXPERIMENT_LOG, "T2 faithfulness", finding 25).
+
+So the only real test of a tier's emission is training the tier above it. A
+lower-tier scorecard verifies that tier is intact; it cannot rank candidates.
+
 ### GVN: the invariant essence is the value-number
 
 **Global value numbering (GVN)** is the compiler analysis that assigns every
@@ -546,16 +570,36 @@ against a *canonical* target, making the task mathematically inconsistent.
 
 **vp is the primary objective, and it has no intrinsic floor.**
 Single-instruction vp is exactly `0.000`, and the head is fed raw value *bits*,
-not log-compressed scalars. vp measures whether the essence is a lossless
-behavioral description of its chunk, which is precisely what a future T3 will
-consume — so it is the metric the current work is driving to zero (TODO.md;
-METRICS.md for what it certifies).
+not log-compressed scalars. What it measures is the essence composed with the
+head's ability to EVALUATE it — a slot describes a function rather than holding
+a value (above) — so a description the essence carries perfectly can still score
+badly when applying it needs carry propagation. Driving vp to zero is therefore
+a demand on the pair, and faithfulness, the property a future T3 actually
+consumes, is the weaker half of it (TODO.md; METRICS.md for what it certifies
+and how to measure the halves apart).
 
 The head reads the **unit-normalized** essence (`F.normalize(vecs)`,
 `t2_value_predict_loss`): magnitude is reserved for validity, so if vp's gradient
 reached ‖essence‖ then "produces register output" would start proxying for
 "is valid" — only register-writers get vp shaping. The operator identity vp needs
 lives in the direction.
+
+**Every output slot is predicted independently, in one pass, and that is
+deliberate.** The head emits all `MAX_OUTPUT_SLOTS` slots' values at once from
+one shared hidden layer, so a slot whose value depends on another slot's gets no
+access to it — a chunk computing `r4 = x+1042; r7 = r4+4` must produce `x+1046`
+for `r7` without reusing the `x+1042` it just produced for `r4`.
+
+Chaining them is architecturally possible — the output slots have a defined SSA
+write order and the dataflow is a DAG, so the iteration would be over the output
+structure rather than over the essence, which has no sequence axis. It is
+rejected on the TIER CONTRACT. T_(n+1) receives only what T_n emitted, so a
+composite that exists solely as something an iterative head can reconstruct is
+not available to the next tier, which then faces the identical problem one level
+up. vp's justification is that it proxies what the next tier can recover, so a
+chained head would raise the score while leaving the representation as
+deficient for the consumer that matters. The composite has to be in the essence,
+not in the readout's control flow.
 
 The operator-clustering that the flat encoder could never get from vp comes
 **for free from the equivariant core** (rename-invariant essence = the
