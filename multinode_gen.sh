@@ -35,13 +35,12 @@
 #   N_STATES        (default 8)
 #   RULE            (default 'single' — single-instruction chunks; the
 #                    old "--gen instr" equivalent)
-#   CONFIG          (default configs/instr_default.json)
-#   INJECT_INVALID  (default 0 — overrides the config's invalidity.rate
-#                    so the corpus is clean by default. Set to e.g. 0.2
-#                    to re-enable validity-training augmentation.)
-#   INJECT_EQUIV    (default unset — uses config's equivalences.rate)
-#   CHAIN_RATE      (default unset — fraction of chunks rewritten so each
-#                   instruction reads its predecessor's result)
+#   CONFIG          (REQUIRED — the corpus config. A corpus is defined by
+#                    that one file: opcode mix, exclude_x0_dest, and the
+#                    equivalence / invalidity / chain rates. There is no
+#                    default and no env override for any rate, so the file a
+#                    run names is the whole corpus definition and
+#                    scripts/record_corpus.py can copy it into the run dir.)
 #   ANCHOR_SEED     (default 0 — passed to BOTH pools; MUST equal the
 #                    trainer's --anchor-seed, else value_predict targets
 #                    silently mismatch, INVARIANT 1.)
@@ -64,10 +63,7 @@ BATCH_SIZE=${BATCH_SIZE:-128}
 TWINS=${TWINS:-3}
 N_STATES=${N_STATES:-8}
 RULE=${RULE:-single}
-CONFIG=${CONFIG:-configs/instr_default.json}
-INJECT_INVALID=${INJECT_INVALID:-0}
-INJECT_EQUIV=${INJECT_EQUIV:-}
-CHAIN_RATE=${CHAIN_RATE:-}
+CONFIG=${CONFIG:?set CONFIG to a corpus config under configs/ — a corpus is one reviewable file, and there is no default}
 ANCHOR_SEED=${ANCHOR_SEED:-0}
 GEN_SEED=${GEN_SEED:-0}
 REMOTE_GEN=${REMOTE_GEN:-96}
@@ -86,14 +82,21 @@ if [ -z "${REMOTE_DIR}" ]; then
   exit 1
 fi
 
+# Teardown must not invent an exit status. Reaping the ssh carrying the remote
+# pool yields 255, and under `set -e` a nonzero step here also abandons the
+# rest of the teardown — so every step absorbs its own failure and the status
+# the script was already exiting with is restored at the end. Without that, a
+# corpus run that wrote every batch it was asked for still reports failure.
 cleanup() {
+  local rc=$?
   if [ -n "${SSH_PID:-}" ]; then
-    kill "${SSH_PID}" 2>/dev/null
+    kill "${SSH_PID}" 2>/dev/null || true
   fi
-  ssh ${REMOTE} 'PID=$(cat /tmp/riscv-thoughts-multinode-remote.'"${PORT}"'.pid 2>/dev/null); if [ -n "$PID" ]; then pkill -P "$PID" 2>/dev/null; kill "$PID" 2>/dev/null; fi; rm -rf '"${REMOTE_DIR}"' 2>/dev/null' 2>/dev/null
+  ssh ${REMOTE} 'PID=$(cat /tmp/riscv-thoughts-multinode-remote.'"${PORT}"'.pid 2>/dev/null); if [ -n "$PID" ]; then pkill -P "$PID" 2>/dev/null; kill "$PID" 2>/dev/null; fi; rm -rf '"${REMOTE_DIR}"' 2>/dev/null' 2>/dev/null || true
   if [ -n "${SSH_PID:-}" ]; then
-    wait "${SSH_PID}" 2>/dev/null
+    wait "${SSH_PID}" 2>/dev/null || true
   fi
+  exit "$rc"
 }
 trap cleanup EXIT
 
@@ -110,14 +113,6 @@ tar -czf - --exclude='__pycache__' --exclude='*.pyc' --exclude='tests' \
 # Spawn the remote 48-worker pool. datagen forks the workers and
 # interleaves their output over netcat to us. Generation is infinite;
 # the local --count bound (below) drives shutdown.
-EXTRA_ARGS="--inject-invalid ${INJECT_INVALID}"
-if [ -n "${INJECT_EQUIV}" ]; then
-  EXTRA_ARGS="${EXTRA_ARGS} --inject-equiv ${INJECT_EQUIV}"
-fi
-if [ -n "${CHAIN_RATE}" ]; then
-  EXTRA_ARGS="${EXTRA_ARGS} --chain-rate ${CHAIN_RATE}"
-fi
-
 ssh ${REMOTE} "bash ${REMOTE_DIR}/scripts/multinode_remote.sh \
     ${REMOTE_DIR} ${REMOTE_PYTHON} ${PORT} \
     --gen-count ${REMOTE_GEN} \
@@ -125,8 +120,7 @@ ssh ${REMOTE} "bash ${REMOTE_DIR}/scripts/multinode_remote.sh \
     --batch-size ${BATCH_SIZE} \
     --twins ${TWINS} --n-states ${N_STATES} \
     --anchor-seed ${ANCHOR_SEED} --seed ${GEN_SEED} \
-    --config ${CONFIG} \
-    ${EXTRA_ARGS}" &
+    --config ${CONFIG}" &
 SSH_PID=$!
 
 # Wait for remote workers to start and nc to begin listening.
@@ -146,5 +140,4 @@ ${PYTHON} -m datagen \
     --twins ${TWINS} --n-states ${N_STATES} \
     --anchor-seed ${ANCHOR_SEED} --seed ${GEN_SEED} \
     --config ${CONFIG} \
-    --count ${TOTAL} \
-    ${EXTRA_ARGS} </dev/null
+    --count ${TOTAL} </dev/null

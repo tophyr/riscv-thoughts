@@ -161,6 +161,21 @@ class TestGenRules:
         assert 'Unknown rule component' in err and 'frobnicate' in err, err
         assert len(out) == 0
 
+    def test_no_cli_override_for_a_corpus_rate(self):
+        """A corpus is defined by its config file alone. Each rate below
+        once had a CLI override, and `--inject-invalid` was passed
+        unconditionally by both generation wrappers, so a config declaring
+        `invalidity.rate: 0.2` produced a clean corpus instead. The flags are
+        gone; re-adding one re-opens that gap between a config and what it
+        generates."""
+        for flag in ('--chain-rate', '--inject-equiv', '--inject-invalid'):
+            out, err, rc = run([
+                PYTHON, '-m', 'datagen', '--batch-size', '4',
+                '--rule', 'cap=2', '--twins', '0', '--n-states', '4',
+                flag, '0.5'])
+            assert rc != 0, f'{flag} must not be accepted'
+            assert 'unrecognized arguments' in err, err
+
 
 class TestCount:
     """`--count N` (folded in from the retired batch_slice): emit exactly N
@@ -463,6 +478,33 @@ def _train_t2(tmp, t1_enc, name='t2', extra_args=()):
     assert rc == 0, f'T2 train failed: {err}'
     assert (Path(run_dir) / 't2.pt').exists(), f'no t2.pt in {run_dir}'
     return Path(run_dir)
+
+
+class TestCorpusRecord:
+    """`record_corpus.py` is how a run says what it trained on: hparams.json
+    is the trainer's own arguments and the trainer never sees the generator,
+    so without this a run is identified by its directory name alone."""
+
+    def test_records_the_config_contents_not_just_its_path(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / 'a_run'
+            out, err, rc = run([
+                PYTHON, 'scripts/record_corpus.py', str(run_dir),
+                '--config', 'configs/instr_alu_writers_chain010.json',
+                '--rule', 'cap=2', '--twins', '2', '--batch-size', '128',
+                '--n-states', '8', '--anchor-seed', '0', '--gen-seed', '7',
+                '--count', '1000'])
+            assert rc == 0, err
+            rec = json.loads((run_dir / 'corpus.json').read_text())
+        # the contents travel with the run, so editing the config file later
+        # cannot change what the run claims to have trained on
+        assert rec['config']['chain']['rate'] == 0.10
+        assert rec['config_path'].endswith('instr_alu_writers_chain010.json')
+        # and the knobs that live OUTSIDE the config file are recorded too
+        assert (rec['rule'], rec['gen_seed'], rec['count']) == ('cap=2', 7, 1000)
+        # anchor seed + count, so INVARIANT 1 is checkable after the fact
+        assert (rec['anchor_seed'], rec['n_states']) == (0, 8)
 
 
 class TestTraining:

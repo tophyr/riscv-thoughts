@@ -243,21 +243,20 @@ def test_chain_rate_raises_composed_density_without_moving_opcodes():
         assert abs(base_ops[op] / nb - hi_ops[op] / nh) < 0.02, op
 
 
-def test_chain_rate_comes_from_the_config_and_cli_overrides_it():
-    """`chain.rate` follows the pattern `equivalences.rate` and
-    `invalidity.rate` already set: the config carries the corpus's own value
-    and the CLI flag overrides it for a sweep."""
+def test_every_augmentation_rate_comes_from_the_config_alone():
+    """A corpus is ONE reviewable file. `chain.rate`, `equivalences.rate` and
+    `invalidity.rate` are read from the config and nothing else can set them,
+    which is what makes the config a run copies into its directory
+    (scripts/record_corpus.py) a complete description of what it trained on."""
     from datagen.generate import load_distribution, validate_distribution
-    d = load_distribution('configs/instr_alu_writers_chained.json')
+    d = load_distribution('configs/instr_alu_writers_chain010.json')
     assert d['chain']['rate'] == 0.10
-    # the resolution the worker performs
-    for cli, want in ((None, 0.10), (0.5, 0.5), (0.0, 0.0)):
-        eff = cli if cli is not None else d.get('chain', {}).get('rate', 0.0)
-        assert eff == want
+    validate_distribution(dict(d))
     # a corpus with no chain block chains nothing
     plain = load_distribution('configs/instr_alu_writers.json')
     assert plain.get('chain', {}).get('rate', 0.0) == 0.0
-    validate_distribution(dict(d))
+    assert plain.get('equivalences', {}).get('rate', 0.0) == 0.0
+    assert plain.get('invalidity', {}).get('rate', 0.0) == 0.0
 
 
 def test_chain_config_block_is_validated():

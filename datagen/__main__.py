@@ -150,15 +150,15 @@ def _build_batches_iter(cfg, seed):
         validate_distribution(dist)
     opcode_table = build_opcode_table(dist)
 
+    # Every augmentation rate comes from the config and from nowhere else:
+    # a corpus is defined by one reviewable file, so a run's corpus can be
+    # reproduced from the config it names (scripts/record_corpus.py copies it
+    # into the run directory).
     eq_cfg = dist.get('equivalences', {})
-    eq_rate = (cfg.inject_equiv if cfg.inject_equiv is not None
-               else eq_cfg.get('rate', 0.0))
-    chain_cfg = dist.get('chain', {})
-    chain_rate = (cfg.chain_rate if cfg.chain_rate is not None
-                  else chain_cfg.get('rate', 0.0))
+    eq_rate = eq_cfg.get('rate', 0.0)
+    chain_rate = dist.get('chain', {}).get('rate', 0.0)
     inv_cfg = dist.get('invalidity', {})
-    inv_rate = (cfg.inject_invalid if cfg.inject_invalid is not None
-                else inv_cfg.get('rate', 0.0))
+    inv_rate = inv_cfg.get('rate', 0.0)
     inv_types = inv_cfg.get('types', DEFAULT_TYPE_WEIGHTS)
 
     invalid_provider = None
@@ -480,7 +480,6 @@ class _GenCfg:
     """Plain container of generation params handed to each forked worker.
     (Picklable-irrelevant under fork, but kept simple and primitive anyway.)"""
     __slots__ = ('rule', 'batch_size', 'twins', 'n_states', 'anchor_seed',
-                 'inject_invalid', 'inject_equiv', 'chain_rate',
                  'max_invalid_window',
                  'config', 'worker_log_every')
 
@@ -490,9 +489,6 @@ class _GenCfg:
         self.twins = args.twins
         self.n_states = args.n_states
         self.anchor_seed = args.anchor_seed
-        self.inject_invalid = args.inject_invalid
-        self.inject_equiv = args.inject_equiv
-        self.chain_rate = args.chain_rate
         self.max_invalid_window = args.max_invalid_window
         self.config = args.config
         self.worker_log_every = args.worker_log_every
@@ -517,23 +513,17 @@ def main():
                    help='Anchor states for value-prediction / aux precompute.')
     g.add_argument('--anchor-seed', type=int, default=0,
                    help='Anchor-states RNG seed (must match the trainer).')
-    g.add_argument('--inject-invalid', type=float, default=None,
-                   help='Invalid-window injection rate. Overrides config.')
-    g.add_argument('--chain-rate', type=float, default=None,
-                   help='Override the config\'s chain.rate. Fraction of chunks '
-                        'rewritten so each instruction '
-                        'reads its predecessor\'s result. A uniform register '
-                        'draw composes only ~4.7%% of two-instruction chunks, '
-                        'and the cells pairing composition with an immediate '
-                        'carry most of T2\'s value-prediction error. Opcodes '
-                        'are untouched, so the config\'s opcode distribution '
-                        'is unchanged. 0 = draw registers freely.')
-    g.add_argument('--inject-equiv', type=float, default=None,
-                   help='Post-chunk MANIFEST equivalence rate. Overrides config.')
     g.add_argument('--max-invalid-window', type=int, default=32,
                    help='Token-length cap on injected invalid windows.')
+    # The corpus's composition — opcode mix, exclude_x0_dest, and the
+    # equivalence / invalidity / chain rates — lives here and ONLY here. There
+    # is deliberately no CLI override for any of those rates: a corpus is one
+    # reviewable file, which is what lets a run record what it trained on
+    # (scripts/record_corpus.py).
     g.add_argument('--config', type=str, default=None,
-                   help='JSON config: opcode mix + equivalences + invalidity.')
+                   help='JSON corpus config: opcode mix + exclude_x0_dest + '
+                        'equivalences / invalidity / chain rates. Unset: the '
+                        'built-in DEFAULT_DISTRIBUTION.')
 
     # Pool + mux flags.
     pool = p.add_argument_group('pool / mux')

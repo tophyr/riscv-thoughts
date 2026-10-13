@@ -534,9 +534,9 @@ right to separate them. `out_pcs` is computed by the oracle and only a
 It is also consistent with the loss. vp is not a pairwise objective: two chunks
 computing the same function have the same vp target, but nothing pushes their
 essences together, and two distinct points can both predict correctly. The same
-reasoning is already recorded for why `--inject-equiv` failed. What is new is
-that the gap is total rather than partial — 0.9× separation, not a loose
-collapse.
+reasoning is already recorded for why injecting manifest equivalents into the
+corpus failed. What is new is that the gap is total rather than partial —
+0.9× separation, not a loose collapse.
 
 A composed slot keeps the two instructions' immediates separately rather than
 folding them into one composite, which is the same fact seen from the other
@@ -1058,9 +1058,10 @@ the gradient from the same rare rows, where generation supplies new ones.
 of dataflow-composed chunks cuts the error by a third to a half — replicated.**
 A uniform register draw composes only ~4.7% of two-instruction chunks, and the
 self-referential immediate chains that carry most of the error are ~0.1% of rows
-(finding 28). `--chain-rate R` rewrites that fraction of chunks so each
-instruction reads its predecessor's result, leaving every opcode untouched,
-which lifts composed chunks to 53% of rows at R=0.5 and both-additive chains
+(finding 28). A corpus config's `chain.rate` R rewrites that fraction of
+chunks so each instruction reads its predecessor's result, leaving every
+opcode untouched, which lifts composed chunks to 53% of rows at R=0.5 and
+both-additive chains
 14×. Cells at the adopted config over the same frozen T1, 1M steps, all graded
 on a NATURALLY drawn corpus so only the training mix differs:
 
@@ -1219,8 +1220,9 @@ GVN rows is a regression).
 - **Diagnosis before architecture.** Round 2's probes found in hours what Round
   1's ten training runs did not.
 - **Every sweep carries a null intervention** — the same configuration trained
-  twice on separately generated corpora. Without it no row is interpretable; at
-  these run lengths it costs ~35 minutes.
+  twice on separately generated corpora. Without it no row is interpretable; a
+  len=2 cell at 1M steps costs ~2 hours of GPU time (7 ms/step solo, 11 ms/step
+  each when two cells share the device).
 - **Run the null on the arm under test — floors do not generalise between
   cells.** Two configurations here differ 20× in their own run-to-run spread
   (0.0026 against 0.0553, finding 25), so a floor borrowed from a quiet cell
@@ -1306,11 +1308,12 @@ produced the number; recover it from git history to re-measure one.
   The pool cannot see `content`, so it must use any channel unconditionally;
   that is the reason, and it does **not** extend to content-conditioned
   consumers such as the op-cell.
-- **Injecting commutative equivalents (`--inject-equiv`) to train the
-  invariance.** Worse, not better: on genuinely-equivalent pairs 0.0110 →
-  0.0235 and separation 119× → 54×, with vp 0.0082 → 0.0252. Nothing in the loss
-  ties an injected variant's essence to its base, so it adds correlated rows
-  while reducing effective diversity. Partially confounded — the injected rows
+- **Injecting commutative equivalents (a corpus config's `equivalences.rate`)
+  to train the invariance.** Worse, not better: on genuinely-equivalent pairs
+  0.0110 → 0.0235 and separation 119× → 54×, with vp 0.0082 → 0.0252. Nothing
+  in the loss ties an injected variant's essence to its base, so it adds
+  correlated rows while reducing effective diversity. Partially confounded —
+  the injected rows
   displace others, so that run saw 545 instructions per batch against 768 — but
   the direction is unambiguous.
 - **More training as a fix for commutative collapse.** 250k → 1M moves it 0.0426
@@ -1345,10 +1348,11 @@ certify, and the noise floors every comparison here is measured against.
    definition, and it gates whether the milestone is reachable at all.
 
 2. **Folding a chain's literals in the op-cell** is the one intervention the
-   measurements point at, and it is TODO task 2's mechanism rather than a
-   separate lever: handed the composite, a readout on the same essence goes
-   from 79.80% to 99.95% (finding 21). What is unsettled is the objective that
-   would produce the fold, and what it costs the discriminative rows.
+   measurements point at, and it is the mechanism of the equivalence-collapse
+   task (TODO task 3) rather than a separate lever: handed the composite, a
+   readout on the same essence goes from 79.80% to 99.95% (finding 21). What is
+   unsettled is the objective that would produce the fold, and what it costs
+   the discriminative rows.
 
 3. **Decoder + reconstruction loss** — the standing untried lever for goal 2.
 4. **Everything after the Round-1 sweep is len=2 only.** In particular,

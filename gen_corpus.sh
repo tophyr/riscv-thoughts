@@ -22,9 +22,13 @@
 #   TWINS           (default 3)
 #   N_STATES        (default 8)
 #   RULE            (default 'branch+cap=8' — T2 chunks)
-#   CONFIG          (default configs/instr_t2.json)
-#   INJECT_INVALID  (default 0 — clean corpus)
-#   INJECT_EQUIV    (default unset — uses config's equivalences.rate)
+#   CONFIG          (REQUIRED — the corpus config. A corpus is defined by
+#                    that one file: opcode mix, exclude_x0_dest, and the
+#                    equivalence / invalidity / chain rates. No default, and
+#                    no env override for any rate.)
+#   ANCHOR_SEED     (default 0 — MUST equal the --anchor-seed of whatever
+#                    trainer eventually consumes this corpus, else the
+#                    value_predict targets silently mismatch, INVARIANT 1.)
 
 set -euo pipefail
 
@@ -41,9 +45,8 @@ BATCH_SIZE=${BATCH_SIZE:-128}
 TWINS=${TWINS:-3}
 N_STATES=${N_STATES:-8}
 RULE=${RULE:-branch+cap=8}
-CONFIG=${CONFIG:-configs/instr_t2.json}
-INJECT_INVALID=${INJECT_INVALID:-0}
-INJECT_EQUIV=${INJECT_EQUIV:-}
+CONFIG=${CONFIG:?set CONFIG to a corpus config under configs/ — a corpus is one reviewable file, and there is no default}
+ANCHOR_SEED=${ANCHOR_SEED:-0}
 
 mkdir -p "$(dirname "$OUT")"
 
@@ -51,13 +54,10 @@ mkdir -p "$(dirname "$OUT")"
 # 8*ncpus arenas per worker and clear_page_erms dominates wall time.
 export MALLOC_ARENA_MAX=2
 
-EXTRA=( --inject-invalid "$INJECT_INVALID" )
-if [ -n "$INJECT_EQUIV" ]; then
-    EXTRA+=( --inject-equiv "$INJECT_EQUIV" )
-fi
 # WORKERS unset → datagen defaults to all CPU cores. Set it to override.
+WORKER_ARGS=()
 if [ -n "$WORKERS" ]; then
-    EXTRA+=( --gen-count "$WORKERS" )
+    WORKER_ARGS=( --gen-count "$WORKERS" )
 fi
 
 # datagen --count emits exactly TOTAL batches then reaps the pool.
@@ -65,7 +65,8 @@ fi
     --rule "$RULE" \
     --batch-size "$BATCH_SIZE" \
     --twins "$TWINS" --n-states "$N_STATES" \
+    --anchor-seed "$ANCHOR_SEED" \
     --config "$CONFIG" \
     --count "$TOTAL" \
-    "${EXTRA[@]}" \
+    "${WORKER_ARGS[@]}" \
     </dev/null > "$OUT"   # pure generator — don't auto-mux an inherited stdin

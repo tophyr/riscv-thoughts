@@ -7,9 +7,10 @@ compressor.train.train_encoder; saves encoder.pt + hparams.json
 + losses.json into a run directory.
 
 Usage:
-    python -m datagen --rule branch+cap=8 --twins 3 --inject-invalid 0.1 \\
+    python -m datagen --rule single --twins 2 --batch-size 128 --n-states 8 \\
+        --anchor-seed 0 --config configs/instr_alu_writers.json \\
         --count 50000 \\
-        | train_encoder.py --n-steps 50000
+        | train_encoder.py --n-steps 50000 --anchor-seed 0 --n-anchor-states 8
 """
 
 import argparse

@@ -118,9 +118,12 @@ score is the essence composed with a readout that has to EVALUATE it — nothing
 in the encoder ever sees a register value, so a slot describes a function rather
 than holding a number. At two instructions the limit is the training corpus
 rather than the architecture: chunks where one instruction consumes another's
-result are ~5% of a randomly drawn corpus and the hardest shapes a fraction of a
-percent, so generating more of them carries overall exact match from 99.83% to
-99.90% with nothing about the model changed.
+result are ~5% of a randomly drawn corpus and the hardest shapes a fraction of
+a percent, so generating more of them — a composed-chunk rate of 0.10 over
+twice the step budget — carries overall exact match from 99.83% to 99.94% with
+nothing about the model changed. Density and budget are one choice rather than
+two: at a fixed budget, raising the rate buys the composed chunks by spending
+the common ones.
 
 *Equivalence.* Two instruction sequences that compute the same function must
 compress to the same point — that is the framework's definition of meaning, and

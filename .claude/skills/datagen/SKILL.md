@@ -59,33 +59,15 @@ python -m datagen --gen-count 0`.)
 `datagen` defaults to all cores; bound the run with `--count N`.
 Generation flags are first-class — there is no `--` separator.
 
-The commands below run generation LOCALLY — correct for smoke tests and quick
-runs. **For a real training run on the GPU box, front the trainer with
-`multinode_gen.sh` instead** so generation lands on odin and does not starve the
-GPU (see "Multinode / remote generation" — same generation flags via env vars,
-same `| trainer` tail). Swap `python -m datagen … --count N` for
-`<env-knobs> ./multinode_gen.sh N`.
-
-T1 (single-instruction encoder):
-```bash
-python -m datagen --rule single --twins 2 --batch-size 128 \
-    --n-states 8 --anchor-seed 0 --config configs/instr_default.json \
-    --count 250000 \
-  | python scripts/train_encoder.py --d-model 128 --n-heads 4 --n-layers 2 \
-    --d-out 64 --max-window 32 --n-steps 250000 --out-dir t1_run
-```
-
-T2 (chunk encoder on a frozen T1):
-```bash
-python -m datagen --rule "branch+cap=4" --twins 3 --batch-size 128 \
-    --n-states 8 --anchor-seed 0 --config configs/instr_t2.json \
-    --count 2000000 \
-  | python scripts/train_t2_encoder.py --t1-model runs/t1_run/encoder.pt \
-    --d-out 512 --d-event 16 --route binding \
-    --n-steps 2000000 --anchor-seed 0 --n-anchor-states 8 --out-dir t2_run
-```
-`--count 2000000` emits exactly that many batches then closes stdout and reaps
-the whole worker pool.
+Two cells are the whole catalogue: the T2 cell below ("Current T2 config") and
+the T1 cell after it ("T1 config"). Both run generation LOCALLY, which is
+correct for a smoke test or a quick run. **For a real training run on the GPU
+box, front the trainer with `multinode_gen.sh` instead** so generation lands on
+odin and does not starve the GPU (see "Multinode / remote generation" — same
+generation flags as env vars, same `| trainer` tail): swap
+`python -m datagen … --count N` for `<env-knobs> ./multinode_gen.sh N`.
+`--count N` emits exactly N batches, then closes stdout and reaps the whole
+worker pool.
 
 `--n-steps` only shapes the cosine-LR schedule and the ETA display — it is NOT a
 hard step cap. Training runs until stdin EOF (`scripts/_common.py:30-34`). Bound
@@ -109,9 +91,12 @@ is a real gain and 512 → 1024 buys nothing at any training budget measured, at
 2.6x the step time (EXPERIMENT_LOG, "T2 faithfulness", finding 17).
 
 `scripts/run_t2.sh` runs exactly this cell with each knob as an env var
-(`DOUT`, `LEN`, `STEPS`, `NPOOL`, …, and `T1` for the frozen lower tier), names
-the run directory after them, offloads generation to odin, and scores the
-result. `TAG=<name>` suffixes the run directory so a re-run of an
+(`DOUT`, `LEN`, `STEPS`, `NPOOL`, …, `T1` for the frozen lower tier and
+`CONFIG` for the corpus), names the run directory after them, offloads
+generation to odin, records the corpus, and scores the result. The directory
+ends in the config's name with the `instr_` prefix dropped
+(`…_pool16_alu_writers`), so two corpus arms of one configuration cannot
+collide; `TAG=<name>` additionally suffixes it so a re-run of an
 already-recorded cell does not overwrite it. Prefer it to typing the pipeline by
 hand — but **never edit it while a copy is running**: bash reads a script
 incrementally, so an edit shifts the file offsets under the running shell. Doing
@@ -180,19 +165,20 @@ do not restate them here.
 - Components join with `+` and compose via `either()` (terminate when ANY fires).
 - **A bare `branch` or `transform` (no `cap=`) is rejected eagerly** — it can
   build an unbounded chunk. Error says "unbounded … add a cap". Validated in the
-  PARENT before forking (`datagen/__main__.py:582-586` calls `_parse_rule`) and
+  PARENT before forking (`datagen/__main__.py:586-592` calls `_parse_rule`) and
   again in `collect_groups` via `rule.max_len is None` (`datagen/generate.py:742`).
 
 Generation flags (per worker, first-class — NO `--` separator; defaults in
-parens, from the argparse block at `datagen/__main__.py:503-521`): `--rule`
+parens, from the argparse block at `datagen/__main__.py:505-527`): `--rule`
 (`branch+cap=8`), `--twins T` (3 — relabeled equivalents per valid source
 chunk), `--batch-size B` (128 — source rows; twins extend the batch beyond B),
-`--n-states` (8 — anchor count), `--anchor-seed` (0), `--inject-invalid R`
-(unset → config), `--inject-equiv R` (unset → config), `--chain-rate R` (unset → config's
-`chain.rate`), `--max-invalid-window`
-(32), `--config PATH` (unset → `DEFAULT_DISTRIBUTION`), `--seed` (0; worker i
-gets seed+i). CLI flags override the JSON config's `equivalences.rate` /
-`invalidity.rate`. There is **no
+`--n-states` (8 — anchor count), `--anchor-seed` (0), `--max-invalid-window`
+(32 — the token-length cap on an injected invalid window), `--config PATH`
+(unset → the built-in `DEFAULT_DISTRIBUTION`), `--seed` (0; worker i
+gets seed+i). **A corpus's composition is settable only in the config file**:
+the opcode mix, `exclude_x0_dest`, and the `equivalences` / `invalidity` /
+`chain` rates have no CLI override, so the file a run names describes the
+corpus completely. There is **no
 `--n-batches`** — generation is infinite; bound the total with `--count N`.
 
 Pool / mux flags: `--gen-count N` (default = all CPU cores; `0` = pure mux of the
@@ -264,43 +250,79 @@ cmdline).
 
 ## Configs (configs/*.json)
 
-Opcode-category mix (weights must sum to 1.0) + optional `equivalences`,
-`invalidity`, `chain`, and `exclude_x0_dest`. Validation: `datagen/generate.py:160`
+**A config file IS a corpus definition, and nothing outside it can change
+one.** It carries the opcode-category mix (weights must sum to 1.0) plus the
+optional `equivalences`, `invalidity`, `chain` and `exclude_x0_dest` keys, and
+no CLI flag or env var overrides any of them. So a sweep over corpus
+composition is a file per arm — each arm reviewable in a diff, and each run
+able to record what it was trained on (see "What a run records about its
+corpus"). Validation: `datagen/generate.py:160`
 `validate_distribution`; the accepted non-opcode keys are `_CONFIG_EXTRA_KEYS`
 (`datagen/generate.py:155`) and an unknown key is a hard error.
+
+Three configs exist. Add one when a run needs a corpus none of them describes,
+and delete it once nothing runs it — an unused config is a corpus nobody can
+attribute a result to.
+
 - `instr_alu_writers.json` — **the corpus all current work uses.**
   R/I-type ALU only (0.55 / 0.45) + `exclude_x0_dest: true`. No equivalences,
   no invalidity → a clean, all-valid, always-register-writing corpus. Every
   chunk is pure ALU, so `cap=N` and `branch+cap=N` behave identically here and
   the scripts use plain `cap=N`.
-- `instr_alu_writers_chained.json` — the same, plus `chain: {rate: 0.10}`.
+- `instr_alu_writers_chain010.json` — the same, plus `chain: {rate: 0.10}`.
   A uniform register draw leaves only ~4.7% of two-instruction chunks with the
   second reading the first's result, and that scarcity — not any architectural
   limit — is what held the composed-slot value prediction down (EXPERIMENT_LOG,
   "T2 faithfulness", finding 30). `chain.rate` rewrites that fraction of chunks
   so each instruction reads its predecessor's result, leaving every opcode
   untouched, which lifts composed chunks to roughly `rate + (1-rate)*0.047` of
-  rows. A no-op on single-instruction rules. Override per run with
-  `--chain-rate` / `CHAIN_RATE`, exactly as `--inject-equiv` overrides
-  `equivalences.rate`.
-- `instr_default.json` — T1 mix; equivalences rate 0.05; **invalidity rate 0.2**.
-- `instr_t2.json` — T2 mix (ALU-heavy, few branches/mem); equivalences only.
-- `instr_no_inject.json` — opcode mix only, no augmentation.
-- `instr_no_mem.json` — excludes LOAD/STORE (no mem-op chunks at all).
-- `instr_branch_heavy.json` — 50% branches.
+  rows (counted over 20 batches of `cap=2`: 4.8% of rows composed at rate 0,
+  15.4% at rate 0.10). A no-op on single-instruction rules. The rate is in the
+  filename because another rate is another file.
+- `instr_r_only.json` — R-type ALU only, so no chunk carries an immediate.
+  Three probes generate from it (`vp_slot_b_split.py`,
+  `opcell_rank_sufficiency.py`, `vp_superposition.py`); it is a probe corpus,
+  not a training one, and a category scored on it says nothing about an
+  immediate (METRICS.md, scope conditions).
 
-`exclude_x0_dest: true` narrows the **rd** pool to x1..x31 (`datagen/__main__.py:170`
+`exclude_x0_dest: true` narrows the **rd** pool to x1..x31 (`datagen/__main__.py:173`
 → `dest_regs=range(1,32)`, consumed at `datagen/generate.py:86`), so every
 generated instruction actually writes a register — no write-to-x0 NOPs. It does
 NOT touch the source pool: rs1/rs2 still draw from x0..x31 (`_SRC_REGS`,
-`datagen/generate.py:41`), so x0-as-operand still occurs. There is no CLI flag
-for it; it is config-only.
+`datagen/generate.py:41`), so x0-as-operand still occurs.
 
 Invalid-window types (`datagen/invalidity.py`): `partial` (sub-slice of one
 instr), `spanning` (crosses an instr boundary mis-aligned), `multi` (2–3 whole
 instrs concatenated), `bogus` (random vocab tokens). The encoder learns to map
 these near the origin (low magnitude); valid windows sit near the unit sphere.
-`--inject-invalid 0` overrides the config to produce a CLEAN corpus.
+A corpus with no `invalidity` block injects none, which is what makes the
+writers corpora clean.
+
+## What a run records about its corpus
+
+A run directory carries `hparams.json` — `vars(args)` of the TRAINER, which
+never sees the generator — so the model is recorded and the data is not.
+`scripts/record_corpus.py` writes the other half as `corpus.json`:
+
+```bash
+python scripts/record_corpus.py runs/<dir> --config configs/<corpus>.json \
+    --rule cap=2 --twins 2 --batch-size 128 --n-states 8 \
+    --anchor-seed 0 --gen-seed 0 --count 1000000
+```
+
+It copies the config's CONTENTS, not its path, so editing that file afterwards
+cannot change what the run claims to have trained on, and it records the knobs
+that live outside the config — rule, twins, batch size, anchor count and seed,
+instruction-stream seed, batch count. `run_t2.sh` calls it before the pipeline
+starts, so a run killed mid-training is still identified. A pipeline typed by
+hand should call it too; a run without a `corpus.json` can only be attributed
+by its directory name.
+
+Recording the anchor seed and state count on both sides is what makes
+INVARIANT 1 (CLAUDE.md) checkable after the fact: compare `corpus.json`'s
+`anchor_seed` / `n_states` against `hparams.json`'s `anchor_seed` /
+`n_anchor_states`, and if they disagree the run's value-prediction targets
+were wrong with no error raised at the time.
 
 ## Multinode / remote generation
 
@@ -315,28 +337,26 @@ Two different scripts — do not confuse them:
   cascade (local→nc→remote) reaps every worker. `REMOTE=chrissarbora@odin`.
   Worker split is `REMOTE_GEN` (default 96) / `LOCAL_GEN` (default **0**):
   local datagen contends with a local GPU trainer's per-step H2D prep and
-  starves the GPU — measured **~54% util / 16.6 ms/step with local gen, against
-  9 ms with generation offloaded**. So the default offloads EVERY worker to
-  odin; bump `LOCAL_GEN>0` only for a pure on-disk corpus with no local trainer.
-  Judge saturation by GPU utilisation, with ms/step against the same config's
-  known-good figure as a floor check.
+  starves the GPU — measured **~54% util / 16.6 ms/step with local gen**
+  against **96–97% util / 7 ms/step with every worker on odin**, at the adopted
+  len=2 cell (`--d-out 512`, op-cell depth 4, 16 pool heads). So the default
+  offloads EVERY worker to odin; bump `LOCAL_GEN>0` only for a pure on-disk
+  corpus with no local trainer. Judge saturation by GPU utilisation, with
+  ms/step against the same config's known-good figure as a floor check, and
+  re-measure both whenever the cell's configuration changes — a figure from one
+  configuration says nothing about another.
 
-  **Offloading generation does not by itself saturate the GPU, and adding remote
-  workers will not either.** At len=2 the trainer's own per-step host work (RVT
-  parse, `_split_to_per_instruction`, `_t2_assemble`) is the constraint — it
-  does not overlap the GPU step, so utilisation sits near 40–50% with the
-  generators idle and backpressured. Measured at `REMOTE_GEN=120`: ~37% util,
-  odin at a load average of ~11 out of 128 cores, 20 MB/s over a ~118 MB/s link.
-  **Check odin's load before adding workers** — if it is low, generation is not
-  what is limiting you. TODO.md carries the diagnosis and the fix.
-  Other defaults: `RULE=single`, `CONFIG=configs/instr_default.json`,
-  `INJECT_INVALID=0` (clean corpus regardless of what the config says) — set
-  them explicitly for any T2 / writers-only run.
+  **Adding remote workers does not raise a rate the GPU is already setting.**
+  At `REMOTE_GEN=120`, odin sat at a load average of ~11 out of its 128 cores
+  with the generators backpressured, so when a cell runs slow, check odin's
+  load before adding workers: if it is low, generation is not what limits you.
+  `RULE` defaults to `single`; `CONFIG` is REQUIRED and the script exits
+  without it, because a corpus is one named file.
   `ANCHOR_SEED` (default 0) is passed to BOTH pools and MUST equal the trainer's
   `--anchor-seed` (INVARIANT 1 — mismatch silently corrupts value_predict
   targets). Pipe it straight to a trainer:
   ```bash
-  RULE="branch+cap=4" CONFIG=configs/instr_t2.json ./multinode_gen.sh 2000000 \
+  RULE="cap=2" CONFIG=configs/instr_alu_writers.json ./multinode_gen.sh 2000000 \
     | python scripts/train_t2_encoder.py --t1-model runs/t1_run/encoder.pt \
       --d-out 512 --d-event 16 --route binding --n-steps 2000000 \
       --anchor-seed 0 --n-anchor-states 8 --out-dir t2_run
@@ -345,13 +365,13 @@ Two different scripts — do not confuse them:
   its header comment mentioning "remote", the script itself runs `datagen`
   LOCALLY** (`gen_corpus.sh`) and writes `OUT` on the local disk via
   `datagen … --count TOTAL > OUT`. "Remote" = the *intended usage* is to ssh
-  into odin and run it there; there is no auto-shipping. Defaults to T2
-  settings (`branch+cap=8`, `instr_t2.json`, no invalid injection); `WORKERS`
-  unset → all CPU cores.
+  into odin and run it there; there is no auto-shipping. `RULE` defaults to
+  `branch+cap=8` and `WORKERS` unset → all CPU cores; `CONFIG` is REQUIRED.
 
-Both override knobs via env vars: `BATCH_SIZE TWINS N_STATES RULE CONFIG
-INJECT_INVALID INJECT_EQUIV` (plus `ANCHOR_SEED REMOTE_GEN LOCAL_GEN PORT` for
-multinode_gen, and `WORKERS` for gen_corpus → `--gen-count`).
+Both take `BATCH_SIZE TWINS N_STATES RULE ANCHOR_SEED` as env vars and REQUIRE
+`CONFIG` (plus `GEN_SEED REMOTE_GEN LOCAL_GEN PORT` for multinode_gen, and
+`WORKERS` for gen_corpus → `--gen-count`). No env var sets an augmentation
+rate: those are the config's.
 
 ### Running two pipelines at once
 

@@ -71,11 +71,11 @@ slot at all and therefore no gradient whatsoever.
    and training budget over the same frozen T1 scores 19.52% on a
    two-immediate composed chain at the corpus's natural composition and ~97%
    when such chains are common. What remains is the (rate, steps) choice
-   (task 3) and whatever sits below ~99.94%.
+   (task 2) and whatever sits below ~99.94%.
 
 2. **Computed equivalents collapse at len=2.** Chunks computing the same
    function land as far apart as chunks computing different ones (Mission's
-   table). Task 2. **Settle it before chunks get longer**: every added
+   table). Task 3. **Settle it before chunks get longer**: every added
    instruction multiplies the equivalences a chunk participates in, so a len=4
    model would learn the same wrong geometry at four times the scale.
 
@@ -85,7 +85,7 @@ slot at all and therefore no gradient whatsoever.
    counter can know — so the len=2 mechanism may not transfer intact.
 
 4. **Beyond the happy path.** Everything above is writers-only (R/I-type ALU,
-   valid, non-x0). Then: no-write instructions (task 7), PC/branches, memory,
+   valid, non-x0). Then: no-write instructions (task 6), PC/branches, memory,
    longer and looser chunks. The vp metric itself needs strengthening here too —
    8 fixed anchors are not enough to certify a lossless description on a harder
    corpus (METRICS.md).
@@ -97,61 +97,19 @@ slot at all and therefore no gradient whatsoever.
 
 ## Open tasks
 
-Tasks 1 and 2 come first and are both housekeeping: the corpus is about to
-become an experimental variable, so its definition and its provenance have to be
-sound before more of it is generated, and the throughput figures every plan
-rests on need re-measuring. Task 3 then settles the faithfulness milestone and
-task 4 is required for the MVP. The rest are queued, not parallel work.
+Task 1 is housekeeping the rest rests on: the throughput figures every plan
+budgets against need re-measuring. Task 2 then settles the faithfulness
+milestone and task 3 is required for the MVP. The rest are queued, not parallel
+work.
 
-### 1. Fold the corpus knobs into config files and delete the flags
-
-**A corpus is currently defined partly by a config file and partly by env vars
-and CLI flags, and the two disagree.** Three separate problems:
-
-- **`--inject-equiv` is never passed in any default path.** Both generation
-  wrappers pass it only when `INJECT_EQUIV` is non-empty, and it defaults to
-  empty. Its only recorded use produced a refuted result (finding: injecting
-  equivalents made collapse worse). Delete the flag and its env plumbing.
-- **`--inject-invalid` is passed unconditionally, and silently overrides the
-  config.** Both wrappers set `INJECT_INVALID=${INJECT_INVALID:-0}` and always
-  pass it, so `configs/instr_default.json` declares `invalidity.rate: 0.2` and
-  the documented entry point delivers 0.0. Either make it opt-in — unset means
-  do not pass the flag, so the config is honoured — or move the clean-corpus
-  decision into the configs and drop the flag. As it stands a config file
-  misdescribes what it produces.
-- **`--chain-rate` should follow `exclude_x0_dest` and be config-only.** It
-  already reads `chain.rate` from the config; the CLI override exists only
-  because the other two augmentation rates have one, and both of those are
-  defects rather than precedent. A config per sweep arm is more friction and
-  strictly better provenance, since each arm becomes a reviewable file.
-
-**Then delete the configs nothing runs.** `instr_branch_heavy.json`,
-`instr_no_inject.json` and `instr_no_mem.json` are referenced only by the
-`datagen` skill's own catalogue of them — no script, probe or test uses any of
-the three. `instr_default.json` and `instr_t2.json` survive only as wrapper
-defaults that every real run overrides, so decide whether a default corpus
-should exist at all.
-
-**The reason this is first.** Corpus composition is now the main lever on the
-headline metric (task 3), so it is about to be varied deliberately and often.
-And a run records nothing about the corpus it trained on: `hparams.json` is
-`vars(args)` of the trainer, which never sees the generator's config, rule,
-twins or batch size. The seven T2 runs under `runs/` are identified by directory
-name alone — exactly the failure mode where a run's name and its configuration
-disagree. Decide where provenance lives before generating more corpora: a
-`corpus.json` written into the run directory by the launcher (cheap, bypassed by
-a hand-run pipeline), a trainer flag recording the config path (a label, not an
-observation), or the generator's effective configuration carried in the RVT
-stream so the trainer records what it actually received (heavier, and the only
-one that cannot lie).
-### 2. Get more throughput out of the hardware
+### 1. Get more throughput out of the hardware
 
 **A single training cell already saturates the GPU: 96–97% utilisation at
 7 ms/step** at the adopted len=2 configuration (`--d-out 512`, op-cell depth 4,
-16 pool heads) with generation offloaded to the remote worker pool. The
-host-side per-step preparation that once bound this — RVT parse, the
-per-instruction split, the frozen-T1 assembly — is no longer the constraint at
-this configuration, so there is no idle GPU to reclaim.
+16 pool heads) with generation offloaded to the remote worker pool. Host-side
+per-step preparation — RVT parse, the per-instruction split, the frozen-T1
+assembly — does not bound the step at this configuration, so there is no idle
+GPU to reclaim.
 
 That makes the available levers different ones, and none is measured:
 
@@ -165,11 +123,12 @@ That makes the available levers different ones, and none is measured:
   at, so each needs the null intervention of METRICS.md.
 - **A second device.** Generation already spans two machines; training does not.
 
-**Measure before changing anything.** The ~50% utilisation figure this task
-previously carried was true of an earlier configuration and is not true now, so
+**Measure before changing anything.** A utilisation or ms/step figure belongs
+to the cell configuration it was taken on and says nothing about another, so
 re-measure the solo and concurrent rates at the configuration about to be used
-and state them with their configuration (METRICS.md, scope conditions).
-### 3. Settle the composed-chain density and the step budget together
+and state them with that configuration (METRICS.md, scope conditions).
+
+### 2. Settle the composed-chain density and the step budget together
 
 **The len=2 residual is a corpus-density problem and the fix is measured; what
 is left is choosing the operating point.** Chunks where one instruction consumes
@@ -199,15 +158,17 @@ is a rate of 0.10 at 2M steps.
   number: a higher rate buys the composed cells, which is what a future T3
   consumes most of, at the cost of the common depth-1 cells and of aggregate
   points. One cell per candidate.
-- **Then adopt it** as a corpus config and remint — which needs task 1 done
-  first. It does not obviously move the frozen T1, whose chunks are single
-  instructions so a chain rate is a no-op there; confirm rather than assume.
+- **Then adopt it** by adding the rate's own config under `configs/` — one
+  file per arm, named for the rate, which is what a run copies into its
+  `corpus.json` — and remint against it. The rate does not obviously move the
+  frozen T1, whose chunks are single instructions so a chain rate is a no-op
+  there; confirm rather than assume.
 
 **Replication standard for this task:** two corpus draws at one rate spread
 0.021 points, against effects of 0.05–0.11. Any candidate pair needs its own
 draw-to-draw null, not one borrowed from another pair (METRICS.md).
 
-### 4. Collapse computed equivalences (milestone 2 — required for MVP)
+### 3. Collapse computed equivalences (milestone 2 — required for MVP)
 
 
 Two chunks computing the same function must land on the same point. They do not,
@@ -227,7 +188,7 @@ commutative swap — free because the pool is a multiset over register slots —
 sits at 117x. **At both tiers, an equivalence collapses when the architecture
 cannot represent the difference and otherwise does not.** Any fix has to be
 designed for T1 and T2 together: they are one class (`compressor/`), so a
-mechanism that works at T1 applies at T2 unchanged. It also means task 5's
+mechanism that works at T1 applies at T2 unchanged. It also means task 4's
 validity remint should not happen before this is settled, or T1 will be
 reminted without it.
 
@@ -235,10 +196,10 @@ reminted without it.
 place — the manifest in `datagen/generate.py` — and all 15 of its classes are
 single-instruction **rewrites**, one operation expressed another way
 (`template_instr_counts=[1]`). Everything built on that manifest inherits the
-limit: the `--inject-equiv` augmentation, `eval.py`'s commutative-swap row, and
-a pairwise equivalence loss the trainer carried until commit `7797c81`,
-recoverable from git history. A **fold** — where seeing the equivalence requires
-arithmetic on the operands — appears in none of them.
+limit: the corpus's `equivalences.rate` augmentation, `eval.py`'s
+commutative-swap row, and a pairwise equivalence loss the trainer carried until
+commit `7797c81`, recoverable from git history. A **fold** — where seeing the
+equivalence requires arithmetic on the operands — appears in none of them.
 
 **Start at identity recognition.** It is the best-defined target in either task,
 it isolates "untrained" from "cannot compute", and one capability surfaces in
@@ -252,7 +213,7 @@ three places:
 - T1's binding, and hence T2's vp: every `dest` misprediction measured is an
   instruction the oracle says modifies nothing, i.e. T1 predicting a write for
   `ADD x5,x5,x0`. That is 6.2% of T2's remaining vp error, arriving through
-  task 5's tier interface rather than through anything T2 does.
+  task 4's tier interface rather than through anything T2 does.
 
 It is not a weighting problem — T1's binding is otherwise accurate against the
 oracle. It is a missing capability: knowing that `+x0`, `+0`, `|0`, `^0` and
@@ -267,26 +228,27 @@ Decisions to make before building, in order:
 - **Essence or op-cell?** The measured distances are essence distances, but the
   composite is formed one step earlier, when the second instruction's op-cell
   reads the slot the first wrote. A cell that computed `i1+i2` there would
-  collapse the pair before any pooling — and would fix task 3, which an
+  collapse the pair before any pooling — and would fix task 2, which an
   essence-level term alone would not.
 - **What is the objective?** A pairwise term over generated equivalent pairs is
   the obvious candidate, and nothing in the loss is pairwise today — that was a
-  deliberate choice, and undoing it is the decision. `--inject-equiv` is a
-  recorded failure at buying collapse with data alone. The manifest would also
-  need multi-instruction classes, which means generating folds rather than
-  rewrites.
+  deliberate choice, and undoing it is the decision. Injecting manifest
+  equivalents into the corpus (`equivalences.rate`) is a recorded failure at
+  buying collapse with data alone. The manifest would also need
+  multi-instruction classes, which means generating folds rather than rewrites.
 - **What does it cost?** Every collapse gain so far has traded against
   discriminativeness, and a term that pulls equivalents together can pull
   inequivalents together too. The guard is `behav-diff` (METRICS.md), which must
   stay large.
 
-### 5. Give T1 a validity task
+### 4. Give T1 a validity task
 
 
 The frozen T1 (`runs/t1_writers_250k_rank`) is a diagnostic trained on a clean
-corpus (`--inject-invalid 0`), so it has no validity task and cannot reject
-invalid input. That is the only remaining gap between it and a production T1: it
-trains against the corrected oracle, at the core's settled settings, with the
+corpus (`configs/instr_alu_writers.json`, which declares no `invalidity`
+block), so it has no validity task and cannot reject invalid input. That is the
+only remaining gap between it and a production T1: it trains against the
+corrected oracle, at the core's settled settings, with the
 `rd==x0` immediate mask applied (`compressor/train.py:275`), and its
 single-instruction vp is a 100.0000% exact 32-bit match
 (`probes/t1_scorecard.py`). Needed before anything leaves the happy path.
@@ -304,7 +266,7 @@ the binding as its WIRING, so the tier interface is optimised at a tenth of the
 priority of the essence. T1 is nonetheless accurate against the oracle's
 binding, so this is a thing to check, not a known deficit.
 
-### 6. The anchor states are unstructured, and branches will need them to be
+### 5. The anchor states are unstructured, and branches will need them to be
 
 
 `make_anchor_states` (`datagen/compare.py:319`) draws pure uniform int32 with
@@ -324,7 +286,7 @@ reminces the frozen T1 and invalidates every vp number measured against the old
 states (CLAUDE.md INVARIANT 1: the generator's and trainer's anchor seed and
 count must match).
 
-### 7. No-write instructions are invisible to the essence
+### 6. No-write instructions are invisible to the essence
 
 
 Blocks milestone 4 (~⅓ of the ISA). Content reaches the essence only through a
@@ -354,10 +316,10 @@ them:
   no PC target at all. `out_pcs` is computed and only a `pc_writes` boolean is
   shipped, so this would mean widening the RVT batch.
 - **PC advance does not count.** Then those chunks are equivalent and the 0.1041
-  is a collapse failure, which puts it in task 4.
+  is a collapse failure, which puts it in task 3.
 
 Deferred deliberately: it is a definition, not an experiment, and it should be
-settled before either task 4 builds a collapse objective or this task ships a
+settled before either task 3 builds a collapse objective or this task ships a
 PC-effect target — each would bake in an answer.
 
 ## Long horizon

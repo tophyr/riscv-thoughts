@@ -3,6 +3,7 @@
 # config as its default, so a cell is named by what it changes:
 #
 #   LEN=2 STEPS=1000000 GEN_SEED=7 TAG=s7 bash scripts/run_t2.sh
+#   CONFIG=configs/instr_alu_writers_chain010.json bash scripts/run_t2.sh
 #
 # The equivariant core's settings are no longer knobs: read positions are
 # canonical ranks, register slots are seeded from those ranks, and the pool
@@ -28,18 +29,33 @@ T1=${T1:-runs/t1_writers_250k_rank/encoder.pt}
 # data and a fresh head sees too few.
 LEN=${LEN:-2} DOUT=${DOUT:-512} STEPS=${STEPS:-250000} OC=${OC:-4} VP=${VP:-1}
 NPOOL=${NPOOL:-16}
+# The corpus is ONE file: opcode mix, exclude_x0_dest, and the equivalence /
+# invalidity / chain rates all live in it, and no flag can override any of
+# them. A sweep over corpus composition is therefore a config per arm, and the
+# run directory is named after the config so two arms cannot collide.
+CONFIG=${CONFIG:-configs/instr_alu_writers.json}
+# The instruction-stream seed. Re-running a cell without changing it redraws
+# the SAME corpus and measures initialization variance only, so a replicate
+# needs GEN_SEED (METRICS.md, null interventions).
+GEN_SEED=${GEN_SEED:-0}
 # Distinguishes a re-run of an already-recorded cell (the run dir is otherwise a
 # pure function of the knobs, so it would silently overwrite it).
 TAG=${TAG:-}
+CORPUS_SLUG=$(basename "$CONFIG" .json); CORPUS_SLUG=${CORPUS_SLUG#instr_}
 
 cell() {
-  local OUT=t2_len${LEN}_d${DOUT}_s${STEPS}_dep${OC}_vp${VP}_pool${NPOOL}${TAG:+_$TAG}_writers
+  local OUT=t2_len${LEN}_d${DOUT}_s${STEPS}_dep${OC}_vp${VP}_pool${NPOOL}${TAG:+_$TAG}_${CORPUS_SLUG}
   echo "######## $(date '+%m-%d %H:%M:%S')  -> $OUT"
+  # What the run trained on, recorded before it starts: hparams.json is the
+  # trainer's own arguments and says nothing about the data. The config's
+  # contents are copied in, so editing the file later cannot rewrite history.
+  python scripts/record_corpus.py "runs/$OUT" --config "$CONFIG" \
+    --rule "cap=$LEN" --twins 2 --batch-size 128 --n-states 8 \
+    --anchor-seed 0 --gen-seed "$GEN_SEED" --count "$STEPS" || return 1
   # Generation runs on odin (multinode_gen.sh, LOCAL_GEN=0) so local cores stay
   # free for the trainer's per-step host work. ANCHOR_SEED must equal the
-  # trainer's --anchor-seed (INVARIANT 1). The config carries no invalidity
-  # block, so multinode's INJECT_INVALID=0 default matches the local corpus.
-  RULE="cap=$LEN" CONFIG=configs/instr_alu_writers.json \
+  # trainer's --anchor-seed (INVARIANT 1).
+  RULE="cap=$LEN" CONFIG="$CONFIG" GEN_SEED="$GEN_SEED" \
   TWINS=2 BATCH_SIZE=128 N_STATES=8 ANCHOR_SEED=0 \
     ./multinode_gen.sh "$STEPS" \
     | python scripts/train_t2_encoder.py --t1-model "$T1" \
@@ -71,7 +87,10 @@ cell() {
     | grep -vE "Warning|readline|history" | sed 's/^/   /'
 }
 
-# One shared held-out corpus so every cell is scored on identical data.
+# One shared held-out corpus so every cell is scored on identical data. It is
+# drawn from the UNMODIFIED writers corpus whatever a cell trained on, because
+# a cell that raised the density of some chunk shape has to be graded on the
+# population the model will actually meet, not on its own training mix.
 if [ ! -f "/tmp/t2_eval_${LEN}.rvt" ]; then
   echo "generating shared eval corpus..."
   python -m datagen --rule "cap=$LEN" --twins 2 --batch-size 128 --n-states 8 \

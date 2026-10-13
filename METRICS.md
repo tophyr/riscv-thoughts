@@ -331,7 +331,7 @@ table is the operative copy, that is the evidence.
 | retraining the frozen T1 beneath it moves exact match | 0.023 points (σ) | five same-config T1s |
 | the same, on depth-2 exact match | 0.24 points | the same five |
 | spread between two configurations' own floors | 20× | the two above |
-| a null intervention's cost | ~35 min | one len=2 cell |
+| a null intervention's cost | ~2 h | one len=2 cell at 1M steps, 7 ms/step solo |
 
 So: use ~0.01 for a T2-level claim unless that specific cell has been
 replicated, and 0.023 for anything comparing one T1 against another. No T1
