@@ -4,7 +4,7 @@ Chronological record of all experiments with full results and analysis, one
 file per phase in [`EXPERIMENT_LOG/`](EXPERIMENT_LOG/). This file is the index.
 For theoretical framework, see WHAT_IS_A_THOUGHT.md. For testbed design,
 see RISCV_DESIGN.md. For lessons from prior work, see
-TRANSFERABLE_LESSONS.md. For what to do next, see TODO.md.
+TRANSFERABLE_LESSONS.md.
 
 **What to read.** Phases 14 and 15 are the live record — the current
 architecture and the open problem. Everything before Phase 14 is superseded

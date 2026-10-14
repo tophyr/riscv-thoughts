@@ -312,8 +312,7 @@ instruction" feature the emit gate needed to read. That finding is what motivate
 the magnitude-as-validity retrain. `train_gates()` was removed from
 the codebase; the architecture description above is retained as the design to
 resume from, and gate training resumes only once an encoder carries validity in
-its magnitude on a corpus that actually contains invalid windows (TODO.md open
-task 3).
+its magnitude on a corpus that actually contains invalid windows.
 
 ---
 

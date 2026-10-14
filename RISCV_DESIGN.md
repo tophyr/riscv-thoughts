@@ -575,8 +575,8 @@ head's ability to EVALUATE it — a slot describes a function rather than holdin
 a value (above) — so a description the essence carries perfectly can still score
 badly when applying it needs carry propagation. Driving vp to zero is therefore
 a demand on the pair, and faithfulness, the property a future T3 actually
-consumes, is the weaker half of it (TODO.md; METRICS.md for what it certifies
-and how to measure the halves apart).
+consumes, is the weaker half of it (METRICS.md states what it certifies and
+how to measure the halves apart).
 
 The head reads the **unit-normalized** essence (`F.normalize(vecs)`,
 `t2_value_predict_loss`): magnitude is reserved for validity, so if vp's gradient
@@ -611,7 +611,8 @@ One scope caveat on the metric: vp is supervised and scored against a small
 fixed anchor set (8 states, seed 0, shared by generator, trainer, eval and every
 probe), so `vp = 0` certifies the I/O function *at those points*, not everywhere.
 Adequate for the current happy-path corpus; METRICS.md states exactly what it
-certifies, and TODO.md milestone 4 is where it has to get stronger.
+certifies, and a corpus beyond writers-only ALU chunks will need more anchors
+than 8.
 
 **Emergent equivalence.** With the behavioral targets alone, provably
 equivalent instructions/chunks collapse without any equivalence loss:

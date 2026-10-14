@@ -50,6 +50,13 @@ In this project:
 | `.claude/skills/` | procedures, commands and operational hazards for a task | findings |
 | commit messages | the **differential** — what is true at this commit that was not true at its parent | the route taken between the two |
 
+**TODO links out; nothing links in.** TODO cites the documents that hold its
+evidence and definitions, and no other document cites TODO — not a task number,
+not a milestone, not "see TODO". Task numbers change as tasks close, and a
+document that leans on the roadmap stops being true when the roadmap moves.
+State the fact the reference stood for instead. README's map and reading order
+are the one exception: listing every document is what a map is for.
+
 A result that changes an architectural claim usually needs edits in two places:
 the finding in the experiment log, and the rationale in the design doc. Changing
 only one leaves the other asserting something false.

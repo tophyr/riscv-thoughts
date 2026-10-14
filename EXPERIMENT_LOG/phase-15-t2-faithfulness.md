@@ -1348,8 +1348,8 @@ certify, and the noise floors every comparison here is measured against.
    definition, and it gates whether the milestone is reachable at all.
 
 2. **Folding a chain's literals in the op-cell** is the one intervention the
-   measurements point at, and it is the mechanism of the equivalence-collapse
-   task (TODO task 2) rather than a separate lever: handed the composite, a
+   measurements point at, and it is the mechanism of equivalence collapse
+   rather than a separate lever: handed the composite, a
    readout on the same essence goes from 79.80% to 99.95% (finding 21). What is
    unsettled is the objective that would produce the fold, and what it costs
    the discriminative rows.

@@ -5,9 +5,8 @@ moves when nothing has changed, and the conditions under which a number from it
 is true. Every rule here exists because a figure was once quoted without it and
 a wrong conclusion followed.
 
-Measured values live elsewhere: a model's current score is in TODO.md, and the
-evidence behind a result is in EXPERIMENT_LOG.md. This file is the instrument,
-not the readings.
+Measured values and the evidence behind them live in EXPERIMENT_LOG.md. This
+file is the instrument, not the readings.
 
 ---
 

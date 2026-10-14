@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Would giving the op-cell each operand's canonical rank be ENOUGH?
 
-Open task 1 proposes feeding the canonical read rank to the op-cell, so operand
-binding becomes a local association instead of a cross-slot join the pool cannot
-do. This probe decides whether that CAN work before any GPU time is spent.
+Feeding the canonical read rank to the op-cell would make operand binding a
+local association instead of a cross-slot join the pool cannot do. This probe
+decides whether that CAN work before any GPU time is spent.
 
 The test is on slot B's OWN per-slot state (the essence tracks it at 97.75% vs
 97.61%, so the pool is not the loser). Predict slot B's 32-bit output value from

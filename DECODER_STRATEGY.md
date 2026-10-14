@@ -1,8 +1,8 @@
 # Decoder Strategy
 
 > **Status: unproven theory, and not the current objective.** Decode-back is
-> an explicit non-goal of the current work — the live objective is `vp = 0`
-> (TODO.md). The encoder this document assumes has also been replaced: it is
+> an explicit non-goal of the current work — the live objective is `vp = 0`.
+> The encoder this document assumes has also been replaced: it is
 > now the rename-equivariant register-state machine in RISCV_DESIGN.md. No
 > decoder exists in the tree.
 >
