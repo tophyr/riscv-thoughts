@@ -295,6 +295,56 @@ Deferred deliberately: it is a definition, not an experiment, and it should be
 settled before either task 2 builds a collapse objective or this task ships a
 PC-effect target — each would bake in an answer.
 
+## Open ideas
+
+Not scheduled and not yet a task; each needs a decision before it becomes one.
+
+### Steer the corpus mix from the training signal, while training runs
+
+A corpus config fixes its composition (opcode mix, `chain.rate`) for the whole
+run, which presumes the right proportions are known in advance. They are not:
+at a fixed step budget, raising the composed-chunk rate buys depth-2 accuracy by
+spending depth-1 exposure, and depth-2 accuracy tracks the absolute number of
+composed rows seen rather than their share (EXPERIMENT_LOG, "T2 faithfulness",
+finding 30). A static rate is a guess at a trade a controller could manage
+continuously: generate less of what the model has mastered, more of what it is
+still learning, and raise a cell's rate again if its accuracy slips.
+
+The lever has to be on the DATA side. Reweighting the loss toward hard slots
+(`--vp-depth-weight`) failed because it amplifies gradient from the same rare
+rows, while generation supplies new ones (finding 17).
+
+Prior work to start from: Teacher–Student Curriculum Learning (Matiisen et al.,
+2017) samples tasks by the absolute slope of their learning curves, so a
+plateaued task fades and a forgotten one returns; Automated Curriculum Learning
+(Graves et al., 2017) treats the mix as a bandit rewarded by learning progress;
+DoReMi (Xie et al., 2023) and Online Data Mixing (Albalak et al., 2023) reweight
+pretraining domains online; Prioritized Level Replay (Jiang et al., 2021) does
+it over a procedural generator's settings, the closest structural match here.
+
+What would have to be settled:
+
+- **Drive on learning progress, not error level.** Some rows cannot be
+  satisfied — where T1's emitted wiring disagrees with the tokens (~3% of len=2
+  chunks), T2 is graded against a chunk it was not shown — and an error-chasing
+  controller would pour data into them indefinitely.
+- **Rare cells give noisy readings.** The rarest error bucket at len=2 is about
+  one supervised triple per batch, so the controller must be slow and smoothed.
+- **The knobs are not the buckets.** Error is measured on sources × immediate ×
+  depth (METRICS.md); the generator controls opcode mix and `chain.rate`, and
+  nothing controls shared sources directly. It needs a knob-to-bucket mapping or
+  new generator knobs.
+- **Plumbing.** The pipeline is a one-way filter with generation on odin behind
+  a deep prefetch queue, so it needs a back-channel, or per-bucket streams that a
+  trainer-side mux selects among (`datagen --mode weighted` biases order, not
+  count, so it does not do this as-is).
+- **Reproducibility.** A run would no longer be described by one config file; it
+  would have to record its mix trajectory. The cosine LR schedule also assumes a
+  fixed distribution.
+
+The comparison it has to win is against the best fixed (rate, steps) pair, scored
+on the naturally drawn corpus.
+
 ## Long horizon
 
 Loosened boundary supervision; eventually natural language
