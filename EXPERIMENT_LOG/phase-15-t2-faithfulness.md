@@ -1,16 +1,29 @@
 # Phase 15 (IN PROGRESS): making the T2 chunk vector faithful to the instructions it encodes
 
-**Status: open.** Faithfulness at two instructions is largely settled;
-equivalence collapse is not, and nothing beyond two instructions or outside the
-R/I-type ALU subset has been attempted. Claims here are corrected in place, so
+**Status: open.** Faithfulness is unestablished at every length: every vp
+figure here is exact at the 8 anchor states the head trained on, and the trained
+heads do not generalize from them (finding 32). Equivalence collapse is
+unresolved, and nothing beyond two instructions or outside the R/I-type ALU
+subset has been attempted. Claims here are corrected in place, so
 read them as current belief rather than as a chronology.
 
 **Headline.** Two properties have to hold and each has its own state.
 
-*Faithfulness.* Exact 32-bit match of the predicted output value reaches
-**99.9364%** at two instructions — 512 failing (row, output-slot, anchor)
-triples out of 805,408 — on `configs/instr_alu_writers.json` at `cap=2` over the
-frozen `runs/t1_writers_250k_rank`, at `--d-out 512` with a one-hidden-layer
+*Faithfulness.* vp is supervised and scored on one fixed set of 8 anchor
+states, and the head stored answers at them: scored at anchor states it never
+saw, T2 falls to ~5% exact and T1 to 21% (finding 32). A fresh head trained with
+anchors redrawn per batch evaluates T1's FROZEN essence at 98.98% on unseen
+anchors, so T1's essence carries its instruction's function and the head is what
+memorized; T2's essence is untested. Faithfulness has to be re-measured on a
+T1 and T2 reminted with anchors redrawn per batch. Every figure below is
+therefore an 8-point figure, true of the mechanisms it located and not of
+whether a function was learned.
+
+At the 8 training anchors, exact 32-bit match of the predicted output value
+reaches **99.9364%** at two instructions — 512 failing (row, output-slot, anchor)
+triples out of 805,408 — graded on `configs/instr_alu_writers.json` at `cap=2`
+after training at a chain rate of 0.10 for 2M steps, over the frozen
+`runs/t1_writers_250k_rank`, at `--d-out 512` with a one-hidden-layer
 value-prediction head. Four architecture fixes carried it to 99.83%: the
 per-slot write step fed into the essence pool, canonical read position as the
 input registers' leaf identity, per-head pool value projections, and two
@@ -18,7 +31,12 @@ corrections to the oracle's supervision (findings 14 and 24). The remaining
 factor was not architectural at all but the training corpus: chunks where one
 instruction consumes another's result are ~4.7% of a randomly drawn corpus and
 the hardest shapes a fraction of a percent, and generating more of them
-accounts for the rest (finding 30). The core's own settings are fixed on first
+accounts for the rest (finding 30). What is left is not learnable: ~96% of the
+remaining failures are rows that T1's emitted wiring makes unsatisfiable for any
+T2 — SLTIU's input judged constant at uniform-random anchor states, a canonical
+input frame shifted by reads T1 omits, and T1 dropping the source of
+`SUB`/`XOR`/`SLT rd,x0,rs` (finding 31). Those three are defects of T1's
+binding, the oracle's frame and the anchors, and stand regardless of finding 32. The core's own settings are fixed on first
 principles rather than chosen by measurement (finding 25).
 
 *Equivalence.* Unresolved, and untouched by any of the above. Two chunks that
@@ -32,9 +50,10 @@ fixed frozen T1 has spread 0.002 and 0.009 points of exact match on the two
 configurations where it was replicated, and 0.021 on a third; retraining the
 frozen T1 spreads 0.023 (finding 25). Use ~0.01 for a T2-level claim unless the
 specific cell has been replicated, and 0.023 for anything comparing T1s.
-`probes/vp_budget.py` draws a fresh unseeded corpus per invocation, which moves
-its own aggregate by ~0.02 points between runs of one model — score every arm of
-a per-bucket comparison against ONE corpus file.
+`probes/vp_budget.py` draws a fresh unseeded corpus per invocation unless given a
+corpus path, which moves its own aggregate by ~0.02 points between runs of one
+model — score every arm of a per-bucket comparison against ONE corpus file, by
+passing every call the same path.
 
 **Aggregates do not span either oracle change** — a model is scored on the
 target it trained on. For the canonical-frame change compare on the rows where
@@ -1128,13 +1147,11 @@ and the shared op-cell shows no interference between the two — it only slows
 depth-1 by giving it fewer examples per step, and buying the steps back recovers
 it. What is being chosen is therefore a (rate, steps) pair.
 
-**The control that is missing is R=0 at 2M**, without which the step budget and
-the rate are not separated. A budget increase alone has moved composed-slot
-accuracy substantially before, though only at `d_out` 256 and against the
-syntactic-frame target, which makes that figure incomparable to the ones here
-and indicative of a direction rather than a magnitude (finding 17). If the
-budget alone reaches most of this, the rate is an efficiency knob rather than a
-necessary one.
+**The step budget alone does not reach it, so the rate is necessary.** Two
+corpus draws of R=0 at 2M score 99.8827% and 99.8830% against 99.9265% and
+99.9290% for R=0.10 at 2M, all on one shared corpus: ~2830 failing triples
+against ~1750, with depth-1 identical under both rates and the whole difference
+on depth-2 (finding 31 has the table).
 
 **There is no established collapse cost.** One draw at R=0.25 reads separation
 27.5× and another 33.5×, against the adopted 35.5× — the row's draw-to-draw
@@ -1173,17 +1190,174 @@ difficulty tracks how much structure the function has rather than whether it
 collapses: `ADDI;SLLI`, a shift applied to a composed sum, is the worst arm at
 every density and the only one still below 95% at R=0.50.
 
-**Not yet established:** a replicate. The aggregate gain is 0.053 points against
-a T2-level run-to-run floor of ~0.01 (finding 25), so ~5×; the hard-cell gain
-(+16 points) and the arm gain (+74) are far outside any floor measured here, but
-the aggregate figure wants the null before R=0.25 is adopted. The collapse cost
-is real and small — separation 35.5× → 27.5×, with `behav-diff` holding at 0.89
-— and has to be watched rather than ignored (METRICS: a vp gain that craters the
-GVN rows is a regression).
+**31. What remains at len=2 is the T1→T2 interface: ~96% of the failing
+triples are rows that T1's emitted wiring makes unsatisfiable, so neither
+training nor corpus mix can reach them.** Every cell below is at `d_out` 512,
+op-cell depth 4, a one-hidden-layer vp head and 16 pool heads, over the frozen
+`runs/t1_writers_250k_rank`, and every figure is `probes/vp_budget.py` on ONE
+shared 1200-batch corpus drawn from `configs/instr_alu_writers.json` (2,416,416
+supervised triples). That file is not finding 30's, so its figures do not
+compare with finding 30's tables. Every figure is at the 8 training anchors, and
+the head is a lookup there (finding 32).
 
+| chain rate, steps | cells | overall exact | failing | depth-1 failing | depth-2 failing |
+|---|---|---|---|---|---|
+| 0, 2M | 2 | 99.8827%, 99.8830% | 2835, 2827 | 1613, 1514 | 1221, 1312 |
+| 0.10, 1M | 3 | 99.8943–99.9046% | 2305–2554 | 1762–2029 | 526–554 |
+| 0.10, 2M | 2 | 99.9265%, 99.9290% | 1777, 1715 | 1583, 1538 | 195, 177 |
+| 0.10, 10M | 1 | 99.9387% | 1482 | 1434 | 48 |
+
+The commutative-swap collapse rows do not move across any of them (equivalent
+pairs 0.035–0.041). Both depths saturate: fitted to 1M and 2M, a pure power law
+predicts 987 depth-1 and 16 depth-2 failures at 10M, an exponential 322 and 0,
+against 1434 and 48 observed. A floor plus a power law puts the floors near 1427
+and 40, though with three points and three parameters that fit is exact by
+construction.
+
+**The floor is a fixed set of rows.** SLTIU-written slots fail on exactly 361
+triples in all six R=0.10 models, across three budgets and two corpus draws, and
+they are the same 361 triples in the 1M and 10M models; SLT holds at ~170 and
+SLTU at ~70 throughout. Decoding every failing chunk of the 10M model and
+comparing T1's emitted wiring with the tokens sorts 1428 of its 1482 failures
+into three mechanisms:
+
+| mechanism | failing triples | share |
+|---|---|---|
+| SLTIU reads the other instruction's result; T1 emits no input for it | 361 | 24.4% |
+| the canonical input frame is shifted by a read T1 omits | 800 | 54.0% |
+| T1 omits a behavioral source of `SUB`/`XOR`/`SLT rd,x0,rs` | 267 | 18.0% |
+| no wiring or frame anomaly found | 54 | 3.6% |
+
+- **SLTIU's input is non-behavioral at T1 for every immediate, because the
+  anchors are uniform int32.** With 8 such anchors `rs <u imm` is constant for
+  any 12-bit `imm` — never true for a positive one, always true for a negative
+  one, which sign-extends to a huge unsigned value — so `precompute_chunk` gives
+  `SLTIU x13,x28,imm` input magnitude 0.0 at imm 1359, −1439 and 626, and T1 is
+  correctly trained to report no read. Inside a chunk the source is often the
+  other instruction's small result (`SRAI` by 30, an `SLT` result, an `ANDI`
+  mask, `ADDI x31,x0,878`), where the comparison varies; T2 is then wired as if
+  SLTIU read nothing. `vp_budget` derives depth from that same wiring, so these
+  composed slots are filed under depth 1.
+- **The oracle orders behavioral inputs by first syntactic read; T2 ranks them
+  by first EMITTED read.** In `SLTIU x31,x22,-606 ; SLT x4,x25,x22` the oracle
+  puts x22 at canonical position 1, because SLTIU read it first, while T2 never
+  sees that read and ranks x25 first. The operands arrive swapped — the 8–20
+  wrong bits per failure on `SUB` and the shifts, and the even split between
+  0→1 and 1→0 errors on `SLT`/`SLTU`. The omitted read is SLTIU's in 600 of the
+  800; the other 200 are reads that are legitimately non-behavioral at their
+  own instruction (`XOR rd,rs,rs`, `SRA rd,x0,rs`, …), so structured anchors
+  alone would not remove this class.
+- **T1's binding drops the source whenever x0 is the FIRST operand of `SUB`,
+  `XOR` or `SLT`.** On 400 random instructions per form, T1's emitted source set
+  matches the oracle's on 0.0% of `SUB`/`XOR`/`SLT rd,x0,rs`, against 97% for
+  `ADD`/`OR rd,x0,rs` and 95–100% for `op rd,rs,x0` and `op rd,rs1,rs2`. The
+  oracle marks those sources behavioral, so this is a T1 binding error against
+  its own targets. T1's own vp is unaffected because T1 encodes from token
+  wiring; only the binding heads T2 routes on are wrong.
+
+Each mechanism is unsatisfiable by collision, not merely hard:
+`SLTIU x31,x22,-606 ; SLT x4,x25,x22` and `SLTIU x31,x9,-606 ; SLT x4,x25,x22`
+give T2 identical inputs and carry opposite targets, and a slot whose source T2
+is never told about depends on a value it cannot see. This is the case METRICS
+describes as vp scoring T1∘T2.
+
+So the (rate, steps) choice is settled at R=0.10 for 2M steps: five times the
+budget buys ~260 failing triples, most of them the trained head leaning toward
+the more common side of a collision. Removing the floor needs changes outside
+T2 — structured anchor states, T1's binding on the x0-first-operand forms, and an
+oracle frame that orders inputs by the reads T2 can see — and each changes the
+oracle or the frozen T1, so each remints T1 and T2.
+
+**32. The vp head memorized the 8 anchor states, at both tiers: every vp figure
+in this project is "exact at 8 input points", and none certifies that a function
+was learned.** vp is supervised and scored on ONE set of 8 anchor register
+files, drawn once from seed 0 and shared by every row of every batch
+(`make_anchor_states`, `datagen/__main__.py` and `compressor/train.py`). The
+canonical frame narrows it further: a chunk's k-th input is always sourced from
+anchor position k+1, so across a whole run input 1 takes only 8 distinct values,
+input 2 another 8, and so on. "Predict the output" is therefore solvable as
+"recognise which of 8 known inputs this is and emit the answer stored for it".
+
+Scored at anchor states the model never trained on (`probes/vp_budget.py` with
+an anchor seed other than 0, on a corpus generated at that seed), it collapses:
+
+| model | exact at the 8 training anchors | exact at held-out anchors |
+|---|---|---|
+| T2, chain rate 0.10, 2M steps (two corpus draws) | 99.9265%, 99.9290% | 6.2364%, 4.7533% |
+| T2, chain rate 0.10, 10M steps | 99.9387% | 4.7161% |
+| T1 `runs/t1_writers_250k_rank`, its own vp head | 100.0000% | 20.84% |
+
+Held-out per-bit accuracy is 66–69%. Plain `ADD` falls from 100.0000% to 0.06%,
+and `SLT`, whose output is 0 or 1, to 10.7% — below what a constant guess
+scores. The held-out targets were checked against the oracle run at the held-out
+anchors (200 of 200 rows agree; none agree with the training anchors), and the
+head's inputs go through the trainer's own `vp_canonical_in_vals`.
+
+**The ESSENCE is not what memorized — the head is.** The encoder never sees a
+register value, so an essence is a fixed function of the instruction; only the
+readout's behaviour between input points is in question. A fresh vp head, of
+T1's depth-4 architecture, trained on FROZEN T1 essences with 8 anchor states
+redrawn uniformly for every batch (so it never sees an input twice), scored on 64
+anchors from a disjoint seed:
+
+| fresh head trained on | steps | exact at held-out anchors |
+|---|---|---|
+| frozen T1 essence, the fixed 8 training anchors | 20k | 19.77% (99.9963% at the training anchors) |
+| frozen T1 essence, anchors redrawn per batch | 20k / 200k | 70.03% / **98.98%** |
+| opcode one-hot + immediate bits, anchors redrawn per batch | 20k / 200k | 84.00% / 96.62% |
+
+The fixed-anchor arm reproduces the trained head's memorization, so the harness
+reproduces the trainer; its targets match the oracle's bit-for-bit at the
+training anchors. With anchors redrawn, the essence feeds a head at least as
+well as hand-built ground-truth content — 89.0% against 89.2% at 40k steps,
+98.98% against 96.62% at 200k — so that arm is a comparison, not a ceiling, and
+the essence arm was still climbing under a constant learning rate. The shortfall at 200k sits on `ADD` (92.9%) and
+`SUB` (94.1%), register-register carries over two random 32-bit inputs; every
+other opcode is at 97.2% or above. The held-out anchors are uniform too, so the
+comparisons read near-constant there and their 100% is not a test of them.
+
+So T1's essence carries enough to evaluate its instruction, plausibly because T1
+also trains a linear immediate head that puts the immediate into the essence
+directly; a fitted readout recovers it at 99.96–100% (finding 25), though not
+broken out for SLTIU, the opcode whose 8-point outputs cannot tell immediates
+apart. Shaping through 8 fixed points rewards an essence only for separating
+instructions whose outputs differ somewhere among those points, which is an
+8-point fingerprint rather than a function; T2 has no immediate head, so how far
+its essence is a fingerprint is untested.
+
+**What this invalidates.** Every vp number in this phase, and T1's 100.0000%, is
+an 8-point figure. The analysis that treats the head as an evaluator (findings
+21, 26, 29), the density result (finding 30) and every architecture choice whose
+evidence was vp need re-reading before they are relied on; probes that read
+content from the essence, the collapse distances and the equivariance results
+involve no anchors and stand. Finding 31's mechanisms are defects of T1's
+binding, the oracle's frame and the anchors' power as witnesses, and stand as
+defects; the shares quoted there are shares of the 8-point error.
+
+**What it requires.** Anchors redrawn for every batch, so the head cannot store
+answers, and scored on anchors it never trained on; drawn from a structured
+distribution, so that comparisons are witnessed (finding 31's SLTIU mechanism).
+That remints T1 and T2.
 
 ## Decisions taken
 
+- **Anchor states are redrawn for every batch, from a structured distribution,
+  and vp is scored at anchors no model trained on.** A fixed set is memorized
+  (finding 32) and uniform values do not witness comparisons (finding 31). This
+  remints T1 and T2; until then every vp figure is an 8-point figure.
+- **vp is accepted end to end, through T1's emitted wiring.** `vp = 0` at a
+  chunk length means 100% exact on the T1∘T2 pipeline against the oracle, not on
+  the rows T1's wiring gets right, so a T1-side, anchor-side or oracle-side
+  defect blocks it as surely as a T2 one (finding 31). Splitting the score by
+  wiring agreement is a diagnostic, not the criterion.
+- **T2 trains on `configs/instr_alu_writers_chain010.json` (chain rate 0.10)
+  for 2M steps.** The rate is necessary, since the budget alone does not reach
+  it, and 2M is where the curve meets the interface floor (finding 31). Both
+  were measured at the 8 training anchors and need re-checking after the
+  remint. T1 is
+  unaffected: on single-instruction chunks a chain rate draws one extra random
+  number per chunk and rewrites nothing, so T1's corpus has the same
+  distribution under either config.
 - **The pool reads each slot's write step.** Unconditional: the core carries no
   alternative.
 - **Feeding the pool the full event block is rejected** on the equivalence-
@@ -1339,21 +1513,6 @@ certify, and the noise floors every comparison here is measured against.
 
 ## Open threads
 
-1. **The acceptance criterion for milestone 1.** On the cell carrying the whole
-   len=2 residual the essence is a faithful description and the vp head cannot
-   evaluate it (finding 26), so `vp = 0` is a stronger demand than "the essence
-   preserves the chunk's behavior". Either the criterion has to say that it
-   scores the essence composed with an evaluator, or it has to be replaced by
-   something that reads the description rather than the evaluation. That is a
-   definition, and it gates whether the milestone is reachable at all.
-
-2. **Folding a chain's literals in the op-cell** is the one intervention the
-   measurements point at, and it is the mechanism of equivalence collapse
-   rather than a separate lever: handed the composite, a
-   readout on the same essence goes from 79.80% to 99.95% (finding 21). What is
-   unsettled is the objective that would produce the fold, and what it costs
-   the discriminative rows.
-
-3. **Decoder + reconstruction loss** — the standing untried lever for goal 2.
-4. **Everything after the Round-1 sweep is len=2 only.** In particular,
+1. **Decoder + reconstruction loss** — the standing untried lever for goal 2.
+2. **Everything after the Round-1 sweep is len=2 only.** In particular,
    input-ordering recovery sits at chance (0.518) at len=8 and is unexplained.

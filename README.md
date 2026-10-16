@@ -111,19 +111,19 @@ assumed: nothing reaches T2 except what T1 emitted.
 
 *Faithfulness.* Whether T2's essence is a lossless behavioral description of its
 chunk, measured by whether the chunk's output register values can be recovered
-from it and scored discretely rather than as a loss value. It is lossless at one
-instruction and within a fraction of a percent at two; four and eight are open,
-as is everything outside the R/I-type ALU subset the work currently runs on. The
-score is the essence composed with a readout that has to EVALUATE it — nothing
-in the encoder ever sees a register value, so a slot describes a function rather
-than holding a number. At two instructions the limit is the training corpus
-rather than the architecture: chunks where one instruction consumes another's
-result are ~5% of a randomly drawn corpus and the hardest shapes a fraction of
-a percent, so generating more of them — a composed-chunk rate of 0.10 over
-twice the step budget — carries overall exact match from 99.83% to 99.94% with
-nothing about the model changed. Density and budget are one choice rather than
-two: at a fixed budget, raising the rate buys the composed chunks by spending
-the common ones.
+from it and scored discretely rather than as a loss value. The score is the
+essence composed with a readout that has to EVALUATE it — nothing in the encoder
+ever sees a register value, so a slot describes a function rather than holding a
+number. **It is unestablished at every length.** The readout has only ever been
+trained and scored at one fixed set of 8 input states, and it stored answers at
+them: models exact there score ~5% (T2) and 21% (T1) at input states they never
+saw. The essence is not what memorized — a fresh readout trained on inputs
+redrawn for every batch evaluates T1's frozen essence at 99% on unseen inputs —
+so the fix is to redraw the input states for every batch, with enough structure
+that comparisons and branches are witnessed, and to remint T1 and T2 under it.
+At the 8 fixed states, two-instruction chunks reach 99.94% exact, and nearly all
+of the rest is chunks where T1's emitted wiring disagrees with the oracle's
+target, which no T2 can satisfy; those wiring defects stand regardless.
 
 *Equivalence.* Two instruction sequences that compute the same function must
 compress to the same point — that is the framework's definition of meaning, and

@@ -563,14 +563,14 @@ invariant essence):
 (plus a bounded smooth-magnitude term): from `(essence, canonical input-slot
 values)` predict each output register's **canonical** value (the `out_regs`
 baseline — inputs relocated to canonical first-read positions, so the target
-depends only on operand structure, not register names), on a fixed set of
-sampled anchor input states. Feeding the head canonical inputs to match the
+depends only on operand structure, not register names), at sampled anchor
+input states that are redrawn for every batch (see the end of this section for
+why one fixed set fails). Feeding the head canonical inputs to match the
 canonical target is load-bearing: the earlier bug fed *raw* register values
 against a *canonical* target, making the task mathematically inconsistent.
 
-**vp is the primary objective, and it has no intrinsic floor.**
-Single-instruction vp is exactly `0.000`, and the head is fed raw value *bits*,
-not log-compressed scalars. What it measures is the essence composed with the
+**vp is the primary objective.** The head is fed raw value *bits*, not
+log-compressed scalars. What it measures is the essence composed with the
 head's ability to EVALUATE it — a slot describes a function rather than holding
 a value (above) — so a description the essence carries perfectly can still score
 badly when applying it needs carry propagation. Driving vp to zero is therefore
@@ -607,12 +607,21 @@ value-number), and the canonical vp target is what collapses the
 *non-structural* equivalences. GVN collapse and vp are both load-bearing — a vp
 gain that craters the GVN rows is a regression, not a win.
 
-One scope caveat on the metric: vp is supervised and scored against a small
-fixed anchor set (8 states, seed 0, shared by generator, trainer, eval and every
-probe), so `vp = 0` certifies the I/O function *at those points*, not everywhere.
-Adequate for the current happy-path corpus; METRICS.md states exactly what it
-certifies, and a corpus beyond writers-only ALU chunks will need more anchors
-than 8.
+**The anchor states must be redrawn for every batch, and drawn with
+structure.** With one fixed set the head is fed the same few input values for
+every row, so it can store each instruction shape's answers at those points
+instead of evaluating the described function — and it does: trained heads that
+are exact at their 8 fixed anchors score ~5% (T2) and 21% (T1) at anchors they
+never saw (EXPERIMENT_LOG, "T2 faithfulness", finding 32). Redrawing them per
+batch makes storing impossible, so a correct prediction can only come from
+evaluating. Uniform 32-bit values are also poor witnesses: a comparison against
+a 12-bit immediate is constant over them, so the oracle judges its input
+irrelevant (finding 31), and two registers almost never hold equal values, so a
+branch on equality is never taken (Phase 4). The draw therefore needs small
+values, zeros and equal pairs alongside generic 32-bit values, which exercise
+full-width carries. The pipeline still uses one fixed set of 8, so every vp
+figure measured so far is an 8-point figure; METRICS.md states how to score a
+held-out one.
 
 **Emergent equivalence.** With the behavioral targets alone, provably
 equivalent instructions/chunks collapse without any equivalence loss:

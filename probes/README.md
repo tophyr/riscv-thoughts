@@ -21,7 +21,7 @@ python probes/vp_budget.py runs/<t2_dir> runs/<t1_dir>/encoder.pt 2 300
 
 | probe | the question it answers |
 |---|---|
-| `vp_budget.py` | **reach for this first** — the whole vp error budget from the model's own head, crossed over sources × immediate × depth plus opcode and bit position, each bucket as a rate AND as its share of total error. Takes a corpus config, so a past claim can be re-scored on its own population |
+| `vp_budget.py` | **reach for this first** — the whole vp error budget from the model's own head, crossed over sources × immediate × depth plus opcode and bit position, each bucket as a rate AND as its share of total error. Takes a corpus config, so a past claim can be re-scored on its own population, an optional corpus path, so several models can be scored on identical data, and an optional anchor seed, so the head can be scored at anchor states it never trained on — the only vp figure that says a function was learned |
 | `vp_depth2.py` | splits depth-2 error by WHICH instruction carries the immediate (producer, writer, both) and by opcode class — an axis a chunk-level "has an immediate" split cannot show |
 | `vp_imm_share.py` | R-type vs I-type share, immediate bit positions, error crossed with depth. The mixed-corpus counterpart to `vp_slot_b_split` |
 | `vp_slot_b_split.py` | operation vs operands, disjoint vs shared sources. Generates from an R-only corpus by construction, so it cannot see an immediate failure at all |

@@ -21,7 +21,16 @@ Splits, coarse to fine: dataflow depth; operand type; the two crossed; the
 opcode that wrote the slot; whether the chunk's instructions share a source
 register; and the per-bit error curve by bit position.
 
-Usage: vp_budget.py <t2_dir> <t1_path> [chunk_len] [n_batches] [config]
+Usage: vp_budget.py <t2_dir> <t1_path> [chunk_len] [n_batches] [config] [corpus]
+                    [anchor_seed]
+
+Without `corpus` each call draws a fresh corpus, which moves the aggregate by
+~0.02 points between calls on one model. To compare models per bucket, pass the
+same `corpus` path to every call: the first generates it, the rest read it.
+
+`anchor_seed` (default 0, the seed every model trains on) scores the head at
+anchor states it never saw; a corpus file is only valid for the seed it was
+generated with.
 """
 import os
 import subprocess
@@ -51,18 +60,23 @@ NB = int(sys.argv[4]) if len(sys.argv) > 4 else 1200
 # an R-only corpus reads a point better than the same subset on the mixed
 # corpus the model trains on.
 CONFIG = sys.argv[5] if len(sys.argv) > 5 else 'configs/instr_alu_writers.json'
-N_ANCHORS, ANCHOR_SEED, NBITS = 8, 0, 32
+N_ANCHORS, NBITS = 8, 32
+ANCHOR_SEED = int(sys.argv[7]) if len(sys.argv) > 7 else 0
 
 dev = resolve_device('auto')
 t1 = load_frozen_encoder(T1_PATH, dev)
 t2, _ = load_t2(T2_DIR, t1, dev)
 
-CORPUS = f'/tmp/vp_budget_len{LEN}_{CONFIG.split("/")[-1][:-5]}_{os.getpid()}.rvt'
-subprocess.run(
-    f'python -m datagen --rule "cap={LEN}" --twins 0 --batch-size 128 '
-    f'--n-states {N_ANCHORS} --anchor-seed {ANCHOR_SEED} '
-    f'--config {CONFIG} --count {NB} > {CORPUS}',
-    shell=True, check=True, stderr=subprocess.DEVNULL)
+CORPUS = sys.argv[6] if len(sys.argv) > 6 else \
+    f'/tmp/vp_budget_len{LEN}_{CONFIG.split("/")[-1][:-5]}_{os.getpid()}.rvt'
+if not os.path.exists(CORPUS):
+    # Renamed into place only once complete, so a reused corpus is never partial.
+    subprocess.run(
+        f'python -m datagen --rule "cap={LEN}" --twins 0 --batch-size 128 '
+        f'--n-states {N_ANCHORS} --anchor-seed {ANCHOR_SEED} '
+        f'--config {CONFIG} --count {NB} > {CORPUS}.part',
+        shell=True, check=True, stderr=subprocess.DEVNULL)
+    os.replace(f'{CORPUS}.part', CORPUS)
 
 anchors = torch.from_numpy(
     np.asarray(make_anchor_states(N_ANCHORS, ANCHOR_SEED))).to(dev)

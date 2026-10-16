@@ -79,12 +79,20 @@ from those ranks, and the pool reads each slot's write step, at every tier.
 
 ```bash
 python -m datagen --rule "cap=$LEN" --twins 2 --batch-size 128 --n-states 8 \
-    --anchor-seed 0 --config configs/instr_alu_writers.json --count "$STEPS" \
+    --anchor-seed 0 --config configs/instr_alu_writers_chain010.json --count "$STEPS" \
   | python scripts/train_t2_encoder.py --t1-model runs/t1_writers_250k_rank/encoder.pt \
     --d-out 512 --d-event 16 --op-cell-depth 4 --vp-head-depth 1 \
     --n-pool-heads 16 --route binding \
     --n-steps "$STEPS" --anchor-seed 0 --n-anchor-states 8 --out-dir "$OUT"
 ```
+
+T2 trains at `LEN=2`, `STEPS=2000000` on the chain-rate-0.10 corpus: the rate is
+necessary for the composed slots, and 2M steps is where the curve meets a floor
+that more steps do not move (EXPERIMENT_LOG, "T2 faithfulness", finding 31) —
+both measured at the 8 fixed training anchors, where the vp head stores answers
+(finding 32), so both are to be re-checked once anchors are redrawn per batch. It
+is graded on the unmodified `instr_alu_writers.json`, the population the model
+will actually meet.
 
 `--d-out 512` is the register-state width, and 512 is where it stays: 256 → 512
 is a real gain and 512 → 1024 buys nothing at any training budget measured, at
@@ -265,12 +273,13 @@ Three configs exist. Add one when a run needs a corpus none of them describes,
 and delete it once nothing runs it — an unused config is a corpus nobody can
 attribute a result to.
 
-- `instr_alu_writers.json` — **the corpus all current work uses.**
-  R/I-type ALU only (0.55 / 0.45) + `exclude_x0_dest: true`. No equivalences,
+- `instr_alu_writers.json` — **T1's training corpus, and the corpus every T2
+  is graded on.** R/I-type ALU only (0.55 / 0.45) + `exclude_x0_dest: true`. No equivalences,
   no invalidity → a clean, all-valid, always-register-writing corpus. Every
   chunk is pure ALU, so `cap=N` and `branch+cap=N` behave identically here and
   the scripts use plain `cap=N`.
-- `instr_alu_writers_chain010.json` — the same, plus `chain: {rate: 0.10}`.
+- `instr_alu_writers_chain010.json` — **T2's training corpus.** The same, plus
+  `chain: {rate: 0.10}`.
   A uniform register draw leaves only ~4.7% of two-instruction chunks with the
   second reading the first's result, and that scarcity — not any architectural
   limit — is what held the composed-slot value prediction down (EXPERIMENT_LOG,
@@ -278,7 +287,9 @@ attribute a result to.
   so each instruction reads its predecessor's result, leaving every opcode
   untouched, which lifts composed chunks to roughly `rate + (1-rate)*0.047` of
   rows (counted over 20 batches of `cap=2`: 4.8% of rows composed at rate 0,
-  15.4% at rate 0.10). A no-op on single-instruction rules. The rate is in the
+  15.4% at rate 0.10). On single-instruction rules it rewrites nothing; it does
+draw one extra random number per chunk, so the stream differs byte-wise from
+`instr_alu_writers.json` while keeping the same distribution. The rate is in the
   filename because another rate is another file.
 - `instr_r_only.json` — R-type ALU only, so no chunk carries an immediate.
   Three probes generate from it (`vp_slot_b_split.py`,

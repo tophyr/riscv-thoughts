@@ -3,7 +3,7 @@
 # config as its default, so a cell is named by what it changes:
 #
 #   LEN=2 STEPS=1000000 GEN_SEED=7 TAG=s7 bash scripts/run_t2.sh
-#   CONFIG=configs/instr_alu_writers_chain010.json bash scripts/run_t2.sh
+#   CONFIG=configs/instr_alu_writers.json bash scripts/run_t2.sh
 #
 # The equivariant core's settings are no longer knobs: read positions are
 # canonical ranks, register slots are seeded from those ranks, and the pool
@@ -27,13 +27,13 @@ T1=${T1:-runs/t1_writers_250k_rank/encoder.pt}
 # anchor points, so its capacity is a confound in every vp number; refitting it
 # on frozen essences cannot test that, because depth-2 slots are 2.5% of the
 # data and a fresh head sees too few.
-LEN=${LEN:-2} DOUT=${DOUT:-512} STEPS=${STEPS:-250000} OC=${OC:-4} VP=${VP:-1}
+LEN=${LEN:-2} DOUT=${DOUT:-512} STEPS=${STEPS:-2000000} OC=${OC:-4} VP=${VP:-1}
 NPOOL=${NPOOL:-16}
 # The corpus is ONE file: opcode mix, exclude_x0_dest, and the equivalence /
 # invalidity / chain rates all live in it, and no flag can override any of
 # them. A sweep over corpus composition is therefore a config per arm, and the
 # run directory is named after the config so two arms cannot collide.
-CONFIG=${CONFIG:-configs/instr_alu_writers.json}
+CONFIG=${CONFIG:-configs/instr_alu_writers_chain010.json}
 # The instruction-stream seed. Re-running a cell without changing it redraws
 # the SAME corpus and measures initialization variance only, so a replicate
 # needs GEN_SEED (METRICS.md, null interventions).
