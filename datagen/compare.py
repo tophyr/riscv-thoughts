@@ -37,17 +37,6 @@ from emulator import (
 PC_REG = 32
 MEM_REG = 33
 
-# Truly commutative ops: f(a, b) = f(b, a) under all input values.
-# - ADD, XOR, OR, AND: R/I-type ALU symmetries (I-type variants are
-#   NOT commutative because the immediate operand is structurally
-#   distinct from the register operand).
-# - BEQ_COND / BNE_COND: equality and inequality comparators are
-#   symmetric.
-COMMUTATIVE_OPS = frozenset({
-    'ADD', 'XOR', 'OR', 'AND',
-    'BEQ_COND', 'BNE_COND',
-})
-
 # Branch ops produce a boolean comparator node tagged with the
 # branch's condition. We name these `<OP>_COND` so they're distinct
 # in SSA from the branch itself (which becomes a SELECT_PC).
@@ -276,9 +265,8 @@ def to_ssa(instrs):
 # ---------------------------------------------------------------------------
 
 def live_nodes(g):
-    """Return SSA node ids reachable backward from outputs. Dead nodes
-    don't contribute to the chunk's externally-observable effect, so
-    distance must ignore them."""
+    """Return SSA node ids reachable backward from outputs; the rest cannot
+    affect any output, so evaluation skips them."""
     live = set()
     frontier = list(g.output_versions.values())
     while frontier:
@@ -580,15 +568,11 @@ class Precomputed:
     4*chunk_len; these chunks contribute no PC residual when paired
     with another non-explicit chunk.
     """
-    chunk: list                  # list[Instruction]
-    ssa: SSAGraph                # for σ-permuted re-evaluation
-    live: set                    # live SSA node ids after DCE
     inputs: list                 # all live regular inputs (syntactic)
     behavioral_inputs: list      # subset of `inputs` with magnitude > threshold
     input_mags: dict             # reg → behavioral magnitude
     reg_outs: list               # actually-modified regular output regs
     out_regs: np.ndarray         # (n_states, 32) anchor exec result
-    out_pcs: np.ndarray          # (n_states,) final PC per state
     out_mags: dict               # reg → loglog'd output magnitude
     pc_explicit: bool            # does any live SSA op write PC
     # Per-row aux targets (T2 register-identity supervision).
@@ -677,15 +661,11 @@ def precompute_chunk(chunk, anchor_states):
         out_slot_regs[i] = r
 
     return Precomputed(
-        chunk=chunk,
-        ssa=ssa,
-        live=live,
         inputs=inputs,
         behavioral_inputs=behavioral_inputs,
         input_mags=input_mags,
         reg_outs=actual_reg_outs,
         out_regs=out_regs,
-        out_pcs=out_pcs,
         out_mags=out_mags,
         pc_explicit=pc_explicit,
         live_in_mask=live_in_mask,
