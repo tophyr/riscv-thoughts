@@ -58,33 +58,19 @@ another needs no computation on operands and still reaches only 5.9x, so "the
 encoder cannot compute with operands" does not explain the failure on its own.
 **Nothing trains any of it** — that is the common cause. vp cannot supply the
 pressure: it is not a pairwise objective, so two distinct points can both
-predict the same outputs correctly, and for a true no-op it emits no supervised
-slot at all and therefore no gradient whatsoever.
+predict the same outputs correctly, and for an instruction that writes no
+register it emits no supervised slot at all and therefore no gradient
+whatsoever.
 
 ## Milestones
 
-1. **[CURRENT] vp = 0 at len=2, at held-out anchors — unmeasured; blocked on
-   task 1.** Every vp figure so far is at the one fixed set of 8 anchor states
-   the head trained on, where it stored answers: the len=2 model that is 99.94%
-   exact there scores ~5% at anchors it never saw (EXPERIMENT_LOG, "T2
-   faithfulness", finding 32). The milestone is scored end to end, through T1's
-   emitted wiring (METRICS.md), so besides the remint it needs the three wiring
-   defects removed that make ~96% of the 8-point residual unsatisfiable for any
-   T2 (finding 31):
-   - SLTIU's source is judged non-behavioral at T1 for every immediate, because
-     uniform-random anchor states make `rs <u imm` constant (24% of the 8-point
-     failures; task 1).
-   - The oracle orders a chunk's behavioral inputs by first syntactic read,
-     including reads that are non-behavioral at their own instruction and that
-     T1 therefore never emits, so T2's operands arrive swapped (54%; most of it
-     is SLTIU reads, which task 1 also removes). The rest is removed too if task
-     1 builds the frame from per-instruction relevance composed by dataflow, its
-     preferred design.
-   - T1's binding drops the source of `SUB`/`XOR`/`SLT rd,x0,rs` on every such
-     instruction (18%; task 3).
-
-   T2's corpus is `configs/instr_alu_writers_chain010.json` at 2M steps, both
-   chosen at the 8 training anchors and to be re-checked after the remint.
+1. **[CURRENT] vp = 0 at len=2, at held-out anchors.** 98.56–98.63% exact, with
+   a four-hidden-layer T2 vp head, two seeds in each of two input frames that vp
+   cannot tell apart, over a T1 with exact wiring and a four-layer vp head
+   (EXPERIMENT_LOG, "T2 faithfulness", finding 33); task 1 retrains T2 over the
+   frozen `runs/t1_writers_500k_vp3`. Scored end to end, through T1's emitted
+   wiring (METRICS.md). `SUB` carries just under half the failing
+   triples and slots composed from the other instruction's result about 40%.
 
 2. **Computed equivalents collapse at len=2.** Chunks computing the same
    function land as far apart as chunks computing different ones (Mission's
@@ -92,13 +78,13 @@ slot at all and therefore no gradient whatsoever.
    instruction multiplies the equivalences a chunk participates in, so a len=4
    model would learn the same wrong geometry at four times the scale.
 
-3. **vp = 0 at len=4, then len=8.** Was 0.244 and 0.461 before canonical read
-   ranks. Those ranks match the vp target's frame on only 83.7% of len=4 and
-   52.9% of len=8 chunks — the residual is dead code, which no causal read-time
-   counter can know — so the len=2 mechanism may not transfer intact.
+3. **vp = 0 at len=4, then len=8.** Was 0.244 and 0.461 at the 8 fixed anchors,
+   before canonical read ranks. A chunk's input list counts the reads of dead
+   instructions, which are 15% of len=4 and 46% of len=8 chunks (finding 33), so
+   T2's read ranks match the target's frame at every length.
 
 4. **Beyond the happy path.** Everything above is writers-only (R/I-type ALU,
-   valid, non-x0). Then: no-write instructions (task 4), PC/branches, memory,
+   valid, non-x0). Then: no-write instructions (task 3), PC/branches, memory,
    longer and looser chunks.
 
 5. **T3.** Sequences of T2 blocks. Prerequisite: decide what a *composed*
@@ -108,99 +94,55 @@ slot at all and therefore no gradient whatsoever.
 
 ## Open tasks
 
-Task 1 comes first: until it lands, no vp figure says whether a function was
-learned. Task 2 is required for the MVP, and task 3 carries one of the wiring
-fixes milestone 1 needs. The rest are queued, not parallel work.
+In order. Task 1 gates milestone 1, and task 2 is required for the MVP. The
+rest are queued, not parallel work.
 
-### 1. Remint T1 and T2 with anchor states redrawn every batch, from a structured draw
+### 1. Adopt the remint
 
-**vp has only ever been trained and scored at one fixed set of 8 anchor states,
-and the head stored answers at them.** Every row of every batch sees the same 8
-register files, and the canonical frame sources a chunk's k-th input from
-position k+1 of them, so input 1 takes 8 distinct values in an entire run.
-Scored at anchors it never saw, the len=2 T2 that is 99.94% exact falls to ~5%,
-and T1's own head from 100.0000% to 21% (EXPERIMENT_LOG, "T2 faithfulness",
-finding 32). Every vp number in the project is an 8-point figure.
+Anchors are drawn afresh for every source chunk, from a structured mix, and
+ride in the batch; structural labels come from fixed witness states and decide
+nothing at the anchors; every write counts; scoring is at one fixed held-out set
+(RISCV_DESIGN.md; METRICS.md; finding 33). T1 passes both of its losses within
+one triple: `runs/t1_writers_500k_vp3`, whose vp head has three hidden layers —
+the smallest that reaches correct results — emits the oracle's wiring on
+100.0000% of instructions and is 99.9999% exact on vp at held-out anchors (1
+failing triple of 819,200, a comparison next to its immediate; Open ideas). A T1
+is judged by the T2 trained over it, so train T2 over this one and settle what
+is open on T2's side, each against held-out numbers. The T2 figures below are
+from a cell that differs from `scripts/run_t2.sh`'s defaults — a four-layer vp
+head rather than one, 1M steps rather than 2M, generated locally rather than
+on odin (the datagen skill, "Multinode / remote generation") — and over a T1
+with a four-layer vp head, not the frozen one.
 
-**The objective can train the function; the fixed set is what prevents it.** A
-fresh head trained on FROZEN T1 essences with anchors redrawn per batch reaches
-98.98% at anchors it never saw, still climbing at 200k steps, and does at least
-as well as one handed the opcode and immediate directly (96.62%). T2's essence
-has not had the same test, and is more at risk: T1 also trains a linear
-immediate head, while T2's essence is shaped by vp alone.
+- **T2's binding, exact, with a target of 100%.** T2's binding is the wiring T3
+  will route on, so it needs the score T1's has: exact per chunk, broken down by
+  form, rather than `scripts/eval.py`'s per-register averages, which read 1.000
+  over real errors (METRICS.md, "T1 binding"). Those averages give 1.000 for
+  T2's input slots with dead reads counted and 0.984 with them skipped.
 
-**Uniform values are also poor witnesses, so the draw needs structure.**
-`make_anchor_states` (`datagen/compare.py:319`) draws pure uniform int32. A
-comparison against a 12-bit immediate is then constant, so the oracle marks
-SLTIU's source non-behavioral and T1 learns to emit no read for it — 24% of the
-8-point len=2 failures directly and most of the 54% from the shifted input frame
-(finding 31) — and two registers almost never hold equal values, so every BEQ
-is not-taken once branches enter (milestone 4; Phase 4). Phase 4's structured
-draw — occasional equal pairs, small values, extra zeros — still exists as
-`random_regs` (`emulator/cpu_emulator.py:344`), called only by tests.
-
-Decisions to make before building:
-
-- **How the structural labels stay deterministic.** The anchors do two jobs.
-  They decide the oracle's structural labels — which inputs and outputs an
-  instruction has, hence T1's binding targets and the canonical frame the vp
-  target is built in — and they supply the input values vp is evaluated at.
-  Labels are a property of the instruction, so they must not depend on which
-  anchors a batch happened to draw: `SLTIU x4,x5,40` is "reads x5" only in a
-  batch where some anchor puts a value below 40 there, so per-batch anchors used
-  for both jobs would flip its binding target between batches.
-
-  **Preferred: decide relevance per instruction, and compose it for chunks by
-  dataflow.** For each instruction, decide which of its reads matter by testing
-  it against a small FIXED, generic witness set (zeros, small values of both
-  signs, equal pairs) — no per-opcode perturbation rules, and cacheable per
-  instruction form, since a single instruction is cheap to test at hundreds of
-  states. Zero alone witnesses SLTIU at every nonzero immediate: `0 <u k` holds
-  and its bit-flip `0xFFFFFFFF <u k` does not. A chunk input is then behavioral
-  iff a path of per-instruction-relevant reads connects it to a chunk output —
-  static liveness over the SSA graph, with no values and nothing to invert,
-  where testing chunk inputs by execution would mean solving for an input that
-  pushes an intermediate across a boundary. The vp values come from per-batch
-  anchors, which decide no labels. Consequences:
-  - Labels are deterministic and independent of any anchor draw, and the
-    witness set is never learned from, so it cannot be memorized.
-  - The canonical frame is built from the same per-instruction relevance T1's
-    binding is trained on, plus the wiring T2 is given, so a correct T1 cannot
-    produce the frame-shift class of finding 31; a T1 binding error still can.
-  - Cancellation ACROSS instructions (`ADDI x5,x5,1 ; ADDI x5,x5,-1`) no longer
-    removes an input: the targets stop imposing that equivalence, and
-    recognising it becomes the essence's job (task 2).
-  - Whether a same-value write counts as a write is still task 4's open
-    definition; read relevance is unaffected by it.
-
-  Alternatives if that does not pan out:
-  - decide chunk-level labels by execution against one large, fixed,
-    structured witness set, with vp values from per-batch anchors. Keeps
-    value-level cancellation in the labels, at the cost of a second anchor set
-    and execution over hundreds of states per chunk.
-  - keep one set per batch for both jobs, and guarantee that every batch's draw
-    contains the witnesses. Simpler plumbing, but it needs a guarantee per
-    narrow function (`SLTIU …,1` varies only at 0), inside an 8-state budget
-    that also has to exercise full-width carries.
-- **The vp draw.** Structured as well, with enough generic 32-bit values to
-  exercise full-width carries, where the fresh head's shortfall sits (`ADD`,
-  `SUB`).
-- **How many per batch.** 8 today; the per-step cost of more is unmeasured.
-- **The wire format.** The anchors ride in every RVT batch and the trainer reads
-  them from it instead of rebuilding one fixed set from a seed. That is a format
-  change and a rewrite of CLAUDE.md's INVARIANT 1.
-- **The held-out set.** One fixed anchor set no model ever trains on, from the
-  same structured distribution, used by the criterion and every probe
-  (`probes/vp_budget.py` already takes an anchor seed).
-
-Then remint T1, then T2 over it, and score both at the held-out set. Every
-choice whose evidence was vp needs re-checking against held-out numbers rather
-than inheriting: the chain rate and 2M budget, the vp-as-evaluator analysis
-(findings 21, 26, 29, 30), and the architecture settings argued from vp. Fold in
-task 3's binding fix if it is ready, since that remints T1 too.
+- **The vp head's depth.** Over the T1 with exact wiring, two T2 seeds score
+  98.56–98.63% with four hidden layers and 85.34–86.46% with two; with one, an
+  earlier T1's T2 was at 69% by mid-training. On ground-truth features no
+  one-layer head reaches exact at any width tried (best 95.12% at 4,096 wide),
+  two layers reach 99.36% and four 100.00% (finding 33). The criterion is the
+  one T1's head was chosen by: the smallest head that still reaches correct
+  results, so the essence does as much of the work as possible — a fixed small
+  head reads T1's essence better the weaker the head T1 trained with. The
+  adopted cell (`scripts/run_t2.sh`, `VP=1`) has not been changed.
+- **The batch payload, if generation moves off this machine.** Per-row anchors
+  make a batch 2.7x larger compressed, ~84 MB/s at T2's step rate over the link
+  from the generator machine. Local generation keeps up at len=2 (~468 batches/s
+  from 26 workers against T2's ~200), so this waits until it does not. Shipping
+  only the canonical input columns of the anchors and only the written slots of
+  `out_regs` would remove most of it.
+- **The residual.** Over the T1 with exact wiring, `SUB` is ~88% exact and
+  carries ~47% of the failing triples; slots composed from the other
+  instruction's result are 77–79% and carry ~40%.
+- **Everything argued from 8-anchor vp**: the chain rate and 2M budget, the
+  vp-as-evaluator analysis (findings 21, 26, 29, 30), and the architecture
+  settings argued from vp.
 
 ### 2. Collapse computed equivalences (milestone 2 — required for MVP)
-
 
 Two chunks computing the same function must land on the same point. They do not,
 and the failure is total rather than partial (Mission's table).
@@ -213,8 +155,8 @@ sits at 117x. **At both tiers, an equivalence collapses when the architecture
 cannot represent the difference and otherwise does not.** Any fix has to be
 designed for T1 and T2 together: they are one class (`compressor/`), so a
 mechanism that works at T1 applies at T2 unchanged. A collapse change to the
-core therefore remints T1, as do tasks 1 and 3; batch them where that costs
-nothing, but no order between them is required.
+core therefore remints T1; batch it with any other T1 change where that costs
+nothing.
 
 **Nothing in the project covers this class.** Equivalences are enumerated in one
 place — the manifest in `datagen/generate.py` — and all 15 of its classes are
@@ -234,16 +176,15 @@ three places:
   `ORI`/`XORI`/`SLLI x,y,0`) sit 0.2794 apart, and `ADD x,y,y` against
   `SLLI x,y,1` sits 0.5696 apart, both within 2x of the 0.6948–0.9675 between
   instructions computing *different* functions;
-- T1's binding, and hence T2's vp: every `dest` misprediction measured is an
-  instruction the oracle says modifies nothing, i.e. T1 reporting a read and a
-  write for `ADD x5,x5,x0`. It costs T2 nothing measurable: on the chain-rate
-  0.10 len=2 model none of the failing triples at the 8 training anchors sits in
-  such a chunk, because the oracle's chunk frame counts that read as well. It is
-  an error only under the oracle's current definition of a write, which is open
-  (task 4).
+- the targets: a same-value self-write (`ADD x5,x5,x0`) is a read and a write,
+  so the binding is never told that it is the identity; recognising
+  `+x0`, `+0`, `|0`, `^0` and `<<0` as the identity is the essence's job.
 
-If that definition stands, it is a missing capability: knowing that
-`+x0`, `+0`, `|0`, `^0` and `<<0` are the identity.
+**Dead-code elimination is part of this task.** A dead instruction's reads are
+the chunk's inputs (`ADD x5,x6,x7 ; ADDI x5,x8,1` has inputs x6, x7, x8), so
+the targets never make a chunk with dead code equal to its live part; making
+the essences land together is collapse work, measured as equivalence rather
+than as correctness.
 
 Decisions to make before building, in order:
 
@@ -266,39 +207,7 @@ Decisions to make before building, in order:
   inequivalents together too. The guard is `behav-diff` (METRICS.md), which must
   stay large.
 
-### 3. Give T1 a validity task
-
-
-The frozen T1 (`runs/t1_writers_250k_rank`) is a diagnostic trained on a clean
-corpus (`configs/instr_alu_writers.json`, which declares no `invalidity`
-block), so it has no validity task and cannot reject invalid input. That and
-one binding error (below) are the gaps between it and a production T1: it
-trains against the corrected oracle, at the core's settled settings, with the `rd==x0` immediate
-mask applied (`_t1_immediates` in `compressor/train.py`), and its
-single-instruction vp is a 100.0000% exact 32-bit match at the 8 training
-anchors (`probes/t1_scorecard.py`) and 21% at anchors it never saw — a stored
-answer, which task 1 replaces. Needed before anything leaves the happy path.
-
-**A candidate T1 can only be judged by training a T2 over it** (~65 min at
-len=2, 1M steps).
-T1-side metrics do not predict what T2 extracts: six T1s all scoring 100.0000%
-on their own single-instruction vp at the 8 training anchors yielded T2s spanning 0.059 points, with their
-binding accuracies ranked *anti*-correlated to their T2s. Budget for that before
-proposing a T1 sweep, and replicate.
-
-Scrutinise when reminting: **the binding heads are weighted 0.1 against vp's
-1.0** — `in_slot_weight`, `live_in_weight`, `live_out_weight` and
-`out_slot_weight` are all 0.1 while `value_predict_weight` is 1.0. T2 consumes
-the binding as its WIRING, so the tier interface is optimised at a tenth of the
-priority of the essence. The binding has one measured deficit against the
-oracle: whenever x0 is the FIRST operand of `SUB`, `XOR` or `SLT`, T1 emits no
-source at all (0.0% of 400 random instructions per opcode, against 95–100% for
-every other operand form measured), although the oracle marks the source
-behavioral. That is 18% of T2's len=2 failures at the 8 training anchors
-(EXPERIMENT_LOG, "T2 faithfulness", finding 31).
-
-### 4. No-write instructions are invisible to the essence
-
+### 3. No-write instructions are invisible to the essence
 
 Blocks milestone 4 (~⅓ of the ISA). Content reaches the essence only through a
 register write (`value[out] = res` is gated on `out != 0`), so for branches,
@@ -315,66 +224,37 @@ the result makes equivalent x0-write no-ops spuriously distinct across
 immediates; and whether branches also need a real PC-effect vp target (the SSA
 oracle computes `SELECT_PC` but does not ship it).
 
-**Decide first whether PC advance is part of the behavior**, because it is not
-only a branch question and it gates work in two other tasks. A true register
-no-op — `ADD x5,x5,x0`, `ADDI x5,x5,0` — changes nothing but the PC, and the
-oracle gives it no supervised slot, so vp is silent about it while the
-essence still moves (0.1041). Two readings, and nothing currently distinguishes
-them:
+**Decide first whether PC advance is part of the behavior**, because it gates
+work in another task. An instruction that writes no register — a branch not
+taken, a store, an x0-write — changes nothing but the PC (or memory), and the
+oracle gives it no supervised slot, so vp is silent about it while the essence
+still moves. Two readings, and nothing currently distinguishes them:
 
-- **PC advance counts.** Then a chunk with a no-op and one without genuinely
-  differ, the essence is right to separate them, and vp is *incomplete* — it has
-  no PC target at all. `out_pcs` is computed and only a `pc_writes` boolean is
-  shipped, so this would mean widening the RVT batch.
-- **PC advance does not count.** Then those chunks are equivalent and the 0.1041
-  is a collapse failure, which puts it in task 2.
+- **PC advance counts.** Then a chunk with such an instruction and one without
+  genuinely differ, the essence is right to separate them, and vp is
+  *incomplete* — it has no PC target at all. `out_pcs` is computed and only a
+  `pc_writes` boolean is shipped, so this would mean widening the RVT batch.
+- **PC advance does not count.** Then those chunks are equivalent and their
+  distance is a collapse failure, which puts it in task 2.
 
 Deferred deliberately: it is a definition, not an experiment, and it should be
 settled before either task 2 builds a collapse objective or this task ships a
 PC-effect target — each would bake in an answer.
 
-**Decide with it whether a same-value write counts as a write.** The oracle
-currently says no: a register the chunk READ counts as written only if its final
-value differs from its initial one at some anchor (`_actually_modified`,
-`datagen/compare.py`), so `ADD x5,x5,x0` has no input and no output. That forces
-one answer to a question with two defensible ones, and it has three costs:
+### 4. Give T1 a validity task
 
-- It decides a structural question by comparing values, at 8 anchor points.
-- It reaches across instructions: `ADDI x5,x5,1 ; ADDI x5,x5,-1`,
-  `AND x5,x5,x5` and any chain folding back to identity also lose their slot and
-  their input, so the binding and vp targets demand the computed-equivalence
-  recognition that task 2 has not built. At longer chunks the dropped input also
-  shifts every later input's canonical position.
-- The binding is the interface the next tier wires on, and for an interface the
-  safe contract is "may write": reporting a same-value write is harmless to a
-  consumer, while omitting a real one is not. Under that contract T1 predicting
-  a write for `ADD x5,x5,x0` is correct.
-
-The alternative counts every syntactic write to a read register: the chunk then
-maps input x5 to output x5 by identity, its vp target stays self-consistent, and
-`ADD x5,x5,x0` stays equivalent to `ADDI x5,x5,0` but not to an empty chunk —
-which is the PC-advance question again. Identity collapse would then be the
-essence's job (task 2), not something the targets impose on the binding.
-
-- **Accepting both answers is possible, as a way to defer the definition.**
-  Dropping a write is not one unscored slot: output slots are positional in
-  write order, so later outputs renumber, and the dropped register leaves the
-  behavioral inputs, so later inputs shift canonical position. The two answers
-  are two canonical frames. The oracle would execute in both (it already
-  re-executes when the syntactic and behavioral frames differ), the RVT batch
-  would ship both target sets, and vp, T1's binding losses and every scorer
-  would take the per-row minimum. That is semantically the "may write"
-  contract — an omitted write is accepted only when it is a same-value write.
-  Costs: frames multiply as 2^k in the number of same-value writes; "same
-  value" is still decided at 8 anchors; and the vp head's input mask, which
-  comes from the oracle's input count rather than from T2, would be supplied
-  per frame, so the minimum rewards whichever ground-truth count helps — derive
-  that mask from T2's own state in the same change. Emitting "may write"
-  unconditionally is the simpler destination: one frame, one changed rule.
-Behavioral READS are not part of this question and stay: they set the canonical
-frame of the vp target (EXPERIMENT_LOG, "T2 faithfulness", finding 14).
-Changing the write rule changes the oracle, so it remints T1 and T2 and resets
-every vp baseline.
+T1's output norm is meant to say whether its token window is a complete, valid
+instruction — near 1 if so, near 0 for a partial instruction, a window spanning
+an instruction boundary, several instructions run together or random tokens —
+with the meaning in the direction (Phase 10, magnitude-as-validity). That is
+what a segmenter reading a raw token stream needs, and a gate trained on an
+encoder without it plateaued at ~70% (Phase 9). The loss exists
+(`(‖essence‖ − valid)²`, `valid_weight` 0.1), but the writers corpus declares
+no `invalidity` block, so every row is valid, the target is always 1 and the
+loss teaches nothing: the current T1 cannot reject invalid input. Every chunk T2
+sees is valid by construction, so this does not block the milestones above; it
+is needed before anything leaves the happy path. Invalid windows are generated
+by `datagen/invalidity.py` from a config's `invalidity` block.
 
 ## Open ideas
 
@@ -425,6 +305,20 @@ What would have to be settled:
 
 The comparison it has to win is against the best fixed (rate, steps) pair, scored
 on the naturally drawn corpus.
+
+### Draw anchor values aimed at the instruction
+
+Anchors are drawn per source chunk, so a draw could look at the chunk it is for.
+The residual of a T1 trained at fresh structured anchors is two input patterns
+the generic draw reaches only by chance: a value carrying through a long run of
+zero bits (six ADDI failures, all on one held-out input, 0x723005C9 with a
+negative immediate), and a comparison within a few units of the immediate
+(`SLTIU x30,x10,1492` at 1497) — 7 failing triples of 819,200 (EXPERIMENT_LOG,
+"T2 faithfulness", finding 33). Two classes would aim at them: a source value
+set to `imm + δ` for small δ, and a uniform value with a random span of bits
+forced to all-0 or all-1. The cost is a draw specialised to the opcode set, and
+a held-out set that would need the same classes to test them on purpose rather
+than by chance.
 
 ## Long horizon
 

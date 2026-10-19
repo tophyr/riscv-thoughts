@@ -445,15 +445,14 @@ class TestMalformedInputFatal:
 
 def _train_t1(tmp, name='t1'):
     """Produce a tiny 1-step T1 encoder checkpoint under tmp/<name>.
-    Returns the encoder.pt path. --n-anchor-states 4 matches the corpus's
-    --n-states 4 (canonical vp runs on the shipped out_regs)."""
+    Returns the encoder.pt path."""
     run_dir = str(Path(tmp) / name)
     data = gen(n_batches=2, batch_size=8, rule='cap=2', twins=1, n_states=4)
     out, err, rc = run([
         PYTHON, 'scripts/train_encoder.py',
         '--n-steps', '1', '--log-every', '1', '--out-dir', run_dir,
         '--d-model', '32', '--n-heads', '2', '--n-layers', '1',
-        '--d-out', '32', '--max-window', '32', '--n-anchor-states', '4',
+        '--d-out', '32', '--max-window', '32',
         '--no-compile'],
         stdin=data, timeout=120)
     assert rc == 0, f'T1 train failed: {err}'
@@ -472,7 +471,7 @@ def _train_t2(tmp, t1_enc, name='t2', extra_args=()):
         PYTHON, 'scripts/train_t2_encoder.py', '--t1-model', str(t1_enc),
         '--n-steps', '1', '--log-every', '1', '--out-dir', run_dir,
         '--d-out', '32', '--d-event', '16',
-        '--n-anchor-states', '4', '--warmup-steps', '0', '--no-compile',
+        '--warmup-steps', '0', '--no-compile',
         *extra_args],
         stdin=data, timeout=180)
     assert rc == 0, f'T2 train failed: {err}'
@@ -493,7 +492,7 @@ class TestCorpusRecord:
                 PYTHON, 'scripts/record_corpus.py', str(run_dir),
                 '--config', 'configs/instr_alu_writers_chain010.json',
                 '--rule', 'cap=2', '--twins', '2', '--batch-size', '128',
-                '--n-states', '8', '--anchor-seed', '0', '--gen-seed', '7',
+                '--n-states', '8', '--gen-seed', '7',
                 '--count', '1000'])
             assert rc == 0, err
             rec = json.loads((run_dir / 'corpus.json').read_text())
@@ -503,15 +502,13 @@ class TestCorpusRecord:
         assert rec['config_path'].endswith('instr_alu_writers_chain010.json')
         # and the knobs that live OUTSIDE the config file are recorded too
         assert (rec['rule'], rec['gen_seed'], rec['count']) == ('cap=2', 7, 1000)
-        # anchor seed + count, so INVARIANT 1 is checkable after the fact
-        assert (rec['anchor_seed'], rec['n_states']) == (0, 8)
+        assert rec['n_states'] == 8
 
 
 class TestTraining:
     def test_encoder_train_smoke(self):
-        """datagen | train_encoder smoke (single step). T1 now runs the
-        unified canonical vp on out_regs (present for every rule), so
-        --n-anchor-states must match gen's --n-states (4) per invariant 1."""
+        """datagen | train_encoder smoke (single step): T1 runs the canonical
+        vp on the shipped out_regs at the anchors each batch carries."""
         data = gen(n_batches=2, batch_size=8)
         with tempfile.TemporaryDirectory() as tmp:
             out, err, rc = run([
@@ -519,7 +516,7 @@ class TestTraining:
                 '--n-steps', '1', '--log-every', '1',
                 '--out-dir', tmp,
                 '--d-model', '32', '--n-heads', '2', '--n-layers', '1',
-                '--d-out', '32', '--max-window', '32', '--n-anchor-states', '4',
+                '--d-out', '32', '--max-window', '32',
                 '--no-compile'],
                 stdin=data, timeout=120)
         assert rc == 0, f'encoder training failed: {err}'

@@ -85,7 +85,7 @@ class RegisterStateMachine(nn.Module):
       r0, r1 = value[in0], value[in1]          (one-hot reads)
       res    = op_cell(content, r0, r1)        (role-aware combine)
       value[out] = res                         (one-hot write; x0 = nop)
-      event[in0],[in1] += read_pulse(content, r)   (content-dependent)
+      event[in0],[in1] += read_pulse(op_cell hidden)[role]   (whole operand context)
       event[out]       += write_pulse
 
     No per-register parameters: a slot is seeded only with the canonical read
@@ -129,16 +129,11 @@ class RegisterStateMachine(nn.Module):
                 nn.Linear(d_value, 4 * d_value), nn.ReLU(),
                 nn.Linear(4 * d_value, d_value))
             for _ in range(op_cell_depth - 1)])
-        # content-dependent read pulse: a behaviorally-irrelevant read
-        # (AND rs1,x0) can be marked differently from a relevant one, so the
-        # magnitude-filtered live_in target is recoverable.
-        self.read_pulse = nn.Linear(d_content + d_value, d_event)
-        # Per-operand-role bias on the read event. in_slot is read-ORDER;
-        # within one instruction both operands are read in the same step, so
-        # the cross-step read-order ramp can't separate them — this role bias
-        # (operand position 0 vs 1, register-independent so equivariance is
-        # preserved) is what lets in_score recover which operand is slot 0.
-        self.read_role = nn.Parameter(torch.randn(2, d_event) * 0.1)
+        # Read pulses, one per operand POSITION, from the op-cell's hidden layer:
+        # whether a read matters depends on the opcode AND on the other operand
+        # (`AND rs,x0` vs `AND rs,rt`; x0 arrives as the zero vector, aliasing
+        # as r0 == r1), which no function of one operand can see.
+        self.read_pulse = nn.Linear(4 * d_value, 2 * d_event)
         self.write_pulse = nn.Parameter(torch.randn(d_event) * 0.1)
         # essence pool: Pooling-by-Multihead-Attention (Set Transformer). k=
         # n_pool_heads learned seed QUERIES, each doing a permutation-invariant
@@ -219,7 +214,8 @@ class RegisterStateMachine(nn.Module):
                 value = value * (1.0 - fr) + fr * e.unsqueeze(1)
             r0 = torch.bmm(oh0.unsqueeze(1), value).squeeze(1)   # (B,d_value)
             r1 = torch.bmm(oh1.unsqueeze(1), value).squeeze(1)
-            res = self.op_cell(torch.cat([c, r0, r1], dim=-1))   # (B,d_value)
+            hidden = F.relu(self.op_cell[0](torch.cat([c, r0, r1], dim=-1)))
+            res = self.op_cell[2](hidden)                        # (B,d_value)
             for blk in self.op_cell_blocks:                      # residual depth
                 res = res + blk(res)
             # write value at dest (x0 write = nop), active rows only.
@@ -227,10 +223,9 @@ class RegisterStateMachine(nn.Module):
                 * not_x0_row
             w = (oh_out * a).unsqueeze(-1)                       # (B,n_regs,1)
             value = value * (1.0 - w) + w * res.unsqueeze(1)
-            # event channels: content-dependent read pulse (x0 reads leave no
-            # trace) + write pulse.
-            p0 = self.read_pulse(torch.cat([c, r0], dim=-1)) + self.read_role[0]
-            p1 = self.read_pulse(torch.cat([c, r1], dim=-1)) + self.read_role[1]
+            # event channels: per-position read pulses (x0 reads leave no trace
+            # on the x0 slot) + write pulse.
+            p0, p1 = self.read_pulse(hidden).view(-1, 2, self.d_event).unbind(1)
             event = event + (oh0e * a).unsqueeze(-1) * p0.unsqueeze(1)
             event = event + (oh1e * a).unsqueeze(-1) * p1.unsqueeze(1)
             event = event + (oh_out * a).unsqueeze(-1) \
@@ -283,14 +278,14 @@ class RegisterStateMachine(nn.Module):
         """Stamp this step's operands with their canonical read POSITION: the
         running count of distinct registers read BEFORE they are written. First
         read sticks; operand 0 is stamped before operand 1, so two inputs of one
-        instruction get different positions (read_role separately marks which
+        instruction get different positions (the per-position read pulses mark which
         operand slot each filled).
 
         A register read twice receives one position twice, which is correct —
-        it is one input. The count diverges from the target's canonical frame
-        only on a DEAD input, which the frame skips and no causal read-time
-        counter can know. All values are per-chunk scalars placed through the
-        wiring one-hots, so equivariance is unaffected.
+        it is one input. The target's canonical frame counts a dead
+        instruction's reads too, so given T1's wiring the count is the frame's
+        exactly. All values are per-chunk scalars placed through the wiring
+        one-hots, so equivariance is unaffected.
         """
         firsts, ranks = [], []
         for oh in (oh0e, oh1e):
@@ -383,7 +378,8 @@ class TokenEmbedder(nn.Module):
 # detail: it is the only consumer a T2 essence has, so its capacity is an
 # implicit claim about what the next tier will be able to read, and `vp = 0` at
 # a deeper head is a strictly weaker statement than at a shallow one. Quote the
-# depth with the number. Adopted: one hidden layer (`run_t2.sh` VP=1).
+# depth with the number. The target is the smallest head that still reaches
+# correct results.
 def _build_vp_head(vp_in, vp_out, depth):
     """vp value-prediction head with `depth` hidden layers of _VP_HIDDEN.
     depth=0 -> a single linear readout. depth=4 reproduces the historical
@@ -400,13 +396,11 @@ def _build_vp_head(vp_in, vp_out, depth):
 
 _IN_SCORE_HIDDEN = 256
 _VP_HIDDEN = 1024
-_VP_HEAD_DEPTH = 4     # vp_head hidden layers. Entry scripts pass their own;
-                       # the adopted T2 cell uses 1. Capacity here is work the
-                       # representation is NOT required to do, so deeper trades
-                       # rather than gains: depth 4 end-to-end moved one
-                       # composed arm +20 points and another -14, left the
-                       # aggregate inside the noise floor and cost GVN
-                       # separation (EXPERIMENT_LOG finding 22).
+_VP_HEAD_DEPTH = 4     # vp_head hidden layers. Entry scripts pass their own
+                       # (T1: 3, the smallest that reaches exact vp at held-out
+                       # anchors; EXPERIMENT_LOG finding 33). Capacity here is
+                       # evaluation the encoder is spared, so the smallest head
+                       # that still reaches correct results is the target.
 _VP_VALUE_BITS = 32    # two's-complement bit width of the vp value target (RV32)
 _IMM_N_FREQ = 12       # rotary immediate: power-of-2 periods 2..4096 (2*this = target dim)
 

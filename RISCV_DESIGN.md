@@ -489,10 +489,11 @@ The rename-invariant essence *is* a value-number — two computations producing
 the same value get the same essence; different values stay apart.
 Rename-equivalence collapses **structurally** (free, from the equivariant
 core). Other behavioral equivalences — commutative operand swaps (`a+b==b+a`),
-dead code, algebraic identities — are *not* structural and are **trained in**
-by the behavioral targets (the canonical `out_regs` value-prediction supervises
-the rename-invariant I/O function, so equivalent chunks receive identical
-targets). Distinct behaviors must stay apart — the essence is behavioral, not a
+dead code, algebraic identities — are *not* structural, and the targets do not
+impose them: a chunk with dead code, an identity or a cancellation is labelled
+by what it reads and writes, not by the shorter chunk it is equivalent to.
+Collapsing those is the essence's job, pursued as equivalence rather than as
+correctness. Distinct behaviors must stay apart — the essence is behavioral, not a
 syntactic hash.
 
 **Reordering independent instructions is NOT an essence-level equivalence.**
@@ -563,9 +564,9 @@ invariant essence):
 (plus a bounded smooth-magnitude term): from `(essence, canonical input-slot
 values)` predict each output register's **canonical** value (the `out_regs`
 baseline — inputs relocated to canonical first-read positions, so the target
-depends only on operand structure, not register names), at sampled anchor
-input states that are redrawn for every batch (see the end of this section for
-why one fixed set fails). Feeding the head canonical inputs to match the
+depends only on operand structure, not register names), at anchor input states
+drawn afresh for every source chunk (see the end of this section for why one
+fixed set fails). Feeding the head canonical inputs to match the
 canonical target is load-bearing: the earlier bug fed *raw* register values
 against a *canonical* target, making the task mathematically inconsistent.
 
@@ -607,27 +608,51 @@ value-number), and the canonical vp target is what collapses the
 *non-structural* equivalences. GVN collapse and vp are both load-bearing — a vp
 gain that craters the GVN rows is a regression, not a win.
 
-**The anchor states must be redrawn for every batch, and drawn with
-structure.** With one fixed set the head is fed the same few input values for
-every row, so it can store each instruction shape's answers at those points
-instead of evaluating the described function — and it does: trained heads that
-are exact at their 8 fixed anchors score ~5% (T2) and 21% (T1) at anchors they
-never saw (EXPERIMENT_LOG, "T2 faithfulness", finding 32). Redrawing them per
-batch makes storing impossible, so a correct prediction can only come from
-evaluating. Uniform 32-bit values are also poor witnesses: a comparison against
-a 12-bit immediate is constant over them, so the oracle judges its input
-irrelevant (finding 31), and two registers almost never hold equal values, so a
-branch on equality is never taken (Phase 4). The draw therefore needs small
-values, zeros and equal pairs alongside generic 32-bit values, which exercise
-full-width carries. The pipeline still uses one fixed set of 8, so every vp
-figure measured so far is an 8-point figure; METRICS.md states how to score a
-held-out one.
+**The anchor states are drawn afresh for every source chunk, with structure,
+and they decide no labels.** With one fixed set the head is fed the same few
+input values for every row, so it can store each instruction shape's answers at
+those points instead of evaluating the described function — and it does: heads
+exact at 8 fixed anchors score ~5% (T2) and 21% (T1) at anchors they never saw
+(EXPERIMENT_LOG, "T2 faithfulness", finding 32). A fresh draw per source chunk —
+its twins share it, since a rename must not change the targets — makes storing
+impossible, so a correct prediction can only come from evaluating. What trains
+the evaluator is how many distinct input values a step sees: one shared set per
+batch needs 64 anchors to match 8 per row, at 2.7x the step time (finding 33).
+
+Uniform 32-bit values are poor witnesses: a comparison against a 12-bit
+immediate is constant over them, two registers almost never hold equal values,
+and a sum almost never carries through all 32 bits. Each register is therefore
+drawn from a mixture of zeros, small and mid-range values, boundary values,
+powers of two and uniform values, and some registers copy a lower-numbered one
+exactly, to within a few units, or negated — behavioral input k is read from
+register k+1, so the copies are what make two inputs equal, adjacent or
+opposite (`draw_anchor_states`).
+
+The anchors decide no structural label. Which reads an instruction's outputs
+depend on is decided once per instruction form at a fixed set of witness values
+— every pair of 0, 1, -1 and one generic value, which agrees with several
+thousand rich states on every ALU form. A chunk's inputs are those reads in
+first-read order, counting only registers not yet written — the order T2's read
+ranks number them in, given T1's wiring — including the reads of an instruction
+whose result is overwritten: they are shown to the encoder, so leaving them out
+would shift every later input off its rank. Every register the chunk writes is
+an output, including one rewritten with the value it held. A label that
+depended on the draw would flip from row to row (`SLTIU x4,x5,40` reads x5 only where some
+anchor puts a value below 40 there), and the binding targets with it. The cost
+is that a value cancelled across instructions keeps its input:
+`ADDI x6,x5,1 ; SUB x7,x6,x5` makes x7 the constant 1 and still lists x5, and
+recognising that is the essence's job. Likewise `ADD x5,x5,x0` and
+`ADDI x5,x5,1 ; ADDI x5,x5,-1` read and write x5, and
+`ADD x5,x6,x7 ; ADDI x5,x8,1` has inputs x6, x7 and x8: calling the first a
+no-op, or dropping the dead instruction's inputs from the second, would make
+the targets impose an equivalence (identity equals the empty chunk; dead code
+equals its absence) that is the essence's to learn.
 
 **Emergent equivalence.** With the behavioral targets alone, provably
 equivalent instructions/chunks collapse without any equivalence loss:
-rename-twins collapse *structurally* (the equivariant core), and non-rename
-behavioral equivalents (commutativity, dead code) collapse from the canonical
-vp target. Measured as GVN collapse split by pair type (EXPERIMENT_LOG,
+rename-twins collapse *structurally* (the equivariant core), and a commutative
+operand swap leaves the canonical vp target unchanged. Dead code and identities
+are deliberately not given shared targets (above). Measured as GVN collapse split by pair type (EXPERIMENT_LOG,
 "Rename-equivariant T1/T2") — note the measurement covers commutative operand
 swaps only
 (`_commute_variant`), so treat the other types as expected-but-unmeasured.

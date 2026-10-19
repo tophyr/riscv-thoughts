@@ -270,7 +270,7 @@ class Batch:
     # valid Precomputed (invalid windows, mem-op chunks) get zero
     # masks and AUX_CE_IGNORE in the slot arrays.
     live_in_mask:   np.ndarray   # (B, N_REGS) bool — behavioral inputs
-    live_out_mask:  np.ndarray   # (B, N_REGS) bool — actually-modified regs
+    live_out_mask:  np.ndarray   # (B, N_REGS) bool — written regs
     pc_writes:      np.ndarray   # (B,) bool — pc_explicit flag
     in_slot_regs:   np.ndarray   # (B, MAX_INPUT_SLOTS) int8 — reg or AUX_CE_IGNORE
     out_slot_regs:  np.ndarray   # (B, MAX_OUTPUT_SLOTS) int8
@@ -281,6 +281,10 @@ class Batch:
     # otherwise; out_regs_valid marks decodable non-mem rows.
     out_regs:       np.ndarray   # (OB, n_anchors, N_REGS) int32
     out_regs_valid: np.ndarray   # (OB,) bool
+    # The register files each row's out_regs was executed from, drawn per
+    # source chunk and shared by its twins. The vp head is fed its canonical
+    # input values from them.
+    anchors:        np.ndarray   # (OB, n_anchors, N_REGS) int32
 
 
 RVT_FORMAT = BinaryFormat(
@@ -293,6 +297,7 @@ RVT_FORMAT = BinaryFormat(
         BodyField('instr_lens', np.dtype(np.int32), ('B', 'max_n_instrs')),
         BodyField('out_regs', np.dtype(np.int32), ('OB', 'n_anchors', N_REGS)),
         BodyField('out_regs_valid', np.dtype(np.bool_), ('OB',)),
+        BodyField('anchors', np.dtype(np.int32), ('OB', 'n_anchors', N_REGS)),
         BodyField('live_in_mask', np.dtype(np.bool_), ('B', N_REGS)),
         BodyField('live_out_mask', np.dtype(np.bool_), ('B', N_REGS)),
         BodyField('pc_writes', np.dtype(np.bool_), ('B',)),
@@ -379,7 +384,7 @@ def _out_regs_from_precomputeds(precomputeds, n_anchors):
 def pack_batch(chunks, *,
                target_B, target_max_tokens,
                target_max_n_instrs,
-               out_regs=None, out_regs_valid=None,
+               out_regs=None, out_regs_valid=None, anchors=None,
                aux_payload=None):
     """Build a Batch from chunks with the canonical out_regs oracle.
 
@@ -452,6 +457,7 @@ def pack_batch(chunks, *,
     if out_regs is None:
         out_regs_arr = np.zeros((0, n_anchors, N_REGS), dtype=np.int32)
         out_regs_valid_arr = np.zeros((0,), dtype=bool)
+        anchors_arr = np.zeros((0, n_anchors, N_REGS), dtype=np.int32)
     else:
         if out_regs.shape[0] != actual_B:
             raise ValueError(
@@ -461,6 +467,11 @@ def pack_batch(chunks, *,
         out_regs_arr[:actual_B] = out_regs
         out_regs_valid_arr = np.zeros((B,), dtype=bool)
         out_regs_valid_arr[:actual_B] = out_regs_valid
+        if anchors is None or anchors.shape != out_regs.shape:
+            raise ValueError('anchors must be shipped with out_regs, one '
+                             'register file per row and anchor')
+        anchors_arr = np.zeros((B, n_anchors, N_REGS), dtype=np.int32)
+        anchors_arr[:actual_B] = anchors
 
     aux = aux_payload if aux_payload is not None else _empty_aux(actual_B)
     if aux.live_in_mask.shape[0] != actual_B:
@@ -482,6 +493,7 @@ def pack_batch(chunks, *,
                  instr_lens=instr_lens,
                  out_regs=out_regs_arr,
                  out_regs_valid=out_regs_valid_arr,
+                 anchors=anchors_arr,
                  live_in_mask=live_in_arr,
                  live_out_mask=live_out_arr,
                  pc_writes=pc_writes_arr,
@@ -525,7 +537,7 @@ def _make_invalid_chunk(tokens):
     return Chunk(tokens=list(tokens), valid=False, instructions=None)
 
 
-def build_twins(chunks, twins, anchor_states, rng):
+def build_twins(chunks, twins, draw_anchors, rng):
     """Add `twins` relabeled copies of each valid source chunk and build
     the parallel T2 register-identity aux targets.
 
@@ -534,10 +546,15 @@ def build_twins(chunks, twins, anchor_states, rng):
     Memory-op chunks keep no twins (their Precomputed is unavailable in
     V1 scope) and contribute an empty aux row.
 
-    Returns (chunks_out, aux, out_regs, out_regs_valid) where chunks_out
-    extends `chunks` with the new twins, aux is the parallel AuxPayload, and
-    out_regs/out_regs_valid are the per-row post-exec register file (the
-    value-prediction oracle target, shipped from the gen workers).
+    draw_anchors(k) supplies the anchor states of k source chunks as one
+    (k, n_anchors, 32) array; a source's twins share its states, since a rename
+    must not change the targets.
+
+    Returns (chunks_out, aux, out_regs, out_regs_valid, anchors) where
+    chunks_out extends `chunks` with the new twins, aux is the parallel
+    AuxPayload, out_regs/out_regs_valid are the per-row post-exec register
+    file (the value-prediction oracle target, shipped from the gen workers)
+    and anchors the per-row pre-exec register files it was executed from.
     """
     # Filter out memory-op chunks at the source list — twins inherit
     # their parent's filtering.
@@ -553,30 +570,38 @@ def build_twins(chunks, twins, anchor_states, rng):
 
     # Build the chunks_out list: original chunks + twins after each
     # valid source. Track which output rows have a usable Precomputed.
+    drawn = draw_anchors(max(sum(s is not None for s in valid_sources), 1))
     chunks_out = []
-    has_pre = []           # one entry per output row
+    row_anchors = []       # one entry per output row (None: no Precomputed)
+    n_drawn = 0
     for original, source in zip(chunks, valid_sources):
         chunks_out.append(original)
         if source is None:
-            has_pre.append(False)
+            row_anchors.append(None)
             continue
-        has_pre.append(True)
+        a = drawn[n_drawn]
+        n_drawn += 1
+        row_anchors.append(a)
         for _ in range(twins):
             twin_instrs = random_relabel(source.instructions, rng)
             chunks_out.append(_make_valid_chunk(twin_instrs))
-            has_pre.append(True)
+            row_anchors.append(a)
 
     # Aux targets: rows with a usable source get their Precomputed;
     # mem-op / invalid rows get None → empty aux row.
     aux_pre = [
-        precompute_chunk(ch.instructions, anchor_states) if hp else None
-        for ch, hp in zip(chunks_out, has_pre)
+        precompute_chunk(ch.instructions, a) if a is not None else None
+        for ch, a in zip(chunks_out, row_anchors)
     ]
     aux = _aux_from_precomputeds(aux_pre)
     out_regs, out_regs_valid = _out_regs_from_precomputeds(
-        aux_pre, anchor_states.shape[0])
+        aux_pre, drawn.shape[1])
+    anchors = np.zeros_like(out_regs)
+    for i, a in enumerate(row_anchors):
+        if a is not None:
+            anchors[i] = a
 
-    return chunks_out, aux, out_regs, out_regs_valid
+    return chunks_out, aux, out_regs, out_regs_valid, anchors
 
 
 # ===========================================================================
@@ -621,7 +646,7 @@ def generate_chunks(rule, rng, *, opcode_table=None, dest_regs=None,
 
 
 def collect_into_batches(chunks_iter, *, batch_size, twins,
-                         anchor_states, rng,
+                         draw_anchors, rng,
                          invalid_rate=0.0, invalid_provider=None,
                          max_invalid_window=None,
                          max_chunk_len):
@@ -637,6 +662,10 @@ def collect_into_batches(chunks_iter, *, batch_size, twins,
 
     Every rule (single → T1, multi-instr → T2) ships the canonical out_regs
     oracle via build_twins (the T1/T2 unification).
+
+    draw_anchors(k) supplies k source chunks' anchor states — a fresh draw per
+    source for training, one fixed set for a scoring corpus. A source's twins
+    share its states, and every row's states ship with it.
 
     max_chunk_len: maximum number of instructions per chunk under the
                    chunking rule (the rule's length cap; 1 for 'single').
@@ -674,9 +703,8 @@ def collect_into_batches(chunks_iter, *, batch_size, twins,
             invalids = [_make_invalid_chunk(invalid_provider())
                         for _ in range(n_invalid)]
             mixed = valid_sources + invalids
-            chunks_out, aux, out_regs, out_regs_valid = build_twins(
-                mixed, twins=twins,
-                anchor_states=anchor_states, rng=rng)
+            chunks_out, aux, out_regs, out_regs_valid, anchors = build_twins(
+                mixed, twins=twins, draw_anchors=draw_anchors, rng=rng)
             yield pack_batch(
                 chunks_out,
                 target_B=target_B,
@@ -684,4 +712,5 @@ def collect_into_batches(chunks_iter, *, batch_size, twins,
                 target_max_n_instrs=target_max_n_instrs,
                 out_regs=out_regs,
                 out_regs_valid=out_regs_valid,
+                anchors=anchors,
                 aux_payload=aux)

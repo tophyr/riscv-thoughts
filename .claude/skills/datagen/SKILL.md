@@ -79,11 +79,11 @@ from those ranks, and the pool reads each slot's write step, at every tier.
 
 ```bash
 python -m datagen --rule "cap=$LEN" --twins 2 --batch-size 128 --n-states 8 \
-    --anchor-seed 0 --config configs/instr_alu_writers_chain010.json --count "$STEPS" \
-  | python scripts/train_t2_encoder.py --t1-model runs/t1_writers_250k_rank/encoder.pt \
+    --config configs/instr_alu_writers_chain010.json --count "$STEPS" \
+  | python scripts/train_t2_encoder.py --t1-model runs/t1_writers_500k_vp3/encoder.pt \
     --d-out 512 --d-event 16 --op-cell-depth 4 --vp-head-depth 1 \
     --n-pool-heads 16 --route binding \
-    --n-steps "$STEPS" --anchor-seed 0 --n-anchor-states 8 --out-dir "$OUT"
+    --n-steps "$STEPS" --out-dir "$OUT"
 ```
 
 T2 trains at `LEN=2`, `STEPS=2000000` on the chain-rate-0.10 corpus: the rate is
@@ -116,9 +116,8 @@ Wait for the sweep, or edit a copy.
 **A replicate needs `GEN_SEED`.** Both generator pools default to `--seed 0`, so
 re-running a cell otherwise redraws the same instruction stream and measures
 only initialization variance. `GEN_SEED=7 … TAG=s7 bash scripts/run_t2.sh` draws
-a different corpus from the same distribution. It is unrelated to `ANCHOR_SEED`,
-which must stay equal to the trainer's `--anchor-seed` (INVARIANT 1). Replicating
-is not optional for a sweep — see METRICS.md on null interventions.
+a different corpus from the same distribution, anchor states included.
+Replicating is not optional for a sweep — see METRICS.md on null interventions.
 
 **A run's `t2.pt` appears long before the run ends**, because the trainer
 checkpoints every `--save-every` steps (default 10000; a save stalls the GPU,
@@ -129,14 +128,17 @@ exists reads a partial model.
 **T1 config** (the writers-only corpus T2 is trained against). T1 and T2 run
 the same core at the same settings, so the command below differs from the T2
 cell only in its ingestion front-end and its hparams. The frozen T1 is
-`runs/t1_writers_250k_rank`.
+`runs/t1_writers_500k_vp3`. Its vp head has three hidden layers (the trainer's
+default), the smallest with which T1 reaches exact vp at held-out anchors, and
+that takes the 500k-step schedule (EXPERIMENT_LOG, "T2 faithfulness",
+finding 33).
 
 ```bash
 python -m datagen --rule single --twins 2 --batch-size 128 --n-states 8 \
-    --anchor-seed 0 --config configs/instr_alu_writers.json --count 250000 \
+    --config configs/instr_alu_writers.json --count 500000 \
   | python scripts/train_encoder.py --d-model 128 --n-heads 4 --n-layers 2 \
-    --d-out 64 --max-window 32 --imm-weight 0.3 \
-    --n-steps 250000 --anchor-seed 0 --n-anchor-states 8 --out-dir "$OUT"
+    --d-out 64 --max-window 32 --imm-weight 0.3 --vp-head-depth 3 \
+    --n-steps 500000 --out-dir "$OUT"
 ```
 
 Both trainers expose the same model hparams — `--d-event`, `--op-cell-depth`,
@@ -145,12 +147,12 @@ Both trainers expose the same model hparams — `--d-event`, `--op-cell-depth`,
 dimensions; the core's behaviour is not configurable from either trainer, so
 there is no way to run the two tiers on different versions of it.
 
-**A checkpoint predating the core's settling will not load.** The core has no
-branch for an alternative read position, slot seeding or pool channel, so a
-checkpoint carrying `tag_proj` instead of `rank_emb`, or a pool sized without
-the write-step channel, fails at `load_state_dict`. Only checkpoints trained at
-the settled configuration are usable; `runs/t1_writers_250k_rank` is the frozen
-T1.
+**A checkpoint predating the current core will not load.** The core has no
+branch for an alternative read position, slot seeding, pool channel or read
+pulse, so a checkpoint carrying `tag_proj` instead of `rank_emb`, a pool sized
+without the write-step channel, or a `read_pulse` fed `[content, operand]`
+instead of the op-cell's hidden layer (with a separate `read_role`) fails at
+`load_state_dict`. `runs/t1_writers_500k_vp3` is the frozen T1.
 (A checkpoint trained when all pool heads shared one value projection is still
 remapped on load — `_tile_shared_pool_v` repeats those weights once per head,
 reproducing the old computation exactly.)
@@ -181,7 +183,9 @@ Generation flags (per worker, first-class — NO `--` separator; defaults in
 parens, from the argparse block at `datagen/__main__.py:505-527`): `--rule`
 (`branch+cap=8`), `--twins T` (3 — relabeled equivalents per valid source
 chunk), `--batch-size B` (128 — source rows; twins extend the batch beyond B),
-`--n-states` (8 — anchor count), `--anchor-seed` (0), `--max-invalid-window`
+`--n-states` (8 — anchor states per row, drawn per source chunk and shipped in
+the batch), `--heldout-anchors` (off — execute every row at the fixed held-out
+set instead; for scoring corpora only), `--max-invalid-window`
 (32 — the token-length cap on an injected invalid window), `--config PATH`
 (unset → the built-in `DEFAULT_DISTRIBUTION`), `--seed` (0; worker i
 gets seed+i). **A corpus's composition is settable only in the config file**:
@@ -242,12 +246,14 @@ cmdline).
   - **Second epoch = `cat corpus.rvt corpus.rvt | trainer`.** There is no built-in
     repeat; epochs are shell-level `cat`.
 - Header fields: `B, max_tokens, max_n_instrs, n_anchors, OB` (`RVT_FORMAT`,
-  `datagen/batch.py:286-288`). `OB` is the out_regs row count — `B` in practice,
+  `datagen/batch.py:290-292`). `OB` is the out_regs row count — `B` in practice,
   always, since `build_twins` returns one out_regs row per output row
-  (`datagen/batch.py:363-376`); the format still permits 0.
+  (`datagen/batch.py:368-381`); the format still permits 0. `anchors`
+  (`OB, n_anchors, 32`) carries the register files each row's `out_regs` was
+  executed from, and is what the trainer feeds the vp head (INVARIANT 1).
   Body field list + dtypes are the `BodyField(...)` block at
-  `datagen/batch.py:289-303`; the per-field header sanity bounds are the
-  `header_bounds={...}` at `datagen/batch.py:306`, enforced on every read by
+  `datagen/batch.py:293-308`; the per-field header sanity bounds are the
+  `header_bounds={...}` at `datagen/batch.py:311`, enforced on every read by
   `BinaryFormat._check_header_bounds` (`datagen/batch.py:148`).
 - The "no version field" statement is current and load-bearing in the code, not
   aspirational: the only per-batch schema check is magic + dtype-signature
@@ -269,7 +275,7 @@ corpus"). Validation: `datagen/generate.py:160`
 `validate_distribution`; the accepted non-opcode keys are `_CONFIG_EXTRA_KEYS`
 (`datagen/generate.py:155`) and an unknown key is a hard error.
 
-Three configs exist. Add one when a run needs a corpus none of them describes,
+Two configs exist. Add one when a run needs a corpus none of them describes,
 and delete it once nothing runs it — an unused config is a corpus nobody can
 attribute a result to.
 
@@ -291,11 +297,6 @@ attribute a result to.
 draw one extra random number per chunk, so the stream differs byte-wise from
 `instr_alu_writers.json` while keeping the same distribution. The rate is in the
   filename because another rate is another file.
-- `instr_r_only.json` — R-type ALU only, so no chunk carries an immediate.
-  Three probes generate from it (`vp_slot_b_split.py`,
-  `opcell_rank_sufficiency.py`, `vp_superposition.py`); it is a probe corpus,
-  not a training one, and a category scored on it says nothing about an
-  immediate (METRICS.md, scope conditions).
 
 `exclude_x0_dest: true` narrows the **rd** pool to x1..x31 (`datagen/__main__.py:173`
 → `dest_regs=range(1,32)`, consumed at `datagen/generate.py:86`), so every
@@ -319,22 +320,17 @@ never sees the generator — so the model is recorded and the data is not.
 ```bash
 python scripts/record_corpus.py runs/<dir> --config configs/<corpus>.json \
     --rule cap=2 --twins 2 --batch-size 128 --n-states 8 \
-    --anchor-seed 0 --gen-seed 0 --count 1000000
+    --gen-seed 0 --count 1000000
 ```
 
 It copies the config's CONTENTS, not its path, so editing that file afterwards
 cannot change what the run claims to have trained on, and it records the knobs
-that live outside the config — rule, twins, batch size, anchor count and seed,
+that live outside the config — rule, twins, batch size, anchors per row,
 instruction-stream seed, batch count. `run_t2.sh` calls it before the pipeline
 starts, so a run killed mid-training is still identified. A pipeline typed by
 hand should call it too; a run without a `corpus.json` can only be attributed
 by its directory name.
 
-Recording the anchor seed and state count on both sides is what makes
-INVARIANT 1 (CLAUDE.md) checkable after the fact: compare `corpus.json`'s
-`anchor_seed` / `n_states` against `hparams.json`'s `anchor_seed` /
-`n_anchor_states`, and if they disagree the run's value-prediction targets
-were wrong with no error raised at the time.
 
 ## Multinode / remote generation
 
@@ -361,20 +357,26 @@ Two different scripts — do not confuse them:
   configuration changes — a figure from one configuration says nothing about
   another.
 
+  **Per-row anchors make a batch ~2.7x larger on the wire** (324 KB lz4-compressed
+  at len=2, against 118 KB with one shared anchor set), ~84 MB/s at T2's step
+  rate over `nc`; odin's throughput at that size has not been re-measured. Local
+  generation keeps up at len=2 instead: `python -m datagen … --gen-count 26`
+  piped straight to the trainer delivers ~468 batches/s against T2's ~200, at
+  98% GPU utilisation — that is how the T2 cells in EXPERIMENT_LOG "T2
+  faithfulness" finding 33 were run. Check GPU utilisation either way.
+
   **Adding remote workers does not raise a rate the GPU is already setting.**
   At `REMOTE_GEN=120`, odin sat at a load average of ~11 out of its 128 cores
   with the generators backpressured, so when a cell runs slow, check odin's
   load before adding workers: if it is low, generation is not what limits you.
   `RULE` defaults to `single`; `CONFIG` is REQUIRED and the script exits
   without it, because a corpus is one named file.
-  `ANCHOR_SEED` (default 0) is passed to BOTH pools and MUST equal the trainer's
-  `--anchor-seed` (INVARIANT 1 — mismatch silently corrupts value_predict
-  targets). Pipe it straight to a trainer:
+  Pipe it straight to a trainer:
   ```bash
   RULE="cap=2" CONFIG=configs/instr_alu_writers.json ./multinode_gen.sh 2000000 \
     | python scripts/train_t2_encoder.py --t1-model runs/t1_run/encoder.pt \
       --d-out 512 --d-event 16 --route binding --n-steps 2000000 \
-      --anchor-seed 0 --n-anchor-states 8 --out-dir t2_run
+      --out-dir t2_run
   ```
 - **`gen_corpus.sh TOTAL_BATCHES OUT_PATH`** — writes an on-disk corpus. **Despite
   its header comment mentioning "remote", the script itself runs `datagen`
@@ -383,7 +385,7 @@ Two different scripts — do not confuse them:
   into odin and run it there; there is no auto-shipping. `RULE` defaults to
   `branch+cap=8` and `WORKERS` unset → all CPU cores; `CONFIG` is REQUIRED.
 
-Both take `BATCH_SIZE TWINS N_STATES RULE ANCHOR_SEED` as env vars and REQUIRE
+Both take `BATCH_SIZE TWINS N_STATES RULE` as env vars and REQUIRE
 `CONFIG` (plus `GEN_SEED REMOTE_GEN LOCAL_GEN PORT` for multinode_gen, and
 `WORKERS` for gen_corpus → `--gen-count`). No env var sets an augmentation
 rate: those are the config's.

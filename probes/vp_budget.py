@@ -22,15 +22,16 @@ opcode that wrote the slot; whether the chunk's instructions share a source
 register; and the per-bit error curve by bit position.
 
 Usage: vp_budget.py <t2_dir> <t1_path> [chunk_len] [n_batches] [config] [corpus]
-                    [anchor_seed]
+                    [n_anchors]
 
-Without `corpus` each call draws a fresh corpus, which moves the aggregate by
-~0.02 points between calls on one model. To compare models per bucket, pass the
-same `corpus` path to every call: the first generates it, the rest read it.
+Scored at the fixed held-out anchor set (`datagen --heldout-anchors`), which no
+model trains on; `n_anchors` (default 16) is how many of its states each row is
+executed at. Each row is scored at the anchors its batch carries, so a corpus
+generated without `--heldout-anchors` scores at whatever it was drawn with.
 
-`anchor_seed` (default 0, the seed every model trains on) scores the head at
-anchor states it never saw; a corpus file is only valid for the seed it was
-generated with.
+Without `corpus` each call draws a fresh corpus. To compare models per bucket,
+pass the same `corpus` path to every call: the first generates it, the rest
+read it.
 """
 import os
 import subprocess
@@ -47,7 +48,7 @@ from compressor.train import (_split_to_per_instruction, _t2_assemble,
                               _value_bits, vp_head_predict,
                               vp_canonical_in_vals)
 from datagen import (RVT_FORMAT, Batch, AUX_CE_IGNORE, MAX_OUTPUT_SLOTS,
-                     N_REGS, make_anchor_states)
+                     N_REGS)
 from emulator import I_TYPE
 from scripts._common import resolve_device, load_frozen_encoder, load_t2
 from tokenizer import decode_instruction
@@ -60,8 +61,8 @@ NB = int(sys.argv[4]) if len(sys.argv) > 4 else 1200
 # an R-only corpus reads a point better than the same subset on the mixed
 # corpus the model trains on.
 CONFIG = sys.argv[5] if len(sys.argv) > 5 else 'configs/instr_alu_writers.json'
-N_ANCHORS, NBITS = 8, 32
-ANCHOR_SEED = int(sys.argv[7]) if len(sys.argv) > 7 else 0
+NBITS = 32
+N_ANCHORS = int(sys.argv[7]) if len(sys.argv) > 7 else 16
 
 dev = resolve_device('auto')
 t1 = load_frozen_encoder(T1_PATH, dev)
@@ -73,13 +74,11 @@ if not os.path.exists(CORPUS):
     # Renamed into place only once complete, so a reused corpus is never partial.
     subprocess.run(
         f'python -m datagen --rule "cap={LEN}" --twins 0 --batch-size 128 '
-        f'--n-states {N_ANCHORS} --anchor-seed {ANCHOR_SEED} '
+        f'--n-states {N_ANCHORS} --heldout-anchors '
         f'--config {CONFIG} --count {NB} > {CORPUS}.part',
         shell=True, check=True, stderr=subprocess.DEVNULL)
     os.replace(f'{CORPUS}.part', CORPUS)
 
-anchors = torch.from_numpy(
-    np.asarray(make_anchor_states(N_ANCHORS, ANCHOR_SEED))).to(dev)
 
 
 def slot_depth(in0, in1, out, n):
@@ -120,11 +119,12 @@ with open(CORPUS, 'rb') as f:
         vp_mask = torch.from_numpy(batch.out_regs_valid).to(dev)
         valid = (out_slot != AUX_CE_IGNORE) & vp_mask.unsqueeze(-1)
 
+        anchors = torch.from_numpy(batch.anchors).to(dev)
         with torch.no_grad():
             iv = vp_canonical_in_vals(anchors, in_slot)
             pred = vp_head_predict(t2, ess, iv)
             tgt = out_regs.gather(-1, out_slot.clamp(min=0).unsqueeze(1)
-                                  .expand(-1, N_ANCHORS, -1))
+                                  .expand(-1, anchors.shape[-2], -1))
             hit = ((pred[..., :NBITS] > 0).float()
                    == _value_bits(tgt))               # (B, A, MAX_OUT, 32)
             exact = hit.all(-1).float()               # (B, A, MAX_OUT)
@@ -184,7 +184,7 @@ with open(CORPUS, 'rb') as f:
 
         ex, pb = exact.cpu().numpy(), perbit.cpu().numpy()
         for (b, s), (d, op, typ, shared, how, anyi) in cats.items():
-            e, p_, nn = float(ex[b, :, s].sum()), float(pb[b, :, s].sum()), N_ANCHORS
+            e, p_, nn = float(ex[b, :, s].sum()), float(pb[b, :, s].sum()), anchors.shape[-2]
             for key in (f'depth {d}', f'{typ}-type', f'{typ}-type depth {d}',
                         f'op {op}', f'shared source: {shared}',
                         f'depth {d}, shared {shared}',
@@ -196,7 +196,7 @@ with open(CORPUS, 'rb') as f:
                 a[0] += e; a[1] += p_; a[2] += nn
             a = acc['ALL']
             a[0] += e; a[1] += p_; a[2] += nn
-        m = valid.unsqueeze(1).expand(-1, N_ANCHORS, -1)
+        m = valid.unsqueeze(1).expand(-1, anchors.shape[-2], -1)
         bit_err += ((1 - hit.float()) * m.unsqueeze(-1).float()).sum((0, 1, 2))
         bit_n += float(m.sum())
 

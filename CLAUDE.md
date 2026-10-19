@@ -117,23 +117,24 @@ not know you need.
 
 ### The invariants
 
-1. **anchor-seed AND n-states must match gen↔train.** value_predict supervision
-   is computed against anchor states reconstructed from `--anchor-seed` +
-   `--n-anchor-states` (`scripts/train_encoder.py:71-76`,
-   `scripts/train_t2_encoder.py:70-74`, both funnelled into
-   `make_anchor_states` at `compressor/train.py:593`).
-   `datagen`'s `--anchor-seed`/`--n-states` must equal the trainer's
-   `--anchor-seed`/`--n-anchor-states`. Mismatch → wrong targets, no error.
-   `make_anchor_states` is `datagen/compare.py:319`. (Anchor seed only needs to
-   match gen↔train; it is *not* needed for cross-worker comparability — distances
-   are self-contained per row.)
+1. **The vp head reads its input values from the batch's own anchors, never
+   from a rebuilt set.** Every row's `out_regs` was executed at anchor states
+   drawn for that row (one draw per source chunk, shared by its twins) and
+   shipped beside it as `batch.anchors` (`build_twins`, `datagen/batch.py:540`;
+   the draw is `draw_anchor_states`, `datagen/compare.py:315`). The trainer
+   stages that field and feeds it to `t2_value_predict_loss`
+   (`compressor/train.py:1215`); a scorer must do the same. Building input values
+   from any other set of states — a seed, a fixed table — gives wrong targets
+   with no error. Score at the fixed held-out set by generating the corpus with
+   `datagen --heldout-anchors` (`heldout_anchor_states`,
+   `datagen/compare.py:378`), whose states no training draw produces.
 
 2. **Fixed batch shape, derived from the rule's length cap.** Every emitted batch
    is padded to identical (B, max_tokens, max_n_instrs) so PyTorch's caching
    allocator doesn't fragment. Stochastically-varying batch shape is a real OOM
    trigger we hit (~step 500 of t1_cosine_full). The targets come from
-   `max_chunk_len = rule.max_len` (`datagen/batch.py:648-658` inside
-   `collect_into_batches`, `datagen/batch.py:615`).
+   `max_chunk_len = rule.max_len` (`datagen/batch.py:685-693` inside
+   `collect_into_batches`, `datagen/batch.py:648`).
    This is why a `--rule` with no cap is REJECTED (see Rule grammar). Don't add a
    code path that emits a differently-shaped batch mid-run.
 
@@ -147,11 +148,11 @@ not know you need.
 4. **value_predict is CANONICAL for both tiers, in the BEHAVIORAL frame.**
    `out_regs` is the rename-invariant canonical baseline: `precompute_chunk`
    relocates the chunk's i-th **behavioral** input to canonical position i+1
-   (`_canonical_state`, `datagen/compare.py:331`, positions
-   `_CANON_POSITIONS = range(1, 32)` at `datagen/compare.py:84`; applied at
-   `datagen/compare.py:651`) and executes there, so `out_regs[:, r]` depends only
+   (`_canonical_state`, `datagen/compare.py:386`, positions
+   `_CANON_POSITIONS = range(1, 32)` at `datagen/compare.py:80`; applied at
+   `datagen/compare.py:759`) and executes there, so `out_regs[:, r]` depends only
    on operand structure. The vp loss (`t2_value_predict_loss`,
-   `compressor/train.py:1056`, used by BOTH T1 and T2) therefore feeds the head
+   `compressor/train.py:1215`, used by BOTH T1 and T2) therefore feeds the head
    the canonical-position values `anchor[:, k+1]` for input slot k — never the raw
    value at the slot's actual register. Feeding raw input values against the
    canonical target is mathematically inconsistent — the head must see canonical
@@ -159,29 +160,33 @@ not know you need.
 
    **The frame must be behavioral, not syntactic, and the same one everywhere.**
    `in_slot_regs` lists the behavioral inputs, so a canonical position spent on a
-   live-but-value-irrelevant read (e.g. `ANDI _,_,0`, or `SLTIU rd,rs,-k` whose
-   sign-extended immediate makes it the constant 1) shifts every later input off
-   its slot. The encoder is never given such a read — T1's binding heads are
-   behavioral and correctly omit it — so the target would depend on something
-   the encoder cannot see, and two chunks with a bit-identical encoder input
-   would carry different targets. Determining which inputs are behavioral needs a
-   frame to perturb within, so `precompute_chunk` builds a syntactic frame first,
-   uses it ONLY to compute `input_mags`, and re-executes in the behavioral frame.
-   The regression guard is
-   `test_canonical_positions_go_to_behavioral_inputs`.
+   live-but-value-irrelevant read (e.g. `ANDI _,_,0`, or `XOR rd,rs,rs`) shifts
+   every later input off its slot. The encoder is never given such a read — T1's
+   binding heads are behavioral and correctly omit it — so the target would
+   depend on something the encoder cannot see, and two chunks with a
+   bit-identical encoder input would carry different targets. Which reads are
+   behavioral is decided per instruction at FIXED witness states
+   (`instruction_reads`, `datagen/compare.py:612`), never at the anchors: per-row
+   anchors would otherwise flip a label from one row to the next. The chunk's
+   inputs are those reads in first-read order, a dead instruction's included
+   (`_input_order`, `datagen/compare.py:638`): T1 emits them and T2's read ranks
+   number them, so skipping them would shift every later input off its rank.
+   The regression guards are `test_canonical_positions_go_to_behavioral_inputs`,
+   `test_a_dead_instructions_reads_are_inputs` and
+   `test_labels_do_not_depend_on_the_anchor_draw`.
 
 5. **x0 is fixed under relabeling.** `random_perm`/`relabel` require `perm[0]==0`
-   (`datagen/generate.py:287,301`; the check is `datagen/generate.py:309-310`).
+   (`datagen/generate.py:298,312`; the check is `datagen/generate.py:320-321`).
    x0 is hardwired zero, not a register.
 
 6. **Memory-op chunks get no twins and no aux (V1 scope).** `build_twins`
-   (`datagen/batch.py:528`) drops chunks containing LOAD/STORE from twin+aux
+   (`datagen/batch.py:540`) drops chunks containing LOAD/STORE from twin+aux
    construction because their `Precomputed` is
    unavailable — `precompute_chunk` raises NotImplementedError on memory ops
-   (`datagen/compare.py:606,609`). The chunk's tokens are still shipped (so the
+   (`datagen/compare.py:724-725`). The chunk's tokens are still shipped (so the
    encoder sees them for magnitude/validity), but its aux row is zero-mask /
    `AUX_CE_IGNORE` and its value-prediction row is masked off via
-   `out_regs_valid=False` (`_out_regs_from_precomputeds`, `datagen/batch.py:363`).
+   `out_regs_valid=False` (`_out_regs_from_precomputeds`, `datagen/batch.py:368`).
 
 ## Anchored memory
 

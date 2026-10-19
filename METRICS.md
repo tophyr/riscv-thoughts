@@ -25,8 +25,9 @@ implicit claim about what the next tier will be able to read. `vp = 0` at a
 deeper head is a strictly weaker statement than at a shallow one, because
 capacity granted to the head is structure the representation is no longer
 required to expose, and that compounds at every tier of a hierarchy whose
-premise is cheap coarse checks. The adopted cell uses one hidden layer of 1024
-(`run_t2.sh` VP=1); depth 4 was measured and trades rather than gains.
+premise is cheap coarse checks. The criterion for choosing it is the smallest
+head that still reaches correct results; T1's has three hidden layers of 1024,
+and T2's is not yet chosen.
 
 **Score it as exact 32-bit match of the predicted output value, never
 per-bit.** The output is discrete, and per-bit flatters a broken subset badly:
@@ -39,44 +40,36 @@ acceptance criterion.
 length means **100% exact 32-bit match on `probes/vp_budget.py` at anchor
 states the model never trained on**, which scores the model's own head over the
 training corpus and crosses the three properties
-that decide a slot. `probes/vp_slot_b_split.py` is a second, narrower bar on
-operand binding alone: it generates from an R-type-only corpus, so it cannot see
-an immediate failure at all — it sat at 99.8% on its overlap column while the
-model was recovering I-type outputs at 65.9%, and did not move when that was
-fixed. Read it as a binding check beside the budget, not as the criterion.
+that decide a slot.
 
-**A vp number in a training log is held out in its rows, not in its inputs.**
-`datagen` generates every batch fresh and the trainer never revisits one, but
-every row is evaluated at the same 8 anchor states, so a training-log vp says
-nothing about inputs the head has not seen (below). `scripts/eval.py` exists to
-score *binding* and the collapse rows on a fixed corpus.
+**A vp number in a training log is held out in its rows and in its inputs.**
+`datagen` generates every batch fresh, draws each source chunk's anchor states
+afresh, and the trainer never revisits one, so a training-log vp is measured at
+input points the head has not seen. It is still noisy from batch to batch — the
+draw decides how hard a batch's values are — and it is not exact match, so
+`probes/vp_budget.py` remains the criterion. `scripts/eval.py` exists to score
+*binding* and the collapse rows on a fixed corpus.
 
 ### What `vp = 0` certifies, and what it does not
 
-vp is supervised *and* scored against **8 fixed anchor states**
-(`make_anchor_states(8, seed=0)`, the same set gen-side, trainer-side, in
-`compressor/eval.py` and in every probe), and the head's input features are
-those same 8 vectors for every row — the canonical frame sources a chunk's k-th
-input from anchor position k+1, so input 1 takes only 8 distinct values in a
-whole run. A head can satisfy that by storing answers at the 8 points, and the
-trained heads do: scored at anchor states they never saw, T2 falls from 99.94%
-to ~5% exact and T1 from 100.0000% to 21% (EXPERIMENT_LOG, "T2 faithfulness",
-finding 32). **So `vp = 0` at the training anchors certifies nothing about the
-function.**
+A head trained at a fixed set of anchor states can satisfy vp by storing answers
+at those points instead of evaluating, and trained heads did: models exact at 8
+fixed anchors scored ~5% (T2) and 21% (T1) at states they never saw
+(EXPERIMENT_LOG, "T2 faithfulness", finding 32). **So `vp = 0` certifies a
+function only at anchor states the model never trained on.** Training draws
+fresh anchors for every source chunk and ships them in the batch (CLAUDE.md,
+INVARIANT 1), so no input point repeats; scoring uses one fixed held-out set
+(`heldout_anchor_states`, a seed no generator uses), which every scorer reaches
+by generating its corpus with `datagen --heldout-anchors`. `probes/vp_budget.py`
+and `probes/t1_scorecard.py` do so. Its value classes and copy rates are pinned
+separately from the training draw's, so tuning the training draw does not move
+the criterion; it contains no negated pairs, so it exercises full-width carries
+only through its uniform values.
 
-**Score vp at anchors the model never trained on.** `probes/vp_budget.py`
-takes an anchor seed as its seventh argument and generates its corpus at that
-seed. A held-out figure is the only one that says a function was learned; a
-training-anchor figure says only what was stored, and the gap between the two is
-the memorization. Training has to redraw the anchors for every batch so that
-storing answers is impossible, which means shipping them in the RVT batch — a
-change to CLAUDE.md's INVARIANT 1, which today requires generator and trainer to
-rebuild one fixed set from a shared seed.
-
-The essence is not what memorizes. It is a fixed function of the instruction —
-the encoder never sees a value — so a fresh head trained with anchors redrawn per
-batch can test what a frozen essence carries: on T1 it reaches 98.98% at
-held-out anchors (finding 32).
+The essence is not what memorized. It is a fixed function of the instruction —
+the encoder never sees a value — so a fresh head trained with anchors redrawn
+per batch can test what a frozen essence carries: on the fixed-anchor T1 it
+reaches 98.98% at held-out anchors (finding 32).
 
 **It measures the head's arithmetic as well as the essence's content.** The
 encoder never sees a register value — its inputs are each instruction's opcode
@@ -84,18 +77,19 @@ and immediate and the wiring — so a register slot holds a symbolic description
 of the function that produced it and the head must EVALUATE that description at
 the anchor points. vp scores the composition.
 
-How much the evaluation costs is not established. The measurements that put it
-near zero — exact three-term addition, a decoded constant added exactly, a
-composed prediction equal to its summands plus a constant — were made at the 8
-training anchors, where a stored answer and an evaluated one cannot be told
-apart (finding 32). At held-out anchors a fresh head on T1's frozen essence
-reaches 98.98% after 200k steps, short mainly on `ADD` and `SUB`, so carrying
-between two arbitrary 32-bit inputs is a cost of the readout that a held-out
-score includes.
+How much the evaluation costs depends on the head. A T1 trained at fresh
+structured anchors is 99.9999% exact at held-out anchors with a three-hidden-
+layer head (finding 33), so at one instruction a small head evaluates it. Fed
+ground-truth instruction features instead of an essence, no one-hidden-layer
+head reaches exact at any width tried, two layers reach 99.36% and four 100.00%
+(finding 33), so at T2 the readout's capacity is a live confound in every vp
+number. The measurements that put the cost near zero
+at T2 — exact three-term addition, a decoded constant added exactly — were made
+at 8 fixed anchors, where a stored answer and an evaluated one cannot be told
+apart (finding 32).
 
 Do NOT attribute a residual by reconstructing the instructions and executing
-them. That measures instruction reconstruction, which the project already does
-better elsewhere (`probes/t2_reconstruct.py`), and then answers the question
+them. That measures instruction reconstruction, and then answers the question
 with an emulator — if re-executing the chunk is allowed, the compressed vector
 is not being tested at all.
 
@@ -106,9 +100,10 @@ chunk and is graded against another, and the row is unsatisfiable however good
 T2 is. "T1 has perfect vp" does not license reading the pipeline number as T2's:
 vp scores `vp_head` on T1's essence, while the wiring comes from
 `in_score_head` / `out_score_head` / `live_in_head`, a different loss at a tenth
-of the weight. Re-check the gap with `probes/vp_frame.py` after any T1 change,
-and note that probe must compare against the ORACLE's per-instruction binding,
-not the tokens' — both it and T1 are behavioral, while the tokens are syntactic.
+of the weight. Re-check the wiring with `scripts/eval.py`'s T1 binding score
+("T1 binding", below) after any T1 change; it compares against the ORACLE's
+per-instruction binding, not the tokens', since T1's binding is behavioral and
+the tokens are syntactic.
 The pipeline number is the acceptance criterion: "solved" means 100% through
 T1's emitted wiring, so a defect in T1's binding, the anchor states or the
 oracle's frame blocks it as surely as one in T2. Splitting the score by whether
@@ -185,6 +180,33 @@ population it targets.
 
 ---
 
+## T1 binding — the wiring T2 is given
+
+**The requirement:** T1's emitted wiring is the oracle's, for every
+instruction. T2 never sees tokens; it routes each instruction's operands and
+destination off T1's binding heads (`_t1_predicted_wiring`), so a mis-wired
+instruction hands T2 a chunk different from the one it is graded on, and no T2
+can recover it (vp scores T1∘T2, above).
+
+**Score it per instruction, exact, as T2 consumes it.** `scripts/eval.py`
+(`t1_binding_accuracy`) counts an instruction correct only if the emitted
+`(in0, in1, out)` equals the oracle's first two input slots in order and its
+first output slot, x0 where absent. **"Solved" is 100%.** It also lists every
+opcode-and-operand form below 100% — x0 in either source, aliased sources, a
+destination aliasing a source — because the defects found so far each occupy
+whole forms at 0% while the aggregate stays near 98.5%.
+
+Do not score the binding per register. A per-register average over 32 slots
+reads 1.000 when one instruction in seventy is wired wrong, and a per-slot
+order check that ignores how many reads the heads say exist passes an
+instruction that is given no input at all. Both read 1.000 on a T1 whose
+emitted wiring is 98.5% exact.
+
+The score is against the oracle's definitions: every write counts, so a
+same-value self-write (`ADD x5,x5,x0`) is scored as a read and a write of x5.
+
+---
+
 ## Equivalence collapse
 
 **The requirement:** two instruction sequences that compute the same function
@@ -233,9 +255,8 @@ and each `different` pair is not.
 
 The denominator is a mean over a few hundred pairs of a near-zero quantity, so
 it is tail-dominated. Two corpus draws of one configuration give 46.6× and
-41.2×, and `scripts/eval.py` and `probes/t2_faithfulness.py` disagree on the
-*sign* of
-smaller gaps because they build independent pair samples. The instability is
+41.2×, and two scorers building independent pair samples have disagreed on the
+*sign* of smaller gaps. The instability is
 concentrated in the denominator, so two draws can report a ratio as 0.8 and 1.0
 when they are one number.
 
@@ -253,13 +274,13 @@ any collapse objective.
 
 **Magnitude as validity** is a health check, not a live objective: the corpus
 injects no invalid windows, so every validity target is 1 and vp normalizes the
-essence anyway. Essences should sit on the unit sphere, and a regression in
-`frac<0.9` is a symptom to chase rather than a semantic failure.
+essence anyway. Essences should sit on the unit sphere, and a drop in the
+fraction of essences near norm 1 is a symptom to chase rather than a semantic
+failure; no current scorer reports it.
 
 **Reconstruction** (decoding the essence back to instructions) is an explicit
-non-goal — check it has not regressed with `probes/t2_reconstruct.py` at the
-model's own chunk length, nothing more. It is per-instruction and compounds over
-a chunk, so two lengths are not comparable.
+non-goal, and no current scorer measures it. It is per-instruction and compounds
+over a chunk, so two lengths are not comparable.
 
 ---
 
@@ -310,7 +331,7 @@ invisible to any split of the corpus.** Splitting by "does this row have the
 defect" reported one target bug as harmless for as long as it was measured that
 way, because the cost fell on the rows that did NOT carry it. Where a defect can
 make two different inputs collide, build both sides of the collision and vary
-one thing (`probes/vp_drop_control.py` is that shape).
+one thing.
 
 **Diagnose before training.** Probe frozen checkpoints until the diagnosis
 yields a *falsifiable* hypothesis, then spend GPU time only to test that
@@ -343,6 +364,14 @@ table is the operative copy, that is the evidence.
 | one T2 cell against another of the same config, chain rate 0.10 | 0.011 points (σ per cell) | nine cells, `vp_budget` on one shared corpus |
 | two corpus draws at 2M steps, chain rate 0.10 | 0.0025 points | two cells, `vp_budget` on one shared corpus |
 | two corpus draws at 2M steps, chain rate 0 | 0.0003 points | two cells, `vp_budget` on one shared corpus |
+
+At held-out anchors the floor is larger. Over `runs/t1_writers_250k_ctxpulse`,
+len=2, chain rate 0.10, four-layer vp head, 1M steps, scored on 300 batches × 16
+held-out anchors:
+
+| quantity | value | measured over |
+|---|---|---|
+| two instruction-stream seeds of one T2 configuration | 0.04–0.08 points | two configurations, each at seeds 0 and 7 |
 | a null intervention's cost | ~65 min | one len=2 cell at 1M steps, ~3.9 ms/step, scoring included |
 
 So: use ~0.01 for a T2-level claim unless that specific cell has been

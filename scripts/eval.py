@@ -5,7 +5,8 @@ Drives compressor.eval. Reports the
 load-bearing properties:
 
   - equivariance: relabel -> state permutes EXACTLY, essence invariant (~0)
-  - binding accuracy: live_in/out, pc, in/out-slot order, dup rate
+  - binding: T1's emitted wiring exact per instruction, by operand form (T1);
+    live_in/out, pc, in/out-slot order (T2)
   - (T2 only) GVN collapse split by pair type: rename-twin (free) vs
     behavioral-non-rename (trained) vs distinct
 
@@ -68,10 +69,12 @@ def main():
               f'essence_max_err={eq["essence_max_err"]:.2e}')
         b1 = E.t1_binding_accuracy(t1, batches, device=device,
                                    max_batches=args.max_batches)
-        print(f'binding: live_in={b1["live_in_acc"]:.3f} '
-              f'live_out={b1["live_out_acc"]:.3f} pc={b1["pc_acc"]:.3f} '
-              f'in_slot={b1["in_slot_acc"]:.3f} out_slot={b1["out_slot_acc"]:.3f} '
-              f'dup={b1["dup_rate"]:.3f} (rows={b1["n_rows"]})')
+        print(f'binding: emitted wiring exact {100 * b1["exact"]:.4f}% '
+              f'of {b1["n_rows"]} instructions (target 100%)')
+        misses = sorted((acc, k, n) for k, (acc, n) in b1['by_form'].items()
+                        if acc < 1.0)
+        for acc, k, n in misses:
+            print(f'  {k:<28} {100 * acc:7.2f}%  of {n}')
 
     if args.t2:
         t2, _ = load_t2(args.t2, t1, device)

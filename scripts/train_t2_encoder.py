@@ -69,16 +69,10 @@ def main():
     p.add_argument('--value-predict-weight', type=float, default=1.0,
                    help='Per-anchor per-out-slot value prediction MSE '
                         'on shape (chunk I/O function supervision). '
-                        'Reconstructs '
-                        'anchor_states from --anchor-seed and '
-                        '--n-anchor-states — must match datagen.')
+                        'The anchor states ride in each batch.')
     p.add_argument('--vp-smooth-weight', type=float, default=0.2,
                    help='weight on the vp smooth-magnitude (ordering) term; the '
                         'per-bit target carries resolution.')
-    p.add_argument('--anchor-seed', type=int, default=0,
-                   help='Anchor-states seed (must match datagen).')
-    p.add_argument('--n-anchor-states', type=int, default=8,
-                   help='Anchor states count (must match datagen).')
 
     p.add_argument('--route', choices=('binding', 'tokens'), default='binding',
                    help="How T2 gets per-instruction wiring. 'binding' "
@@ -118,8 +112,6 @@ def main():
         out_slot_weight=args.out_slot_weight,
         value_predict_weight=args.value_predict_weight,
         vp_smooth_weight=args.vp_smooth_weight,
-        anchor_seed=args.anchor_seed,
-        n_anchor_states=args.n_anchor_states,
         t2_checkpoint=args.resume,
         t2_route=args.route,
         device=device,

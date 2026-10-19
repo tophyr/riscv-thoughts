@@ -114,16 +114,14 @@ chunk, measured by whether the chunk's output register values can be recovered
 from it and scored discretely rather than as a loss value. The score is the
 essence composed with a readout that has to EVALUATE it — nothing in the encoder
 ever sees a register value, so a slot describes a function rather than holding a
-number. **It is unestablished at every length.** The readout has only ever been
-trained and scored at one fixed set of 8 input states, and it stored answers at
-them: models exact there score ~5% (T2) and 21% (T1) at input states they never
-saw. The essence is not what memorized — a fresh readout trained on inputs
-redrawn for every batch evaluates T1's frozen essence at 99% on unseen inputs —
-so the fix is to redraw the input states for every batch, with enough structure
-that comparisons and branches are witnessed, and to remint T1 and T2 under it.
-At the 8 fixed states, two-instruction chunks reach 99.94% exact, and nearly all
-of the rest is chunks where T1's emitted wiring disagrees with the oracle's
-target, which no T2 can satisfy; those wiring defects stand regardless.
+number. The input states are drawn afresh for every chunk, with structure, and
+the score is taken at a fixed set no model trains on: a readout trained on one
+fixed set stores answers at it instead of evaluating. **At one instruction it
+holds**: T1's emitted wiring matches the oracle on every instruction and its
+essence is evaluated exactly at unseen inputs, to 1 failure in 819,200. **At
+two instructions it is open**: T2 reaches 98.6% exact at unseen inputs, with
+subtraction and slots computed from the other instruction's result carrying
+most of the rest.
 
 *Equivalence.* Two instruction sequences that compute the same function must
 compress to the same point — that is the framework's definition of meaning, and
@@ -198,8 +196,8 @@ python -m datagen <corpus flags> | python scripts/train_t2_encoder.py <model fla
 **The canonical commands for T1 and T2, with the flags that are actually
 current, are in the `datagen` skill** (`.claude/skills/datagen/SKILL.md`).
 They are not repeated here: two copies drift, and the ones that matter carry
-invariants (the anchor seed and state count must match between generator and
-trainer, or the targets are silently wrong — `CLAUDE.md`). `scripts/run_t2.sh`
+invariants (the vp head must read the anchor states shipped in each batch, or
+the targets are silently wrong — `CLAUDE.md`). `scripts/run_t2.sh`
 runs one scored training cell end to end and is the normal entry point.
 
 There is no decoder in the tree. Decode-back is a non-goal of the current work;

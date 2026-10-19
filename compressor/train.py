@@ -29,7 +29,7 @@ from tokenizer import BOS, EOS, PAD, VOCAB_SIZE, encode_instruction
 from tokenizer.tokenizer import decode_instruction
 from datagen import (
     padding_mask,
-    make_anchor_states, precompute_chunk,
+    precompute_chunk,
     N_REGS, MAX_INPUT_SLOTS, MAX_OUTPUT_SLOTS, AUX_CE_IGNORE,
 )
 from emulator import Instruction, I_TYPE
@@ -176,7 +176,8 @@ def _pack_step_arrays(batch, split, *, vp, valid, imm):
               (batch.live_out_mask, f32), (batch.pc_writes, f32),
               (batch.in_slot_regs, i64), (batch.out_slot_regs, i64)]
     if vp:
-        arrays += [(batch.out_regs, None), (batch.out_regs_valid, None)]
+        arrays += [(batch.out_regs, None), (batch.out_regs_valid, None),
+                   (batch.anchors, None)]
     if valid:
         arrays += [(batch.valid, f32)]
     if imm:
@@ -227,6 +228,8 @@ def _value_feat(x_i):
 
 def vp_canonical_in_vals(anchor_states_t, in_slot_regs_t):
     """The CANONICAL input values the vp head is fed: (B, A, MAX_IN) int64.
+    `anchor_states_t` is (B, A, 32), each row's own anchors, or one (A, 32) set
+    shared by every row.
 
     `out_regs` is the canonical baseline — precompute_chunk relocates the
     chunk's i-th BEHAVIORAL input to canonical position i+1 and executes there
@@ -243,7 +246,9 @@ def vp_canonical_in_vals(anchor_states_t, in_slot_regs_t):
     canon_pos = torch.arange(
         1, max_in + 1, device=anchor_states_t.device).clamp(max=N_REGS - 1)
     in_filled_i = (in_slot_regs_t != AUX_CE_IGNORE).to(torch.int64)
-    return (anchor_states_t[:, canon_pos].to(torch.int64).unsqueeze(0)
+    if anchor_states_t.dim() == 2:
+        anchor_states_t = anchor_states_t.unsqueeze(0)
+    return (anchor_states_t[..., canon_pos].to(torch.int64)
             * in_filled_i.unsqueeze(1))
 
 
@@ -703,7 +708,6 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
                      pc_writes_weight=0.1, in_slot_weight=0.1,
                      out_slot_weight=0.1, value_predict_weight=1.0,
                      vp_smooth_weight=0.2, imm_weight=1.0,
-                     anchor_seed=0, n_anchor_states=8,
                      resume=None, device='auto', on_log=None, save_every=10000,
                      compile_step=True):
     """The ONE trainer for the equivariant Compressor — T1 and T2 run the SAME
@@ -768,8 +772,6 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
     opt, scheduler = build_optim_sched(
         model.parameters(), lr, n_steps, warmup_steps=warmup_steps,
         lr_min=lr_min, device=device)
-    anchor_states_t = torch.from_numpy(
-        make_anchor_states(n_anchor_states, anchor_seed)).to(device)
 
     def _fmt(r, ms, eta, lr_now):
         return (
@@ -835,7 +837,8 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
     # ONE compiled CUDA-graph step (the one-graph fold): front-end + core + losses, all
     # at a fixed-padded instruction count (B*MNI). Host-sync-free, static-shape.
     def _fwd_loss(tok, pad, w0, w1, wo, active,
-                  li, lo, pc, in_slot, out_slot, out_regs, vp_mask, valid_f,
+                  li, lo, pc, in_slot, out_slot, out_regs, vp_mask, anchors,
+                  valid_f,
                   ike, oke, imm_target, imm_mask):
         content_seq, c0, c1, co = _content(tok, pad, w0, w1, wo, active)
         T, essence = comp.encode_state(content_seq, c0, c1, co, active)
@@ -845,7 +848,7 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
             comp, T, essence, live_in_t=li, live_out_t=lo, pc_writes_t=pc,
             in_slot_t=in_slot, out_slot_t=out_slot, in_k_eff=ike, out_k_eff=oke)
         vp = (t2_value_predict_loss(
-                  comp, essence, anchor_states_t, in_slot, out_slot,
+                  comp, essence, anchors, in_slot, out_slot,
                   out_regs, vp_mask, vp_smooth_weight=vp_smooth_weight,
                   n_in=ike, n_out=oke)
               if vp_active else essence.new_zeros(()))
@@ -882,12 +885,13 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
             return None
         staged = iter(stage(packed, specs))
         fixed = [next(staged) for _ in range(11)]
-        out_regs_t, vp_mask_t = ((next(staged), next(staged)) if vp_active
-                                 else (_dummy, _dummy))
+        out_regs_t, vp_mask_t, anchors_t = (
+            (next(staged), next(staged), next(staged)) if vp_active
+            else (_dummy, _dummy, _dummy))
         valid_f = next(staged) if valid_active else _dummy
         imm_target_t, imm_mask_t = ((next(staged), next(staged)) if imm_active
                                     else (_dummy, _dummy))
-        return (*fixed, out_regs_t, vp_mask_t, valid_f, IN_K, OUT_K,
+        return (*fixed, out_regs_t, vp_mask_t, anchors_t, valid_f, IN_K, OUT_K,
                 imm_target_t, imm_mask_t)
 
     def _extra(item, aux):
@@ -903,7 +907,7 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
 def train_encoder(batch_iter, *,
                   d_model=128, n_heads=4, n_layers=2, d_out=128,
                   max_window=72,
-                  d_event=16, op_cell_depth=1, vp_head_depth=4,
+                  d_event=16, op_cell_depth=1, vp_head_depth=3,
                   n_pool_heads=1,
                   lr=3e-4, n_steps=None, log_every=100, lr_min=1e-6,
                   valid_weight=0.1,
@@ -911,7 +915,6 @@ def train_encoder(batch_iter, *,
                   pc_writes_weight=0.1,
                   in_slot_weight=0.1, out_slot_weight=0.1,
                   value_predict_weight=1.0, vp_smooth_weight=0.2, imm_weight=1.0,
-                  anchor_seed=0, n_anchor_states=8,
                   device='auto', on_log=None, save_every=10000,
                   compile_step=True):
     """Train a T1 encoder on RVT batches.
@@ -961,7 +964,6 @@ def train_encoder(batch_iter, *,
         in_slot_weight=in_slot_weight, out_slot_weight=out_slot_weight,
         value_predict_weight=value_predict_weight,
         vp_smooth_weight=vp_smooth_weight, imm_weight=imm_weight,
-        anchor_seed=anchor_seed, n_anchor_states=n_anchor_states,
         device=device, on_log=on_log, save_every=save_every,
         compile_step=compile_step)
 
@@ -1076,10 +1078,10 @@ def _t1_predicted_wiring(t1, T):
       in0, in1 = top-2 in_score over predicted-read regs in read order
                  (gated by predicted live_in count; absent => x0).
 
-    T1's binding heads are behavioral (magnitude-filtered live sets), so this
-    routes the behaviorally-relevant operands — exactly what T2's own binding
-    targets supervise, and what value-numbering needs (a non-behavioral read
-    can't change the output, so dropping it is correct).
+    T1's binding heads are behavioral (reads labelled at fixed witness states),
+    so this routes the behaviorally-relevant operands — exactly what T2's own
+    binding targets supervise, and what value-numbering needs (a non-behavioral
+    read can't change the output, so dropping it is correct).
 
     Equivariance is preserved EXACTLY: in_score/out_score/live heads are
     equivariant per-slot readouts of T, so an argmax/topk over the register
@@ -1227,7 +1229,8 @@ def t2_value_predict_loss(t2, vecs, anchor_states_t,
     Args:
       t2:               T2Compressor (uses t2.vp_head)
       vecs:             (B, d) — T2 output vector
-      anchor_states_t:  (A, 32) int32 — register file per anchor (pre-exec)
+      anchor_states_t:  (B, A, 32) int32 — each row's register file per
+                        anchor (pre-exec)
       in_slot_regs_t:   (B, MAX_INPUT_SLOTS) int64 — input slot register IDs;
                         used ONLY as a fill mask (which slots carry an input).
                         The values fed are canonical (anchor[:, k+1]), not the
@@ -1244,7 +1247,7 @@ def t2_value_predict_loss(t2, vecs, anchor_states_t,
     MSE) over (row, output-slot, anchor) triplets where out_slot_regs is not
     IGNORE.
     """
-    n_anchors = anchor_states_t.shape[0]
+    n_anchors = anchor_states_t.shape[-2]
     if n_out is not None:
         out_slot_regs_t = out_slot_regs_t[:, :n_out]
 
@@ -1445,14 +1448,14 @@ def binding_losses(model, T, essence, *, live_in_t, live_out_t, pc_writes_t,
     }
 
 
-def _compute_chunk_out_regs(batch, anchor_states_np):
+def _compute_chunk_out_regs(batch):
     """Per row of the batch, run precompute_chunk to get the post-
-    execution full register file per anchor. Returns:
+    execution full register file at the row's own anchors. Returns:
       out_regs: (B, n_anchors, 32) int32
       mask:     (B,) bool — True for rows we got valid out_regs from
     Rows that fail (decode error, memory ops, etc.) get zero out_regs."""
     B = batch.tokens.shape[0]
-    n_anchors = anchor_states_np.shape[0]
+    n_anchors = batch.anchors.shape[1]
     out = np.zeros((B, n_anchors, 32), dtype=np.int32)
     mask = np.zeros(B, dtype=bool)
     for b in range(B):
@@ -1460,7 +1463,7 @@ def _compute_chunk_out_regs(batch, anchor_states_np):
         if instrs is None:
             continue
         try:
-            pre = precompute_chunk(instrs, anchor_states_np)
+            pre = precompute_chunk(instrs, batch.anchors[b])
         except NotImplementedError:
             continue
         except Exception:
@@ -1619,7 +1622,6 @@ def train_t2_encoder(batch_iter, t1_encoder, *,
                      pc_writes_weight=0.1,
                      in_slot_weight=0.1, out_slot_weight=0.1,
                      value_predict_weight=0.0, vp_smooth_weight=0.2,
-                     anchor_seed=0, n_anchor_states=8,
                      t2_checkpoint=None, t2_route='binding',
                      device='auto',
                      on_log=None, save_every=10000, compile_step=True):
@@ -1637,9 +1639,7 @@ def train_t2_encoder(batch_iter, t1_encoder, *,
         live_out_weight=live_out_weight, pc_writes_weight=pc_writes_weight,
         in_slot_weight=in_slot_weight, out_slot_weight=out_slot_weight,
         value_predict_weight=value_predict_weight,
-        vp_smooth_weight=vp_smooth_weight,
-        anchor_seed=anchor_seed,
-        n_anchor_states=n_anchor_states, resume=t2_checkpoint,
+        vp_smooth_weight=vp_smooth_weight, resume=t2_checkpoint,
         device=device, on_log=on_log, save_every=save_every,
         compile_step=compile_step)
 

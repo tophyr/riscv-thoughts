@@ -22,7 +22,7 @@ source .venv/bin/activate
 D=/home/tophy/Projects/riscv-thoughts/logs
 # The frozen lower tier. A T2 checkpoint is only interchangeable with others
 # trained on the SAME T1, so a cell that changes this must be named for it.
-T1=${T1:-runs/t1_writers_250k_rank/encoder.pt}
+T1=${T1:-runs/t1_writers_500k_vp3/encoder.pt}
 # VP = vp-head hidden layers. The head must EVALUATE the chunk's function at the
 # anchor points, so its capacity is a confound in every vp number; refitting it
 # on frozen essences cannot test that, because depth-2 slots are 2.5% of the
@@ -51,17 +51,16 @@ cell() {
   # contents are copied in, so editing the file later cannot rewrite history.
   python scripts/record_corpus.py "runs/$OUT" --config "$CONFIG" \
     --rule "cap=$LEN" --twins 2 --batch-size 128 --n-states 8 \
-    --anchor-seed 0 --gen-seed "$GEN_SEED" --count "$STEPS" || return 1
+    --gen-seed "$GEN_SEED" --count "$STEPS" || return 1
   # Generation runs on odin (multinode_gen.sh, LOCAL_GEN=0) so local cores stay
-  # free for the trainer's per-step host work. ANCHOR_SEED must equal the
-  # trainer's --anchor-seed (INVARIANT 1).
+  # free for the trainer's per-step host work.
   RULE="cap=$LEN" CONFIG="$CONFIG" GEN_SEED="$GEN_SEED" \
-  TWINS=2 BATCH_SIZE=128 N_STATES=8 ANCHOR_SEED=0 \
+  TWINS=2 BATCH_SIZE=128 N_STATES=8 \
     ./multinode_gen.sh "$STEPS" \
     | python scripts/train_t2_encoder.py --t1-model "$T1" \
       --d-out "$DOUT" --d-event 16 --op-cell-depth "$OC" --vp-head-depth "$VP" \
       --n-pool-heads "$NPOOL" --route binding \
-      --n-steps "$STEPS" --anchor-seed 0 --n-anchor-states 8 --out-dir "$OUT" \
+      --n-steps "$STEPS" --out-dir "$OUT" \
       > "$D/t2_${OUT}.log" 2>&1
   local RC=$?
   if [ ! -f "runs/$OUT/t2.pt" ]; then
@@ -73,29 +72,29 @@ cell() {
   # OWN pairs and defaults to 4, so a len=2 cell would otherwise be scored
   # entirely out of distribution.
   python scripts/eval.py --t1-model "$T1" --t2 "runs/$OUT" \
-      --t2-corpus "/tmp/t2_eval_${LEN}.rvt" --route binding --max-batches 20 \
+      --t2-corpus "$EVAL" --route binding --max-batches 20 \
       --gvn-chunk-len "$LEN" 2>&1 \
     | grep -vE "Warning|readline|history" | sed 's/^/   /'
-  echo "   --- faithfulness / on-sphere ---"
-  python probes/t2_faithfulness.py "runs/$OUT" "$T1" "$LEN" 2>&1 \
-    | grep -vE "Warning|readline|history" | sed 's/^/   /'
-  # vp_budget, not vp_imm_share: the criterion is exact 32-bit match and the
-  # axes have to be crossed. Per-bit flatters a broken subset (96% per-bit has
-  # been 74% exact), and either axis alone hides the cells that carry the error.
+  # The criterion is exact 32-bit match with the axes crossed: per-bit flatters
+  # a broken subset (96% per-bit has been 74% exact), and either axis alone
+  # hides the cells that carry the error.
   echo "   --- vp error budget: sources x immediate x depth ---"
-  python probes/vp_budget.py "runs/$OUT" "$T1" "$LEN" 300 2>&1 \
+  python probes/vp_budget.py "runs/$OUT" "$T1" "$LEN" 300 \
+      configs/instr_alu_writers.json "$EVAL" 2>&1 \
     | grep -vE "Warning|readline|history" | sed 's/^/   /'
 }
 
-# One shared held-out corpus so every cell is scored on identical data. It is
-# drawn from the UNMODIFIED writers corpus whatever a cell trained on, because
-# a cell that raised the density of some chunk shape has to be graded on the
-# population the model will actually meet, not on its own training mix.
-if [ ! -f "/tmp/t2_eval_${LEN}.rvt" ]; then
+# One shared held-out corpus so every cell is scored on identical data, at the
+# fixed held-out anchor set no model trains on. It is drawn from the UNMODIFIED
+# writers corpus whatever a cell trained on, because a cell that raised the
+# density of some chunk shape has to be graded on the population the model will
+# actually meet, not on its own training mix.
+EVAL=/tmp/t2_eval_heldout_${LEN}.rvt
+if [ ! -f "$EVAL" ]; then
   echo "generating shared eval corpus..."
   python -m datagen --rule "cap=$LEN" --twins 2 --batch-size 128 --n-states 8 \
-      --anchor-seed 0 --config configs/instr_alu_writers.json --count 200 \
-      > "/tmp/t2_eval_${LEN}.rvt" 2>/dev/null
+      --heldout-anchors --config configs/instr_alu_writers.json --count 200 \
+      > "$EVAL.part" 2>/dev/null && mv "$EVAL.part" "$EVAL"
 fi
 
 cell

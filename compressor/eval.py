@@ -4,7 +4,7 @@ Pure functions, no CLI (driven by scripts/eval.py and the test suite);
 each returns a flat dict of metrics. Coverage:
 
   equivariance_error   — relabel -> state permutes EXACTLY, essence invariant
-  t1_binding_accuracy  — live_in/out, pc, in/out-slot order, dup rate (T1)
+  t1_binding_accuracy  — exact per-instruction wiring as T2 consumes it (T1)
   t2_binding_accuracy  — same, routing off T1's predicted binding (T2)
   gvn_collapse         — essence distance split by pair type: rename-twin
                          (free/structural) vs behavioral-non-rename
@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from datagen import (
-    padding_mask, make_anchor_states, precompute_chunk,
+    padding_mask, heldout_anchor_states, precompute_chunk,
     DEFAULT_DISTRIBUTION, build_opcode_table, random_instruction,
     AUX_CE_IGNORE, N_REGS,
 )
@@ -26,8 +26,10 @@ from tokenizer import encode_instruction, PAD
 
 from .model import instruction_wiring, X0_SLOT
 from .train import (
-    _t1_wiring, _split_to_per_instruction, _t2_assemble, t2_chunk_forward,
+    _t1_wiring, _t1_predicted_wiring, _split_to_per_instruction,
+    _t2_assemble, t2_chunk_forward,
 )
+from tokenizer import decode_instruction
 
 _MAX_INSTR_TOKENS = 9   # matches datagen.batch.MAX_INSTR_TOKENS
 _COMMUTATIVE = frozenset({'ADD', 'AND', 'OR', 'XOR'})
@@ -206,23 +208,55 @@ def _finalize(acc):
     }
 
 
+def _operand_form(instr):
+    """The operand pattern a binding head has to read: which sources are x0 or
+    alias each other, and whether the destination aliases a source."""
+    rd, *rest = instr.args
+    if instr.opcode in R_TYPE:
+        rs1, rs2 = rest
+        form = ('x0,x0' if rs1 == rs2 == 0 else 'x0,rs' if rs1 == 0
+                else 'rs,x0' if rs2 == 0 else 'rs,rs' if rs1 == rs2
+                else 'rs1,rs2')
+        srcs = (rs1, rs2)
+    else:
+        form, srcs = 'imm', (rest[0],)
+    return f'{instr.opcode} {form}' + (' (self-write)' if rd in srcs else '')
+
+
 @torch.no_grad()
 def t1_binding_accuracy(encoder, batches, *, device, max_batches=20):
-    """Held-out T1 binding-head accuracy over RVT batches."""
+    """Held-out T1 binding: the fraction of instructions whose EMITTED wiring
+    (`_t1_predicted_wiring`, the (in0, in1, out) T2 routes on) equals the
+    oracle's — the first two input slots in order and the first output slot,
+    x0 where absent. The target is 1.0. Per-register averages over 32 slots
+    saturate at 1.000 with one instruction in seventy mis-wired, so this scores
+    whole instructions, and breaks the misses down by operand form."""
     encoder.eval()
-    acc = {}
+    hits = total = 0
+    forms = {}
     for n, batch in enumerate(batches):
         if n >= max_batches:
             break
         tok = torch.from_numpy(batch.tokens).to(device).long()
         pad = torch.from_numpy(padding_mask(batch)).to(device)
         in0, in1, out = (torch.from_numpy(a).to(device) for a in _t1_wiring(batch))
-        T, ess = encoder.encode_state(tok, pad, in0, in1, out)
-        li, lo, pc, in_slot, out_slot, active = _targets(batch, device)
-        _accumulate(acc, _binding_metrics(
-            encoder, T, ess, live_in=li, live_out=lo, pc_writes=pc,
-            in_slot=in_slot, out_slot=out_slot, active=active))
-    return _finalize(acc)
+        T, _ = encoder.encode_state(tok, pad, in0, in1, out)
+        emitted = torch.stack(_t1_predicted_wiring(encoder, T), 1).cpu().numpy()
+        slots = np.where(batch.in_slot_regs[:, :2] == AUX_CE_IGNORE, 0,
+                         batch.in_slot_regs[:, :2])
+        dest = np.where(batch.out_slot_regs[:, 0] == AUX_CE_IGNORE, 0,
+                        batch.out_slot_regs[:, 0])
+        want = np.concatenate([slots, dest[:, None]], 1)
+        ok = (emitted == want).all(1)
+        for b in np.nonzero(batch.out_regs_valid)[0]:
+            ins, _ = decode_instruction(batch.tokens[b].tolist(), 0)
+            f = forms.setdefault(_operand_form(ins), [0, 0])
+            f[0] += int(ok[b]); f[1] += 1
+            hits += int(ok[b]); total += 1
+    return {
+        'exact': hits / max(total, 1), 'n_rows': total,
+        'by_form': {k: (h / n, n) for k, (h, n) in forms.items()},
+    }
 
 
 @torch.no_grad()
@@ -317,7 +351,7 @@ def gvn_collapse(t1, t2, *, device, route='binding', n=200, chunk_len=4,
     `distinct`; if only `rename` collapses, the trained GVN is doing nothing."""
     t1.eval(); t2.eval()
     rng = np.random.default_rng(seed)
-    anchors = make_anchor_states(8, 0)
+    anchors = heldout_anchor_states()
     table = build_opcode_table(DEFAULT_DISTRIBUTION)
 
     bases, twins, commutes = [], [], []

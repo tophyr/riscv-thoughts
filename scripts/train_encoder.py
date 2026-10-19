@@ -8,9 +8,8 @@ compressor.train.train_encoder; saves encoder.pt + hparams.json
 
 Usage:
     python -m datagen --rule single --twins 2 --batch-size 128 --n-states 8 \\
-        --anchor-seed 0 --config configs/instr_alu_writers.json \\
-        --count 50000 \\
-        | train_encoder.py --n-steps 50000 --anchor-seed 0 --n-anchor-states 8
+        --config configs/instr_alu_writers.json --count 50000 \\
+        | train_encoder.py --n-steps 50000
 """
 
 import argparse
@@ -44,10 +43,11 @@ def main():
     p.add_argument('--op-cell-depth', type=int, default=1,
                    help='Number of op-cell blocks (1 = shallow baseline; '
                         '>1 stacks residual FFN blocks for deeper composition).')
-    p.add_argument('--vp-head-depth', type=int, default=4,
-                   help='vp value-prediction head hidden layers (4 = default; '
-                        '0 = linear — weakens the head to force the essence to '
-                        'expose value structure geometrically).')
+    p.add_argument('--vp-head-depth', type=int, default=3,
+                   help='vp value-prediction head hidden layers. 3 is the '
+                        'smallest head with which T1 reaches exact vp at '
+                        'held-out anchors (500k steps); a shallower head puts '
+                        'more of the work on the encoder but stops short.')
     p.add_argument('--n-pool-heads', type=int, default=1,
                    help='essence pool seed queries (1 = single-query sum; '
                         '>1 = multi-head, keeps multiple outputs separable). '
@@ -70,11 +70,7 @@ def main():
                         'from (shape, input register values). Tests '
                         'whether shape encodes the I/O function of '
                         'the operator. Requires a --rule single corpus. '
-                        'Uses anchor_states '
-                        'reconstructed from --anchor-seed and '
-                        '--n-anchor-states — these MUST match the '
-                        'values datagen used or the targets and '
-                        'inputs will be inconsistent.')
+                        'The anchor states ride in each batch.')
     p.add_argument('--vp-smooth-weight', type=float, default=0.2,
                    help='weight on the vp smooth-magnitude (ordering) term. The '
                         'per-bit target carries resolution; this keeps '
@@ -86,12 +82,6 @@ def main():
                         'becomes a consistent, opcode-independent rotation. '
                         '0 disables. T1 only (T2 chunks have no single '
                         'immediate).')
-    p.add_argument('--anchor-seed', type=int, default=0,
-                   help='Anchor-states seed for value-prediction. Must '
-                        'match datagen --anchor-seed.')
-    p.add_argument('--n-anchor-states', type=int, default=8,
-                   help='Anchor states count. Must match datagen '
-                        '--n-states.')
     p.add_argument('--no-compile', action='store_true',
                    help='Disable torch.compile (CUDA-graph) of the train '
                         'step. Compile is on by default (~2x faster, ~80%% '
@@ -120,8 +110,6 @@ def main():
         out_slot_weight=args.out_slot_weight,
         value_predict_weight=args.value_predict_weight,
         vp_smooth_weight=args.vp_smooth_weight, imm_weight=args.imm_weight,
-        anchor_seed=args.anchor_seed,
-        n_anchor_states=args.n_anchor_states,
         device=device,
         on_log=save, save_every=args.save_every,
         compile_step=not args.no_compile,

@@ -1,8 +1,8 @@
 """SSA analysis + canonical-baseline execution over RV32I chunks.
 
-Owns the Precomputed/AuxPayload schema (SSA + DCE + anchor execution +
-input-sensitivity magnitudes) — the canonical out_regs / binding targets
-consumed by training (`precompute_chunk`).
+Owns the Precomputed schema — structural labels decided at fixed witness
+states, and the canonical out_regs executed at a chunk's anchor states — that
+training consumes (`precompute_chunk`), and the anchor-state draws.
 
 Shared infrastructure:
   - SSA construction (to_ssa) — converts an instruction list into a
@@ -18,12 +18,13 @@ V1 scope: ALU R/I-type, LUI, AUIPC, B-type, JAL, JALR. Memory ops
 (LOAD/STORE) raise NotImplementedError.
 """
 
+import functools
 from dataclasses import dataclass, field
 
 import numpy as np
 
 from emulator import (
-    R_TYPE, I_TYPE, B_TYPE, LOAD_TYPE, STORE_TYPE,
+    Instruction, R_TYPE, I_TYPE, B_TYPE, LOAD_TYPE, STORE_TYPE,
 )
 
 
@@ -58,17 +59,12 @@ SUPPORTED_OPS = (
 # Lower 5 bits of shift amounts per RV32I spec.
 _SHIFT_MASK = np.int32(0x1f)
 
-# An input register's behavioral magnitude must exceed this to be
-# treated as behaviorally relevant. Set just above floating-point noise
-# so that "no observable effect on any output" reliably filters out.
-BEHAVIORAL_RELEVANCE_THRESHOLD = 1e-9
-
 N_REGS = 32
 
 # Canonical anchor-position list for register input sourcing during SSA
 # evaluation. A chunk's behavioral inputs (in syntactic first-read order) are
 # sourced from these positions instead of from the row's actual register
-# positions, so out_regs / magnitudes don't leak register names — the
+# positions, so out_regs does not leak register names — the
 # rename-invariant canonical baseline. Position 0 stays reserved for x0.
 _CANON_POSITIONS = list(range(1, N_REGS))
 
@@ -304,16 +300,83 @@ def _split_outputs(g):
 # Anchor states + SSA-numpy evaluator
 # ---------------------------------------------------------------------------
 
-def make_anchor_states(n_states, seed):
-    """Generate the shared anchor states (random register files) used as
-    test inputs for value-prediction / canonical execution. gen and trainer
-    must reconstruct the same states from matching (n_states, seed)."""
-    rng = np.random.default_rng(seed)
-    anchor_states = rng.integers(
-        np.iinfo(np.int32).min, np.iinfo(np.int32).max,
-        size=(n_states, 32), dtype=np.int32)
-    anchor_states[:, 0] = 0
-    return anchor_states
+def draw_anchor_states(rng, n_states, mix=None, copies=None):
+    """Anchor states: (n_states, 32) int32 register files, x0 = 0.
+
+    Drawn fresh for every source chunk, so the vp head never sees an input
+    point twice and cannot store answers at it. Each register's value is drawn
+    from one of the classes in `mix`, and some registers then (`copies`) copy a
+    LOWER-numbered register exactly, to within a few units, or negated.
+    Behavioral input k is read from register k+1, so the copies are what make
+    two inputs equal, adjacent or opposite: without them `x == y`, `x < y` near
+    its boundary and `x + y` carrying through all 32 bits are almost never
+    exercised.
+    """
+    n = n_states
+    mix = _ANCHOR_MIX if mix is None else mix
+    p_equal, p_near, p_negated = _ANCHOR_COPIES if copies is None else copies
+    p = np.array([w for _, w in mix])
+    cls = rng.choice(len(p), size=(n, N_REGS), p=p / p.sum())
+    pow2 = ((np.int64(1) << rng.integers(0, 31, size=(n, N_REGS)))
+            * rng.choice([-1, 1], size=(n, N_REGS))
+            + rng.integers(-1, 2, size=(n, N_REGS)))
+    by_class = {
+        'zero': np.zeros((n, N_REGS), dtype=np.int64),
+        'small': rng.integers(-64, 64, size=(n, N_REGS)),
+        'mid': rng.integers(-4096, 4096, size=(n, N_REGS)),
+        'boundary': rng.choice(_BOUNDARY_VALUES, size=(n, N_REGS)),
+        'pow2': pow2,
+        'uniform': rng.integers(np.iinfo(np.int32).min,
+                                np.iinfo(np.int32).max,
+                                size=(n, N_REGS), endpoint=True).astype(np.int64),
+    }
+    v = np.zeros((n, N_REGS), dtype=np.int64)
+    for i, (name, _) in enumerate(mix):
+        v = np.where(cls == i, by_class[name], v)
+    # Register r copies a uniformly chosen register in 1..r-1 (as drawn above,
+    # so copies do not chain).
+    r = np.arange(N_REGS)
+    src = 1 + (rng.random((n, N_REGS)) * np.maximum(r - 1, 1)).astype(np.int64)
+    copied = np.take_along_axis(v, src, axis=1)
+    u = rng.random((n, N_REGS))
+    u[:, :2] = 1.0                      # x0 and x1 have no lower register
+    delta = rng.integers(-3, 4, size=(n, N_REGS))
+    v = np.where(u < p_equal, copied,
+                 np.where(u < p_equal + p_near, copied + delta,
+                          np.where(u < p_equal + p_near + p_negated,
+                                   delta - copied, v)))
+    v = (v & 0xFFFFFFFF).astype(np.uint32).view(np.int32)
+    v[:, 0] = 0
+    return v
+
+
+# Value classes and their weights for one anchor register.
+_ANCHOR_MIX = (('zero', 0.06), ('small', 0.12), ('mid', 0.06),
+               ('boundary', 0.08), ('pow2', 0.08), ('uniform', 0.60))
+# Probabilities that a register copies a lower one exactly, to within +-3, or
+# negated to within +-3.
+_ANCHOR_COPIES = (0.15, 0.05, 0.05)
+_BOUNDARY_VALUES = np.array(
+    [0, 1, -1, 2, -2, 2**31 - 1, -2**31, 2**30, -2**30,
+     2047, -2048, 2048, -2049, 31, 32], dtype=np.int64)
+
+# The fixed anchor set every score is reported at, from a seed no generator
+# uses, so no model trains on it. Its value classes are pinned here rather than
+# following _ANCHOR_MIX, so tuning the training draw cannot move the criterion.
+HELDOUT_N_ANCHORS = 64
+_HELDOUT_MIX = (('zero', 0.10), ('small', 0.20), ('mid', 0.10),
+                ('boundary', 0.10), ('pow2', 0.10), ('uniform', 0.40))
+_HELDOUT_COPIES = (0.15, 0.05, 0.0)
+_HELDOUT_SEED = 0x5EED0FF
+
+
+def heldout_anchor_states(n_states=HELDOUT_N_ANCHORS):
+    """The first n_states of the one fixed held-out set, so a smaller scoring
+    corpus is a subset of a larger one."""
+    assert n_states <= HELDOUT_N_ANCHORS, n_states
+    return draw_anchor_states(np.random.default_rng(_HELDOUT_SEED),
+                              HELDOUT_N_ANCHORS, _HELDOUT_MIX,
+                              _HELDOUT_COPIES)[:n_states].copy()
 
 
 def _canonical_state(anchor_states, inputs, canon_positions):
@@ -462,97 +525,109 @@ def _eval_ssa_numpy(ssa, chunk_len, anchor_states, live=None):
     return out_regs, out_pcs
 
 
-# ---------------------------------------------------------------------------
-# Magnitude analysis (input perturbation + output diff)
-# ---------------------------------------------------------------------------
-
-def _loglog(x):
-    """log1p(log1p(|x|)) on a numpy array."""
-    return np.log1p(np.log1p(np.abs(x).astype(np.float64)))
-
-
 def _has_memory_ops(chunk):
     return any(instr.opcode in LOAD_TYPE or instr.opcode in STORE_TYPE
                for instr in chunk)
 
 
-def _output_magnitudes(out_regs, in_states, output_regs):
-    """For each output register, mean loglog'd |delta| across states."""
-    if not output_regs:
-        return {}
-    # int64 upcast: int32-int32 deltas can overflow to INT32_MIN, whose
-    # abs is also INT32_MIN, which log1p turns into NaN.
-    deltas = (out_regs[:, output_regs].astype(np.int64)
-              - in_states[:, output_regs].astype(np.int64))
-    mags = _loglog(deltas).mean(axis=0)
-    return {r: float(m) for r, m in zip(output_regs, mags)}
+# ---------------------------------------------------------------------------
+# Structural labels — decided on FIXED witness states, never on the anchors
+# ---------------------------------------------------------------------------
+#
+# Which registers a chunk reads and writes is a property of the chunk, so it
+# must not depend on which anchor states a batch drew: with per-batch anchors,
+# `SLTIU x4,x5,40` would read x5 only in batches where some anchor puts a value
+# below 40 there, and its binding target would flip between batches.
+
+# Every pair of these is tried on an instruction's (at most two) sources. This
+# decides read relevance for every RV32I ALU form exactly as several thousand
+# rich states do: zero witnesses the unsigned compares, the small values the
+# signed ones, and the generic value the shifts and masks.
+_WITNESS_VALUES = (0, 1, -1, 0x5A3C96E1)
+_READ_WITNESS = np.zeros((len(_WITNESS_VALUES) ** 2, N_REGS), dtype=np.int32)
+_READ_WITNESS[:, 1] = np.repeat(_WITNESS_VALUES, len(_WITNESS_VALUES))
+_READ_WITNESS[:, 2] = np.tile(_WITNESS_VALUES, len(_WITNESS_VALUES))
 
 
-def _actually_modified(ssa, out_regs, in_states, ssa_candidates):
-    """Filter SSA's candidate output regs to those the chunk really modifies.
-    SSA over-claims when intra-chunk control flow drops some writes; execution
-    truth drives the matched-output set.
+def _source_regs(instr):
+    op = instr.opcode
+    if op in R_TYPE:
+        return instr.args[1:3]
+    if op in B_TYPE:
+        return instr.args[0:2]
+    if op in I_TYPE or op == 'JALR':
+        return instr.args[1:2]
+    return ()
 
-    A register the chunk never READ is modified by any write to it. Comparing
-    its post-value against its pre-value asks whether the written value happens
-    to equal whatever the anchor state left in that register — a property of the
-    anchor state, not of the chunk. It has a systematic answer, too, because
-    canonical position i IS register x_i: a chunk that copies canonical input 1
-    into x1 writes exactly the value x1 already held. Deciding "no write
-    happened" from that made the emitted supervision depend on register NAMES,
-    so a chunk and its rename got different input and output slots.
 
-    A register the chunk DID read is different: there, "does the output equal
-    the input" is a real question about the chunk, and answering it yes is what
-    makes `ADD x5,x5,x0` a genuine no-op with no behavioral effect at all.
+def _written_regs(instr):
+    """The registers an instruction writes (PC aside)."""
+    op = instr.opcode
+    if op in B_TYPE or op in STORE_TYPE or instr.args[0] == 0:
+        return ()
+    return (instr.args[0],)
+
+
+@functools.lru_cache(maxsize=None)
+def _canonical_form_reads(opcode, args):
+    """Relevant source registers of an instruction whose sources are x1/x2 (in
+    read order) and whose destination is x3 unless it aliases a source. Keyed
+    by value: an Instruction hashes by identity."""
+    ssa = to_ssa([Instruction(opcode, *args)])
+    live = live_nodes(ssa)
+    base_regs, base_pcs = _eval_ssa_numpy(ssa, 1, _READ_WITNESS, live)
+    outs = [r for r in ssa.output_versions if r < N_REGS]
+    relevant = []
+    for r in ssa.input_regs:
+        state = _READ_WITNESS.copy()
+        state[:, r] = ~state[:, r]
+        regs, pcs = _eval_ssa_numpy(ssa, 1, state, live)
+        if ((regs[:, outs] != base_regs[:, outs]).any()
+                or (PC_REG in ssa.output_versions and (pcs != base_pcs).any())):
+            relevant.append(r)
+    return tuple(relevant)
+
+
+def instruction_reads(instr):
+    """The source registers an instruction's outputs depend on, in read order.
+
+    Decided once per instruction FORM — the opcode, the immediate and which
+    sources are x0 or alias each other — by flipping each source at the fixed
+    witness states, so no per-opcode rule is written down and no anchor draw
+    can change the answer.
     """
-    if not ssa_candidates:
-        return []
-    keep = []
-    for r in ssa_candidates:
-        if r not in ssa.input_node_id:
-            keep.append(r)
-        elif bool((out_regs[:, r] != in_states[:, r]).any()):
-            keep.append(r)
-    return keep
+    canon, inverse = {0: 0}, {0: 0}
+    for r in _source_regs(instr):
+        if r not in canon:
+            canon[r] = len(canon)
+            inverse[canon[r]] = r
+    args = list(instr.args)
+    op = instr.opcode
+    pos = {'R': (1, 2), 'B': (0, 1)}.get(
+        'R' if op in R_TYPE else 'B' if op in B_TYPE else '', (1,))
+    if op in R_TYPE or op in B_TYPE or op in I_TYPE or op == 'JALR':
+        for i in pos:
+            args[i] = canon[args[i]]
+    if op not in B_TYPE:
+        rd = instr.args[0]
+        args[0] = canon.get(rd, 0 if rd == 0 else 3)
+    return [inverse[r] for r in _canonical_form_reads(op, tuple(args))]
 
 
-def _input_magnitudes(ssa, live, syntactic_inputs, anchor_states,
-                      baseline_out_regs, baseline_out_pcs, chunk_len,
-                      output_regs, has_pc_out):
-    """Per syntactic input, behavioral magnitude: how much do outputs
-    change when this input's values are perturbed?
-
-    Magnitude = max-across-output-slots of mean-per-state loglog'd
-    abs-output-difference. Magnitude near 0 → input is behaviorally
-    irrelevant → filter out of bijection search. Magnitude > 0 →
-    weights the unaligned-input edit cost.
-
-    Perturbations and baseline both run on the canonical state, so
-    magnitudes are register-name-invariant — two GVN-equivalent rows
-    produce identical input_mags.
-    """
-    mags = {}
-    for r in syntactic_inputs:
-        perturbed = _canonical_state(
-            anchor_states, syntactic_inputs, _CANON_POSITIONS)
-        perturbed[:, r] = ~perturbed[:, r]
-        perturbed[:, 0] = 0  # x0 always 0
-
-        out_regs, out_pcs = _eval_ssa_numpy(ssa, chunk_len, perturbed, live)
-
-        per_slot_means = []
-        if output_regs:
-            reg_diffs = (out_regs[:, output_regs].astype(np.int64) -
-                         baseline_out_regs[:, output_regs].astype(np.int64))
-            slot_means = _loglog(reg_diffs).mean(axis=0)
-            per_slot_means.extend(slot_means.tolist())
-        if has_pc_out:
-            pc_diffs = out_pcs.astype(np.int64) - baseline_out_pcs.astype(np.int64)
-            per_slot_means.append(float(_loglog(pc_diffs).mean()))
-
-        mags[r] = max(per_slot_means) if per_slot_means else 0.0
-    return mags
+def _input_order(chunk):
+    """The chunk's inputs in first-read order: every read relevant at its own
+    instruction of a register not yet written, whether or not that instruction's
+    result survives. That is the order T2's read ranks number them in, given
+    T1's emitted wiring; a dead instruction's reads are shown to the encoder, so
+    the target must count them. Whether dead code is equivalent to its absence
+    is for the essence to learn, not for the targets to impose."""
+    order, written = [], set()
+    for instr in chunk:
+        for r in instruction_reads(instr):
+            if r not in written and r not in order:
+                order.append(r)
+        written.update(_written_regs(instr))
+    return order
 
 
 # ---------------------------------------------------------------------------
@@ -561,33 +636,27 @@ def _input_magnitudes(ssa, live, syntactic_inputs, anchor_states,
 
 @dataclass
 class Precomputed:
-    """Per-chunk data cached across many distance computations.
+    """Per-chunk structural labels and canonical execution at the anchors.
 
-    pc_explicit indicates whether some live SSA op writes PC. For
-    chunks that don't write PC explicitly, the implicit final PC =
-    4*chunk_len; these chunks contribute no PC residual when paired
-    with another non-explicit chunk.
+    pc_explicit indicates whether some live SSA op writes PC.
     """
     inputs: list                 # all live regular inputs (syntactic)
-    behavioral_inputs: list      # subset of `inputs` with magnitude > threshold
-    input_mags: dict             # reg → behavioral magnitude
-    reg_outs: list               # actually-modified regular output regs
+    behavioral_inputs: list      # relevant reads in first-read order, dead included
+    reg_outs: list               # written regular output regs
     out_regs: np.ndarray         # (n_states, 32) anchor exec result
-    out_mags: dict               # reg → loglog'd output magnitude
     pc_explicit: bool            # does any live SSA op write PC
     # Per-row aux targets (T2 register-identity supervision).
     live_in_mask: np.ndarray     # (N_REGS,) bool — behavioral inputs as mask
-    live_out_mask: np.ndarray    # (N_REGS,) bool — actually-modified regs as mask
+    live_out_mask: np.ndarray    # (N_REGS,) bool — written regs as mask
     in_slot_regs: np.ndarray     # (MAX_INPUT_SLOTS,) int8 — reg or AUX_CE_IGNORE
     out_slot_regs: np.ndarray    # (MAX_OUTPUT_SLOTS,) int8 — reg or AUX_CE_IGNORE
 
 
 def precompute_chunk(chunk, anchor_states):
-    """SSA + DCE + anchor execution + sensitivity analysis.
+    """Structural labels from the fixed witness states, and canonical execution
+    at `anchor_states` for the value-prediction target.
 
-    Builds a `Precomputed` from the SSA + numpy evaluator. Owns the
-    supervision schema (live masks, slot registers).
-    Raises NotImplementedError on memory ops (V1 distance scope).
+    Raises NotImplementedError on memory ops (V1 scope).
     """
     if _has_memory_ops(chunk):
         raise NotImplementedError(
@@ -602,43 +671,20 @@ def precompute_chunk(chunk, anchor_states):
     inputs = live_input_regs(ssa, live)
     pc_explicit = pc_out is not None
 
-    # Which inputs are BEHAVIORAL — the ones an output actually depends on —
-    # is what decides the canonical frame, and finding them needs a frame to
-    # perturb within. So the syntactic frame is built first and used only to
-    # answer that question; the shipped baseline is re-executed below.
-    probe_state = _canonical_state(anchor_states, inputs, _CANON_POSITIONS)
-    probe_regs, probe_pcs = _eval_ssa_numpy(ssa, len(chunk), probe_state, live)
-    input_mags = _input_magnitudes(
-        ssa, live, inputs, anchor_states,
-        probe_regs, probe_pcs, len(chunk),
-        _actually_modified(ssa, probe_regs, probe_state, sorted(reg_out.keys())),
-        pc_explicit)
-    behavioral_inputs = [r for r in inputs
-                         if input_mags[r] > BEHAVIORAL_RELEVANCE_THRESHOLD]
+    # Outputs: every register the chunk writes, even with the value it already
+    # held. Calling `ADD x5,x5,x0` a no-op would make the binding targets impose
+    # an equivalence (identity == empty chunk) that is the essence's to learn.
+    actual_reg_outs = sorted(reg_out.keys())
 
-    # Baseline executes on a canonical state: the chunk's BEHAVIORAL inputs are
-    # sourced from canonical anchor positions 1, 2, ... in read order, so
-    # behavioral input i is at position i+1 — exactly the mapping the value-
-    # prediction head applies when it feeds input slot k the value at position
-    # k+1, and exactly the read-order frame the encoder's own state machine
-    # builds. Positions must not be spent on a live-but-non-behavioral input:
-    # that shifts every later input off its slot and makes the target depend on
-    # a read the encoder is never given, so two chunks with identical encoder
-    # input end up with different targets. All outputs and magnitudes below are
-    # register-name-invariant — two GVN-equivalent chunks produce identical
-    # canonical out_regs / out_pcs / mags.
-    # Generation is CPU-bound, and the two frames coincide for most chunks —
-    # only a live-but-non-behavioral input separates them.
-    if behavioral_inputs == inputs:
-        canon_state, out_regs, out_pcs = probe_state, probe_regs, probe_pcs
-    else:
-        canon_state = _canonical_state(
-            anchor_states, behavioral_inputs, _CANON_POSITIONS)
-        out_regs, out_pcs = _eval_ssa_numpy(ssa, len(chunk), canon_state, live)
+    behavioral_inputs = _input_order(chunk)
 
-    ssa_reg_outs = sorted(reg_out.keys())
-    actual_reg_outs = _actually_modified(ssa, out_regs, canon_state, ssa_reg_outs)
-    out_mags = _output_magnitudes(out_regs, canon_state, actual_reg_outs)
+    # Baseline executes on a canonical state: behavioral input i is sourced from
+    # anchor position i+1 — exactly the mapping the value-prediction head
+    # applies when it feeds input slot k the value at position k+1, and exactly
+    # the read-order frame the encoder's own state machine builds.
+    canon_state = _canonical_state(
+        anchor_states, behavioral_inputs, _CANON_POSITIONS)
+    out_regs, _ = _eval_ssa_numpy(ssa, len(chunk), canon_state, live)
 
     # Aux targets: live-in/out masks + per-slot register IDs.
     live_in_mask = np.zeros(N_REGS, dtype=bool)
@@ -652,7 +698,7 @@ def precompute_chunk(chunk, anchor_states):
     for i, r in enumerate(behavioral_inputs[:MAX_INPUT_SLOTS]):
         in_slot_regs[i] = r
 
-    # SSA-write-order: sort the actually-modified regs by their final-
+    # SSA-write-order: sort the written regs by their final-
     # write SSA node id (later id = later write).
     write_ordered = sorted(actual_reg_outs,
                            key=lambda r: ssa.output_versions[r])
@@ -663,15 +709,11 @@ def precompute_chunk(chunk, anchor_states):
     return Precomputed(
         inputs=inputs,
         behavioral_inputs=behavioral_inputs,
-        input_mags=input_mags,
         reg_outs=actual_reg_outs,
         out_regs=out_regs,
-        out_mags=out_mags,
         pc_explicit=pc_explicit,
         live_in_mask=live_in_mask,
         live_out_mask=live_out_mask,
         in_slot_regs=in_slot_regs,
         out_slot_regs=out_slot_regs,
     )
-
-

@@ -6,7 +6,8 @@ there: its GVN rows call `gvn_collapse`, which requires a T2. So the two
 properties T2 actually consumes from T1 had no T1-only scorer.
 
   A. FAITHFULNESS — exact 32-bit match of T1's own vp head on single
-     instructions, split by operand type. T1 is the tier whose essence T2 is
+     instructions, split by operand type, at the fixed held-out anchor set
+     no model trains on. T1 is the tier whose essence T2 is
      fed, so a value T1 cannot describe is one T2 can never recover. Reported
      as exact match rather than as the training log's per-bit figure, which
      flatters a broken subset badly.
@@ -32,7 +33,7 @@ properties T2 actually consumes from T1 had no T1-only scorer.
 The encode is deterministic, so a distance between two sets reflects only the
 instructions, never a resampling artifact.
 
-Usage: t1_scorecard.py <t1_path> [n_pairs] [n_batches] [config]
+Usage: t1_scorecard.py <t1_path> [n_pairs] [n_batches] [config] [n_anchors]
 """
 import contextlib
 import os
@@ -50,7 +51,7 @@ from compressor.train import (_split_to_per_instruction, _value_bits,
                               _value_smooth)
 from compressor.model import instruction_wiring
 from datagen import (RVT_FORMAT, Batch, AUX_CE_IGNORE, MAX_INPUT_SLOTS,
-                     MAX_OUTPUT_SLOTS, N_REGS, make_anchor_states)
+                     MAX_OUTPUT_SLOTS, N_REGS)
 from emulator import Instruction, I_TYPE
 from emulator import run as emu_run
 from scripts._common import resolve_device, load_frozen_encoder
@@ -63,15 +64,13 @@ T1_PATH = sys.argv[1]
 N_PAIRS = int(sys.argv[2]) if len(sys.argv) > 2 else 2000
 NB = int(sys.argv[3]) if len(sys.argv) > 3 else 400
 CONFIG = sys.argv[4] if len(sys.argv) > 4 else 'configs/instr_alu_writers.json'
-N_ANCHORS, ANCHOR_SEED, NBITS = 8, 0, 32
+N_ANCHORS = int(sys.argv[5]) if len(sys.argv) > 5 else 64
+NBITS = 32
 
 dev = resolve_device('auto')
 t1 = load_frozen_encoder(T1_PATH, dev)
 
-anchors = torch.from_numpy(
-    np.asarray(make_anchor_states(N_ANCHORS, ANCHOR_SEED))).to(dev)
 canon_pos = torch.arange(1, MAX_INPUT_SLOTS + 1, device=dev).clamp(max=N_REGS - 1)
-ANCH_IN = anchors[:, canon_pos].to(torch.int64)
 
 
 def encode(rows, bs=1024):
@@ -111,7 +110,7 @@ CORPUS = f'/tmp/t1_scorecard_{CONFIG.split("/")[-1][:-5]}_{os.getpid()}.rvt'
 if NB:
     subprocess.run(
         f'python -m datagen --rule single --twins 0 --batch-size 128 '
-        f'--n-states {N_ANCHORS} --anchor-seed {ANCHOR_SEED} '
+        f'--n-states {N_ANCHORS} --heldout-anchors '
         f'--config {CONFIG} --count {NB} > {CORPUS}',
         shell=True, check=True, stderr=subprocess.DEVNULL)
 
@@ -140,8 +139,9 @@ with (open(CORPUS, 'rb') if NB else contextlib.nullcontext(())) as f:
         vp_mask = torch.from_numpy(batch.out_regs_valid).to(dev)
         valid = (out_slot != AUX_CE_IGNORE) & vp_mask.unsqueeze(-1)
 
+        ANCH_IN = torch.from_numpy(batch.anchors).to(dev)[..., canon_pos].to(torch.int64)
         with torch.no_grad():
-            iv = (ANCH_IN.unsqueeze(0)
+            iv = (ANCH_IN
                   * (in_slot != AUX_CE_IGNORE).to(torch.int64).unsqueeze(1))
             ifeat = torch.cat(
                 [_value_bits(iv), _value_smooth(iv.float()).unsqueeze(-1)],

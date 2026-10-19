@@ -176,19 +176,19 @@ def test_gen_shipped_out_regs_matches_recompute():
     identical to what the trainer would recompute single-threaded (the
     gen-side shipping is a perf move, not a semantic change)."""
     from datagen.batch import collect_into_batches, generate_chunks
-    from datagen.compare import make_anchor_states
+    from datagen.compare import draw_anchor_states
     from datagen.generate import either, until_branch, length_cap
 
-    anchors = make_anchor_states(8, 0)
     rng = np.random.default_rng(0)
     chunks = generate_chunks(either(until_branch(), length_cap(4)), rng,
                              eq_rate=0.05)
     batch = next(collect_into_batches(
-        chunks, batch_size=64, twins=3, anchor_states=anchors, rng=rng,
+        chunks, batch_size=64, twins=3,
+        draw_anchors=lambda k: draw_anchor_states(rng, k * 8).reshape(k, 8, -1), rng=rng,
         max_chunk_len=4))
 
     assert batch.out_regs.shape[0] == batch.tokens.shape[0]   # OB == B (T2)
-    ref_out, ref_valid = _compute_chunk_out_regs(batch, anchors)
+    ref_out, ref_valid = _compute_chunk_out_regs(batch)
     assert np.array_equal(batch.out_regs, ref_out)
     assert np.array_equal(batch.out_regs_valid, ref_valid)
 
@@ -196,12 +196,13 @@ def test_gen_shipped_out_regs_matches_recompute():
 def _small_batches(n):
     import itertools
     from datagen.batch import collect_into_batches, generate_chunks
-    from datagen.compare import make_anchor_states
+    from datagen.compare import draw_anchor_states
     from datagen.generate import length_cap
     rng = np.random.default_rng(0)
     chunks = generate_chunks(length_cap(2), rng)
     return list(itertools.islice(collect_into_batches(
-        chunks, batch_size=8, twins=1, anchor_states=make_anchor_states(8, 0),
+        chunks, batch_size=8, twins=1,
+        draw_anchors=lambda k: draw_anchor_states(rng, k * 8).reshape(k, 8, -1),
         rng=rng, max_chunk_len=2), n))
 
 
@@ -237,7 +238,7 @@ def test_packed_step_stages_to_the_arrays_it_packed():
         want = [(tok, L), (pad, None), (g0, L), (g1, L), (go, L), (act, F),
                 (b.live_in_mask, F), (b.live_out_mask, F), (b.pc_writes, F),
                 (b.in_slot_regs, L), (b.out_slot_regs, L), (b.out_regs, None),
-                (b.out_regs_valid, None), (b.valid, F)]
+                (b.out_regs_valid, None), (b.anchors, None), (b.valid, F)]
         got = _H2DStager('cpu')(packed, specs)
         assert len(got) == len(want) + 2                    # + immediates
         for g, (a, dt) in zip(got, want):
@@ -554,10 +555,10 @@ def test_vp_head_predict_matches_the_raw_head():
     from compressor.model import T2Compressor
     from compressor.train import (vp_head_predict, vp_head_inputs,
                                   vp_canonical_in_vals)
-    from datagen import AUX_CE_IGNORE, MAX_OUTPUT_SLOTS, make_anchor_states
+    from datagen import AUX_CE_IGNORE, MAX_OUTPUT_SLOTS, draw_anchor_states
     torch.manual_seed(0)
     t2 = T2Compressor(d_t1=8, d_out=16, d_event=4)
-    anchors = torch.from_numpy(make_anchor_states(8, 0))
+    anchors = torch.from_numpy(draw_anchor_states(np.random.default_rng(0), 8))
     in_slot = torch.full((2, 32), AUX_CE_IGNORE, dtype=torch.long)
     in_slot[:, 0] = 3
     iv = vp_canonical_in_vals(anchors, in_slot)
@@ -577,9 +578,9 @@ def test_vp_head_live_matches_the_full_head():
     from compressor.model import T2Compressor
     from compressor.train import (vp_head_live, vp_head_inputs,
                                   vp_canonical_in_vals)
-    from datagen import AUX_CE_IGNORE, make_anchor_states
+    from datagen import AUX_CE_IGNORE, draw_anchor_states
     torch.manual_seed(0)
-    anchors = torch.from_numpy(make_anchor_states(8, 0))
+    anchors = torch.from_numpy(draw_anchor_states(np.random.default_rng(0), 8))
     in_slot = torch.full((3, 32), AUX_CE_IGNORE, dtype=torch.long)
     in_slot[:, :3] = torch.tensor([5, 9, 2])
     in_slot[1, 3] = 7
@@ -599,10 +600,10 @@ def test_bounded_vp_loss_equals_the_full_loss():
     import torch
     from compressor.model import T2Compressor
     from compressor.train import t2_value_predict_loss
-    from datagen import AUX_CE_IGNORE, make_anchor_states
+    from datagen import AUX_CE_IGNORE, draw_anchor_states
     torch.manual_seed(0)
     t2 = T2Compressor(d_t1=8, d_out=16, d_event=4, vp_head_depth=1)
-    anchors = torch.from_numpy(make_anchor_states(8, 0))
+    anchors = torch.from_numpy(draw_anchor_states(np.random.default_rng(0), 8))
     B = 4
     in_slot = torch.full((B, 32), AUX_CE_IGNORE, dtype=torch.long)
     in_slot[:, :3] = torch.tensor([5, 9, 2])
@@ -628,9 +629,9 @@ def test_out_slots_beyond_the_instruction_count_are_ignore():
     trusting the arithmetic."""
     import itertools
     import numpy as np
-    from datagen import (AUX_CE_IGNORE, precompute_chunk, make_anchor_states,
+    from datagen import (AUX_CE_IGNORE, precompute_chunk, draw_anchor_states,
                          generate_chunks, length_cap)
-    anchors = make_anchor_states(8, 0)
+    anchors = draw_anchor_states(np.random.default_rng(0), 8)
     rng = np.random.default_rng(0)
     n_checked = 0
     for chunk in itertools.islice(generate_chunks(length_cap(2), rng), 300):
@@ -652,7 +653,7 @@ def test_every_probe_and_entry_script_compiles():
     from pathlib import Path
     root = Path(__file__).resolve().parents[2]
     files = sorted(root.glob('probes/*.py')) + sorted(root.glob('scripts/*.py'))
-    assert len(files) > 15, files
+    assert len(files) > 5, files
     for f in files:
         py_compile.compile(str(f), doraise=True, cfile=str(f) + 'c')
         Path(str(f) + 'c').unlink(missing_ok=True)

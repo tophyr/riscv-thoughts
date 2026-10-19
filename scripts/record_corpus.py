@@ -10,17 +10,12 @@ pipeline so an interrupted run is still identified.
 The config file's CONTENTS are copied in, not its path: a config edited after
 the run would otherwise silently rewrite what the run claims to have trained
 on. Everything else a corpus depends on — the chunk rule, twins, batch size,
-anchor count and seed, the instruction-stream seed, and how many batches were
+anchors per batch, the instruction-stream seed, and how many batches were
 drawn — is a CLI argument here because it lives outside the config file.
 
     python scripts/record_corpus.py runs/<dir> --config configs/<c>.json \
         --rule cap=2 --twins 2 --batch-size 128 --n-states 8 \
-        --anchor-seed 0 --gen-seed 0 --count 1000000
-
-`--anchor-seed` and `--n-states` are recorded because a mismatch against the
-trainer's `--anchor-seed` / `--n-anchor-states` corrupts the value-prediction
-targets with no error (CLAUDE.md INVARIANT 1); a run that records both can be
-checked after the fact.
+        --gen-seed 0 --count 1000000
 """
 
 import argparse
@@ -39,11 +34,11 @@ def main():
     p.add_argument('--twins', type=int, required=True)
     p.add_argument('--batch-size', type=int, required=True)
     p.add_argument('--n-states', type=int, required=True)
-    p.add_argument('--anchor-seed', type=int, required=True)
     p.add_argument('--gen-seed', type=int, required=True,
-                   help='Instruction-stream seed (datagen --seed); worker i '
-                        'draws seed+i. Two runs differing only here are '
-                        'replicates on separately drawn corpora.')
+                   help='Instruction-stream and anchor seed (datagen '
+                        '--seed); worker i draws seed+i. Two runs differing '
+                        'only here are replicates on separately drawn '
+                        'corpora.')
     p.add_argument('--count', type=int, required=True,
                    help='Batches drawn (datagen --count).')
     p.add_argument('--generator', default='multinode_gen.sh',
@@ -57,7 +52,6 @@ def main():
         'twins': args.twins,
         'batch_size': args.batch_size,
         'n_states': args.n_states,
-        'anchor_seed': args.anchor_seed,
         'gen_seed': args.gen_seed,
         'count': args.count,
         'generator': args.generator,

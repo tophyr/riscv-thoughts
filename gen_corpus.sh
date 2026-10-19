@@ -26,9 +26,6 @@
 #                    that one file: opcode mix, exclude_x0_dest, and the
 #                    equivalence / invalidity / chain rates. No default, and
 #                    no env override for any rate.)
-#   ANCHOR_SEED     (default 0 — MUST equal the --anchor-seed of whatever
-#                    trainer eventually consumes this corpus, else the
-#                    value_predict targets silently mismatch, INVARIANT 1.)
 
 set -euo pipefail
 
@@ -46,7 +43,6 @@ TWINS=${TWINS:-3}
 N_STATES=${N_STATES:-8}
 RULE=${RULE:-branch+cap=8}
 CONFIG=${CONFIG:?set CONFIG to a corpus config under configs/ — a corpus is one reviewable file, and there is no default}
-ANCHOR_SEED=${ANCHOR_SEED:-0}
 
 mkdir -p "$(dirname "$OUT")"
 
@@ -65,7 +61,6 @@ fi
     --rule "$RULE" \
     --batch-size "$BATCH_SIZE" \
     --twins "$TWINS" --n-states "$N_STATES" \
-    --anchor-seed "$ANCHOR_SEED" \
     --config "$CONFIG" \
     --count "$TOTAL" \
     "${WORKER_ARGS[@]}" \

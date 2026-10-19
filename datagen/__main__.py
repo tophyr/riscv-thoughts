@@ -48,7 +48,7 @@ import numpy as np
 
 from . import (
     RVT_FORMAT, generate_chunks, collect_into_batches,
-    make_anchor_states,
+    draw_anchor_states, heldout_anchor_states,
     DEFAULT_DISTRIBUTION, build_opcode_table, validate_distribution,
     load_distribution,
     single, until_branch, until_transformation, length_cap, either,
@@ -141,7 +141,12 @@ def _build_batches_iter(cfg, seed):
     streams)."""
     rule = _parse_rule(cfg.rule)
     rng = np.random.default_rng(seed)
-    anchor_states = make_anchor_states(cfg.n_states, cfg.anchor_seed)
+    if cfg.heldout_anchors:
+        heldout = heldout_anchor_states(cfg.n_states)
+        draw_anchors = lambda k: np.broadcast_to(heldout, (k, *heldout.shape))
+    else:
+        draw_anchors = lambda k: draw_anchor_states(
+            rng, k * cfg.n_states).reshape(k, cfg.n_states, -1)
 
     if cfg.config:
         dist = load_distribution(cfg.config)
@@ -184,7 +189,7 @@ def _build_batches_iter(cfg, seed):
         chunks_iter,
         batch_size=cfg.batch_size,
         twins=cfg.twins,
-        anchor_states=anchor_states, rng=rng,
+        draw_anchors=draw_anchors, rng=rng,
         invalid_rate=inv_rate, invalid_provider=invalid_provider,
         max_invalid_window=cfg.max_invalid_window,
         max_chunk_len=rule.max_len,
@@ -479,7 +484,7 @@ class WorkerPool:
 class _GenCfg:
     """Plain container of generation params handed to each forked worker.
     (Picklable-irrelevant under fork, but kept simple and primitive anyway.)"""
-    __slots__ = ('rule', 'batch_size', 'twins', 'n_states', 'anchor_seed',
+    __slots__ = ('rule', 'batch_size', 'twins', 'n_states', 'heldout_anchors',
                  'max_invalid_window',
                  'config', 'worker_log_every')
 
@@ -488,7 +493,7 @@ class _GenCfg:
         self.batch_size = args.batch_size
         self.twins = args.twins
         self.n_states = args.n_states
-        self.anchor_seed = args.anchor_seed
+        self.heldout_anchors = args.heldout_anchors
         self.max_invalid_window = args.max_invalid_window
         self.config = args.config
         self.worker_log_every = args.worker_log_every
@@ -510,9 +515,12 @@ def main():
     g.add_argument('--twins', type=int, default=3,
                    help='Relabeled equivalents per valid source chunk.')
     g.add_argument('--n-states', type=int, default=8,
-                   help='Anchor states for value-prediction / aux precompute.')
-    g.add_argument('--anchor-seed', type=int, default=0,
-                   help='Anchor-states RNG seed (must match the trainer).')
+                   help='Anchor states per batch: the input points the '
+                        'value-prediction target is executed at.')
+    g.add_argument('--heldout-anchors', action='store_true',
+                   help='Execute every batch at the fixed held-out anchor set '
+                        'instead of a fresh draw per batch: for scoring '
+                        'corpora, never for training.')
     g.add_argument('--max-invalid-window', type=int, default=32,
                    help='Token-length cap on injected invalid windows.')
     # The corpus's composition — opcode mix, exclude_x0_dest, and the
