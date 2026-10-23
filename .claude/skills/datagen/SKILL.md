@@ -60,13 +60,12 @@ python -m datagen --gen-count 0`.)
 Generation flags are first-class — there is no `--` separator.
 
 Two cells are the whole catalogue: the T2 cell below ("Current T2 config") and
-the T1 cell after it ("T1 config"). Both run generation LOCALLY, which is
-correct for a smoke test or a quick run. **For a real training run on the GPU
-box, front the trainer with `multinode_gen.sh` instead** so generation lands on
-odin and does not starve the GPU (see "Multinode / remote generation" — same
-generation flags as env vars, same `| trainer` tail): swap
-`python -m datagen … --count N` for `<env-knobs> ./multinode_gen.sh N`.
-`--count N` emits exactly N batches, then closes stdout and reaps the whole
+the T1 cell after it ("T1 config"). Both run generation LOCALLY, and at len=2
+local generation keeps the GPU saturated (see "Multinode / remote generation").
+When a cell outruns the local cores, front the trainer with `multinode_gen.sh`
+instead so generation lands on odin — same generation flags as env vars, same
+`| trainer` tail: swap `python -m datagen … --count N` for
+`<env-knobs> ./multinode_gen.sh N`. `--count N` emits exactly N batches, then closes stdout and reaps the whole
 worker pool.
 
 `--n-steps` only shapes the cosine-LR schedule and the ETA display — it is NOT a
@@ -79,20 +78,21 @@ from those ranks, and the pool reads each slot's write step, at every tier.
 
 ```bash
 python -m datagen --rule "cap=$LEN" --twins 2 --batch-size 128 --n-states 8 \
-    --config configs/instr_alu_writers_chain010.json --count "$STEPS" \
+    --config configs/instr_alu_writers_chain010.json --gen-count 26 \
+    --count "$STEPS" \
   | python scripts/train_t2_encoder.py --t1-model runs/t1_writers_500k_vp3/encoder.pt \
-    --d-out 512 --d-event 16 --op-cell-depth 4 --vp-head-depth 1 \
+    --d-out 512 --d-event 16 --op-cell-depth 4 --vp-head-depth 4 \
     --n-pool-heads 16 --route binding \
     --n-steps "$STEPS" --out-dir "$OUT"
 ```
 
-T2 trains at `LEN=2`, `STEPS=2000000` on the chain-rate-0.10 corpus: the rate is
-necessary for the composed slots, and 2M steps is where the curve meets a floor
-that more steps do not move (EXPERIMENT_LOG, "T2 faithfulness", finding 31) —
-both measured at the 8 fixed training anchors, where the vp head stores answers
-(finding 32), so both are to be re-checked once anchors are redrawn per batch. It
-is graded on the unmodified `instr_alu_writers.json`, the population the model
-will actually meet.
+T2 trains at `LEN=2`, `STEPS=1000000` on the chain-rate-0.10 corpus, with a
+four-hidden-layer vp head. The rate is necessary for the composed slots
+(EXPERIMENT_LOG, "T2 faithfulness", finding 30); the rate, the step budget and
+the head are all open at held-out anchors, and the head's shape is free until
+T2 reaches vp = 0 at len=2 (METRICS.md). It is graded on the
+unmodified `instr_alu_writers.json`, the population the model will actually
+meet.
 
 `--d-out 512` is the register-state width, and 512 is where it stays: 256 → 512
 is a real gain and 512 → 1024 buys nothing at any training budget measured, at
@@ -100,8 +100,9 @@ is a real gain and 512 → 1024 buys nothing at any training budget measured, at
 
 `scripts/run_t2.sh` runs exactly this cell with each knob as an env var
 (`DOUT`, `LEN`, `STEPS`, `NPOOL`, …, `T1` for the frozen lower tier and
-`CONFIG` for the corpus), names the run directory after them, offloads
-generation to odin, records the corpus, and scores the result. The directory
+`CONFIG` for the corpus, `GEN` for the local generator workers), names the run
+directory after them, records the corpus, and scores the result: vp at held-out
+anchors, and the emitted binding exact per chunk. The directory
 ends in the config's name with the `instr_` prefix dropped
 (`…_pool16_alu_writers`), so two corpus arms of one configuration cannot
 collide; `TAG=<name>` additionally suffixes it so a re-run of an
@@ -275,7 +276,7 @@ corpus"). Validation: `datagen/generate.py:160`
 `validate_distribution`; the accepted non-opcode keys are `_CONFIG_EXTRA_KEYS`
 (`datagen/generate.py:155`) and an unknown key is a hard error.
 
-Two configs exist. Add one when a run needs a corpus none of them describes,
+Three configs exist. Add one when a run needs a corpus none of them describes,
 and delete it once nothing runs it — an unused config is a corpus nobody can
 attribute a result to.
 
@@ -297,6 +298,17 @@ attribute a result to.
 draw one extra random number per chunk, so the stream differs byte-wise from
 `instr_alu_writers.json` while keeping the same distribution. The rate is in the
   filename because another rate is another file.
+- `instr_alu_writers_chain100.json` — **a scoring corpus for composed slots,
+  never trained on.** The same at `chain.rate` 1.0, so every two-instruction
+  chunk's second instruction reads the first's result. A natural held-out corpus
+  holds ~2k composed chunks per 300 batches, too few to resolve a near-exact
+  readout's residual; this one holds 128 per batch. Generate it when needed
+  (~5 s), at the held-out anchors and an instruction seed no training pool uses:
+  ```bash
+  python -m datagen --rule cap=2 --twins 0 --batch-size 128 --n-states 64 \
+      --heldout-anchors --config configs/instr_alu_writers_chain100.json \
+      --seed 1000 --count 2000 --gen-count 16 > /tmp/h64_chain100_$$.rvt
+  ```
 
 `exclude_x0_dest: true` narrows the **rd** pool to x1..x31 (`datagen/__main__.py:173`
 → `dest_regs=range(1,32)`, consumed at `datagen/generate.py:86`), so every
@@ -362,8 +374,8 @@ Two different scripts — do not confuse them:
   rate over `nc`; odin's throughput at that size has not been re-measured. Local
   generation keeps up at len=2 instead: `python -m datagen … --gen-count 26`
   piped straight to the trainer delivers ~468 batches/s against T2's ~200, at
-  98% GPU utilisation — that is how the T2 cells in EXPERIMENT_LOG "T2
-  faithfulness" finding 33 were run. Check GPU utilisation either way.
+  98% GPU utilisation, and is what `scripts/run_t2.sh` does. Check GPU
+  utilisation either way.
 
   **Adding remote workers does not raise a rate the GPU is already setting.**
   At `REMOTE_GEN=120`, odin sat at a load average of ~11 out of its 128 cores
@@ -467,9 +479,9 @@ Remote operational facts:
 
 ## Where things live / what's tracked
 
-- `corpora/` — on-disk `.rvt` corpora. Present but empty by default; **NOT in
-  .gitignore**, yet not committed — `.rvt` files are large binary, keep them out
-  of commits.
+- `corpora/` — on-disk `.rvt` corpora, created by whichever command first writes
+  one (`mkdir -p corpora`). **NOT in .gitignore**, yet not committed — `.rvt`
+  files are large binary, keep them out of commits.
 - `runs/<name>/` — checkpoints + hparams.json + losses.json (gitignored).
 - Pipeline regression tests: `scripts/tests/test_pipeline.py` (covers rule
   parsing, format detect/validate, mux modes, the pdeathsig orphan guard, and

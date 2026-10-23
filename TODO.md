@@ -64,13 +64,13 @@ whatsoever.
 
 ## Milestones
 
-1. **[CURRENT] vp = 0 at len=2, at held-out anchors.** 98.56–98.63% exact, with
-   a four-hidden-layer T2 vp head, two seeds in each of two input frames that vp
-   cannot tell apart, over a T1 with exact wiring and a four-layer vp head
-   (EXPERIMENT_LOG, "T2 faithfulness", finding 33); task 1 retrains T2 over the
-   frozen `runs/t1_writers_500k_vp3`. Scored end to end, through T1's emitted
-   wiring (METRICS.md). `SUB` carries just under half the failing
-   triples and slots composed from the other instruction's result about 40%.
+1. **[CURRENT] vp = 0 at len=2, at held-out anchors.** 98.72–98.86% exact over
+   the frozen `runs/t1_writers_500k_vp3`, with a four-hidden-layer plain T2 vp
+   head, two instruction-stream seeds, scored end to end through T1's emitted
+   wiring at all 64 held-out anchors (METRICS.md; EXPERIMENT_LOG, "T2
+   faithfulness", finding 33). `SUB` carries 45–49% of the failing triples and
+   slots composed from the other instruction's result 41–44%. T2's binding is
+   exact on every chunk scored.
 
 2. **Computed equivalents collapse at len=2.** Chunks computing the same
    function land as far apart as chunks computing different ones (Mission's
@@ -97,7 +97,7 @@ whatsoever.
 In order. Task 1 gates milestone 1, and task 2 is required for the MVP. The
 rest are queued, not parallel work.
 
-### 1. Adopt the remint
+### 1. vp = 0 at len=2 over the frozen T1
 
 Anchors are drawn afresh for every source chunk, from a structured mix, and
 ride in the batch; structural labels come from fixed witness states and decide
@@ -106,39 +106,47 @@ nothing at the anchors; every write counts; scoring is at one fixed held-out set
 one triple: `runs/t1_writers_500k_vp3`, whose vp head has three hidden layers —
 the smallest that reaches correct results — emits the oracle's wiring on
 100.0000% of instructions and is 99.9999% exact on vp at held-out anchors (1
-failing triple of 819,200, a comparison next to its immediate; Open ideas). A T1
-is judged by the T2 trained over it, so train T2 over this one and settle what
-is open on T2's side, each against held-out numbers. The T2 figures below are
-from a cell that differs from `scripts/run_t2.sh`'s defaults — a four-layer vp
-head rather than one, 1M steps rather than 2M, generated locally rather than
-on odin (the datagen skill, "Multinode / remote generation") — and over a T1
-with a four-layer vp head, not the frozen one.
+failing triple of 819,200, a comparison next to its immediate; Open ideas). Over
+it, `scripts/run_t2.sh`'s cell — four-hidden-layer plain vp head, chain rate
+0.10, 1M steps — is 98.72–98.86% exact on vp with exact binding (finding 33).
 
-- **T2's binding, exact, with a target of 100%.** T2's binding is the wiring T3
-  will route on, so it needs the score T1's has: exact per chunk, broken down by
-  form, rather than `scripts/eval.py`'s per-register averages, which read 1.000
-  over real errors (METRICS.md, "T1 binding"). Those averages give 1.000 for
-  T2's input slots with dead reads counted and 0.984 with them skipped.
+**T2's vp head is free in shape until this milestone passes** (METRICS.md).
+Handed a perfect description of a two-instruction chunk, no plain ReLU head of
+the vp head's shape is exact, while a twelve-layer residual head with LayerNorm,
+after 10M steps, misses 0.0024% of held-out triples on a corpus where every
+chunk is composed (finding 34). A smaller head is the requirement after that, not before.
 
-- **The vp head's depth.** Over the T1 with exact wiring, two T2 seeds score
-  98.56–98.63% with four hidden layers and 85.34–86.46% with two; with one, an
-  earlier T1's T2 was at 69% by mid-training. On ground-truth features no
-  one-layer head reaches exact at any width tried (best 95.12% at 4,096 wide),
-  two layers reach 99.36% and four 100.00% (finding 33). The criterion is the
-  one T1's head was chosen by: the smallest head that still reaches correct
-  results, so the essence does as much of the work as possible — a fixed small
-  head reads T1's essence better the weaker the head T1 trained with. The
-  adopted cell (`scripts/run_t2.sh`, `VP=1`) has not been changed.
+- **A residual vp head with LayerNorm in T2.** `_build_vp_head`
+  (`compressor/model.py`) builds a plain Linear+ReLU stack, and `vp_head_live`
+  (`compressor/train.py`) assumes one: it splits the first layer's weights by
+  hand to skip empty input slots. Both need the residual form, and a checkpoint
+  with the plain head must still load. Two instruction-stream seeds over the
+  frozen T1, scored at all 64 held-out anchors against the plain four-layer
+  cells.
+- **What a perfect description still leaves.** The twelve-layer residual head's
+  remaining misses are carries rippling through long runs of ones in `SUB`,
+  `ADD` and `ADDI` writers, at a few held-out states (finding 34; Open ideas,
+  "Draw anchor values aimed at the instruction").
+- **A smaller head, once a deep one passes.** Put pressure on the encoder to
+  describe the chunk well enough for a smaller head, judged by the criterion
+  T1's head was chosen by: the smallest head that still reaches correct
+  results, so the essence does as much of the work as possible.
+- **One head form at both tiers, once T2's residual head is settled.** T1's vp
+  head is the plain three-layer stack. Remint T1 with the residual form at the
+  smallest depth that still passes, show that neither tier regressed, and then
+  delete the plain form. Batch it with task 2's T1 remint if the timing lines
+  up.
 - **The batch payload, if generation moves off this machine.** Per-row anchors
   make a batch 2.7x larger compressed, ~84 MB/s at T2's step rate over the link
   from the generator machine. Local generation keeps up at len=2 (~468 batches/s
   from 26 workers against T2's ~200), so this waits until it does not. Shipping
   only the canonical input columns of the anchors and only the written slots of
   `out_regs` would remove most of it.
-- **The residual.** Over the T1 with exact wiring, `SUB` is ~88% exact and
-  carries ~47% of the failing triples; slots composed from the other
-  instruction's result are 77–79% and carry ~40%.
-- **Everything argued from 8-anchor vp**: the chain rate and 2M budget, the
+- **The residual.** With the plain four-layer head over the frozen T1, `SUB` is
+  89.7–90.0% exact and carries 45–49% of the failing triples; slots composed
+  from the other instruction's result are 78.3–79.3% and carry 41–44%.
+- **Everything argued from 8-anchor vp**: the chain rate, the step budget
+  (`run_t2.sh` runs 1M; 2M was chosen at 8 anchors), the
   vp-as-evaluator analysis (findings 21, 26, 29, 30), and the architecture
   settings argued from vp.
 
@@ -314,7 +322,11 @@ the generic draw reaches only by chance: a value carrying through a long run of
 zero bits (six ADDI failures, all on one held-out input, 0x723005C9 with a
 negative immediate), and a comparison within a few units of the immediate
 (`SLTIU x30,x10,1492` at 1497) — 7 failing triples of 819,200 (EXPERIMENT_LOG,
-"T2 faithfulness", finding 33). Two classes would aim at them: a source value
+"T2 faithfulness", finding 33). At two instructions, a twelve-layer residual
+readout handed a perfect chunk description fails on the same kind of value: 130
+of its 777 misses on a composed-only corpus are one held-out state where a
+difference of 0xEFFFFEFF plus an immediate carries from bit 9 to bit 28
+(finding 34). Two classes would aim at them: a source value
 set to `imm + δ` for small δ, and a uniform value with a random span of bits
 forced to all-0 or all-1. The cost is a draw specialised to the opcode set, and
 a held-out set that would need the same classes to test them on purpose rather

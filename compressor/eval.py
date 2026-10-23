@@ -5,7 +5,7 @@ each returns a flat dict of metrics. Coverage:
 
   equivariance_error   — relabel -> state permutes EXACTLY, essence invariant
   t1_binding_accuracy  — exact per-instruction wiring as T2 consumes it (T1)
-  t2_binding_accuracy  — same, routing off T1's predicted binding (T2)
+  t2_exact_binding     — exact per-chunk input/output lists, by chunk shape (T2)
   gvn_collapse         — essence distance split by pair type: rename-twin
                          (free/structural) vs behavioral-non-rename
                          (commutativity — TRAINED) vs distinct
@@ -20,6 +20,7 @@ from datagen import (
     DEFAULT_DISTRIBUTION, build_opcode_table, random_instruction,
     AUX_CE_IGNORE, N_REGS,
 )
+from datagen.compare import _source_regs, _written_regs, instruction_reads
 from datagen.generate import random_perm, relabel
 from emulator import Instruction, R_TYPE
 from tokenizer import encode_instruction, PAD
@@ -114,7 +115,7 @@ def equivariance_error(encoder, batch, *, device, seed=0):
 
 
 # ===========================================================================
-# Binding accuracy (shared T1/T2 core)
+# Binding accuracy, exact, as the next tier routes on it
 # ===========================================================================
 
 def _decode_order(scores):
@@ -124,88 +125,6 @@ def _decode_order(scores):
     s = scores.clone()
     s[:, X0_SLOT] = torch.finfo(s.dtype).min
     return s.argsort(dim=-1, descending=True)
-
-
-@torch.no_grad()
-def _binding_metrics(model, T, essence, *, live_in, live_out, pc_writes,
-                     in_slot, out_slot, active):
-    """Accuracy of the binding heads against the batch targets, over active
-    rows. live_*: per-element accuracy; in/out-slot: per-filled-slot order
-    accuracy (argsort decode); dup: rows whose slot decode repeats a register
-    (0 with argsort). All tensors on the model's device; active (B,) bool."""
-    n_regs = model.n_regs
-    a = active
-    na = a.sum().clamp(min=1)
-
-    li = (torch.sigmoid(model.live_in_head(T).squeeze(-1)) > 0.5).float()
-    lo = (torch.sigmoid(model.live_out_head(T).squeeze(-1)) > 0.5).float()
-    # pc reads essence DIRECTION only (magnitude = validity), matching training.
-    pc = (torch.sigmoid(
-        model.pc_writes_head(F.normalize(essence, dim=-1)).squeeze(-1)) > 0.5).float()
-    li_acc = (((li == live_in).float().mean(-1)) * a).sum() / na
-    lo_acc = (((lo == live_out).float().mean(-1)) * a).sum() / na
-    pc_acc = ((pc == pc_writes).float() * a).sum() / na
-
-    in_order = _decode_order(model.in_score_head(T).squeeze(-1))     # (B,n_regs)
-    out_order = _decode_order(model.out_score_head(T).squeeze(-1))
-
-    def slot_acc(order, slot_t, K):
-        # per-filled-slot: order[:, k] == slot_t[:, k], over filled (!=IGNORE).
-        pred = order[:, :K]
-        tgt = slot_t[:, :K]
-        filled = (tgt != AUX_CE_IGNORE) & a.unsqueeze(-1)
-        correct = (pred == tgt) & filled
-        n = filled.sum().clamp(min=1)
-        return correct.sum() / n, int(filled.sum())
-
-    in_acc, n_in = slot_acc(in_order, in_slot, model.max_input_slots)
-    out_acc, n_out = slot_acc(out_order, out_slot, model.max_output_slots)
-    # Duplicate rate of the decode over filled slots (argsort => 0).
-    dup = 0.0
-    return {
-        'live_in_acc': float(li_acc), 'live_out_acc': float(lo_acc),
-        'pc_acc': float(pc_acc),
-        'in_slot_acc': float(in_acc), 'out_slot_acc': float(out_acc),
-        'dup_rate': dup, 'n_active': int(a.sum()),
-        'n_in_slots': n_in, 'n_out_slots': n_out,
-    }
-
-
-def _targets(batch, device):
-    """The batch's binding targets as device tensors + the active-row mask."""
-    li = torch.from_numpy(batch.live_in_mask).to(device).float()
-    lo = torch.from_numpy(batch.live_out_mask).to(device).float()
-    pc = torch.from_numpy(batch.pc_writes).to(device).float()
-    in_slot = torch.from_numpy(batch.in_slot_regs.astype(np.int64)).to(device)
-    out_slot = torch.from_numpy(batch.out_slot_regs.astype(np.int64)).to(device)
-    active = (li.any(-1) | lo.any(-1))
-    return li, lo, pc, in_slot, out_slot, active
-
-
-def _accumulate(acc, m):
-    """Sum metric dicts weighted by their slot/row counts for a clean mean."""
-    for k in ('live_in_acc', 'live_out_acc', 'pc_acc'):
-        acc[k] = acc.get(k, 0.0) + m[k] * m['n_active']
-    acc['in_slot_acc'] = acc.get('in_slot_acc', 0.0) + m['in_slot_acc'] * m['n_in_slots']
-    acc['out_slot_acc'] = acc.get('out_slot_acc', 0.0) + m['out_slot_acc'] * m['n_out_slots']
-    acc['_rows'] = acc.get('_rows', 0) + m['n_active']
-    acc['_in'] = acc.get('_in', 0) + m['n_in_slots']
-    acc['_out'] = acc.get('_out', 0) + m['n_out_slots']
-
-
-def _finalize(acc):
-    rows = max(acc.get('_rows', 0), 1)
-    nin = max(acc.get('_in', 0), 1)
-    nout = max(acc.get('_out', 0), 1)
-    return {
-        'live_in_acc': acc.get('live_in_acc', 0.0) / rows,
-        'live_out_acc': acc.get('live_out_acc', 0.0) / rows,
-        'pc_acc': acc.get('pc_acc', 0.0) / rows,
-        'in_slot_acc': acc.get('in_slot_acc', 0.0) / nin,
-        'out_slot_acc': acc.get('out_slot_acc', 0.0) / nout,
-        'dup_rate': 0.0,
-        'n_rows': acc.get('_rows', 0),
-    }
 
 
 def _operand_form(instr):
@@ -259,14 +178,73 @@ def t1_binding_accuracy(encoder, batches, *, device, max_batches=20):
     }
 
 
+def _emitted_binding(model, T):
+    """The binding a tier emits, as the next tier would route on it: per row,
+    the registers its live heads say are read (written), ordered by the score
+    heads. Generalises `_t1_predicted_wiring` from (in0, in1, out) to every
+    slot. Returns two lists of per-row register lists."""
+    def decode(live_head, score_head):
+        live = torch.sigmoid(live_head(T).squeeze(-1)) > 0.5
+        live[:, X0_SLOT] = False
+        n = live.sum(-1).cpu().numpy()
+        order = _decode_order(score_head(T).squeeze(-1)).cpu().numpy()
+        return [order[b, :n[b]].tolist() for b in range(order.shape[0])]
+    return (decode(model.live_in_head, model.in_score_head),
+            decode(model.live_out_head, model.out_score_head))
+
+
+def _filled(slot_regs):
+    return [[int(r) for r in row if r != AUX_CE_IGNORE] for row in slot_regs]
+
+
+def _chunk_instrs(batch, b):
+    toks, pos, out = batch.tokens[b].tolist(), 0, []
+    for _ in range(int((batch.instr_lens[b] > 0).sum())):
+        ins, pos = decode_instruction(toks, pos)
+        out.append(ins)
+    return out
+
+
+def _chunk_shape(instrs):
+    """The dataflow features a chunk's binding has to get right, as one label:
+    an instruction reading another's result, two instructions reading one
+    input, a write overwritten unread, a read the output ignores, x0 or aliased
+    operands, a destination that is also a source."""
+    tags, written, unread, readers = set(), set(), set(), {}
+    for i, ins in enumerate(instrs):
+        srcs, rel = _source_regs(ins), instruction_reads(ins)
+        if 0 in srcs:
+            tags.add('x0 operand')
+        if len(srcs) == 2 and srcs[0] == srcs[1] != 0:
+            tags.add('aliased')
+        if any(r and r not in rel for r in srcs):
+            tags.add('ignored read')
+        for r in rel:
+            if r in written:
+                tags.add('composed')
+            elif readers.setdefault(r, i) != i:
+                tags.add('shared input')
+            unread.discard(r)
+        for r in _written_regs(ins):
+            if r in unread:
+                tags.add('dead write')
+            if r in srcs:
+                tags.add('self-write')
+            unread.add(r)
+            written.add(r)
+    return ' + '.join(sorted(tags)) or 'plain'
+
+
 @torch.no_grad()
-def t2_binding_accuracy(t1, t2, batches, *, device, route='binding',
-                        max_batches=20):
-    """Held-out T2 binding-head accuracy, routing off T1's predicted binding.
-    Confirms the binding survives running on T1's *predicted* wiring,
-    not ground-truth tokens."""
+def t2_exact_binding(t1, t2, batches, *, device, route='binding',
+                     max_batches=20):
+    """Held-out T2 binding: the fraction of chunks whose EMITTED binding — every
+    input register in first-read order and every output register in write
+    order — equals the oracle's. The target is 1.0. Broken down by chunk shape
+    (`_chunk_shape`), and by opcode-and-operand form for the misses."""
     t1.eval(); t2.eval()
-    acc = {}
+    hits = hits_in = hits_out = total = 0
+    shapes, forms = {}, {}
     for n, batch in enumerate(batches):
         if n >= max_batches:
             break
@@ -274,15 +252,27 @@ def t2_binding_accuracy(t1, t2, batches, *, device, route='binding',
         if split[0].shape[0] == 0:
             continue
         n_chunks, max_ni = batch.instr_lens.shape
-
         chunk_t1, c0, c1, co, cact = _t2_assemble(
             t1, split, n_chunks, max_ni, device, route=route)
-        T, ess = t2.encode_state(chunk_t1, c0, c1, co, cact)
-        li, lo, pc, in_slot, out_slot, active = _targets(batch, device)
-        _accumulate(acc, _binding_metrics(
-            t2, T, ess, live_in=li, live_out=lo, pc_writes=pc,
-            in_slot=in_slot, out_slot=out_slot, active=active))
-    return _finalize(acc)
+        T, _ = t2.encode_state(chunk_t1, c0, c1, co, cact)
+        ins_e, outs_e = _emitted_binding(t2, T)
+        ins_w, outs_w = _filled(batch.in_slot_regs), _filled(batch.out_slot_regs)
+        for b in np.nonzero(batch.out_regs_valid)[0]:
+            ok_in, ok_out = ins_e[b] == ins_w[b], outs_e[b] == outs_w[b]
+            ok = ok_in and ok_out
+            instrs = _chunk_instrs(batch, b)
+            for d, k in ((shapes, _chunk_shape(instrs)),
+                         (forms, ' ; '.join(map(_operand_form, instrs)))):
+                f = d.setdefault(k, [0, 0])
+                f[0] += int(ok); f[1] += 1
+            hits += ok; hits_in += ok_in; hits_out += ok_out; total += 1
+    t = max(total, 1)
+    return {
+        'exact': hits / t, 'exact_in': hits_in / t, 'exact_out': hits_out / t,
+        'n_rows': total,
+        'by_shape': {k: (h / m, m) for k, (h, m) in shapes.items()},
+        'by_form': {k: (h / m, m) for k, (h, m) in forms.items()},
+    }
 
 
 # ===========================================================================

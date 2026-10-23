@@ -119,9 +119,10 @@ the score is taken at a fixed set no model trains on: a readout trained on one
 fixed set stores answers at it instead of evaluating. **At one instruction it
 holds**: T1's emitted wiring matches the oracle on every instruction and its
 essence is evaluated exactly at unseen inputs, to 1 failure in 819,200. **At
-two instructions it is open**: T2 reaches 98.6% exact at unseen inputs, with
+two instructions it is open**: T2 reaches 98.7–98.9% exact at unseen inputs, with
 subtraction and slots computed from the other instruction's result carrying
-most of the rest.
+most of the rest. Part of that gap is the readout: no head of T2's shape
+evaluates even a perfectly described two-instruction chunk exactly.
 
 *Equivalence.* Two instruction sequences that compute the same function must
 compress to the same point — that is the framework's definition of meaning, and

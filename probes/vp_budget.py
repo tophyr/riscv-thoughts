@@ -25,9 +25,11 @@ Usage: vp_budget.py <t2_dir> <t1_path> [chunk_len] [n_batches] [config] [corpus]
                     [n_anchors]
 
 Scored at the fixed held-out anchor set (`datagen --heldout-anchors`), which no
-model trains on; `n_anchors` (default 16) is how many of its states each row is
-executed at. Each row is scored at the anchors its batch carries, so a corpus
-generated without `--heldout-anchors` scores at whatever it was drawn with.
+model trains on; `n_anchors` (default 64, the whole set) is how many of its
+states each row is executed at. With fewer, a bucket meets only a few value
+pairs per operand position, and one pair the head gets wrong decides it.
+Each row is scored at the anchors its batch carries, so a corpus generated
+without `--heldout-anchors` scores at whatever it was drawn with.
 
 Without `corpus` each call draws a fresh corpus. To compare models per bucket,
 pass the same `corpus` path to every call: the first generates it, the rest
@@ -62,7 +64,7 @@ NB = int(sys.argv[4]) if len(sys.argv) > 4 else 1200
 # corpus the model trains on.
 CONFIG = sys.argv[5] if len(sys.argv) > 5 else 'configs/instr_alu_writers.json'
 NBITS = 32
-N_ANCHORS = int(sys.argv[7]) if len(sys.argv) > 7 else 16
+N_ANCHORS = int(sys.argv[7]) if len(sys.argv) > 7 else 64
 
 dev = resolve_device('auto')
 t1 = load_frozen_encoder(T1_PATH, dev)

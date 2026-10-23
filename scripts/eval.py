@@ -5,8 +5,8 @@ Drives compressor.eval. Reports the
 load-bearing properties:
 
   - equivariance: relabel -> state permutes EXACTLY, essence invariant (~0)
-  - binding: T1's emitted wiring exact per instruction, by operand form (T1);
-    live_in/out, pc, in/out-slot order (T2)
+  - binding: the emitted wiring exact per instruction, by operand form (T1);
+    the emitted input and output lists exact per chunk, by chunk shape (T2)
   - (T2 only) GVN collapse split by pair type: rename-twin (free) vs
     behavioral-non-rename (trained) vs distinct
 
@@ -81,14 +81,23 @@ def main():
         print(f'== T2 (route={args.route}) ==')
         if args.t2_corpus:
             t2_batches = _read_batches(args.t2_corpus, args.max_batches)
-            b2 = E.t2_binding_accuracy(t1, t2, t2_batches, device=device,
-                                       route=args.route,
-                                       max_batches=args.max_batches)
-            print(f'binding: live_in={b2["live_in_acc"]:.3f} '
-                  f'live_out={b2["live_out_acc"]:.3f} pc={b2["pc_acc"]:.3f} '
-                  f'in_slot={b2["in_slot_acc"]:.3f} '
-                  f'out_slot={b2["out_slot_acc"]:.3f} dup={b2["dup_rate"]:.3f} '
-                  f'(rows={b2["n_rows"]})')
+            b2 = E.t2_exact_binding(t1, t2, t2_batches, device=device,
+                                    route=args.route,
+                                    max_batches=args.max_batches)
+            print(f'binding: emitted inputs and outputs exact '
+                  f'{100 * b2["exact"]:.4f}% of {b2["n_rows"]} chunks '
+                  f'(target 100%; inputs {100 * b2["exact_in"]:.4f}%, '
+                  f'outputs {100 * b2["exact_out"]:.4f}%)')
+            for k, (acc, n) in sorted(b2['by_shape'].items(),
+                                      key=lambda kv: kv[1][0]):
+                print(f'  {k:<48} {100 * acc:7.2f}%  of {n}')
+            misses = sorted(((1 - acc) * n, k, acc, n)
+                            for k, (acc, n) in b2['by_form'].items()
+                            if acc < 1.0)[::-1][:20]
+            if misses:
+                print('  forms with the most failing chunks:')
+            for _, k, acc, n in misses:
+                print(f'    {k:<60} {100 * acc:7.2f}%  of {n}')
         g = E.gvn_collapse(t1, t2, device=device, route=args.route,
                            n=args.gvn_pairs, chunk_len=args.gvn_chunk_len)
         rr = g['rename_ratio']; br = g['behavioral_ratio']

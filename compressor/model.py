@@ -378,8 +378,8 @@ class TokenEmbedder(nn.Module):
 # detail: it is the only consumer a T2 essence has, so its capacity is an
 # implicit claim about what the next tier will be able to read, and `vp = 0` at
 # a deeper head is a strictly weaker statement than at a shallow one. Quote the
-# depth with the number. The target is the smallest head that still reaches
-# correct results.
+# depth with the number. T1's is the smallest that reaches correct results; T2's
+# is free in shape until T2 reaches vp = 0 (METRICS.md).
 def _build_vp_head(vp_in, vp_out, depth):
     """vp value-prediction head with `depth` hidden layers of _VP_HIDDEN.
     depth=0 -> a single linear readout. depth=4 reproduces the historical
@@ -399,8 +399,7 @@ _VP_HIDDEN = 1024
 _VP_HEAD_DEPTH = 4     # vp_head hidden layers. Entry scripts pass their own
                        # (T1: 3, the smallest that reaches exact vp at held-out
                        # anchors; EXPERIMENT_LOG finding 33). Capacity here is
-                       # evaluation the encoder is spared, so the smallest head
-                       # that still reaches correct results is the target.
+                       # evaluation the encoder is spared.
 _VP_VALUE_BITS = 32    # two's-complement bit width of the vp value target (RV32)
 _IMM_N_FREQ = 12       # rotary immediate: power-of-2 periods 2..4096 (2*this = target dim)
 

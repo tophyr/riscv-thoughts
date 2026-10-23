@@ -2,7 +2,7 @@
 
 **Status: open.** Faithfulness holds at one instruction and is open at two:
 scored at anchor states no model trained on, T1 is exact and T2 at len=2 is
-98.6% (finding 33). Findings 1–32 were measured at one fixed set of 8 anchor
+98.7–98.9% (finding 33). Findings 1–32 were measured at one fixed set of 8 anchor
 states, where the head stores answers rather than evaluating (finding 32), so
 their figures describe the mechanisms they located, not whether a function was
 learned. Equivalence collapse is unresolved, and nothing beyond two
@@ -21,8 +21,12 @@ of the anchors, and every score is at a held-out set. On that footing
 `runs/t1_writers_500k_vp3` emits the oracle's wiring on 100.0000% of
 instructions and is 99.9999% exact on vp, once T1's read pulses see both
 operands and its vp head has three hidden layers, the smallest that reaches
-correct results; T2 at len=2 is 98.56–98.63% with a four-layer vp head, `SUB`
-and composed slots carrying most of the rest (finding 33).
+correct results. T2 at len=2 over that T1 is 98.72–98.86% with a four-layer vp
+head, `SUB` and composed slots carrying most of the rest (finding 33). The vp
+head's own shape is part of that gap: handed a perfect description of the chunk
+instead of an essence, no plain ReLU readout of the vp head's shape is exact,
+while a twelve-layer residual readout with LayerNorm misses 8 of 4.8M held-out
+triples (finding 34).
 
 At the 8 training anchors, exact 32-bit match of the predicted output value
 reaches **99.9364%** at two instructions — 512 failing (row, output-slot, anchor)
@@ -1346,11 +1350,11 @@ distribution, so that comparisons are witnessed (finding 31's SLTIU mechanism).
 That remints T1 and T2.
 
 **33. With anchors drawn afresh per source chunk, structured, and deciding no
-labels, T1 evaluates its instruction at held-out anchors to 99.9995%, and T2's
-remaining gap is its readout's depth.** Every figure here is at the fixed
+labels, T1 evaluates its instruction at held-out anchors to 99.9999%, and T2's
+score turns on its readout's depth.** Every figure here is at the fixed
 held-out anchor set (`heldout_anchor_states`), which no training draw produces,
 on `configs/instr_alu_writers.json`; T1 scores are 100 batches × 64 anchors
-(`probes/t1_scorecard.py`), T2 scores 300 batches × 16 anchors
+(`probes/t1_scorecard.py`), T2 scores 300 batches × 16 anchors unless stated
 (`probes/vp_budget.py`), one corpus per comparison.
 
 *Structural labels need fixed witnesses, and a small set suffices.* Decided by
@@ -1545,6 +1549,155 @@ reads, seeds 0 and 7), score 86.46% and 85.34% against 98.56% and 98.63%, with
 `SUB` at 40–41% and `ADD` at 52–62% exact; binding is exact and swap collapse
 0.0087–0.0095.
 
+*T2 over the frozen T1.* Two T2s over `runs/t1_writers_500k_vp3`, len=2, chain
+rate 0.10, four-layer vp head, 1M steps, instruction-stream seeds 0 and 7
+(`scripts/run_t2.sh`), scored on one corpus of 100 batches × all 64 held-out
+anchors drawn from `configs/instr_alu_writers.json` — a different corpus and
+anchor count from the 300 × 16 figures above, so the two do not compare
+directly:
+
+| seed | vp exact | depth 1 | depth 2 | `SUB` share of failing triples | T2 binding exact per chunk | swap collapse |
+|---|---|---|---|---|---|---|
+| 0 | 98.8554% | 99.3461% | 79.3086% | 49.0% | 100.0000% of 7,680 | 0.0126 |
+| 7 | 98.7166% | 99.2285% | 78.3252% | 45.3% | 100.0000% of 7,680 | 0.0113 |
+
+"T2 binding exact per chunk" counts a chunk correct only if the external inputs
+and outputs decoded from T2's heads equal the oracle's, in order (METRICS.md,
+"Binding"); "swap collapse" is the commutative-swap distance on pairs the swap
+left equivalent, against a `distinct` mean of 1.19.
+
+**34. Handed a perfect description of a two-instruction chunk, a readout of the
+vp head's plain ReLU shape cannot be trained to evaluate it exactly; a
+twelve-layer residual readout with LayerNorm reaches 99.995% of composed slots,
+and what it still misses are carries that ripple a long way.**
+`probes/vp_gt_depth.py` trains several readouts side by side on identical
+batches. Instead of an essence, each is handed ground-truth chunk features — per
+instruction its opcode, its 12 immediate bits, what feeds each operand (x0,
+canonical input k, the other instruction's result, or a read the output
+ignores) and which output slot it writes — plus the canonical input values
+exactly as the vp head receives them, and predicts every output slot's value.
+No encoder is involved, so every figure here is a property of the readout: a
+readout shape that never reaches exact on a perfect description cannot be made
+exact by any essence. Training streams `configs/instr_alu_writers_chain010.json`
+at `cap=2` with anchors drawn per row, under a cosine schedule from a learning
+rate of 3e-4; every readout is 1,024 wide.
+
+Every score is at all 64 held-out anchor states, on one of two corpora generated
+with `datagen --heldout-anchors` and no twins:
+
+- **natural** — 300 batches of `configs/instr_alu_writers.json`, the population
+  T2 is graded on: 4,833,216 (row, output slot, anchor) triples, 122,752 of them
+  at depth 2;
+- **composed-dense** — 2,000 batches of `configs/instr_alu_writers_chain100.json`,
+  in which every chunk's second instruction reads the first's result, at
+  instruction seed 1000 (the datagen skill has the command): 32,241,088 triples,
+  16,384,000 at depth 2.
+
+The *trained T2 head* is the four-hidden-layer vp head of the seed-0 T2 over
+`runs/t1_writers_500k_vp3` (finding 33), scored by the same probe through T1's
+emitted wiring. On the natural corpus it
+reads 98.915% overall and 79.80% at depth 2, against `probes/vp_budget.py`'s
+98.8554% and 79.31% for the same model on its own corpus, so the probe
+reproduces the trainer's scoring.
+
+*Plain heads* — Linear+ReLU layers, the vp head's own shape — at 1M steps on the
+natural corpus, exact match overall and at depth 2, under PyTorch's `nn.Linear`
+default initialization and under He initialization of the hidden layers (weight
+variance 2/fan-in, the scale that keeps a ReLU stack's signal from shrinking):
+
+| hidden layers | default init: all / depth 2 | He init: all / depth 2 |
+|---|---|---|
+| 4 | 99.757% / 92.13% | 99.462% / 84.51% |
+| 6 | 99.940% / 98.16% | 99.870% / 95.44% |
+| 8 | 99.880% / 95.61% | 99.831% / 94.43% |
+| 12 | 95.915% / 81.61% | 99.484% / 96.60% |
+| trained T2 head (4) | 98.915% / 79.80% | |
+
+No plain head beyond six layers does better overall under either
+initialization. At four layers — the trained T2 head's depth — a readout handed
+the true features reaches 92.13% on depth-2 slots where the T2 head reaches
+79.80%, at the same step budget, so part of T2's composed-slot error lies in the
+essence rather than the readout (the T2 head trains jointly with its encoder, at
+a learning rate of 1e-4).
+
+Trained for 10M steps with He initialization, a plain six-layer head reaches
+99.928% (97.62% at depth 2). A plain twelve-layer head dies: 98.09% at 1M,
+95.79% at 3M, 61.36% at 4M, and exactly 21.923% at every checkpoint from 6M on,
+where its output is the same for every input. None of its parameters is
+non-finite. Its activations grow by about an order of magnitude per layer
+(5–57×), to a spread of 4.8e10 across inputs after the tenth, and every unit of
+the eleventh ReLU layer is negative on all 32,768 held-out rows tested, so no
+gradient reaches the layers beneath. The
+six-layer head shows the same growth to a smaller extent: 17.7% of its last
+layer's units are active on any of those rows.
+
+*Residual heads with LayerNorm.* Each hidden layer becomes a pre-activation
+residual block, `h ← h + W·relu(LayerNorm(h))`, with one Linear per block, so
+the Linear count equals the plain head's. Trained the same way for 10M steps,
+failing triples on the natural corpus at each 1M checkpoint:
+
+| step | 1M | 2M | 4M | 6M | 8M | 9M | 10M |
+|---|---|---|---|---|---|---|---|
+| 6 layers | 10,626 | 6,022 | 2,096 | 1,427 | 560 | 408 | 369 |
+| 12 layers | 4,662 | 2,040 | 394 | 288 | 44 | 14 | 8 |
+
+Neither head's count rises at any checkpoint. At 10M the six-layer head is
+99.992% exact overall and 99.736% at depth 2; the twelve-layer head is 99.9998%
+(8 failing triples) and 99.994%.
+
+On the composed-dense corpus at 10M, miss rates (failing triples over triples in
+the bucket); the writer rows count depth-2 slots by the opcode of the
+instruction writing them:
+
+| | 12 layers | 6 layers |
+|---|---|---|
+| all triples | 0.0024% (777) | 0.111% (35,714) |
+| depth 1 / depth 2, failing triples | 1 / 776 | 244 / 35,470 |
+| `SUB` writer | 0.047% | 2.39% |
+| `ADDI` writer | 0.018% | 0.17% |
+| `ADD` writer | 0.015% | 0.79% |
+| shift writers (`SLL`, `SRL`, `SRA`) | ≤0.001% | 0.07–0.21% |
+
+What the twelve-layer head still misses, by the probe's *cell* — the slot's
+producer opcode, its writer opcode, and what feeds the writer's operands, as in
+`SLLI -> SUB [in2,result]`:
+
+- **Additions only.** `SUB`, `ADDI` and `ADD` writers are 90% of its misses;
+  logic, comparison and shift writers miss at most 0.004% of their slots.
+- **A few held-out states.** Each state carries 1/64 of the triples, yet one
+  carries 160 of the 777 misses, six carry 55%, and 21 carry none. The largest
+  single cell is `SUB -> ADDI [result,imm]` at the state whose first two inputs
+  are 0xFFFFFF00 and 0x10000001: their difference, 0xEFFFFEFF, plus a small
+  positive immediate carries from bit 9 to bit 28, and 130 of the 777 misses
+  are exactly that.
+- **Carry chains of middling length.** A word's *longest carry chain* is its
+  longest run of consecutive bit positions producing a carry-out. Depth-2 `SUB`
+  misses 0.01% of words whose longest chain is 0–4 bits, 0.31% at 9–16 bits and
+  0.01% at 25–32. A carry that rippled 16 or more positions arrives at 17.3% of
+  wrong bits against 5.5% of the correct bits of the same words.
+- **Shift-immediate producers.** By producer, `SLLI` and `SRAI` miss 0.024% and
+  0.017% of their slots; `SLL` and `SRA`, which shift by a register, 0.002%.
+- **Narrow errors.** 80% of misses are single-bit, 82% of wrong bits are in bits
+  20–31, and 24% of misses have a wrong bit at |logit| ≥ 2.
+
+The same head at 6M misses 13,707 composed-dense triples, and the slots it
+learns between 6M and 10M are not the ones it still fails. When the producer
+reads two inputs, the writer's fresh operand is the chunk's third input: those
+slots fall from 4,369 misses to 0 as `[in3,result]` (`SUB -> SUB [in3,result]`
+alone was 6.3% at 6M) and from 1,731 to 25 as `[result,in3]`. When the producer
+reads one input, the fresh operand is the second input, and those slots fall
+only 8–13×; `SUB -> ADDI [result,imm]` falls 2.5×. The six-layer head at 10M
+fails composed `SUB`/`ADD` whatever the producer (13,999 misses with an I-type
+producer, 14,388 with an R-type), and shift writers too (4,375 misses), with the
+same carry signature.
+
+So the readout's shape bounds vp before the essence does: a plain ReLU head
+cannot be trained to evaluate composed two-instruction chunks exactly even when
+they are described perfectly, and a deep residual head with LayerNorm can, to
+within long-carry precision at a few held-out states. Because the held-out set
+is 64 fixed states, the size of that remainder depends on which states the set
+contains. `probes/vp_gt_misses.py` produces every composed-dense figure.
+
 ## Decisions taken
 
 - **Anchor states are drawn afresh for every source chunk, from a structured
@@ -1619,11 +1772,17 @@ reads, seeds 0 and 7), score 86.46% and 85.34% against 98.56% and 98.63%, with
   error, while composed slots with an immediate are at 93.01% and are 39.5% of
   it. `probes/vp_budget.py` reports both, crossed. Localise with probes on frozen checkpoints
   first; train only to test a specific mechanism.
-- **The vp head is the smallest that still reaches correct results**, so the
-  essence carries as much of the evaluation as possible: three hidden layers
-  at T1; at T2 not yet chosen, with four layers at 98.6% and two at 86%
-  (finding 33). The 8-anchor result that a four-layer head leaves the aggregate
-  unchanged (finding 22) was measured where the head stored answers.
+- **T1's vp head is the smallest that still reaches correct results** — three
+  hidden layers — so its essence carries as much of the evaluation as possible
+  (finding 33). **T2's vp head is unconstrained in shape until T2 reaches vp = 0
+  at len=2.** A plain ReLU readout of the vp head's shape cannot be trained to
+  evaluate a perfectly described two-instruction chunk exactly, while a deep
+  residual readout with LayerNorm can (finding 34), and a head that cannot
+  execute a perfect description is a worse instrument than one that asks less
+  of the essence. Pressure toward a smaller head is applied once T2's essence is
+  good enough for a large one. The 8-anchor result that a four-layer head
+  leaves the aggregate unchanged (finding 22) was measured where the head
+  stored answers.
 - **`--value-norm` is rejected**, leaving the aggregate inside the noise floor
   at 8 anchors; it moves individual arms by 15–25 points (finding 22), so the
   cell it targets is a trade-off rather than a deficit.

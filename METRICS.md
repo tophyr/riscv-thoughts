@@ -18,16 +18,21 @@ input-slot values)` and predicts each output register's canonical value. It is
 the metric that matters because the essence is what a future T3 consumes: a next
 tier can only recover what this one preserved.
 
-**The head's depth is part of the criterion, so quote it with the number.**
-vp scores the essence composed with a readout, and that readout is the only
-consumer a T2 essence has — T3 does not exist yet — so its capacity is an
+**The head's shape is part of what a vp number certifies, so quote it with the
+number.** vp scores the essence composed with a readout, and that readout is the
+only consumer a T2 essence has — T3 does not exist yet — so its capacity is an
 implicit claim about what the next tier will be able to read. `vp = 0` at a
 deeper head is a strictly weaker statement than at a shallow one, because
 capacity granted to the head is structure the representation is no longer
 required to expose, and that compounds at every tier of a hierarchy whose
-premise is cheap coarse checks. The criterion for choosing it is the smallest
-head that still reaches correct results; T1's has three hidden layers of 1024,
-and T2's is not yet chosen.
+premise is cheap coarse checks. T1's head is the smallest that still reaches
+correct results: three hidden layers of 1024. T2's is unconstrained in shape
+until T2 reaches `vp = 0` at len=2, because a readout that cannot evaluate a
+perfectly described chunk exactly measures its own limit rather than the
+essence's, and at two instructions every plain ReLU readout of the vp head's
+shape is such a readout (EXPERIMENT_LOG, "T2 faithfulness", finding 34). Until
+a smaller head is shown to reach the same score, a T2 figure certifies less than
+a T1 figure of the same value.
 
 **Score it as exact 32-bit match of the predicted output value, never
 per-bit.** The output is discrete, and per-bit flatters a broken subset badly:
@@ -66,6 +71,13 @@ separately from the training draw's, so tuning the training draw does not move
 the criterion; it contains no negated pairs, so it exercises full-width carries
 only through its uniform values.
 
+**Near exact, a few of the 64 held-out states carry most of the residual.** On a
+corpus where every chunk is composed, one state carried 160 of a twelve-layer
+readout's 777 failing triples and six states carried 55%, against 1/64 each
+under uniform exposure (finding 34). A residual's size therefore depends on
+which states the set holds, and a score over a subset of them can be decided by
+one hard value pair; score at all 64.
+
 The essence is not what memorized. It is a fixed function of the instruction —
 the encoder never sees a value — so a fresh head trained with anchors redrawn
 per batch can test what a frozen essence carries: on the fixed-anchor T1 it
@@ -82,8 +94,11 @@ structured anchors is 99.9999% exact at held-out anchors with a three-hidden-
 layer head (finding 33), so at one instruction a small head evaluates it. Fed
 ground-truth instruction features instead of an essence, no one-hidden-layer
 head reaches exact at any width tried, two layers reach 99.36% and four 100.00%
-(finding 33), so at T2 the readout's capacity is a live confound in every vp
-number. The measurements that put the cost near zero
+(finding 33). At two instructions, fed ground-truth chunk features, no plain
+ReLU head of four to twelve layers is exact, and a twelve-layer residual head
+with LayerNorm, after 10M steps, misses 8 of 4.8M held-out triples on the graded
+population (finding 34). So at T2 the
+readout's capacity is a live confound in every vp number. The measurements that put the cost near zero
 at T2 — exact three-term addition, a decoded constant added exactly — were made
 at 8 fixed anchors, where a stored answer and an evaluated one cannot be told
 apart (finding 32).
@@ -101,7 +116,7 @@ T2 is. "T1 has perfect vp" does not license reading the pipeline number as T2's:
 vp scores `vp_head` on T1's essence, while the wiring comes from
 `in_score_head` / `out_score_head` / `live_in_head`, a different loss at a tenth
 of the weight. Re-check the wiring with `scripts/eval.py`'s T1 binding score
-("T1 binding", below) after any T1 change; it compares against the ORACLE's
+("Binding", below) after any T1 change; it compares against the ORACLE's
 per-instruction binding, not the tokens', since T1's binding is behavioral and
 the tokens are syntactic.
 The pipeline number is the acceptance criterion: "solved" means 100% through
@@ -180,9 +195,9 @@ population it targets.
 
 ---
 
-## T1 binding — the wiring T2 is given
+## Binding — the wiring the next tier is given
 
-**The requirement:** T1's emitted wiring is the oracle's, for every
+**The requirement at T1:** T1's emitted wiring is the oracle's, for every
 instruction. T2 never sees tokens; it routes each instruction's operands and
 destination off T1's binding heads (`_t1_predicted_wiring`), so a mis-wired
 instruction hands T2 a chunk different from the one it is graded on, and no T2
@@ -202,8 +217,20 @@ order check that ignores how many reads the heads say exist passes an
 instruction that is given no input at all. Both read 1.000 on a T1 whose
 emitted wiring is 98.5% exact.
 
-The score is against the oracle's definitions: every write counts, so a
-same-value self-write (`ADD x5,x5,x0`) is scored as a read and a write of x5.
+**At T2 the binding is a chunk's interface**, the wiring T3 will route on:
+every register the chunk reads from outside, in first-read order, and every
+register it writes, in write order. `scripts/eval.py` (`t2_exact_binding`)
+decodes those lists from T2's heads the way T1's are decoded — the live heads
+give the count, the score heads the order — and counts a chunk correct only if
+both equal the oracle's. **"Solved" is 100%.** It breaks the score down by chunk
+shape: one instruction reading the other's result, two reading a common input,
+a write overwritten unread, a read the output ignores, x0 or aliased operands,
+a destination that is also a source; and lists the opcode-and-operand forms
+carrying the most failing chunks.
+
+Both scores are against the oracle's definitions: every write counts, so a
+same-value self-write (`ADD x5,x5,x0`) is scored as a read and a write of x5,
+and a dead instruction's reads are inputs.
 
 ---
 

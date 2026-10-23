@@ -3,6 +3,7 @@ register rename must permute the emitted state EXACTLY and leave the
 invariant essence unchanged. These pin that by construction (no training),
 plus the head shapes the binding losses depend on.
 """
+import pytest
 import numpy as np
 import torch
 
@@ -203,3 +204,16 @@ def test_head_shapes():
     assert core.apply_slot_head(m.live_in_head, T).shape == (1, m.n_regs)
     assert core.apply_slot_head(m.in_score_head, T).shape == (1, m.n_regs)
     assert m.pc_writes_head(ess).shape == (1, 1)
+
+
+@pytest.mark.parametrize('chunk, shape', [
+    ([('ADD', 5, 6, 7), ('SUB', 8, 9, 10)], 'plain'),
+    ([('ADDI', 5, 6, 1), ('ADD', 8, 5, 9)], 'composed'),
+    ([('ADD', 5, 6, 7), ('SUB', 8, 6, 9)], 'shared input'),
+    ([('ADD', 5, 6, 7), ('ADDI', 5, 8, 1)], 'dead write'),
+    ([('ADD', 5, 5, 0), ('SUB', 8, 6, 9)], 'self-write + x0 operand'),
+    ([('XOR', 5, 6, 6), ('ADDI', 5, 5, 1)], 'aliased + composed + ignored read + self-write'),
+])
+def test_chunk_shape(chunk, shape):
+    from compressor.eval import _chunk_shape
+    assert _chunk_shape([Instruction(*i) for i in chunk]) == shape
