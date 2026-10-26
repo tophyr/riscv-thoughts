@@ -64,17 +64,20 @@ whatsoever.
 
 ## Milestones
 
-1. **[CURRENT] vp = 0 at len=2, at held-out anchors.** 98.72–98.86% exact over
-   the frozen `runs/t1_writers_500k_vp3`, with a four-hidden-layer plain T2 vp
-   head, two instruction-stream seeds, scored end to end through T1's emitted
-   wiring at all 64 held-out anchors (METRICS.md; EXPERIMENT_LOG, "T2
-   faithfulness", finding 33). `SUB` carries 45–49% of the failing triples and
-   slots composed from the other instruction's result 41–44%. T2's binding is
-   exact on every chunk scored.
+1. **Faithful at len=2, at held-out anchors — holds.** 99.9993% exact — 36
+   failing triples of 4,832,448 — over the frozen `runs/t1_writers_500k_resvp3`,
+   with a twelve-layer residual T2 vp head after 10M steps, one
+   instruction-stream seed, scored end to end through T1's emitted wiring at
+   all 64 held-out anchors (METRICS.md; EXPERIMENT_LOG, "T2 faithfulness",
+   finding 35). The same head handed a perfect description of the chunk fails
+   8. 27 of the 36 are `SUB` slots, 18 of them composed from the other
+   instruction's result on 3 chunks. T2's binding is exact on every chunk
+   scored. Accepted at one seed; the 36 and the head's size are idle-time work
+   (Open ideas).
 
-2. **Computed equivalents collapse at len=2.** Chunks computing the same
-   function land as far apart as chunks computing different ones (Mission's
-   table). Task 2. **Settle it before chunks get longer**: every added
+2. **[CURRENT] Computed equivalents collapse at len=2.** Chunks computing the
+   same function land as far apart as chunks computing different ones
+   (Mission's table). Task 1. **Settle it before chunks get longer**: every added
    instruction multiplies the equivalences a chunk participates in, so a len=4
    model would learn the same wrong geometry at four times the scale.
 
@@ -84,7 +87,7 @@ whatsoever.
    T2's read ranks match the target's frame at every length.
 
 4. **Beyond the happy path.** Everything above is writers-only (R/I-type ALU,
-   valid, non-x0). Then: no-write instructions (task 3), PC/branches, memory,
+   valid, non-x0). Then: no-write instructions (task 2), PC/branches, memory,
    longer and looser chunks.
 
 5. **T3.** Sequences of T2 blocks. Prerequisite: decide what a *composed*
@@ -94,63 +97,10 @@ whatsoever.
 
 ## Open tasks
 
-In order. Task 1 gates milestone 1, and task 2 is required for the MVP. The
-rest are queued, not parallel work.
+In order. Task 1 is required for the MVP. The rest are queued, not parallel
+work.
 
-### 1. vp = 0 at len=2 over the frozen T1
-
-Anchors are drawn afresh for every source chunk, from a structured mix, and
-ride in the batch; structural labels come from fixed witness states and decide
-nothing at the anchors; every write counts; scoring is at one fixed held-out set
-(RISCV_DESIGN.md; METRICS.md; finding 33). T1 passes both of its losses within
-one triple: `runs/t1_writers_500k_vp3`, whose vp head has three hidden layers —
-the smallest that reaches correct results — emits the oracle's wiring on
-100.0000% of instructions and is 99.9999% exact on vp at held-out anchors (1
-failing triple of 819,200, a comparison next to its immediate; Open ideas). Over
-it, `scripts/run_t2.sh`'s cell — four-hidden-layer plain vp head, chain rate
-0.10, 1M steps — is 98.72–98.86% exact on vp with exact binding (finding 33).
-
-**T2's vp head is free in shape until this milestone passes** (METRICS.md).
-Handed a perfect description of a two-instruction chunk, no plain ReLU head of
-the vp head's shape is exact, while a twelve-layer residual head with LayerNorm,
-after 10M steps, misses 0.0024% of held-out triples on a corpus where every
-chunk is composed (finding 34). A smaller head is the requirement after that, not before.
-
-- **A residual vp head with LayerNorm in T2.** `_build_vp_head`
-  (`compressor/model.py`) builds a plain Linear+ReLU stack, and `vp_head_live`
-  (`compressor/train.py`) assumes one: it splits the first layer's weights by
-  hand to skip empty input slots. Both need the residual form, and a checkpoint
-  with the plain head must still load. Two instruction-stream seeds over the
-  frozen T1, scored at all 64 held-out anchors against the plain four-layer
-  cells.
-- **What a perfect description still leaves.** The twelve-layer residual head's
-  remaining misses are carries rippling through long runs of ones in `SUB`,
-  `ADD` and `ADDI` writers, at a few held-out states (finding 34; Open ideas,
-  "Draw anchor values aimed at the instruction").
-- **A smaller head, once a deep one passes.** Put pressure on the encoder to
-  describe the chunk well enough for a smaller head, judged by the criterion
-  T1's head was chosen by: the smallest head that still reaches correct
-  results, so the essence does as much of the work as possible.
-- **One head form at both tiers, once T2's residual head is settled.** T1's vp
-  head is the plain three-layer stack. Remint T1 with the residual form at the
-  smallest depth that still passes, show that neither tier regressed, and then
-  delete the plain form. Batch it with task 2's T1 remint if the timing lines
-  up.
-- **The batch payload, if generation moves off this machine.** Per-row anchors
-  make a batch 2.7x larger compressed, ~84 MB/s at T2's step rate over the link
-  from the generator machine. Local generation keeps up at len=2 (~468 batches/s
-  from 26 workers against T2's ~200), so this waits until it does not. Shipping
-  only the canonical input columns of the anchors and only the written slots of
-  `out_regs` would remove most of it.
-- **The residual.** With the plain four-layer head over the frozen T1, `SUB` is
-  89.7–90.0% exact and carries 45–49% of the failing triples; slots composed
-  from the other instruction's result are 78.3–79.3% and carry 41–44%.
-- **Everything argued from 8-anchor vp**: the chain rate, the step budget
-  (`run_t2.sh` runs 1M; 2M was chosen at 8 anchors), the
-  vp-as-evaluator analysis (findings 21, 26, 29, 30), and the architecture
-  settings argued from vp.
-
-### 2. Collapse computed equivalences (milestone 2 — required for MVP)
+### 1. Collapse computed equivalences (milestone 2 — required for MVP)
 
 Two chunks computing the same function must land on the same point. They do not,
 and the failure is total rather than partial (Mission's table).
@@ -168,8 +118,9 @@ nothing.
 
 **Nothing in the project covers this class.** Equivalences are enumerated in one
 place — the manifest in `datagen/generate.py` — and all 15 of its classes are
-single-instruction **rewrites**, one operation expressed another way
-(`template_instr_counts=[1]`). Everything built on that manifest inherits the
+single-instruction **rewrites**, one operation expressed another way: every
+template in a class is one `InstructionTemplate`, a single instruction, so a
+class can only relate one instruction to another. Everything built on that manifest inherits the
 limit: the corpus's `equivalences.rate` augmentation, `eval.py`'s
 commutative-swap row, and a pairwise equivalence loss the trainer carried until
 commit `7797c81`, recoverable from git history. A **fold** — where seeing the
@@ -215,7 +166,7 @@ Decisions to make before building, in order:
   inequivalents together too. The guard is `behav-diff` (METRICS.md), which must
   stay large.
 
-### 3. No-write instructions are invisible to the essence
+### 2. No-write instructions are invisible to the essence
 
 Blocks milestone 4 (~⅓ of the ISA). Content reaches the essence only through a
 register write (`value[out] = res` is gated on `out != 0`), so for branches,
@@ -243,13 +194,13 @@ still moves. Two readings, and nothing currently distinguishes them:
   *incomplete* — it has no PC target at all. `out_pcs` is computed and only a
   `pc_writes` boolean is shipped, so this would mean widening the RVT batch.
 - **PC advance does not count.** Then those chunks are equivalent and their
-  distance is a collapse failure, which puts it in task 2.
+  distance is a collapse failure, which puts it in task 1.
 
 Deferred deliberately: it is a definition, not an experiment, and it should be
-settled before either task 2 builds a collapse objective or this task ships a
+settled before either task 1 builds a collapse objective or this task ships a
 PC-effect target — each would bake in an answer.
 
-### 4. Give T1 a validity task
+### 3. Give T1 a validity task
 
 T1's output norm is meant to say whether its token window is a complete, valid
 instruction — near 1 if so, near 0 for a partial instruction, a window spanning
@@ -330,7 +281,52 @@ difference of 0xEFFFFEFF plus an immediate carries from bit 9 to bit 28
 set to `imm + δ` for small δ, and a uniform value with a random span of bits
 forced to all-0 or all-1. The cost is a draw specialised to the opcode set, and
 a held-out set that would need the same classes to test them on purpose rather
-than by chance.
+than by chance. The len=2 model's own 36 misses are not of this kind — three
+composed `SUB` chunks each a bit off at six anchors, three composed `ADD`
+chunks and 15 single-instruction slots each wrong at one anchor, nine of those
+one `SUB` operand pair at one anchor state (finding 35) — so this draw is not
+aimed at them.
+
+### A smaller vp head at T2
+
+T2's vp head is twelve residual layers because no plain ReLU head evaluates a
+perfectly described two-instruction chunk exactly (METRICS.md; finding 34). The
+criterion T1's head was chosen by — the smallest head that still reaches
+correct results, so the essence does as much of the work as possible — has not
+been applied at T2. Applying it means putting pressure on the encoder to
+describe the chunk well enough for a shallower head. The essence's geometry has
+tightened with the deep head — mean distance between unrelated chunks 1.19 with
+the plain four-layer head, 0.67–0.69 with the residual head at 10M, swap
+collapse unchanged (finding 35) — and whether that costs a shallower consumer
+is what this would measure.
+
+Depth need not cost parameters: a recurrent head, one block applied repeatedly,
+would be another way to shrink it, if an iterated fixed block can do what twelve
+distinct ones do. Not tried.
+
+It may also not need shrinking at all. The vp head is the measuring instrument,
+not T3. If len=8 chunks turn out to need an absurd head — 64 layers, say — that
+says the chunk's function is expensive to evaluate, not that the essence is
+poor. What has to be ensured is that the encoder produces an essence the next
+tier can USE; it does not have to be ensured that T3 can EXECUTE the chunk. On
+that reading the head's size is a cost of scoring, not a property the essence
+is graded on.
+
+### Shrink the batch payload, if generation moves off this machine
+
+Per-row anchors make a batch 2.7x larger compressed, ~84 MB/s at T2's step rate
+over the link from the generator machine. Local generation keeps up at len=2
+(~468 batches/s from 26 workers against T2's ~200), so this waits until it does
+not. Shipping only the canonical input columns of the anchors and only the
+written slots of `out_regs` would remove most of it.
+
+### Settings argued at 8 fixed anchors
+
+The chain rate, the vp-as-evaluator analysis (findings 21, 26, 29, 30) and the
+architecture settings argued from vp were measured at 8 fixed anchor states,
+where the head stored answers (finding 32). None has been re-derived at held-out
+anchors; the step budget has (1M against 10M, finding 35). Re-check one when a
+decision turns on it.
 
 ## Long horizon
 

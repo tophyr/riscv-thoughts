@@ -284,24 +284,15 @@ def vp_head_live(head, vecs, in_vals_i, n_in, n_out):
     features are exact zeros, and output slots >= n_out are never supervised,
     so those parts are skipped; only the float summation order changes.
     Returns (B, A, n_out*(bits+1))."""
-    layers = list(head) if isinstance(head, nn.Sequential) else [head]
     d = vecs.shape[-1]
     B, A = in_vals_i.shape[:2]
-    rows = slice(None)
-    if len(layers) == 1:
-        rows = slice(0, n_out * (_VP_VALUE_BITS + 1))
-    first = layers[0]
-    w, b = first.weight[rows], first.bias[rows]
+    w, b = head.inp.weight, head.inp.bias
     x = _value_feat(in_vals_i[..., :n_in]).reshape(B, A, -1)
     h = (F.linear(x, w[:, d:d + x.shape[-1]], b)
          + F.linear(F.normalize(vecs, dim=-1), w[:, :d]).unsqueeze(1))
-    if len(layers) == 1:
-        return h
-    for layer in layers[1:-1]:
-        h = layer(h)
-    last = layers[-1]
+    h = head.hidden(h)
     keep = n_out * (_VP_VALUE_BITS + 1)
-    return F.linear(h, last.weight[:keep], last.bias[:keep])
+    return F.linear(h, head.out.weight[:keep], head.out.bias[:keep])
 
 
 # Rotary immediate encoding (T1). POWER-OF-2 periods 2,4,...,4096: each frequency
@@ -698,7 +689,7 @@ def _t1_wiring(batch):
 
 
 def train_compressor(batch_iter, *, ingest, lower_encoder=None,
-                     d_out=128, d_event=16, op_cell_depth=1, vp_head_depth=4,
+                     d_out=128, d_event=16, op_cell_depth=1, vp_head_depth=3,
                      n_pool_heads=1,
                      d_model=128, n_heads=4, n_layers=2, max_window=72,
                      route='binding',
@@ -746,8 +737,7 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
             vocab_size=VOCAB_SIZE, d_model=d_model, n_heads=n_heads,
             n_layers=n_layers, max_window=max_window, d_out=d_out,
             d_event=d_event, op_cell_depth=op_cell_depth,
-            vp_head_depth=vp_head_depth,
-            n_pool_heads=n_pool_heads).to(device)
+            vp_head_depth=vp_head_depth, n_pool_heads=n_pool_heads).to(device)
         comp = model.compressor
         model_file = 'encoder.pt'
     route_binding = (route == 'binding')
@@ -1613,7 +1603,7 @@ class TrainBatchPrefetcher:
 
 
 def train_t2_encoder(batch_iter, t1_encoder, *,
-                     d_out=256, d_event=16, op_cell_depth=1, vp_head_depth=4,
+                     d_out=256, d_event=16, op_cell_depth=1, vp_head_depth=12,
                      n_pool_heads=1,
                      lr=3e-4, n_steps=None, log_every=100, lr_min=1e-6,
                      warmup_steps=0,
@@ -1631,8 +1621,8 @@ def train_t2_encoder(batch_iter, t1_encoder, *,
     return train_compressor(
         batch_iter, ingest='vectors', lower_encoder=t1_encoder,
         d_out=d_out, d_event=d_event, op_cell_depth=op_cell_depth,
-        vp_head_depth=vp_head_depth, n_pool_heads=n_pool_heads,
-        route=t2_route,
+        vp_head_depth=vp_head_depth,
+        n_pool_heads=n_pool_heads, route=t2_route,
         lr=lr, n_steps=n_steps, log_every=log_every, lr_min=lr_min,
         warmup_steps=warmup_steps,
         valid_weight=valid_weight, live_in_weight=live_in_weight,

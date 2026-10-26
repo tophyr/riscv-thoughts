@@ -22,11 +22,12 @@ source .venv/bin/activate
 D=/home/tophy/Projects/riscv-thoughts/logs
 # The frozen lower tier. A T2 checkpoint is only interchangeable with others
 # trained on the SAME T1, so a cell that changes this must be named for it.
-T1=${T1:-runs/t1_writers_500k_vp3/encoder.pt}
-# VP = vp-head hidden layers. The head must EVALUATE the chunk's function at the
-# anchor points, so its capacity is a confound in every vp number; at T2 its
-# shape is free until vp = 0 at len=2 (METRICS.md).
-LEN=${LEN:-2} DOUT=${DOUT:-512} STEPS=${STEPS:-1000000} OC=${OC:-4} VP=${VP:-4}
+T1=${T1:-runs/t1_writers_500k_resvp3/encoder.pt}
+# VP = vp-head hidden layers (residual blocks with LayerNorm). The head must
+# EVALUATE the chunk's function at the anchor points, so its capacity is a
+# confound in every vp number (METRICS.md). STEPS=10000000 is the recorded
+# cell; 1M is the quick check (EXPERIMENT_LOG, finding 35).
+LEN=${LEN:-2} DOUT=${DOUT:-512} STEPS=${STEPS:-10000000} OC=${OC:-4} VP=${VP:-12}
 NPOOL=${NPOOL:-16}
 # Local generator workers. Per-row anchors make a batch ~2.7x larger on the
 # wire, so generation runs on this machine rather than over the link to odin.
@@ -91,8 +92,9 @@ cell() {
 # writers corpus whatever a cell trained on, because a cell that raised the
 # density of some chunk shape has to be graded on the population the model will
 # actually meet, not on its own training mix.
-EVAL=/tmp/t2_eval_heldout64_${LEN}.rvt
+EVAL=runs/eval/t2_heldout64_len${LEN}.rvt
 if [ ! -f "$EVAL" ]; then
+  mkdir -p runs/eval
   echo "generating shared eval corpus..."
   python -m datagen --rule "cap=$LEN" --twins 2 --batch-size 128 --n-states 64 \
       --heldout-anchors --config configs/instr_alu_writers.json --count 100 \

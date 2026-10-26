@@ -25,13 +25,17 @@ implicit claim about what the next tier will be able to read. `vp = 0` at a
 deeper head is a strictly weaker statement than at a shallow one, because
 capacity granted to the head is structure the representation is no longer
 required to expose, and that compounds at every tier of a hierarchy whose
-premise is cheap coarse checks. T1's head is the smallest that still reaches
-correct results: three hidden layers of 1024. T2's is unconstrained in shape
-until T2 reaches `vp = 0` at len=2, because a readout that cannot evaluate a
-perfectly described chunk exactly measures its own limit rather than the
-essence's, and at two instructions every plain ReLU readout of the vp head's
-shape is such a readout (EXPERIMENT_LOG, "T2 faithfulness", finding 34). Until
-a smaller head is shown to reach the same score, a T2 figure certifies less than
+premise is cheap coarse checks. Both heads are pre-activation residual stacks
+with LayerNorm. T1's is the smallest that still reaches correct results: three
+hidden layers of 1024. T2's is twelve layers deep, because a readout that
+cannot evaluate a perfectly described chunk exactly measures its own limit
+rather than the essence's, and at two instructions every plain ReLU readout of
+the vp head's shape is such a readout (EXPERIMENT_LOG, "T2 faithfulness",
+finding 34). A T2 vp figure is therefore read against the same head on a
+perfect description of the chunk, which, after 10M steps, gets 8 of 4.8M
+held-out output values wrong (a value is one output register of one chunk at
+one anchor state) where T2's essence gets 36 wrong (finding 35). Until a
+smaller head is shown to reach the same score, a T2 figure certifies less than
 a T1 figure of the same value.
 
 **Score it as exact 32-bit match of the predicted output value, never
@@ -97,8 +101,10 @@ head reaches exact at any width tried, two layers reach 99.36% and four 100.00%
 (finding 33). At two instructions, fed ground-truth chunk features, no plain
 ReLU head of four to twelve layers is exact, and a twelve-layer residual head
 with LayerNorm, after 10M steps, misses 8 of 4.8M held-out triples on the graded
-population (finding 34). So at T2 the
-readout's capacity is a live confound in every vp number. The measurements that put the cost near zero
+population (finding 34); T2's essence through that head misses 36 (finding 35).
+So at T2 the readout's capacity is a live confound in every vp number, and the
+perfect-description figure for the same head is the floor a T2 figure is read
+against. The measurements that put the cost near zero
 at T2 — exact three-term addition, a decoded constant added exactly — were made
 at 8 fixed anchors, where a stored answer and an evaluated one cannot be told
 apart (finding 32).
@@ -380,7 +386,9 @@ Scope for all of it: chunks of 2 instructions, `d_out` 512, over the frozen
 training anchor states — so these are floors on a stored-answer score, and none
 carries over to a model trained with anchors redrawn per batch. The runs
 behind each row are in EXPERIMENT_LOG, "T2 faithfulness" (findings 25 and 31); this
-table is the operative copy, that is the evidence.
+table is the operative copy, that is the evidence. Neither T1 named in this
+section is kept in `runs/`, so these floors stand as recorded and cannot be
+re-run.
 
 | quantity | value | measured over |
 |---|---|---|
@@ -401,10 +409,26 @@ held-out anchors:
 | two instruction-stream seeds of one T2 configuration | 0.04–0.08 points | two configurations, each at seeds 0 and 7 |
 | a null intervention's cost | ~65 min | one len=2 cell at 1M steps, ~3.9 ms/step, scoring included |
 
-So: use ~0.01 for a T2-level claim unless that specific cell has been
-replicated, and 0.023 for anything comparing one T1 against another. With a
-per-cell σ of 0.011, the mean of a two-cell pair moves by ~0.008, so two pairs
-cannot be told apart below ~0.02. No T1
+With the twelve-layer residual vp head — the only form the code builds — over
+the plain-headed three-layer T1 of finding 33 (not the frozen
+`runs/t1_writers_500k_resvp3`), len=2, chain rate 0.10, 1M steps, every cell
+scored on `runs/eval/t2_heldout64_len2.rvt` at all 64 held-out anchors
+(EXPERIMENT_LOG, "T2 faithfulness", finding 35):
+
+| quantity | value | measured over |
+|---|---|---|
+| two instruction-stream seeds of one T2 configuration | 0.002 points (5,511 against 5,418 failing triples of 4.8M) | seeds 0 and 7 |
+| the same configuration with a plain four-layer vp head | 0.155 points | seeds 0 and 7 |
+| a null intervention's cost | ~8 ms/step, so ~2.3 h at 1M steps | one len=2 cell, 26 local generator workers |
+
+The 10M-step cell over the frozen T1 (36 failing triples) is one seed, so no
+floor is measured for it; a claim against it needs its replicate first.
+
+So: unless the specific cell has been replicated, take the floor from the table
+whose configuration matches — ~0.01 for a plain-headed cell at 8 anchors, 0.002
+for a residual-headed cell at 1M steps — and 0.023 for anything comparing one T1
+against another. With a per-cell σ of 0.011, the mean of a two-cell pair moves
+by ~0.008, so two such pairs cannot be told apart below ~0.02. No T1
 configuration measured is distinguishable from any other.
 
 **The error-budget axes are also len=2-specific.** `sources × immediate ×

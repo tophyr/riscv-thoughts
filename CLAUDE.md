@@ -121,13 +121,13 @@ not know you need.
    from a rebuilt set.** Every row's `out_regs` was executed at anchor states
    drawn for that row (one draw per source chunk, shared by its twins) and
    shipped beside it as `batch.anchors` (`build_twins`, `datagen/batch.py:540`;
-   the draw is `draw_anchor_states`, `datagen/compare.py:315`). The trainer
+   the draw is `draw_anchor_states`, `datagen/compare.py:303`). The trainer
    stages that field and feeds it to `t2_value_predict_loss`
-   (`compressor/train.py:1215`); a scorer must do the same. Building input values
+   (`compressor/train.py:1205`); a scorer must do the same. Building input values
    from any other set of states — a seed, a fixed table — gives wrong targets
    with no error. Score at the fixed held-out set by generating the corpus with
    `datagen --heldout-anchors` (`heldout_anchor_states`,
-   `datagen/compare.py:378`), whose states no training draw produces.
+   `datagen/compare.py:373`), whose states no training draw produces.
 
 2. **Fixed batch shape, derived from the rule's length cap.** Every emitted batch
    is padded to identical (B, max_tokens, max_n_instrs) so PyTorch's caching
@@ -148,11 +148,11 @@ not know you need.
 4. **value_predict is CANONICAL for both tiers, in the BEHAVIORAL frame.**
    `out_regs` is the rename-invariant canonical baseline: `precompute_chunk`
    relocates the chunk's i-th **behavioral** input to canonical position i+1
-   (`_canonical_state`, `datagen/compare.py:386`, positions
-   `_CANON_POSITIONS = range(1, 32)` at `datagen/compare.py:80`; applied at
-   `datagen/compare.py:759`) and executes there, so `out_regs[:, r]` depends only
+   (`_canonical_state`, `datagen/compare.py:382`, positions
+   `_CANON_POSITIONS = range(1, 32)` at `datagen/compare.py:69`; applied at
+   `datagen/compare.py:685`) and executes there, so `out_regs[:, r]` depends only
    on operand structure. The vp loss (`t2_value_predict_loss`,
-   `compressor/train.py:1215`, used by BOTH T1 and T2) therefore feeds the head
+   `compressor/train.py:1205`, used by BOTH T1 and T2) therefore feeds the head
    the canonical-position values `anchor[:, k+1]` for input slot k — never the raw
    value at the slot's actual register. Feeding raw input values against the
    canonical target is mathematically inconsistent — the head must see canonical
@@ -166,10 +166,10 @@ not know you need.
    depend on something the encoder cannot see, and two chunks with a
    bit-identical encoder input would carry different targets. Which reads are
    behavioral is decided per instruction at FIXED witness states
-   (`instruction_reads`, `datagen/compare.py:612`), never at the anchors: per-row
+   (`instruction_reads`, `datagen/compare.py:591`), never at the anchors: per-row
    anchors would otherwise flip a label from one row to the next. The chunk's
    inputs are those reads in first-read order, a dead instruction's included
-   (`_input_order`, `datagen/compare.py:638`): T1 emits them and T2's read ranks
+   (`_input_order`, `datagen/compare.py:617`): T1 emits them and T2's read ranks
    number them, so skipping them would shift every later input off its rank.
    The regression guards are `test_canonical_positions_go_to_behavioral_inputs`,
    `test_a_dead_instructions_reads_are_inputs` and
@@ -183,7 +183,7 @@ not know you need.
    (`datagen/batch.py:540`) drops chunks containing LOAD/STORE from twin+aux
    construction because their `Precomputed` is
    unavailable — `precompute_chunk` raises NotImplementedError on memory ops
-   (`datagen/compare.py:724-725`). The chunk's tokens are still shipped (so the
+   (`datagen/compare.py:661-662`). The chunk's tokens are still shipped (so the
    encoder sees them for magnitude/validity), but its aux row is zero-mask /
    `AUX_CE_IGNORE` and its value-prediction row is masked off via
    `out_regs_valid=False` (`_out_regs_from_precomputeds`, `datagen/batch.py:368`).

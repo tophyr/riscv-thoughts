@@ -42,11 +42,10 @@ it describes. At minimum:
 the current code.** A name encodes intent at launch and can disagree with what
 ran: one run named for a read-position setting was trained with a different one,
 and was recorded in three documents as a failed experiment it never performed.
-The directories under `runs/` also carry suffixes for settings the core no
-longer has (`_pewrite_time_rtrank_seedrank`), and their `hparams.json` still
-records those keys. So read `hparams.json` rather than the name — then check
-that the keys it names still exist in the code before reading meaning into
-them.
+A run directory's suffixes can also name settings the core no longer has, and
+its `hparams.json` still records those keys. So read `hparams.json` rather than
+the name — then check that the keys it names still exist in the code before
+reading meaning into them.
 
 Cite `path:line` for any claim you make about what the code does. If you cannot
 cite it, you have not verified it — say so instead of asserting it.
@@ -55,12 +54,14 @@ cite it, you have not verified it — say so instead of asserting it.
 
 Numbers in this project have scope conditions that are easy to miss:
 
-- **Aggregate metrics hide subset failures.** The current open deficit lives in
-  ~12% of a subset and is invisible in the training-log number. Use the probe
-  the task names, not the aggregate.
-- **Know what a metric certifies.** `vp` is scored against 8 fixed anchor
-  states, so `vp = 0` means "correct at 8 input points", not "encodes the
-  function".
+- **Aggregate metrics hide subset failures.** A bucket holding 1–2% of the
+  scored triples has carried most of the error while the aggregate sat above
+  99.8% (METRICS.md, "Reading the error budget"). Use the probe the task names,
+  not the aggregate.
+- **Know what a metric certifies.** `vp` scores the essence composed with a
+  readout that must EVALUATE it, at 64 held-out anchor states no model trains
+  on. `vp = 0` means that readout is exact at those states; the readout's depth
+  is part of the claim and is quoted with the number (METRICS.md, "vp").
 - **Calibrate every probe** against a quantity known independently, and against
   the base rate. A probe scoring at the majority-class frequency has learned
   nothing; one scoring below the model's own trained head is measuring itself.

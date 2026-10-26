@@ -586,7 +586,7 @@ def test_vp_head_live_matches_the_full_head():
     in_slot[1, 3] = 7
     iv = vp_canonical_in_vals(anchors, in_slot)
     vecs = torch.randn(3, 16)
-    for depth in (0, 1, 4):
+    for depth in (1, 4):
         t2 = T2Compressor(d_t1=8, d_out=16, d_event=4, vp_head_depth=depth)
         want = t2.vp_head(vp_head_inputs(vecs, iv))[..., :3 * 33]
         got = vp_head_live(t2.vp_head, vecs, iv, n_in=4, n_out=3)

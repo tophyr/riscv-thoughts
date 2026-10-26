@@ -116,7 +116,7 @@ def load_frozen_encoder(model_path, device):
         d_out=hp.get('d_out', 64),
         d_event=hp.get('d_event', 16),
         op_cell_depth=hp.get('op_cell_depth', 1),
-        vp_head_depth=hp.get('vp_head_depth', 4),
+        vp_head_depth=hp['vp_head_depth'],
         n_pool_heads=hp.get('n_pool_heads', 1),
     ).to(device)
     encoder.load_state_dict(_tile_shared_pool_v(
@@ -135,7 +135,7 @@ def load_t2(t2_dir, t1, device):
     t2 = T2Compressor(
         d_t1=t1.d_out, d_out=hp['d_out'], d_event=hp.get('d_event', 16),
         op_cell_depth=hp.get('op_cell_depth', 1),
-        vp_head_depth=hp.get('vp_head_depth', 4),
+        vp_head_depth=hp['vp_head_depth'],
         n_pool_heads=hp.get('n_pool_heads', 1),
     ).to(device)
     t2.load_state_dict(_tile_shared_pool_v(

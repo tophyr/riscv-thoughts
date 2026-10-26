@@ -119,10 +119,14 @@ the score is taken at a fixed set no model trains on: a readout trained on one
 fixed set stores answers at it instead of evaluating. **At one instruction it
 holds**: T1's emitted wiring matches the oracle on every instruction and its
 essence is evaluated exactly at unseen inputs, to 1 failure in 819,200. **At
-two instructions it is open**: T2 reaches 98.7–98.9% exact at unseen inputs, with
-subtraction and slots computed from the other instruction's result carrying
-most of the rest. Part of that gap is the readout: no head of T2's shape
-evaluates even a perfectly described two-instruction chunk exactly.
+two instructions it holds to within 36 failures in 4.8 million scored values**
+— every output register of 38,400 held-out chunks, each evaluated at 64 input
+states no model trains on — after 10M training steps, on one seed, with a
+twelve-layer residual readout, and is accepted at that figure; the same readout
+handed a perfect description of the chunk fails 8 of them. The readout's shape
+matters that much because no plain ReLU head evaluates even a perfectly
+described two-instruction chunk exactly. Beyond two instructions it is
+untested.
 
 *Equivalence.* Two instruction sequences that compute the same function must
 compress to the same point — that is the framework's definition of meaning, and

@@ -1,11 +1,12 @@
 # Phase 15 (IN PROGRESS): making the T2 chunk vector faithful to the instructions it encodes
 
-**Status: open.** Faithfulness holds at one instruction and is open at two:
-scored at anchor states no model trained on, T1 is exact and T2 at len=2 is
-98.7–98.9% (finding 33). Findings 1–32 were measured at one fixed set of 8 anchor
-states, where the head stores answers rather than evaluating (finding 32), so
-their figures describe the mechanisms they located, not whether a function was
-learned. Equivalence collapse is unresolved, and nothing beyond two
+**Status: open.** Faithfulness holds at one instruction and is within 36
+triples in 4.8 million at two: scored at anchor states no model trained on, T1
+is exact (finding 33) and T2 at len=2 with a twelve-layer residual vp head is
+99.9993% after 10M steps, one seed (finding 35). Findings 1–32 were measured
+at one fixed set of 8 anchor states, where the head stores answers rather than
+evaluating (finding 32), so their figures describe the mechanisms they located,
+not whether a function was learned. Equivalence collapse is unresolved, and nothing beyond two
 instructions or outside the R/I-type ALU subset has been attempted. Claims here are corrected in place, so
 read them as current belief rather than as a chronology. A probe named here that
 is no longer in `probes/` rebuilt one fixed anchor set and was deleted; recover
@@ -18,15 +19,18 @@ head stored answers: at anchor states it never saw, T2 fell to ~5% exact and T1
 to 21% (finding 32). Anchors are therefore drawn afresh for every source chunk
 from a structured mix, structural labels come from fixed witness states instead
 of the anchors, and every score is at a held-out set. On that footing
-`runs/t1_writers_500k_vp3` emits the oracle's wiring on 100.0000% of
-instructions and is 99.9999% exact on vp, once T1's read pulses see both
-operands and its vp head has three hidden layers, the smallest that reaches
-correct results. T2 at len=2 over that T1 is 98.72–98.86% with a four-layer vp
-head, `SUB` and composed slots carrying most of the rest (finding 33). The vp
-head's own shape is part of that gap: handed a perfect description of the chunk
-instead of an essence, no plain ReLU readout of the vp head's shape is exact,
-while a twelve-layer residual readout with LayerNorm misses 8 of 4.8M held-out
-triples (finding 34).
+the frozen T1, `runs/t1_writers_500k_resvp3`, emits the oracle's wiring on
+100.0000% of instructions and is 99.9999% exact on vp, once T1's read pulses
+see both operands and its vp head has three hidden layers, the smallest depth
+that reaches correct results. T2 at len=2 is 98.7–98.9% with a plain four-layer
+vp head, `SUB` and composed slots carrying most of the rest (finding 33), and
+that gap is the head's shape: handed a perfect description of the chunk instead
+of an essence, no plain ReLU readout of the vp head's shape is exact, while a
+twelve-layer residual readout with LayerNorm misses 8 of 4.8M held-out triples
+(finding 34). Every vp head at either tier is that residual form, and with it
+T2 over the frozen T1 is 99.9993% after 10M steps — 36 failing triples of 4.8M,
+18 of them composed `SUB` slots — so its essence is within about 28 triples of
+a perfect description (finding 35).
 
 At the 8 training anchors, exact 32-bit match of the predicted output value
 reaches **99.9364%** at two instructions — 512 failing (row, output-slot, anchor)
@@ -1463,10 +1467,15 @@ counted, per-row anchors with negated copies), scored at held-out anchors:
 | 3 hidden layers, 1,024 wide | 250k / 500k | 99.9956% / **99.9999%** | ~36 / **1** | 100% |
 | 4 hidden layers, 1,024 wide | 250k | 99.9991% | 7 | 100% |
 
-Three layers at 500k steps — `runs/t1_writers_500k_vp3` — is the smallest that
-reaches correct results; its one failure is `SLTI` next to its immediate. Two
-layers are still short at 500k, spread over `SUB` (98.54%), the shifts and
-`ADDI`.
+Three layers at 500k steps is the smallest depth that reaches correct results;
+the one failure is `SLTI` next to its immediate. Two layers are still short at
+500k, spread over `SUB` (98.54%), the shifts and `ADDI`. The heads in this
+table are plain ReLU stacks. The frozen T1, `runs/t1_writers_500k_resvp3`, has
+the same three hidden layers in the pre-activation residual form with LayerNorm
+that every vp head takes (finding 34; `VPHead`, `compressor/model.py`), on the
+same 500k-step schedule, and scores the same: wiring exact on 100.0000% of
+38,400 instructions, vp 99.9999% at held-out anchors (1 failing triple of
+819,200, an `SLTI`), every other opcode 100.0000%.
 
 How much the head leaves to the encoder is measured by freezing each T1's
 essence and training one fixed small head on it (one hidden layer, 1,024 wide,
@@ -1549,8 +1558,9 @@ reads, seeds 0 and 7), score 86.46% and 85.34% against 98.56% and 98.63%, with
 `SUB` at 40–41% and `ADD` at 52–62% exact; binding is exact and swap collapse
 0.0087–0.0095.
 
-*T2 over the frozen T1.* Two T2s over `runs/t1_writers_500k_vp3`, len=2, chain
-rate 0.10, four-layer vp head, 1M steps, instruction-stream seeds 0 and 7
+*T2 over the plain-headed three-layer T1.* Two T2s over the three-layer
+plain-headed T1 at 500k steps from the table above, len=2, chain rate 0.10,
+four-layer plain vp head, 1M steps, instruction-stream seeds 0 and 7
 (`scripts/run_t2.sh`), scored on one corpus of 100 batches × all 64 held-out
 anchors drawn from `configs/instr_alu_writers.json` — a different corpus and
 anchor count from the 300 × 16 figures above, so the two do not compare
@@ -1593,9 +1603,9 @@ with `datagen --heldout-anchors` and no twins:
   instruction seed 1000 (the datagen skill has the command): 32,241,088 triples,
   16,384,000 at depth 2.
 
-The *trained T2 head* is the four-hidden-layer vp head of the seed-0 T2 over
-`runs/t1_writers_500k_vp3` (finding 33), scored by the same probe through T1's
-emitted wiring. On the natural corpus it
+The *trained T2 head* is the four-hidden-layer plain vp head of the seed-0 T2
+over the plain-headed three-layer T1 (finding 33), scored by the same probe
+through T1's emitted wiring. On the natural corpus it
 reads 98.915% overall and 79.80% at depth 2, against `probes/vp_budget.py`'s
 98.8554% and 79.31% for the same model on its own corpus, so the probe
 reproduces the trainer's scoring.
@@ -1698,6 +1708,107 @@ within long-carry precision at a few held-out states. Because the held-out set
 is 64 fixed states, the size of that remainder depends on which states the set
 contains. `probes/vp_gt_misses.py` produces every composed-dense figure.
 
+**35. With the twelve-layer residual vp head, T2 over the frozen T1 is
+99.9993% exact at held-out anchors after 10M steps — 36 failing triples of
+4,832,448, against 8 for the same head form handed a perfect description of
+the chunk.** Every cell is `scripts/run_t2.sh`'s: len=2, `d_out` 512, op-cell
+depth 4, 16 pool heads, chain rate 0.10, learning rate 1e-4 with a 10k-step
+warmup and cosine decay. The T1 is either the frozen
+`runs/t1_writers_500k_resvp3` or the plain-headed three-layer T1 of finding
+33's table, which scores the same at one instruction; the T2 vp head is either
+the plain four-hidden-layer stack or finding 34's twelve-layer pre-activation
+residual form with LayerNorm (`VPHead`, `compressor/model.py`), the only form
+the code builds. Every cell is scored on ONE corpus,
+`runs/eval/t2_heldout64_len2.rvt`: 100 batches of
+`configs/instr_alu_writers.json` at `cap=2`, every row at all 64 held-out
+anchor states, 4,832,448 supervised (row, output slot, anchor) triples, 118,272
+of them at depth 2. That file is not finding 33's corpus, so the plain cells
+are rescored here and differ from finding 33's table by up to 0.07 points.
+
+"T1 head" is the form and depth of the T1's own vp head, all that differs
+between the two T1s; "depth 1" is an output slot whose instruction read only
+chunk inputs, "depth 2" one whose operand came from the other instruction's
+result; "`SUB` at depth 2" is the exact rate on depth-2 slots written by `SUB`
+(10,944 triples); "binding" is T2's emitted inputs and outputs exact per chunk
+over 7,680 chunks; "swap collapse" is the commutative-swap distance on pairs
+the swap left equivalent and "distinct" the mean distance between unrelated
+chunks, both from `scripts/eval.py`'s collapse rows.
+
+| T1 head | T2 vp head | steps | seed | exact | failing | depth 1 | depth 2 | `SUB` at depth 2 | binding | swap collapse | distinct |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| plain, 3 | plain, 4 | 1M | 0 | 98.9199% | 52,197 | 99.3954% | 79.9665% | 40.84% | 100.0000% | 0.0126 | 1.19 |
+| plain, 3 | plain, 4 | 1M | 7 | 98.7649% | 59,685 | 99.2587% | 79.0813% | 41.01% | 100.0000% | 0.0113 | 1.20 |
+| plain, 3 | residual, 12 | 1M | 0 | 99.8860% | 5,511 | 99.9812% | 96.0887% | 81.85% | 100.0000% | 0.0172 | 0.88 |
+| plain, 3 | residual, 12 | 1M | 7 | 99.8879% | 5,418 | 99.9828% | 96.1039% | 81.47% | 100.0000% | 0.0169 | 0.90 |
+| plain, 3 | residual, 12 | 10M | 0 | 99.9989% | 51 | 99.9996% | 99.9721% | 99.6985% | 100.0000% | 0.0175 | 0.67 |
+| residual, 3 (frozen) | residual, 12 | 10M | 0 | **99.9993%** | **36** | 99.9997% | 99.9822% | 99.8355% | 100.0000% | 0.0183 | 0.69 |
+
+The two seeds of a configuration spread 0.155 points with the plain head and
+0.002 with the residual one; the head changes the aggregate by about a point at
+1M and the composed slots by 16 points, so the plain head's shape, not the
+essence, was the bound finding 33's figures sat against. The two 10M cells,
+which differ only in the T1's head form, differ by 15 triples; with one seed
+each, whether the T1's head form matters at T2 is not resolved.
+
+**Where the 36 failures are** (the 10M model over the frozen T1). 21 are
+depth-2 slots, 18 written by `SUB` and 3 by `ADD`; 15 are depth-1 slots, 9
+written by `SUB`, 3 by `ADDI` and 3 by `SLTIU`. The one bucket
+`probes/vp_budget.py` reports below 99.9% is depth-2 slots in chunks whose
+instructions share a source register and carry an immediate (99.6094% of
+4,608). Every other depth-2 opcode, every I-type depth-2 slot, and every opcode
+but `SUB`, `ADD`, `ADDI` and `SLTIU` at depth 1 is 100.0000%, and per-bit
+accuracy rounds to 100.0000% at every bit position.
+
+`probes/vp_miss_kind.py` on the same corpus (calibration 0 mismatches) sorts
+them further. The 21 depth-2 misses fall on 6 (row, slot) pairs of two shapes:
+`SRAI -> SUB` with the shifted value as the minuend (18 misses on 576 triples)
+and `SLL -> ADD` with the sum's second operand the composed one (3 on 576);
+three pairs fail at one of their 64 anchors and three at six, spread over 7
+anchor states with 3 misses each. The 15 depth-1 misses are 15 slots each
+wrong at exactly one anchor, and the 9 `SUB` misses among them are 9 chunks at
+one anchor state evaluating one operand pair (0x64F44055 − 0x46A44249, two
+large unrelated values) that 12 other chunks at that state get right. 33 of
+the 36 are a single wrong bit, between bit 8 and bit 27 and never a carry run;
+the 3 `SLTIU` misses equal another slot's value, the weakest of the probe's
+classes for a one-bit result. So the residual is a handful of specific chunks
+evaluated a bit off at a few states, not a value class the draw under-serves
+as finding 34's long carries were.
+
+**Against a perfect description.** Finding 34 trained the same twelve-layer
+residual form on ground-truth chunk features, alone, at a learning rate of
+3e-4, and scored it on a corpus of the same population, size and anchors
+(4,833,216 triples, a different draw). Failing triples, perfect description
+against T2's essence through its own head:
+
+| steps | perfect description | T2 essence |
+|---|---|---|
+| 1M | 4,662 | 5,511 (over the plain-headed T1) |
+| 10M | 8 | 36 (over the frozen T1; 51 over the plain-headed one) |
+
+So the essence costs this head at most about 850 triples at 1M and 28 at 10M
+over what the head costs on its own, an upper bound because the T2's head
+trains jointly with its encoder at a third of the readout's learning rate.
+Through a head able to evaluate it, T2's essence is within a hundredth of a
+percentage point of a perfect description of the chunk.
+
+For scale: the best T2 scored at its 8 training anchors, where the head stored
+answers, was 99.9387% with 1,482 failing triples of 2,416,416 (finding 31), and
+that model fell to ~5% at anchors it had not seen (finding 32). The 10M model's
+figure is at anchors no model trains on.
+
+**Geometry moves with the head.** The mean distance between unrelated chunks
+falls from 1.19–1.20 (plain) to 0.88–0.90 (residual, 1M) to 0.67–0.69
+(residual, 10M), and the distance between pairs where a commutative swap changed
+the function from 0.97 to 0.77–0.79 to 0.52–0.55, while swap collapse on
+equivalent pairs stays at 0.011–0.018. Collapse separation is therefore 38× at
+10M against 94× with the plain head; both are above the 10× line below which
+separation ratios are noise (METRICS.md), and whether the shrink costs anything
+is not established.
+
+One instruction-stream seed at 10M. Step time is 8 ms with the residual head
+against 5 ms with the plain one, at 98–99% GPU utilisation from 26 local
+generator workers.
+
 ## Decisions taken
 
 - **Anchor states are drawn afresh for every source chunk, from a structured
@@ -1710,10 +1821,11 @@ contains. `probes/vp_gt_misses.py` produces every composed-dense figure.
   defect blocks it as surely as a T2 one (finding 31). Splitting the score by
   wiring agreement is a diagnostic, not the criterion.
 - **T2 trains on `configs/instr_alu_writers_chain010.json` (chain rate 0.10)
-  for 2M steps.** The rate is necessary, since the budget alone does not reach
-  it, and 2M is where the curve meets the interface floor (finding 31). Both
-  were measured at the 8 training anchors and need re-checking after the
-  remint. T1 is
+  for 10M steps.** The rate is necessary, since the budget alone does not reach
+  the composed slots (finding 30, measured at the 8 training anchors). The
+  budget is measured at held-out anchors: with the twelve-layer residual head,
+  1M steps leave 5,418–5,511 failing triples of 4.8M and 10M leave 36–51
+  (finding 35). T1 is
   unaffected: on single-instruction chunks a chain rate draws one extra random
   number per chunk and rewrites nothing, so T1's corpus has the same
   distribution under either config.
@@ -1774,15 +1886,16 @@ contains. `probes/vp_gt_misses.py` produces every composed-dense figure.
   first; train only to test a specific mechanism.
 - **T1's vp head is the smallest that still reaches correct results** — three
   hidden layers — so its essence carries as much of the evaluation as possible
-  (finding 33). **T2's vp head is unconstrained in shape until T2 reaches vp = 0
-  at len=2.** A plain ReLU readout of the vp head's shape cannot be trained to
-  evaluate a perfectly described two-instruction chunk exactly, while a deep
-  residual readout with LayerNorm can (finding 34), and a head that cannot
-  execute a perfect description is a worse instrument than one that asks less
-  of the essence. Pressure toward a smaller head is applied once T2's essence is
-  good enough for a large one. The 8-anchor result that a four-layer head
-  leaves the aggregate unchanged (finding 22) was measured where the head
-  stored answers.
+  (finding 33). **T2's vp head is the twelve-layer pre-activation residual
+  stack with LayerNorm.** A plain ReLU readout of the vp head's shape cannot be
+  trained to evaluate a perfectly described two-instruction chunk exactly,
+  while this form can (finding 34), and a head that cannot execute a perfect
+  description is a worse instrument than one that asks less of the essence.
+  Through it T2's essence reads within about 28 triples of a perfect
+  description (finding 35). Pressure toward a smaller head is an optimisation
+  applied after that, not a requirement before it. The 8-anchor result that a
+  four-layer head leaves the aggregate unchanged (finding 22) was measured
+  where the head stored answers.
 - **`--value-norm` is rejected**, leaving the aggregate inside the noise floor
   at 8 anchors; it moves individual arms by 15–25 points (finding 22), so the
   cell it targets is a trade-off rather than a deficit.

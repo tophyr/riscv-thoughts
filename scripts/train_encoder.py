@@ -44,10 +44,11 @@ def main():
                    help='Number of op-cell blocks (1 = shallow baseline; '
                         '>1 stacks residual FFN blocks for deeper composition).')
     p.add_argument('--vp-head-depth', type=int, default=3,
-                   help='vp value-prediction head hidden layers. 3 is the '
-                        'smallest head with which T1 reaches exact vp at '
-                        'held-out anchors (500k steps); a shallower head puts '
-                        'more of the work on the encoder but stops short.')
+                   help='vp value-prediction head hidden layers (residual '
+                        'blocks with LayerNorm). 3 is the smallest head with '
+                        'which T1 reaches exact vp at held-out anchors (500k '
+                        'steps); a shallower head puts more of the work on the '
+                        'encoder but stops short.')
     p.add_argument('--n-pool-heads', type=int, default=1,
                    help='essence pool seed queries (1 = single-query sum; '
                         '>1 = multi-head, keeps multiple outputs separable). '

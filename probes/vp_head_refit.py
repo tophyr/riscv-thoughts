@@ -25,7 +25,7 @@ import torch
 
 sys.path.insert(0, '/home/tophy/Projects/riscv-thoughts')
 
-from compressor.model import _build_vp_head, _VP_VALUE_BITS
+from compressor.model import VPHead, _VP_VALUE_BITS
 from compressor.train import (_split_to_per_instruction, _t2_assemble,
                               t2_value_predict_loss)
 from datagen import RVT_FORMAT, Batch, MAX_INPUT_SLOTS, MAX_OUTPUT_SLOTS
@@ -46,7 +46,7 @@ for q in t2.parameters():
     q.requires_grad_(False)
 depth = args.depth if args.depth is not None else hp['vp_head_depth']
 if args.mode == 'fresh' or depth != hp['vp_head_depth']:
-    t2.vp_head = _build_vp_head(
+    t2.vp_head = VPHead(
         t2.d_out + MAX_INPUT_SLOTS * (_VP_VALUE_BITS + 1),
         MAX_OUTPUT_SLOTS * (_VP_VALUE_BITS + 1), depth).to(dev)
 for q in t2.vp_head.parameters():

@@ -39,10 +39,12 @@ def main():
     p.add_argument('--op-cell-depth', type=int, default=1,
                    help='Number of op-cell blocks (1 = shallow baseline; '
                         '>1 stacks residual FFN blocks for deeper composition).')
-    p.add_argument('--vp-head-depth', type=int, default=4,
-                   help='vp value-prediction head hidden layers (4 = default; '
-                        '0 = linear — weakens the head to force the essence to '
-                        'expose value structure geometrically).')
+    p.add_argument('--vp-head-depth', type=int, default=12,
+                   help='vp value-prediction head hidden layers (residual '
+                        'blocks with LayerNorm). 12 is the depth at which T2 '
+                        'at len=2 is near-exact at held-out anchors '
+                        '(EXPERIMENT_LOG, finding 35); a shallower head puts '
+                        'more of the evaluation on the encoder.')
     p.add_argument('--n-pool-heads', type=int, default=1,
                    help='essence pool seed queries (1 = single-query sum; '
                         '>1 = multi-head, keeps multiple outputs separable). '

@@ -378,28 +378,43 @@ class TokenEmbedder(nn.Module):
 # detail: it is the only consumer a T2 essence has, so its capacity is an
 # implicit claim about what the next tier will be able to read, and `vp = 0` at
 # a deeper head is a strictly weaker statement than at a shallow one. Quote the
-# depth with the number. T1's is the smallest that reaches correct results; T2's
-# is free in shape until T2 reaches vp = 0 (METRICS.md).
-def _build_vp_head(vp_in, vp_out, depth):
-    """vp value-prediction head with `depth` hidden layers of _VP_HIDDEN.
-    depth=0 -> a single linear readout. depth=4 reproduces the historical
-    head exactly (same nn.Sequential layout -> same state_dict keys, so
-    existing checkpoints load unchanged)."""
-    if depth <= 0:
-        return nn.Linear(vp_in, vp_out)
-    layers = [nn.Linear(vp_in, _VP_HIDDEN), nn.ReLU()]
-    for _ in range(depth - 1):
-        layers += [nn.Linear(_VP_HIDDEN, _VP_HIDDEN), nn.ReLU()]
-    layers.append(nn.Linear(_VP_HIDDEN, vp_out))
-    return nn.Sequential(*layers)
+# depth with the number. T1's is the smallest that reaches correct results
+# (METRICS.md).
+class VPHead(nn.Module):
+    """The vp value-prediction head, `depth` hidden layers of _VP_HIDDEN as a
+    pre-activation residual MLP: h = W0·x, then h += W·relu(LN(h)) per block,
+    then out = W·relu(LN(h)). A plain ReLU stack cannot evaluate a composed
+    two-instruction chunk exactly even from a perfect description, and a plain
+    stack this deep goes dead in training (EXPERIMENT_LOG, finding 34)."""
+
+    def __init__(self, vp_in, vp_out, depth):
+        super().__init__()
+        assert depth >= 1, 'the vp head needs at least one hidden layer'
+        self.inp = nn.Linear(vp_in, _VP_HIDDEN)
+        self.norms = nn.ModuleList(nn.LayerNorm(_VP_HIDDEN) for _ in range(depth))
+        self.lins = nn.ModuleList(nn.Linear(_VP_HIDDEN, _VP_HIDDEN)
+                                  for _ in range(depth - 1))
+        self.out = nn.Linear(_VP_HIDDEN, vp_out)
+        for lin in (self.inp, *self.lins):
+            nn.init.kaiming_normal_(lin.weight, nonlinearity='relu')
+            nn.init.zeros_(lin.bias)
+
+    def hidden(self, h):
+        """From the input layer's output to the readout layer's input."""
+        for norm, lin in zip(self.norms, self.lins):
+            h = h + lin(F.relu(norm(h)))
+        return F.relu(self.norms[-1](h))
+
+    def forward(self, x):
+        return self.out(self.hidden(self.inp(x)))
 
 
 _IN_SCORE_HIDDEN = 256
 _VP_HIDDEN = 1024
-_VP_HEAD_DEPTH = 4     # vp_head hidden layers. Entry scripts pass their own
-                       # (T1: 3, the smallest that reaches exact vp at held-out
-                       # anchors; EXPERIMENT_LOG finding 33). Capacity here is
-                       # evaluation the encoder is spared.
+_VP_HEAD_DEPTH = 3     # vp_head hidden layers: T1's depth, the smallest that
+                       # reaches exact vp at held-out anchors (finding 33). T2
+                       # passes 12 (finding 35). Capacity here is evaluation
+                       # the encoder is spared.
 _VP_VALUE_BITS = 32    # two's-complement bit width of the vp value target (RV32)
 _IMM_N_FREQ = 12       # rotary immediate: power-of-2 periods 2..4096 (2*this = target dim)
 
@@ -455,7 +470,7 @@ class Compressor(nn.Module):
         # loglog-scalar target crushed away.
         vp_in = d_out + MAX_INPUT_SLOTS * (_VP_VALUE_BITS + 1)
         vp_out = MAX_OUTPUT_SLOTS * (_VP_VALUE_BITS + 1)
-        self.vp_head = _build_vp_head(vp_in, vp_out, vp_head_depth)
+        self.vp_head = VPHead(vp_in, vp_out, vp_head_depth)
         # immediate head (T1 only): a LINEAR readout of a rotary/Fourier encoding
         # of the instruction's immediate. Linear so the rotary structure is
         # forced to live in the essence (imm+δ -> a consistent rotation of the

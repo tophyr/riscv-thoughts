@@ -80,17 +80,20 @@ from those ranks, and the pool reads each slot's write step, at every tier.
 python -m datagen --rule "cap=$LEN" --twins 2 --batch-size 128 --n-states 8 \
     --config configs/instr_alu_writers_chain010.json --gen-count 26 \
     --count "$STEPS" \
-  | python scripts/train_t2_encoder.py --t1-model runs/t1_writers_500k_vp3/encoder.pt \
-    --d-out 512 --d-event 16 --op-cell-depth 4 --vp-head-depth 4 \
+  | python scripts/train_t2_encoder.py --t1-model runs/t1_writers_500k_resvp3/encoder.pt \
+    --d-out 512 --d-event 16 --op-cell-depth 4 --vp-head-depth 12 \
     --n-pool-heads 16 --route binding \
     --n-steps "$STEPS" --out-dir "$OUT"
 ```
 
-T2 trains at `LEN=2`, `STEPS=1000000` on the chain-rate-0.10 corpus, with a
-four-hidden-layer vp head. The rate is necessary for the composed slots
-(EXPERIMENT_LOG, "T2 faithfulness", finding 30); the rate, the step budget and
-the head are all open at held-out anchors, and the head's shape is free until
-T2 reaches vp = 0 at len=2 (METRICS.md). It is graded on the
+T2 trains at `LEN=2`, `STEPS=10000000` on the chain-rate-0.10 corpus, with a
+twelve-layer vp head (every vp head is a residual stack with LayerNorm; a
+plain Linear+ReLU stack cannot evaluate a composed chunk exactly even from a
+perfect description, EXPERIMENT_LOG, "T2 faithfulness", finding 34). The
+rate is necessary for the composed slots (finding 30); 10M steps is the budget
+at which the cell reaches its recorded held-out score, and 1M leaves two
+orders of magnitude more failing triples (finding 35). A 1M cell (~2.5 h) is
+the quick check; the 10M cell takes ~23 h at 8 ms/step. It is graded on the
 unmodified `instr_alu_writers.json`, the population the model will actually
 meet.
 
@@ -110,8 +113,8 @@ already-recorded cell does not overwrite it. Prefer it to typing the pipeline by
 hand — but **never edit it while a copy is running**: bash reads a script
 incrementally, so an edit shifts the file offsets under the running shell. Doing
 this mid-sweep produced a spurious `syntax error near 'fi'` and re-ran the
-eval-corpus block's redirect outside its `if`, truncating `/tmp/t2_eval_2.rvt`
-to 0 bytes — which surfaces as `binding: … rows=0` in every eval afterwards.
+eval-corpus block's redirect outside its `if`, truncating the shared eval
+corpus (`runs/eval/t2_heldout64_len2.rvt`) to 0 bytes — which surfaces as `binding: … rows=0` in every eval afterwards.
 Wait for the sweep, or edit a copy.
 
 **A replicate needs `GEN_SEED`.** Both generator pools default to `--seed 0`, so
@@ -129,10 +132,10 @@ exists reads a partial model.
 **T1 config** (the writers-only corpus T2 is trained against). T1 and T2 run
 the same core at the same settings, so the command below differs from the T2
 cell only in its ingestion front-end and its hparams. The frozen T1 is
-`runs/t1_writers_500k_vp3`. Its vp head has three hidden layers (the trainer's
-default), the smallest with which T1 reaches exact vp at held-out anchors, and
-that takes the 500k-step schedule (EXPERIMENT_LOG, "T2 faithfulness",
-finding 33).
+`runs/t1_writers_500k_resvp3`. Its vp head has three hidden layers (the
+trainer's default) of the residual-with-LayerNorm form every vp head takes, the
+smallest depth with which T1 reaches exact vp at held-out anchors, and that
+takes the 500k-step schedule (EXPERIMENT_LOG, "T2 faithfulness", finding 33).
 
 ```bash
 python -m datagen --rule single --twins 2 --batch-size 128 --n-states 8 \
@@ -153,7 +156,9 @@ branch for an alternative read position, slot seeding, pool channel or read
 pulse, so a checkpoint carrying `tag_proj` instead of `rank_emb`, a pool sized
 without the write-step channel, or a `read_pulse` fed `[content, operand]`
 instead of the op-cell's hidden layer (with a separate `read_role`) fails at
-`load_state_dict`. `runs/t1_writers_500k_vp3` is the frozen T1.
+`load_state_dict`, and so does a checkpoint whose vp head is a plain ReLU
+stack, since `VPHead` (the residual form) is the only head the code builds.
+`runs/t1_writers_500k_resvp3` is the frozen T1.
 (A checkpoint trained when all pool heads shared one value projection is still
 remapped on load — `_tile_shared_pool_v` repeats those weights once per head,
 reproducing the old computation exactly.)
