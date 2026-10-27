@@ -712,3 +712,47 @@ problem, not aesthetic properties of the representation.
 Training the compressor is defining what meaning is. Operations on
 thought-points are thinking. Finding tokens that recompress to a thought
 is expression. Verification is free.
+
+---
+
+## Related Work: Next-Concept Modeling
+
+Next-Concept Modeling (NCM; Kumbong, Khare et al., Stanford Hazy Research,
+arXiv:2610.14162, 2026) is the nearest published system to the expression
+half of this framework. A multiscale residual vector-quantized autoencoder
+turns a text sequence into a hierarchy of discrete code levels, from one code
+for the whole sequence up to one code per token; a transformer then generates
+the levels coarse to fine, predicting every code within a level in parallel.
+The autoencoder is frozen before the generator trains on its codes.
+
+What it realizes of this framework:
+
+- **Expression that is not left-to-right.** NCM's generation fixes the gist
+  first and fills in content afterward — the skeleton-first proposer of
+  "Search Need Not Be Left-to-Right", working at roughly 100M parameters.
+- **The hierarchy as multi-resolution structure, not abstraction.** The paper
+  defines "concept" as only the information the coarse levels carry, the
+  stance taken in "The Hierarchy Is Search Acceleration".
+- **A lower stage frozen before the upper stage trains on its emission** —
+  the tier contract's discipline.
+
+What it lacks, and why it is not a thought-compressor in this document's sense:
+
+- **No equivalence.** The autoencoder is trained to reconstruct tokens, which
+  rewards keeping paraphrases apart. Nothing in NCM asks whether two sequences
+  with the same meaning share codes.
+- **No validity.** Every combination of codes decodes to something; a partial
+  hierarchy decodes to degenerate text with no signal that it is not yet a
+  thought. There is no counterpart to magnitude-as-validity.
+- **No verification.** Candidates are selected by agreement among samples
+  (minimum Bayes risk decoding), never by re-encoding a candidate and comparing
+  it to the target. The encoder that would make verification free exists and
+  is not used for it.
+- **No binding problem.** The levels are additive residuals on a fixed
+  positional grid, so position is the binding and composition by vector sum
+  works. Any domain where the entities a unit ranges over can be renamed needs
+  the explicit binding channel of "The Thought and Its Interface".
+
+The consequence for this project: NCM's generator is a candidate proposer
+shape for the decoding stack, to be paired with the verifier it omits. It
+bears on nothing in the compressor itself.
