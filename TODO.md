@@ -29,7 +29,12 @@ to be ones the head never trained on: with a fixed set it stores answers instead
 of evaluating (METRICS.md). `vp = 0` at held-out anchors is sufficient for
 faithfulness and not necessary.
 
-**Equivalence — computed equivalents collapse.** "Two token sequences mean the
+**Equivalence — computed equivalents collapse.** Two chunks are equivalent when
+their externally visible register inputs and outputs are identical — whatever
+their instruction count, final PC, instruction order, or dead and same-value
+writes; PC is not an independent output. The binding is the interface: a graph
+from external registers through operation roles to results, not an ordered
+list. "Two token sequences mean the
 same thing if and only if they compress to the same point" is the framework's
 definition of meaning (WHAT_IS_A_THOUGHT.md), so an essence that separates
 `ADDI r1,r1,256; ADDI r1,r1,-16` from `ADDI r1,r1,32; ADDI r1,r1,208` is not a
@@ -46,6 +51,8 @@ equivalent ones; larger is better; under ~10x is noise):
 | one no-op exchanged for another (`ADD xa,xa,x0` vs `ADDI xd,xd,0`) | 0.0901 | 5.9x |
 | `XORI` chains with the same composite mask | 0.5121 | 0.8x |
 | additive chains with the same total offset | 0.4374 | 1.0x |
+| reordering of two independent instructions | not measured | separated by the vp target itself (below) |
+| dead code against its live part | not measured | separated by the vp target itself (below) |
 
 The guard on all of this is the opposite row: pairs a transformation did NOT
 leave equivalent must stay far apart, and they do — 0.88 and 0.96 across the
@@ -56,11 +63,23 @@ pulls those together is a worse failure than loose collapse (METRICS.md).
 see it, not whether seeing it needs arithmetic.** Exchanging one no-op for
 another needs no computation on operands and still reaches only 5.9x, so "the
 encoder cannot compute with operands" does not explain the failure on its own.
-**Nothing trains any of it** — that is the common cause. vp cannot supply the
-pressure: it is not a pairwise objective, so two distinct points can both
-predict the same outputs correctly, and for an instruction that writes no
-register it emits no supervised slot at all and therefore no gradient
-whatsoever.
+**Nothing trains any of the measured rows** — that is their common cause. vp
+cannot supply the pressure: it is not a pairwise objective, so two distinct
+points can both predict the same outputs correctly, and for an instruction that
+writes no register it emits no supervised slot at all and therefore no gradient
+whatsoever. The one swap that does collapse is free by construction only when
+both operands are fresh and the destination is a third register; with the
+destination overwriting a source, or the swapped operand already ranked, it is
+learned and incompletely (EXPERIMENT_LOG, "T2 faithfulness", finding 36).
+
+The two unmeasured rows are worse than untrained: **the vp target separates
+them.** The canonical frame numbers inputs by first read and outputs by final
+write, so reordering two independent instructions, or deleting a dead
+instruction whose reads shifted every later input's number, changes the
+canonical function the head is asked to evaluate — and the head reads only the
+essence and the canonical input values, so one essence cannot be exact on both
+members of such a pair (RISCV_DESIGN.md, "GVN" and "Training"). No training
+reaches them; only a change to the frame, or to what the head reads, does.
 
 ## Milestones
 
@@ -77,7 +96,10 @@ whatsoever.
 
 2. **[CURRENT] Computed equivalents collapse at len=2.** Chunks computing the
    same function land as far apart as chunks computing different ones
-   (Mission's table). Task 1. **Settle it before chunks get longer**: every added
+   (Mission's table). Task 1. The first-read frame milestone 1 was reached in
+   separates reordered, renumbered, dead and same-value-writing equivalents;
+   that was accepted to establish vp's capacity first, and replacing it is
+   rework this milestone owes. **Settle it before chunks get longer**: every added
    instruction multiplies the equivalences a chunk participates in, so a len=4
    model would learn the same wrong geometry at four times the scale.
 
@@ -139,18 +161,40 @@ three places:
   so the binding is never told that it is the identity; recognising
   `+x0`, `+0`, `|0`, `^0` and `<<0` as the identity is the essence's job.
 
-**Dead-code elimination is part of this task.** A dead instruction's reads are
-the chunk's inputs (`ADD x5,x6,x7 ; ADDI x5,x8,1` has inputs x6, x7, x8), so
-the targets never make a chunk with dead code equal to its live part; making
-the essences land together is collapse work, measured as equivalence rather
-than as correctness.
+**Dead-code elimination and instruction reordering are part of this task, and
+both are blocked by the frame, not by training.** A dead instruction's reads are
+the chunk's inputs (`ADD x5,x6,x7 ; ADDI x5,x8,1` has inputs x6, x7, x8, so its
+function is `in3 + 1` where the live part's is `in1 + 1`), and reordering two
+independent instructions renumbers both inputs and outputs. In each case the two
+chunks carry different vp targets, and the head reads only the essence and the
+canonical input values, so no shared essence can be exact on both. These two
+collapse only if the frame stops depending on linearization or the evaluator is
+given the binding — the first decision below.
 
 Decisions to make before building, in order:
 
-- **How wide is the class?** Both families tested fail. Check whether any
-  computed equivalence collapses, and whether the rewrite classes that DO
-  collapse do so because they are trained on or because the architecture makes
-  them free.
+- **What function does the essence describe?** The vp target is a function of
+  canonical positions assigned by textual first-read and final-write order, so
+  the essence is graded on a linearization, not on the chunk's
+  register-to-register function (RISCV_DESIGN.md, "GVN"). That frame was
+  adopted knowingly, to establish vp's fundamental capacity at len=2 before the
+  equivalence criterion was imposed; replacing it is owed rework. Two routes: a
+  canonical frame that does not depend on linearization — a canonical form of
+  the dataflow DAG — or an evaluator that reads the `(essence, binding)` pair,
+  with the role assignment carried by the binding, which is what the next tier
+  receives anyway (WHAT_IS_A_THOUGHT.md, "The Thought and Its Interface").
+  Either way the binding becomes a graph — which external register feeds which
+  operation role and receives which result — since an ordered list carries the
+  same linearization.
+  Either redefines the target and the frame the read ranks are expressed in, so
+  it remints T1 and T2 and reopens the operand-binding result that rests on
+  that frame (EXPERIMENT_LOG, "T2 faithfulness", finding 11). Decide this
+  before the objective: a pairwise term over pairs the target separates would
+  fight the target.
+- **How wide is the class?** No computed equivalence measured collapses. The
+  commutative swap is free only when both operands are fresh and the
+  destination is a third register; otherwise it is learned, to 0.04–0.065
+  against a 0.48 `distinct` mean (finding 36).
 - **Essence or op-cell?** The measured distances are essence distances, but the
   composite is formed one step earlier, when the second instruction's op-cell
   reads the slot the first wrote. A cell that computed `i1+i2` there would
@@ -166,11 +210,35 @@ Decisions to make before building, in order:
   inequivalents together too. The guard is `behav-diff` (METRICS.md), which must
   stay large.
 
+Two interface facts reach the essence through the pool, which consumes every
+channel it is given unconditionally (finding 36). Each is a candidate change to
+what the pool reads, independent of the decisions above:
+
+- **The write channel carries the step, not the rank.** A written slot is
+  stamped `(k+1)/K` with `K` the grid's padded length, where the target orders
+  outputs by rank among writes. On every training chunk the two coincide (two
+  outputs → 0.5, 1.0; an overwrite → 1.0), so stamping the rank instead changes
+  no in-distribution number — verifiable by re-scoring the frozen T2 on
+  `runs/eval/t2_heldout64_len2.rvt` and requiring identical results — and
+  removes the dependence of a short chunk's essence on its padding. It matters
+  once chunks contain non-writing steps or differ in length.
+- **Read-only input slots reach the pool.** An input never written keeps its
+  leaf `rank_emb(rank)` in a slot of its own, so the pool sees whether an input
+  still sits untouched — which is why the aliased swap `ADD a,a,b` vs
+  `ADD a,b,a` reads 0.04 while the same swap with a third-register destination
+  reads 0. Pooling written slots only would make that pair structural; the
+  inputs still reach the essence inside the results the op-cell built from
+  them. It changes every training chunk's pool input, so it is a remint of T1
+  and T2 and whether vp survives it is untested.
+
 ### 2. No-write instructions are invisible to the essence
 
 Blocks milestone 4 (~⅓ of the ISA). Content reaches the essence only through a
 register write (`value[out] = res` is gated on `out != 0`), so for branches,
-stores and x0-writes the op-cell result is computed and discarded. Verified:
+stores and x0-writes the op-cell result is computed and discarded. For an
+x0-write that is correct — PC is not an output, so the instruction is equivalent
+to its absence (below) — but for branches and stores, whose effects are on the
+PC and memory, it loses the behavior. Verified:
 valid-no-output and invalid windows produce the *identical* essence (cos
 1.0000), so validity cannot separate them and all branches collapse to one
 point.
@@ -178,27 +246,20 @@ point.
 Designed, not built: route the op-cell result into a non-renameable **operation
 slot** (seeded zero, fixed under rename, like x0) for every active instruction,
 so content reaches the essence regardless of register write. Open: whether a
-single slot last-write or an accumulation across instructions; whether routing
-the result makes equivalent x0-write no-ops spuriously distinct across
-immediates; and whether branches also need a real PC-effect vp target (the SSA
-oracle computes `SELECT_PC` but does not ship it).
+single slot last-write or an accumulation across instructions; and what a taken
+branch contributes to the essence. Routing the result must not make an
+x0-write no-op visible at all: it is equivalent to its absence (below), so a
+slot that carried its content would separate equivalents.
 
-**Decide first whether PC advance is part of the behavior**, because it gates
-work in another task. An instruction that writes no register — a branch not
-taken, a store, an x0-write — changes nothing but the PC (or memory), and the
-oracle gives it no supervised slot, so vp is silent about it while the essence
-still moves. Two readings, and nothing currently distinguishes them:
-
-- **PC advance counts.** Then a chunk with such an instruction and one without
-  genuinely differ, the essence is right to separate them, and vp is
-  *incomplete* — it has no PC target at all. `out_pcs` is computed and only a
-  `pc_writes` boolean is shipped, so this would mean widening the RVT batch.
-- **PC advance does not count.** Then those chunks are equivalent and their
-  distance is a collapse failure, which puts it in task 1.
-
-Deferred deliberately: it is a definition, not an experiment, and it should be
-settled before either task 1 builds a collapse objective or this task ships a
-PC-effect target — each would bake in an answer.
+**PC is not an independent output.** Two chunks with identical externally
+visible register inputs and outputs are equivalent whatever their instruction
+count or final PC. So an x0-write, a same-value write or a dead instruction
+beside a live chunk leaves the chunk equivalent to the live chunk alone, and
+the distance between them is a collapse failure under task 1, not a missing
+target here; no PC-effect vp target is shipped (`out_pcs` stays unshipped). The
+one case the decision does not settle by itself is a taken branch, whose only
+effect is on the PC; confirm what it contributes when branches enter scope,
+before building any target for them.
 
 ### 3. Give T1 a validity task
 

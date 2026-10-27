@@ -57,8 +57,13 @@ measurement (finding 25).
 *Equivalence.* Unresolved, and untouched by any of the above. Two chunks that
 compute the same function sit as far apart as two that do not (finding 18), and
 T1 holds `x+x` and `x<<1` further apart than two different shifts (finding 23).
-What collapses at either tier is what the architecture makes free, such as a
-commutative operand swap; nothing in the objective asks for the rest.
+What collapses at either tier is what the architecture makes free — a
+commutative swap of two fresh operands, exactly, and nothing else: with an
+aliased destination or an already-ranked operand the swap is learned
+incompletely, a write's step and a read-only input's leaf reach the essence
+through the pool, and the first-read frame gives reordered independent
+instructions and dead code different targets from their equivalents (finding
+36). Nothing in the objective asks for the rest.
 
 **Quote the floor that matches the comparison.** Retraining the T2 alone over a
 fixed frozen T1 has spread 0.002 and 0.009 points of exact match on the two
@@ -132,12 +137,14 @@ out.** At 2 instructions, a readout recovers 80% of the output bits from the
 essence but 98% from the encoder's per-register state. So the encoder computes
 the right thing and the final pooling step loses it.
 
-**3. The cause: the pooling step is order-blind, and the essence has to
-describe an ordered function.** The essence is built by summing over the 32
+**3. The cause: the pooling step is order-blind, and the target is an ordered
+function.** The essence is built by summing over the 32
 register slots. Summing is what makes it invariant to register renaming — a
 deliberate and load-bearing property — but it also means the essence receives
 an unordered bag of results with nothing marking which register was written
-first. It must nonetheless encode *"output 1 is this, output 2 is that"*.
+first. The target indexes outputs by write order, so the essence must
+nonetheless encode *"output 1 is this, output 2 is that"* — a demand of the
+first-read frame, not of the register function (RISCV_DESIGN, "GVN").
 
 **4. One number per register fixes most of it.** Feeding the pool each slot's
 **write step** (`pool_extra=write_time`) supplies the missing ordering. It is
@@ -561,11 +568,9 @@ a same-value self-write no supervised output slot at all, so vp emitted no
 gradient about that instruction while the essence still moved by 0.1041. The
 oracle scores it as a read and a write (finding 24).
 
-Whether that pair is equivalent at all depends on a question the project has not
-settled: the two chunks advance PC by the same amount only because both are two
-instructions long. If instruction count is part of the behavior, the essence is
-right to separate them. `out_pcs` is computed by the oracle and only a
-`pc_writes` boolean is shipped, so neither reading is currently testable.
+That pair is equivalent: PC is not an independent output, so instruction count
+is not part of the behavior and the two chunks compute one function of their
+registers.
 
 It is also consistent with the loss. vp is not a pairwise objective: two chunks
 computing the same function have the same vp target, but nothing pushes their
@@ -1808,6 +1813,72 @@ is not established.
 One instruction-stream seed at 10M. Step time is 8 ms with the residual head
 against 5 ms with the plain one, at 98–99% GPU utilisation from 26 local
 generator workers.
+
+**36. What separates equivalent chunks today: the first-read frame for two
+classes, two interface facts the pool consumes, and the op-cell's incomplete
+commutativity; the one structural collapse is a swap of fresh operands.** Every
+distance here is L2 between unit-normalized essences of the 10M model over the
+frozen `runs/t1_writers_500k_resvp3`, 2,000 pairs per row, every chunk encoded
+in the two-slot grid the model trained in. "Random" is the same architecture at
+initialisation: a distance at float noise there is structural, and a reduction
+from it is what training supplied.
+
+*Commutative swap, by class* (`probes/swap_classes.py`; every pair computes one
+function, checked through the emulator; T1 rows encode the first instruction
+alone):
+
+| swap class | trained T1 | random T1 | trained T2 | random T2 |
+|---|---|---|---|---|
+| fresh operands, destination elsewhere | 5e-8 | 8e-8 | 2e-7 | 1e-7 |
+| destination overwrites a swapped source | 0.040 | 0.321 | 0.041 | 0.575 |
+| 2nd instruction: swapped operand already ranked by the 1st | — | — | 0.049 | 0.133 |
+| 2nd instruction: swapped operand is the 1st's result | — | — | 0.065 | 0.098 |
+| unrelated chunks (denominator) | | | 0.483 | 0.254 |
+
+The first row is structural: operand 0 of a fresh pair always receives read
+rank 1 (`_stamp_reads`), so the op-cell's inputs are identical and the two
+leaves trade slots, which the pool cannot see. The second is the surviving
+source's read-only slot, holding rank 2 in one chunk and rank 1 in the other:
+in the trained T2's final state the written slot differs by 7e-3 (inherited
+through T1's content, which has the same leak one tier down) and that leaf slot
+by 0.54. The last two are the op-cell receiving its operands in the other
+order. Training reduced the three learned rows 8–14×, 2.7× and 1.5×; against
+the trained denominator they sit at 12× and 7–10× separation, the line below
+which a ratio is noise (METRICS.md). `scripts/eval.py`'s swap row averages all
+four populations, most of it the first row's zeros.
+
+*Write position and the identity family* (`probes/write_position.py`). The
+pool reads each written slot's write STEP, `(k+1)/K` with `K` the grid's padded
+instruction count. Moving one `ADDI` from step 1 to step 2 beside an inert x0
+no-op moves the essence 0.690, the same single instruction alone against
+padded to two slots 0.690, and `imm+1` at the same step 0.215 (T1 emits
+`(0,0,0)` wiring for `ADD x0,x0,x0`; `ADDI` then no-op against `ADDI` then an
+inactive slot reads 0.0000, so the no-op step is inert). But a lone written
+slot at step 1 never occurs in the training corpus — every chunk is two
+instructions each writing a non-x0 register (`_LengthCap(2)` on an infinite
+stream, `dest_regs = range(1,32)`, no `equivalences` block), and T1 emits a
+write for 76,800 of 76,800 held-out instructions — so those two figures are
+the pool's extrapolation on an input shape it never saw, not a trained
+geometry. On every training chunk the step and the rank among writes coincide
+(two outputs → 0.5, 1.0; an overwrite → 1.0). The in-distribution rows:
+`ADDI r,r,0` against `ADD r,r,x0` 0.215, against 0.263 for `ADDI r,r,1`;
+`nop; ADDI r,r,0` against `ADDI r,r,k; ADDI r,r,-k` 0.709, against 0.207 for
+`+k;-k+1` and 0.708 for unrelated chunks. The empty chunk is one point (spread
+7e-8, the pool's bias), 0.45–0.59 from any of them.
+
+*What the oracle demands.* Every pair above with a supervised output carries
+identical `in_slot_regs`, `out_slot_regs`, `out_regs` and binding targets, so
+none of these distances is asked for. They are untrained inertia, T1's
+immediate head making each literal an explicit linear coordinate of T2's
+content, and a twelve-layer vp head able to add two literals itself, so that
+the gradient never asks the encoder to fold them. Two classes are different in
+kind: reordering two independent instructions permutes the first-read input
+numbers and the final-write output slots, and a dead instruction's reads take
+input numbers that shift every later input, so in both cases the two chunks
+carry **different** vp targets although they compute one function of their
+registers. The head reads the essence and the canonical input values alone, so
+a shared essence cannot be exact on both members of such a pair: these two
+classes are separated by the target, not left untrained.
 
 ## Decisions taken
 

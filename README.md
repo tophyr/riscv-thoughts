@@ -31,6 +31,37 @@ running a training cell are documented in the `datagen` skill
 (`.claude/skills/datagen/SKILL.md`); its silent-corruption invariants live in
 `CLAUDE.md`. Read both before touching data generation.
 
+## Where the documents and the code disagree, and why
+
+WHAT_IS_A_THOUGHT.md, RISCV_DESIGN.md and METRICS.md state what a tier's output
+must be. The code and the frozen checkpoints in `runs/` do not yet do all of it,
+and the gap is deliberate, so read the three documents as the requirement and
+TODO.md as the distance still to cover.
+
+The requirement: two chunks whose externally visible register inputs and
+outputs are identical compress to the same essence — whatever their instruction
+order, instruction count, final PC, or dead and same-value writes (PC is not an
+output) — and the binding is a graph from external registers through operation
+roles to results.
+
+The code: the value-prediction target, the read ranks that seed the encoder, and
+the binding heads are all built in a canonical frame numbered by textual
+first-read and final-write order (`datagen/compare.py`, `compressor/model.py`,
+`compressor/train.py`). In that frame two independent instructions in the other
+order, a commutative swap that renumbers a later operand, a dead instruction
+beside a live one, and a same-value write all carry *different* targets, so the
+trained models separate them, and the binding is emitted as two ordered lists.
+`scripts/eval.py` and the probes score against that frame; METRICS.md says
+which of its numbers certify the current form rather than the required one.
+
+The frame was adopted on purpose: it let the first question — can this
+architecture represent a chunk's output values exactly at all? — be answered
+before the equivalence criterion was imposed on it, and it has been (36
+failures in 4.8 million held-out values at two instructions). Replacing it is
+the current milestone, and TODO.md holds the decisions it needs: what frame the
+essence is graded in, what the evaluator reads, and what the binding's graph
+looks like on the wire.
+
 ## The Idea
 
 LLMs are excellent summarizers — to a point. At 2000 words they
@@ -133,9 +164,13 @@ compress to the same point — that is the framework's definition of meaning, an
 it is required for T2 to count as done. Sequences related by a register rename
 do, exactly. Sequences related by a *computed* equivalence do not: two chunks
 that fold two immediates into the same total land as far apart as two chunks
-computing different functions. The training objective is not pairwise, so
-nothing pushes equivalent chunks together; supplying that pressure is an
-outstanding design decision.
+computing different functions. Two classes are separated by the training target
+itself: the value-prediction target numbers a chunk's inputs by the order they
+are first read, so reordering two independent instructions, or removing a dead
+one, changes the function the target names (RISCV_DESIGN.md, "GVN"). For the
+rest, the training objective is not pairwise, so nothing pushes equivalent
+chunks together. Fixing the frame and supplying that pressure are outstanding
+design decisions.
 
 Beyond both lies T3, the first tier that must *compose* bindings rather than
 merely emit them.

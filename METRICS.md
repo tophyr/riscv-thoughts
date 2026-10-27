@@ -223,9 +223,13 @@ order check that ignores how many reads the heads say exist passes an
 instruction that is given no input at all. Both read 1.000 on a T1 whose
 emitted wiring is 98.5% exact.
 
-**At T2 the binding is a chunk's interface**, the wiring T3 will route on:
-every register the chunk reads from outside, in first-read order, and every
-register it writes, in write order. `scripts/eval.py` (`t2_exact_binding`)
+**At T2 the binding is a chunk's interface**, the wiring T3 will route on. The
+required form is a graph — which external register feeds which operation role
+and which receives which result. The current form is two ordered lists: every
+register the chunk reads from outside, in first-read order, and every register
+it writes, in write order; the order is the linearization the first-read frame
+imposes (RISCV_DESIGN, "GVN"), so the score below certifies the current form,
+not the required one. `scripts/eval.py` (`t2_exact_binding`)
 decodes those lists from T2's heads the way T1's are decoded — the live heads
 give the count, the score heads the order — and counts a chunk correct only if
 both equal the oracle's. **"Solved" is 100%.** It breaks the score down by chunk
@@ -260,7 +264,13 @@ same kind of quantity:
   one of the swapped registers the canonical input positions shift and the two
   chunks compute genuinely different functions. About 2% of generated pairs are
   non-equivalent this way, they sit at the `distinct` scale, and they inflate a
-  pooled mean several-fold. **Judge collapse on the equivalent subset.**
+  pooled mean several-fold. **Judge collapse on the equivalent subset.** That
+  subset is itself three populations (`probes/swap_classes.py`): pairs with
+  fresh operands and a third-register destination, invariant by construction
+  and reading float noise; pairs whose destination overwrites a swapped source;
+  and pairs whose swapped operand already carried a rank. The row's mean is
+  mostly the first population's zeros, so a small value does not say the other
+  two collapse — the probe reports them separately.
 - **behav-diff** — the non-equivalent subset above. It should be LARGE. A model
   that collapses it is failing to distinguish different functions, which is a
   worse failure than loose collapse.

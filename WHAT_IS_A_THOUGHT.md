@@ -167,7 +167,10 @@ computes, invariant to how its operands happen to be named. The
 binding is the interface — which entities fill which roles, as
 references into the surrounding context. In the RISC-V testbed the
 essence is invariant to register renaming, and the binding carries
-the register identities and the order they are read and written in.
+the register identities: which register feeds each operand role and
+which receives each result — a graph between inputs and outputs, not
+a list, because the order the instructions happen to be written in
+is not part of what the unit computes.
 
 The division is the one intuition already supplies. "Sorting" as a
 concept does not include which array is being sorted; that belongs

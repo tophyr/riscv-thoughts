@@ -121,15 +121,17 @@ Each transformation type produces a different kind of "paraphrase" —
 analogous to cross-lingual translation in the natural language setting.
 The compressor should map all equivalent sequences to the same point.
 
-**Exception — the two reordering transformations are raw-execution
-equivalences, not essence-level ones.** Reordering independent instructions
-(and non-overlapping loads/stores) leaves the final register file identical
-*with register identity intact*, but it permutes the canonical first-read
-input order and the write order, so the two chunks are different ordered
-identity-free I/O functions and receive **different** vp targets. Their
-equivalence is recovered at the `(essence, binding)` level, not in the essence
-(see "GVN: the invariant essence is the value-number"). Do not use them as
-positive pairs for an essence-collapse objective or metric.
+**The two reordering transformations are essence-level equivalences that the
+current supervision does not honour.** Reordering independent instructions
+(and non-overlapping loads/stores) leaves the function from input registers to
+output registers unchanged, so the essence must not move. The value-prediction
+target is built in a frame that numbers inputs by first read and outputs by
+final write (see "Training"), and reordering permutes both, so the two chunks
+receive **different** vp targets and the supervision separates them. Which
+register fills which role is the chunk's interface and belongs in the binding
+(WHAT_IS_A_THOUGHT.md, "The Thought and Its Interface"); the frame puts the
+textual order of two independent instructions into the essence's coordinate
+system instead (see "GVN: the invariant essence is the value-number").
 
 ### Near-equivalence pairs (controlled distance)
 
@@ -397,11 +399,19 @@ it, applied one level down to the leaf symbols.
 The cost is a shift in *which* invariances come free. A state that records no
 read-order cannot move under a commutative operand swap, since nothing in it
 distinguishes `a+b` from `b+a` — that invariance is structural. A state that
-records read-order can represent the difference. Whether the invariance then
-still holds structurally — a swap moves the ranks *between* the two registers,
-leaving the pool's multiset of leaf vectors unchanged — or has to be supplied per
-opcode by training is UNSETTLED. The exchange is accepted
-regardless, because a read-order-free state earns its tighter equivalence
+records read-order can represent the difference, and the swap invariance then
+holds structurally only when both operands are fresh and the destination is a
+third register: operand 0 of a fresh pair always receives rank 1, so the
+op-cell's inputs are identical and the two leaves trade slots, which the pool
+cannot see — the distance is float noise on a randomly initialised model
+(`probes/swap_classes.py`). In every other case it has to be learned, and is
+learned incompletely: when the destination overwrites a swapped source, the
+surviving source's read-only slot holds rank 2 in one chunk and rank 1 in the
+other and the pool sees it; when the swapped operand already carries a rank
+from an earlier instruction, or is an earlier instruction's result, the op-cell
+receives its operands in the other order and only its own training can make it
+commutative (EXPERIMENT_LOG, "T2 faithfulness", finding 36). The exchange is
+accepted regardless, because a read-order-free state earns its tighter equivalence
 collapse by also being unable to separate chunks that genuinely compute
 different functions — the worse failure for a representation whose purpose is to
 be a lossless behavioral description of its chunk.
@@ -413,7 +423,9 @@ slot) coincides with it only when every read is fresh and no operand is x0, and
 so mis-states the position on ~1.6% of single instructions and on any repeated
 read. And the pool — a symmetric sum, structurally blind to which register was
 written first — is additionally fed each slot's **write step**, because the
-essence must encode an ordered function ("output 1 is this, output 2 is that").
+value-prediction target indexes outputs by write order, so in the current frame
+the essence has to carry "output 1 is this, output 2 is that" — a demand of the
+frame (see "GVN"), not of the register function.
 That channel is register-indexed, so invariance stays exact, and a commutative
 swap changes neither which slot was written nor when, so equivalence collapse is
 not put at risk. Read-order must *not* reach the pool for exactly that reason
@@ -427,7 +439,10 @@ tier uses, and the code carries no branch for an alternative.
 **T_{n+1} consumes only the output of T_n, never raw tokens.** Every tier
 emits an `(essence, binding)` object: an essence vector (rename-invariant,
 "what this unit computes") and binding references (which registers, in which
-roles, as equivariant indices into the register axis).
+roles, as equivariant indices into the register axis). The binding is a graph —
+which external register feeds which operation role and which receives which
+result; the ordered input and output lists the heads emit today are that graph
+flattened along the first-read frame's linearization (see "GVN").
 
 A tier's emission is therefore a **pair, not a single vector** — there is no
 concatenation step, and `encode_state` returns the two separately. Across the
@@ -493,32 +508,44 @@ dead code, algebraic identities — are *not* structural, and the targets do not
 impose them: a chunk with dead code, an identity or a cancellation is labelled
 by what it reads and writes, not by the shorter chunk it is equivalent to.
 Collapsing those is the essence's job, pursued as equivalence rather than as
-correctness. Distinct behaviors must stay apart — the essence is behavioral, not a
-syntactic hash.
+correctness — and for dead code and instruction reordering the first-read frame
+currently puts it out of the essence's reach (below, and "Training"). Distinct
+behaviors must stay apart — the essence is behavioral, not a syntactic hash.
 
-**Reordering independent instructions is NOT an essence-level equivalence.**
-The canonical frame assigns input positions by FIRST-READ order, so reordering
-permutes them: `[ADD x5,x1,x2 ; SUB x6,x3,x4]` canonicalizes to "out_A =
-in1+in2, out_B = in3−in4" while its swap canonicalizes to "out_A = in1−in2,
-out_B = in3+in4". Verified against the oracle: `in_slot` `[1,2,3,4]` → `[3,4,1,2]`,
-`out_slot` `[5,6]` → `[6,5]`, and the per-output-slot vp targets **differ**
-(they agree only on raw execution, with register identity intact). So the
-supervision actively separates them, correctly: as ordered identity-free I/O
-functions they *are* different functions, and their equivalence is recovered
-only at the `(essence, binding)` level — the essence says what is computed in
-what order, the binding says which register each result lands in. See
-WHAT_IS_A_THOUGHT.md, "The Thought and Its Interface". A consequence worth
-noting: the essence is **not** a canonical form for the dataflow DAG — the same
-DAG under a different linearization gets a different essence.
+**Reordering independent instructions is an essence-level equivalence that the
+canonical frame breaks.** The frame assigns input positions by FIRST-READ order
+and output slots by final write, so reordering permutes both:
+`[ADD x5,x1,x2 ; SUB x6,x3,x4]` canonicalizes to "out_A = in1+in2, out_B =
+in3−in4" while its swap canonicalizes to "out_A = in1−in2, out_B = in3+in4"
+(`in_slot` `[1,2,3,4]` → `[3,4,1,2]`, `out_slot` `[5,6]` → `[6,5]`), and the
+per-output-slot vp targets **differ**. The supervision therefore separates two
+chunks that compute one function of their registers. Which register feeds which
+role and which result lands where is the chunk's interface and belongs in the
+binding (WHAT_IS_A_THOUGHT.md, "The Thought and Its Interface"); the frame
+exists because the value-prediction head reads the essence alone and needs a
+coordinate system in which to match inputs to roles, and textual first-read
+order was adopted knowingly, to establish the architecture's capacity to
+represent vp at all before the equivalence criterion was imposed on it — the
+rework it leaves is accepted, not discovered. The same choice is why a dead instruction's
+reads cannot vanish from the essence (see "Training"). So the essence is
+**not** a canonical form for the dataflow DAG — the same DAG under a different
+linearization gets a different essence — although the equivalence criterion
+requires it to be one. A frame independent of linearization, or an evaluator
+that reads the `(essence, binding)` pair, would remove the dependence; neither
+exists.
 
 ### Open problems (additive over the equivariance skeleton)
 
 These are real work, each additive over a stable "register-indexed state; the
 32 GP registers are the permutable slots" skeleton:
 
-- **PC / branches.** PC is currently read from the invariant essence
-  (`pc_writes`), with `n_regs = 32` (GP only). The clean extension is a
-  non-renameable PC slot (renaming permutes only the 32 GP slots).
+- **PC / branches.** PC is not an independent output of a chunk: two chunks
+  with identical externally visible register inputs and outputs are equivalent
+  whatever their instruction count or final PC, so straight-line advance never
+  enters the essence. What a taken branch contributes is open. `pc_writes` is
+  read from the invariant essence, with `n_regs = 32` (GP only); if a PC effect
+  is ever represented, the clean extension is a non-renameable PC slot
+  (renaming permutes only the 32 GP slots).
 - **Memory (loads/stores).** Modelled as another non-renameable slot;
   structurally clean, but whether the essence can capture value-dependent
   memory dataflow / aliasing is genuinely unproven — the real expressiveness
@@ -646,7 +673,12 @@ recognising that is the essence's job. Likewise `ADD x5,x5,x0` and
 `ADD x5,x6,x7 ; ADDI x5,x8,1` has inputs x6, x7 and x8: calling the first a
 no-op, or dropping the dead instruction's inputs from the second, would make
 the targets impose an equivalence (identity equals the empty chunk; dead code
-equals its absence) that is the essence's to learn.
+equals its absence) that is the essence's to learn. The dead instruction's
+inputs also shift every later input's position, so `ADD x5,x6,x7 ; ADDI
+x5,x8,1` is the function `out = in3 + 1` where its live part `ADDI x5,x8,1` is
+`out = in1 + 1`; the head reads only the essence and the canonical input
+values, so one essence cannot be exact on both. In this frame, collapsing dead
+code is not open to the essence at all (see "GVN").
 
 **Emergent equivalence.** With the behavioral targets alone, provably
 equivalent instructions/chunks collapse without any equivalence loss:
@@ -702,9 +734,10 @@ Do provably equivalent sequences compress to the same point?
 Metric: cosine similarity between equivalence pair compressed points.
 Target: > 0.99.
 
-*Instruction reordering does NOT belong on this list* — it is equivalent only
-with register identity attached, so the essence is expected (and supervised) to
-separate the two orderings. Scoring it here would penalize correct behavior.
+*Instruction reordering belongs on this list* — two orderings of independent
+instructions compute one function of their registers. The first-read canonical
+frame currently supervises the essence to separate them (see "GVN"), so the row
+measures a defect of the frame until the frame changes.
 
 ### 2. Distance preservation (smoothness)
 
