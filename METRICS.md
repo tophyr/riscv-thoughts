@@ -13,10 +13,13 @@ file is the instrument, not the readings.
 ## vp — value prediction
 
 **What it measures.** Given the chunk's input values, can its output register
-values be recovered from the essence? The head reads `(essence, canonical
-input-slot values)` and predicts each output register's canonical value. It is
-the metric that matters because the essence is what a future T3 consumes: a next
-tier can only recover what this one preserved.
+values be recovered from what the tier emits? For each register the chunk
+writes, the evaluator reads that slot's description — its value channels in
+the emitted state — and the values and colours of the registers the output
+depends on, gathered by register, and predicts the register's value
+(`vp_slot_loss`, `compressor/train.py`). It is the metric that matters because
+the descriptions are what the essence pools and what a future T3 consumes: a
+next tier can only recover what this one preserved.
 
 **The head's shape is part of what a vp number certifies, so quote it with the
 number.** vp scores the essence composed with a readout, and that readout is the
@@ -46,18 +49,17 @@ never reaches 0 however good the model is, so it is a training signal and not an
 acceptance criterion.
 
 **What counts as solved.** The loss is asymptotic, so "solved" at a given chunk
-length means **100% exact 32-bit match on `probes/vp_budget.py` at anchor
-states the model never trained on**, which scores the model's own head over the
-training corpus and crosses the three properties
-that decide a slot.
+length means **100% exact 32-bit match on `probes/frame_scorecard.py` at anchor
+states the model never trained on**, which scores the model's own evaluator
+over a held-out corpus, by writing opcode and by input count.
 
 **A vp number in a training log is held out in its rows and in its inputs.**
 `datagen` generates every batch fresh, draws each source chunk's anchor states
 afresh, and the trainer never revisits one, so a training-log vp is measured at
 input points the head has not seen. It is still noisy from batch to batch — the
 draw decides how hard a batch's values are — and it is not exact match, so
-`probes/vp_budget.py` remains the criterion. `scripts/eval.py` exists to score
-*binding* and the collapse rows on a fixed corpus.
+`probes/frame_scorecard.py` remains the criterion. `scripts/eval.py` exists to
+score *binding* and the collapse rows on a fixed corpus.
 
 ### What `vp = 0` certifies, and what it does not
 
@@ -69,8 +71,8 @@ function only at anchor states the model never trained on.** Training draws
 fresh anchors for every source chunk and ships them in the batch (CLAUDE.md,
 INVARIANT 1), so no input point repeats; scoring uses one fixed held-out set
 (`heldout_anchor_states`, a seed no generator uses), which every scorer reaches
-by generating its corpus with `datagen --heldout-anchors`. `probes/vp_budget.py`
-and `probes/t1_scorecard.py` do so. Its value classes and copy rates are pinned
+by generating its corpus with `datagen --heldout-anchors`;
+`probes/frame_scorecard.py` reads such a corpus. Its value classes and copy rates are pinned
 separately from the training draw's, so tuning the training draw does not move
 the criterion; it contains no negated pairs, so it exercises full-width carries
 only through its uniform values.
@@ -133,9 +135,10 @@ the criterion.
 
 ### Reading the error budget
 
-`probes/vp_budget.py` is the first thing to reach for. It crosses three
-properties of an output slot, each of which decides whether that slot is
-predicted correctly:
+`probes/frame_scorecard.py` reports the rate by writing opcode and by input
+count; the finer budget below was measured by a probe of the first-read frame
+(`probes/vp_budget.py`, in git history) and its axes remain the ones that
+decide a slot:
 
 - **sources** — `cross-instr` when the chunk's two instructions read a common
   register, `distinct` otherwise. One instruction reading the same register
@@ -191,11 +194,10 @@ population it targets.
   entirely, and reading 8.8× lower error there than on the mixed corpus was
   taken as a property of the model for a whole phase of work. Quote the
   mixed-corpus figure for statements about the model.
-- **The canonical frame its target was built in.** Numbers predating the
-  behavioral canonical frame are not comparable to current ones: a model is
-  scored on the target it trained on, and the two targets differ on 12.5% of
-  rows. Compare on the rows where they agree, where the change took 99.7383% →
-  99.8347%.
+- **The frame its target was built in.** Numbers measured in the first-read
+  canonical frame (every finding before 37) are not comparable to numbers in
+  the register frame: a model is scored on the target it trained on, and the
+  targets differ in kind, not only on a subset of rows.
 - **The chunk length.** Figures are per-instruction or per-slot and do not carry
   across lengths.
 
@@ -259,18 +261,18 @@ same kind of quantity:
   exact by construction, so this reads ~0 for any model at all. It asserts the
   core is intact; it is not a measure of training quality.
 - **behavioral** — a chunk against a variant with a commutative instruction's
-  operands swapped, **split** by whether the swap actually preserved the chunk's
-  function. Swapping changes first-read order, so if a later instruction reads
-  one of the swapped registers the canonical input positions shift and the two
-  chunks compute genuinely different functions. About 2% of generated pairs are
-  non-equivalent this way, they sit at the `distinct` scale, and they inflate a
-  pooled mean several-fold. **Judge collapse on the equivalent subset.** That
-  subset is itself three populations (`probes/swap_classes.py`): pairs with
-  fresh operands and a third-register destination, invariant by construction
-  and reading float noise; pairs whose destination overwrites a swapped source;
-  and pairs whose swapped operand already carried a rank. The row's mean is
-  mostly the first population's zeros, so a small value does not say the other
-  two collapse — the probe reports them separately.
+  operands swapped, **split** by whether the swap preserved the chunk's
+  function as the targets define it. In the register frame a commutative swap
+  never changes the register function, so the non-equivalent subset is empty
+  there; in the first-read frame about 2% of pairs renumbered a later
+  instruction's inputs and were separated by the target. The equivalent subset
+  is two populations (`probes/swap_classes.py`, `probes/frame_scorecard.py`):
+  swaps of fresh operands with a third-register destination, or with an
+  aliased destination, which are invariant by construction and read float
+  noise; and swaps whose operand is already another instruction's input or
+  result, which only the op-cell's training can collapse. The row's mean is
+  mostly the first population's zeros, so a small value does not say the
+  second collapses — the probes report it separately.
 - **behav-diff** — the non-equivalent subset above. It should be LARGE. A model
   that collapses it is failing to distinguish different functions, which is a
   worse failure than loose collapse.

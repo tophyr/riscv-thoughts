@@ -1,16 +1,20 @@
-# Phase 15 (IN PROGRESS): making the T2 chunk vector faithful to the instructions it encodes
+# Phase 15: making the T2 chunk vector faithful to the instructions it encodes
 
-**Status: open.** Faithfulness holds at one instruction and is within 36
-triples in 4.8 million at two: scored at anchor states no model trained on, T1
-is exact (finding 33) and T2 at len=2 with a twelve-layer residual vp head is
-99.9993% after 10M steps, one seed (finding 35). Findings 1–32 were measured
-at one fixed set of 8 anchor states, where the head stores answers rather than
-evaluating (finding 32), so their figures describe the mechanisms they located,
-not whether a function was learned. Equivalence collapse is unresolved, and nothing beyond two
-instructions or outside the R/I-type ALU subset has been attempted. Claims here are corrected in place, so
-read them as current belief rather than as a chronology. A probe named here that
-is no longer in `probes/` rebuilt one fixed anchor set and was deleted; recover
-it from git history.
+**Status: the first-read frame's record.** Every figure here was measured
+with the essence graded in a frame that numbered a chunk's inputs by textual
+first-read order and its outputs by final write; phase 16 replaces that frame,
+and these numbers are not comparable to phase 16's (METRICS.md). In this
+frame, faithfulness held at one instruction and to within 36 triples in 4.8
+million at two: scored at anchor states no model trained on, T1 was exact
+(finding 33) and T2 at len=2 with a twelve-layer residual vp head was 99.9993%
+after 10M steps, one seed (finding 35). Findings 1–32 were measured at one
+fixed set of 8 anchor states, where the head stores answers rather than
+evaluating (finding 32), so their figures describe the mechanisms they
+located, not whether a function was learned. Claims here are corrected in
+place, so read them as current belief about what was measured rather than as
+a chronology. The probes named here are deleted — they read the first-read
+frame — and can be recovered from git history; their findings stand as
+measured.
 
 **Headline.** Two properties have to hold and each has its own state.
 

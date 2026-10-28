@@ -31,36 +31,36 @@ running a training cell are documented in the `datagen` skill
 (`.claude/skills/datagen/SKILL.md`); its silent-corruption invariants live in
 `CLAUDE.md`. Read both before touching data generation.
 
-## Where the documents and the code disagree, and why
+## The requirement, and how far the code meets it
 
 WHAT_IS_A_THOUGHT.md, RISCV_DESIGN.md and METRICS.md state what a tier's output
-must be. The code and the frozen checkpoints in `runs/` do not yet do all of it,
-and the gap is deliberate, so read the three documents as the requirement and
-TODO.md as the distance still to cover.
+must be; TODO.md holds the distance still to cover. The requirement: two chunks
+whose externally visible register inputs and outputs are identical compress to
+the same essence — whatever their instruction order, instruction count, final
+PC, or dead and same-value writes (PC is not an output) — and the binding is a
+graph from external registers through operation roles to results.
 
-The requirement: two chunks whose externally visible register inputs and
-outputs are identical compress to the same essence — whatever their instruction
-order, instruction count, final PC, or dead and same-value writes (PC is not an
-output) — and the binding is a graph from external registers through operation
-roles to results.
+The code grades the essence in the **register frame**: value prediction is
+evaluated per written slot, from that slot's own description and the values of
+the registers the output depends on, with no input or output numbered by the
+order the instructions are written in; each input register is identified by
+its structural colour in the chunk's dataflow graph, with every operand role
+ordered — the encoder is told nothing about which operations commute; and the
+essence is the pool over the written slots only (`compressor/model.py`,
+`compressor/train.py`, `datagen/signature.py`). Reordering independent
+instructions, inserting dead code and adding an x0-write therefore leave the
+essence bit-identical by construction. What the code does not yet do: the
+binding is still emitted as two ordered lists rather than the graph; the
+colouring is an exact structural rule, built in as scaffolding and to be
+replaced by a learned pass (RISCV_DESIGN.md, "What is built in for good, and
+what is built in for now"); and the equivalences that need the op-cell to
+compute — every commutative swap, identity spellings, cancellations, folds of
+two literals — are not collapsed.
 
-The code: the value-prediction target, the read ranks that seed the encoder, and
-the binding heads are all built in a canonical frame numbered by textual
-first-read and final-write order (`datagen/compare.py`, `compressor/model.py`,
-`compressor/train.py`). In that frame two independent instructions in the other
-order, a commutative swap that renumbers a later operand, a dead instruction
-beside a live one, and a same-value write all carry *different* targets, so the
-trained models separate them, and the binding is emitted as two ordered lists.
-`scripts/eval.py` and the probes score against that frame; METRICS.md says
-which of its numbers certify the current form rather than the required one.
-
-The frame was adopted on purpose: it let the first question — can this
-architecture represent a chunk's output values exactly at all? — be answered
-before the equivalence criterion was imposed on it, and it has been (36
-failures in 4.8 million held-out values at two instructions). Replacing it is
-the current milestone, and TODO.md holds the decisions it needs: what frame the
-essence is graded in, what the evaluator reads, and what the binding's graph
-looks like on the wire.
+A frame numbered by textual first-read and final-write order preceded this
+one, taken knowingly so that the first question — can the architecture
+represent a chunk's output values exactly at all? — could be answered before
+the equivalence criterion was imposed. EXPERIMENT_LOG.md records both.
 
 ## The Idea
 
@@ -121,12 +121,13 @@ writes the destination slot, emitting the final register-indexed state. Reads
 and writes are pure one-hot operations and no parameter is indexed by register,
 so renaming registers **permutes the slots exactly** — equivariance holds by
 construction, not by training. A slot acquires its identity on first read, from
-the register's position in the chunk's read order, which is what distinguishes
-one input from another without naming either; because that position is a
-property of the instruction rather than of a random draw, a tier's output is a
+the register's structural colour in the chunk's dataflow graph, which is what
+distinguishes one input from another without naming either and without regard
+to the order the instructions are written in; because that colour is a
+property of the graph rather than of a random draw, a tier's output is a
 deterministic function of its input, which is what the equivalence criterion
-below requires. The essence is a permutation-invariant pool over
-that state; the per-slot remainder is the binding. T1 is literally T2 with
+below requires. The essence is a permutation-invariant pool over the written
+slots of that state; the per-slot remainder is the binding. T1 is literally T2 with
 `seq_len=1`; the only tier-specific piece is what supplies content — T1 embeds
 one instruction's tokens, T2 is fed a frozen T1's per-instruction essence.
 See RISCV_DESIGN.md for why.
@@ -140,37 +141,37 @@ assumed: nothing reaches T2 except what T1 emitted.
 
 **What is open.** Two properties, and the framework needs both.
 
-*Faithfulness.* Whether T2's essence is a lossless behavioral description of its
-chunk, measured by whether the chunk's output register values can be recovered
-from it and scored discretely rather than as a loss value. The score is the
-essence composed with a readout that has to EVALUATE it — nothing in the encoder
-ever sees a register value, so a slot describes a function rather than holding a
-number. The input states are drawn afresh for every chunk, with structure, and
-the score is taken at a fixed set no model trains on: a readout trained on one
-fixed set stores answers at it instead of evaluating. **At one instruction it
-holds**: T1's emitted wiring matches the oracle on every instruction and its
-essence is evaluated exactly at unseen inputs, to 1 failure in 819,200. **At
-two instructions it holds to within 36 failures in 4.8 million scored values**
-— every output register of 38,400 held-out chunks, each evaluated at 64 input
-states no model trains on — after 10M training steps, on one seed, with a
-twelve-layer residual readout, and is accepted at that figure; the same readout
-handed a perfect description of the chunk fails 8 of them. The readout's shape
-matters that much because no plain ReLU head evaluates even a perfectly
-described two-instruction chunk exactly. Beyond two instructions it is
+*Faithfulness.* Whether what T2 emits is a lossless behavioral description of
+its chunk, measured by whether each output register's value can be recovered
+from that register's emitted description and scored discretely rather than as
+a loss value. The score is the description composed with a readout that has to
+EVALUATE it — nothing in the encoder ever sees a register value, so a slot
+describes a function rather than holding a number. The input states are drawn
+afresh for every chunk, with structure, and the score is taken at a fixed set
+no model trains on: a readout trained on one fixed set stores answers at it
+instead of evaluating. **At one instruction it holds exactly**: T1's emitted
+wiring matches the oracle on every instruction and its description is
+evaluated exactly at 2.46 million unseen input values. **At two instructions
+it holds to 99.8322%** — 8,113 failures in 4.83 million scored values, every
+output register of 38,400 held-out chunks at 64 input states — after 1M
+training steps, one seed, a twelve-layer residual readout; outputs that depend
+on three inputs carry the residual at 90.3%. Beyond two instructions it is
 untested.
 
 *Equivalence.* Two instruction sequences that compute the same function must
 compress to the same point — that is the framework's definition of meaning, and
-it is required for T2 to count as done. Sequences related by a register rename
-do, exactly. Sequences related by a *computed* equivalence do not: two chunks
-that fold two immediates into the same total land as far apart as two chunks
-computing different functions. Two classes are separated by the training target
-itself: the value-prediction target numbers a chunk's inputs by the order they
-are first read, so reordering two independent instructions, or removing a dead
-one, changes the function the target names (RISCV_DESIGN.md, "GVN"). For the
-rest, the training objective is not pairwise, so nothing pushes equivalent
-chunks together. Fixing the frame and supplying that pressure are outstanding
-design decisions.
+it is required for T2 to count as done. Everything that leaves the chunk's live
+dataflow graph unchanged does, exactly and by construction: a register rename,
+reordered independent instructions, an inserted dead instruction. Everything
+that needs the op-cell to compute does not — a commutative swap among them:
+two chunks that fold two immediates into the same total land further apart
+than two chunks computing different totals, an identity beside a live
+instruction sits as far from its absence as from a different instruction, and
+the training objective is not pairwise, so nothing pushes them together. And
+the essence itself, which value prediction does not read, spans a range 30×
+narrower than the first-read frame's models did (unrelated chunks 0.028
+apart); what shapes it is an outstanding design decision, as is the pairwise
+pressure.
 
 Beyond both lies T3, the first tier that must *compose* bindings rather than
 merely emit them.
@@ -210,8 +211,8 @@ emulator/       RV32I emulator + GPU batch emulator (all opcodes via
                 torch.where)
 tokenizer/      Structural tokenizer
 datagen/        RVT batch format + chunk analysis: SSA, anchor
-                execution, canonical out_regs oracle, behavioral binding
-                targets, equivalence manifest.
+                execution, the structural signature (signature.py),
+                behavioral binding targets, equivalence manifest.
 compressor/     Equivariant Compressor (T1/T2), decoder, shared training
                 loop (train.py), held-out eval (eval.py)
 scripts/        Training and evaluation entry points

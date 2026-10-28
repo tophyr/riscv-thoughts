@@ -40,73 +40,65 @@ definition of meaning (WHAT_IS_A_THOUGHT.md), so an essence that separates
 `ADDI r1,r1,256; ADDI r1,r1,-16` from `ADDI r1,r1,32; ADDI r1,r1,208` is not a
 thought vector regardless of its vp.
 
-Where each equivalence class currently stands, on the len=2 model of milestone 1
-(`separation` = distance between inequivalent pairs over distance between
-equivalent ones; larger is better; under ~10x is noise):
+Where each equivalence class stands. The essence is graded in the register
+frame (RISCV_DESIGN.md, "GVN"): every class that leaves the chunk's live
+dataflow graph unchanged collapses **by construction**, and the frozen T1
+reads exactly zero on them (`probes/frame_scorecard.py`, 2000 pairs per
+class); every class that needs the op-cell to compute is the essence's to
+learn, and the figures for those are the last ones measured, in the first-read
+frame that preceded this one (`separation` = distance between inequivalent
+pairs over distance between equivalent ones; larger is better; under ~10x is
+noise):
 
-| equivalence class | distance | separation |
-|---|---|---|
-| register rename | 0.0000 | — (free by construction) |
-| commutative operand swap | 0.0270–0.0352 | 36–47x |
-| one no-op exchanged for another (`ADD xa,xa,x0` vs `ADDI xd,xd,0`) | 0.0901 | 5.9x |
-| `XORI` chains with the same composite mask | 0.5121 | 0.8x |
-| additive chains with the same total offset | 0.4374 | 1.0x |
-| reordering of two independent instructions | not measured | separated by the vp target itself (below) |
-| dead code against its live part | not measured | separated by the vp target itself (below) |
+| equivalence class | status |
+|---|---|
+| register rename | 0 by construction |
+| reordering of independent instructions | 0 by construction |
+| dead code against its live part | 0 by construction |
+| an x0-write beside live instructions | 0 by construction |
+| commutative swap, any form | op-cell — the encoder is told nothing about which operations commute; first-read frame: 0.04–0.065 against 0.48 `distinct` |
+| one no-op exchanged for another (`ADD xa,xa,x0` vs `ADDI xd,xd,0`) | op-cell; first-read frame: 0.0901, 5.9x |
+| `XORI` chains with the same composite mask | op-cell; first-read frame: 0.5121, 0.8x |
+| additive chains with the same total offset | op-cell; first-read frame: 0.4374, 1.0x |
 
 The guard on all of this is the opposite row: pairs a transformation did NOT
-leave equivalent must stay far apart, and they do — 0.88 and 0.96 across the
-same two draws, against a `distinct` mean of 1.26. A collapse objective that
-pulls those together is a worse failure than loose collapse (METRICS.md).
+leave equivalent must stay far apart — the aliasing control reads 0.32 against
+0.83 for unrelated instructions at T1. A collapse objective that pulls those
+together is a worse failure than loose collapse (METRICS.md).
 
-**How well a class collapses tracks how much the architecture has to *learn* to
-see it, not whether seeing it needs arithmetic.** Exchanging one no-op for
-another needs no computation on operands and still reaches only 5.9x, so "the
-encoder cannot compute with operands" does not explain the failure on its own.
-**Nothing trains any of the measured rows** — that is their common cause. vp
-cannot supply the pressure: it is not a pairwise objective, so two distinct
-points can both predict the same outputs correctly, and for an instruction that
-writes no register it emits no supervised slot at all and therefore no gradient
-whatsoever. The one swap that does collapse is free by construction only when
-both operands are fresh and the destination is a third register; with the
-destination overwriting a source, or the swapped operand already ranked, it is
-learned and incompletely (EXPERIMENT_LOG, "T2 faithfulness", finding 36).
-
-The two unmeasured rows are worse than untrained: **the vp target separates
-them.** The canonical frame numbers inputs by first read and outputs by final
-write, so reordering two independent instructions, or deleting a dead
-instruction whose reads shifted every later input's number, changes the
-canonical function the head is asked to evaluate — and the head reads only the
-essence and the canonical input values, so one essence cannot be exact on both
-members of such a pair (RISCV_DESIGN.md, "GVN" and "Training"). No training
-reaches them; only a change to the frame, or to what the head reads, does.
+**Nothing trains the op-cell rows** — that is their common cause. vp cannot
+supply the pressure: it is not a pairwise objective, so two distinct
+descriptions can both evaluate correctly, and for an instruction that writes
+no register it emits no supervised slot at all and therefore no gradient
+whatsoever. How well one of them collapses tracks how much the op-cell has to
+learn to see it, not whether seeing it needs arithmetic: exchanging one no-op
+for another needs no computation on operands and still reached only 5.9x.
 
 ## Milestones
 
-1. **Faithful at len=2, at held-out anchors — holds.** 99.9993% exact — 36
-   failing triples of 4,832,448 — over the frozen `runs/t1_writers_500k_resvp3`,
-   with a twelve-layer residual T2 vp head after 10M steps, one
-   instruction-stream seed, scored end to end through T1's emitted wiring at
-   all 64 held-out anchors (METRICS.md; EXPERIMENT_LOG, "T2 faithfulness",
-   finding 35). The same head handed a perfect description of the chunk fails
-   8. 27 of the 36 are `SUB` slots, 18 of them composed from the other
-   instruction's result on 3 chunks. T2's binding is exact on every chunk
-   scored. Accepted at one seed; the 36 and the head's size are idle-time work
-   (Open ideas).
+1. **[CURRENT] Faithful at len=2, at held-out anchors, in the register
+   frame.** T1 holds exactly: the frozen `runs/t1_register_500k` is 100.0000% exact
+   on 2,457,600 held-out triples with a three-layer residual vp head, its
+   emitted wiring exact on every instruction
+   (`probes/frame_scorecard.py`). The T2 over it is at **99.8322%** — 8,113
+   failing triples of 4,834,176 — after 1M steps, one seed, binding exact on
+   every chunk, with outputs that depend on three inputs (a composed slot over
+   disjoint inputs) at 90.3% and everything else above 99.86% (EXPERIMENT_LOG,
+   "The register frame", finding 38). In the first-read frame the same
+   configuration reached 5,418–5,511 failing at 1M and 36 at 10M (finding
+   35); the 10M cell in this frame is the next run, and its 3-input slots are
+   where to look.
 
-2. **[CURRENT] Computed equivalents collapse at len=2.** Chunks computing the
-   same function land as far apart as chunks computing different ones
-   (Mission's table). Task 1. The first-read frame milestone 1 was reached in
-   separates reordered, renumbered, dead and same-value-writing equivalents;
-   that was accepted to establish vp's capacity first, and replacing it is
-   rework this milestone owes. **Settle it before chunks get longer**: every added
-   instruction multiplies the equivalences a chunk participates in, so a len=4
-   model would learn the same wrong geometry at four times the scale.
+2. **Computed equivalents collapse at len=2.** Everything that leaves the live
+   dataflow graph unchanged collapses by construction (Mission's table); what
+   remains is every equivalence the op-cell has to compute. Task 1. **Settle it
+   before chunks get longer**: every added instruction multiplies the
+   equivalences a chunk participates in, so a len=4 model would learn the same
+   wrong geometry at four times the scale.
 
-3. **vp = 0 at len=4, then len=8.** Was 0.244 and 0.461 at the 8 fixed anchors,
-   before canonical read ranks. A chunk's input list counts the reads of dead
-   instructions, which are 15% of len=4 and 46% of len=8 chunks (finding 33), so
-   T2's read ranks match the target's frame at every length.
+3. **vp = 0 at len=4, then len=8.** Unmeasured in the register frame. A dead
+   instruction is 15% of len=4 and 46% of len=8 chunks (finding 33); its reads
+   are in the binding and pruned from the essence at every length.
 
 4. **Beyond the happy path.** Everything above is writers-only (R/I-type ALU,
    valid, non-x0). Then: no-write instructions (task 2), PC/branches, memory,
@@ -122,21 +114,24 @@ reaches them; only a change to the frame, or to what the head reads, does.
 In order. Task 1 is required for the MVP. The rest are queued, not parallel
 work.
 
-### 1. Collapse computed equivalences (milestone 2 — required for MVP)
+### 1. Collapse the computed equivalences the op-cell owns (milestone 2 — required for MVP)
 
-Two chunks computing the same function must land on the same point. They do not,
-and the failure is total rather than partial (Mission's table).
+Two chunks computing the same function must land on the same point. The
+classes the frame makes structural do (Mission's table); the classes that need
+the op-cell to compute — a commutative swap whose operand is another
+instruction's input or result, identity spellings, cancellations, folds of two
+literals — do not, and on the last models measured the failure on the folds
+was total rather than partial.
 
 **It is not a T2 deficit — T1 fails the same class.** Single-instruction pairs
 sharing an identical binding, so the whole difference is in the essence, sit
-within a factor of 2 of pairs computing *different* functions, while the
-commutative swap — free because the pool is a multiset over register slots —
-sits at 117x. **At both tiers, an equivalence collapses when the architecture
-cannot represent the difference and otherwise does not.** Any fix has to be
-designed for T1 and T2 together: they are one class (`compressor/`), so a
-mechanism that works at T1 applies at T2 unchanged. A collapse change to the
-core therefore remints T1; batch it with any other T1 change where that costs
-nothing.
+within a factor of 2 of pairs computing *different* functions (first-read
+frame, finding 23). **At both tiers, an equivalence collapses when the
+architecture cannot represent the difference and otherwise does not.** Any fix
+has to be designed for T1 and T2 together: they are one class (`compressor/`),
+so a mechanism that works at T1 applies at T2 unchanged. A collapse change to
+the core therefore remints T1; batch it with any other T1 change where that
+costs nothing.
 
 **Nothing in the project covers this class.** Equivalences are enumerated in one
 place — the manifest in `datagen/generate.py` — and all 15 of its classes are
@@ -153,55 +148,106 @@ it isolates "untrained" from "cannot compute", and one capability surfaces in
 three places:
 
 - collapse: exchanging one no-op for another reaches only 5.9x;
-- T1's geometry: three spellings of the identity (`ADDI x,y,0` against
-  `ORI`/`XORI`/`SLLI x,y,0`) sit 0.2794 apart, and `ADD x,y,y` against
-  `SLLI x,y,1` sits 0.5696 apart, both within 2x of the 0.6948–0.9675 between
-  instructions computing *different* functions;
+- T1's geometry (first-read frame, finding 23): three spellings of the
+  identity (`ADDI x,y,0` against `ORI`/`XORI`/`SLLI x,y,0`) sit 0.2794 apart,
+  and `ADD x,y,y` against `SLLI x,y,1` sits 0.5696 apart, both within 2x of
+  the 0.6948–0.9675 between instructions computing *different* functions;
 - the targets: a same-value self-write (`ADD x5,x5,x0`) is a read and a write,
   so the binding is never told that it is the identity; recognising
   `+x0`, `+0`, `|0`, `^0` and `<<0` as the identity is the essence's job.
 
-**Dead-code elimination and instruction reordering are part of this task, and
-both are blocked by the frame, not by training.** A dead instruction's reads are
-the chunk's inputs (`ADD x5,x6,x7 ; ADDI x5,x8,1` has inputs x6, x7, x8, so its
-function is `in3 + 1` where the live part's is `in1 + 1`), and reordering two
-independent instructions renumbers both inputs and outputs. In each case the two
-chunks carry different vp targets, and the head reads only the essence and the
-canonical input values, so no shared essence can be exact on both. These two
-collapse only if the frame stops depending on linearization or the evaluator is
-given the binding — the first decision below.
+**The register frame is built** (RISCV_DESIGN.md, "GVN" and "Leaf identity for
+input registers"): value prediction is evaluated per written slot from that
+slot's description and its inputs' values and colours gathered by register
+(`vp_slot_loss`), the targets are raw register values, the essence is the pool
+over the written slots only, and a leaf's identity is its structural colour —
+a role-aware Weisfeiler–Lehman colouring of the live dataflow graph with
+every operand role ordered, computed in the oracle (`datagen/signature.py`)
+and, from T1's emitted wiring, in the encoder (`RegisterStateMachine._prepass`).
+The encoder is told nothing about which operations commute: the list of
+commutative opcodes reaches only the oracle's labels. The oracle's colouring agrees with
+the emulator on 300 random chunks per class at len 2 and 3: rename,
+reordering, every commutative swap and dead-code insertion leave the signature
+unchanged, and every signature-equal pair found under aliasing, sharing,
+opcode and immediate controls is equal on the emulator or a register rename of
+the other (`datagen/tests/test_signature.py`). On an untrained encoder of the
+same shape, reorder, dead code and an x0-write beside a live instruction give
+bit-identical essences.
 
-Decisions to make before building, in order:
+**Built in now, to be learned later — scaffolding, recorded as such.** The
+liveness pass and the colouring are exact structural rules in the encoder;
+neither knows anything about any operation. Their learned form is a short
+message pass over the same dataflow graph, from the final writers back to the
+leaves, each message built from the reader's content and role: liveness is
+then the direction of the pass (a dead instruction is never reached) and the
+colour is the leaf's learned embedding. The exact rules go first so that a
+failure of the frame cannot be confused with a pass that has not yet learned
+liveness; once the collapse scorecard holds with them, the
+learned pass replaces them, is checked against them, and they are deleted.
+This is the same tactic as establishing vp before collapse: a known
+simplification taken on purpose, with its removal owed. What stays built in for
+good is the graph itself — the wiring T1 emits — and the register symmetry,
+which cannot be learned into a flat vector (RISCV_DESIGN.md, "What is built
+in for good, and what is built in for now").
 
-- **What function does the essence describe?** The vp target is a function of
-  canonical positions assigned by textual first-read and final-write order, so
-  the essence is graded on a linearization, not on the chunk's
-  register-to-register function (RISCV_DESIGN.md, "GVN"). That frame was
-  adopted knowingly, to establish vp's fundamental capacity at len=2 before the
-  equivalence criterion was imposed; replacing it is owed rework. Two routes: a
-  canonical frame that does not depend on linearization — a canonical form of
-  the dataflow DAG — or an evaluator that reads the `(essence, binding)` pair,
-  with the role assignment carried by the binding, which is what the next tier
-  receives anyway (WHAT_IS_A_THOUGHT.md, "The Thought and Its Interface").
-  Either way the binding becomes a graph — which external register feeds which
-  operation role and receives which result — since an ordered list carries the
-  same linearization.
-  Either redefines the target and the frame the read ranks are expressed in, so
-  it remints T1 and T2 and reopens the operand-binding result that rests on
-  that frame (EXPERIMENT_LOG, "T2 faithfulness", finding 11). Decide this
-  before the objective: a pairwise term over pairs the target separates would
-  fight the target.
-- **How wide is the class?** No computed equivalence measured collapses. The
-  commutative swap is free only when both operands are fresh and the
-  destination is a third register; otherwise it is learned, to 0.04–0.065
-  against a 0.48 `distinct` mean (finding 36).
+**The signature is the scorecard's label, never a target.** Two chunks with
+equal signatures must sit at ~0; the classes the signature does not merge —
+identity spellings, cancellations, immediate folds — are exactly the fold work
+the op-cell owes, and the "Essence or op-cell?" and "What is the objective?"
+decisions below are about them. Training the essence toward the signature
+would separate those classes: the syntactic-hash failure RISCV_DESIGN.md's
+"GVN" section names.
+
+Decisions that remain, in order:
+
+- **What shapes the essence?** Value prediction reads a written slot's
+  description in `T`, so the essence gets no vp gradient and is shaped by
+  nothing but the validity magnitude and `pc_writes`: on the 1M T2, unrelated
+  chunks sit 0.023 apart against 0.67–1.19 in the first-read frame, and the
+  aliasing control is inside that (finding 37). The next tier consumes the
+  essence, not `T`, so the essence has to answer for its descriptions. This
+  decision and "What is the objective?" below are one design with two halves,
+  and the order matters: a pairwise term on a flat essence is satisfied by
+  making every chunk coincide, so the half that keeps chunks apart has to be
+  in place first.
+  - *Faithfulness half.* Candidate: a decoder from `(essence, an output's
+    input colours)` to that written slot's description, with value prediction
+    scored on the reconstruction as well as on the slot. Symmetric outputs
+    (same input colours) reconstruct identically, which is correct; the
+    decoder's inputs are graph-determined, so the structural collapse is
+    untouched. An alternative is value prediction read from the essence with
+    the output's colours as the address. Either way, measure first whether
+    the essence still carries the descriptions — a readout fitted on frozen
+    essences against the written slots' values.
+  - *Collapse half.* The pairwise term of "What is the objective?", over pairs
+    the graph does not already identify.
+  - *The baseline to beat* is finding 38's 1M cell: shared-operand swap
+    0.0125 and unrelated chunks 0.0281; fusion 0.0236 against 0.0072; the
+    aliasing control (0.0198) and the fusion-different row are the guard —
+    they must not fall with the rest.
+- **The binding on the wire.** Per output register, its external input
+  registers in the colour order the evaluator gathers them in (`out_inputs`
+  already ships it); the ordered input and output lists (`in_slot`/`out_slot`
+  ListMLE) go away. What the heads predict instead, and how T3 consumes it, is
+  open; until then the binding heads and their ordered targets are unchanged.
+- **How wide is the class?** On the 1M register-frame T2s: a commutative
+  swap whose operand is shared or a result 0.0125 against 0.0281 unrelated
+  (finding 38); additive chains with one composite 0.0236 against 0.0072 for
+  a different composite (0.3×), `XORI` chains 0.0200 against 0.0049;
+  `ADDI r,r,0` against `ADD r,r,x0` 0.0227 against 0.0181 for `ADDI r,r,1`
+  (finding 37). Nothing the op-cell has to compute
+  collapses, and every one of these distances is at the scale the essence's
+  whole range has shrunk to (the decision above).
 - **Essence or op-cell?** The measured distances are essence distances, but the
   composite is formed one step earlier, when the second instruction's op-cell
   reads the slot the first wrote. A cell that computed `i1+i2` there would
   collapse the pair before any pooling.
 - **What is the objective?** A pairwise term over generated equivalent pairs is
   the obvious candidate, and nothing in the loss is pairwise today — that was a
-  deliberate choice, and undoing it is the decision. Injecting manifest
+  deliberate choice, and undoing it is the decision. Commutativity is its
+  easiest member: value prediction gives both operand orders one target and
+  still leaves them apart, because it is satisfied by any description the
+  evaluator can read (finding 36, and the swap rows of finding 37). Injecting manifest
   equivalents into the corpus (`equivalences.rate`) is a recorded failure at
   buying collapse with data alone. The manifest would also need
   multi-instruction classes, which means generating folds rather than rewrites.
@@ -209,27 +255,6 @@ Decisions to make before building, in order:
   discriminativeness, and a term that pulls equivalents together can pull
   inequivalents together too. The guard is `behav-diff` (METRICS.md), which must
   stay large.
-
-Two interface facts reach the essence through the pool, which consumes every
-channel it is given unconditionally (finding 36). Each is a candidate change to
-what the pool reads, independent of the decisions above:
-
-- **The write channel carries the step, not the rank.** A written slot is
-  stamped `(k+1)/K` with `K` the grid's padded length, where the target orders
-  outputs by rank among writes. On every training chunk the two coincide (two
-  outputs → 0.5, 1.0; an overwrite → 1.0), so stamping the rank instead changes
-  no in-distribution number — verifiable by re-scoring the frozen T2 on
-  `runs/eval/t2_heldout64_len2.rvt` and requiring identical results — and
-  removes the dependence of a short chunk's essence on its padding. It matters
-  once chunks contain non-writing steps or differ in length.
-- **Read-only input slots reach the pool.** An input never written keeps its
-  leaf `rank_emb(rank)` in a slot of its own, so the pool sees whether an input
-  still sits untouched — which is why the aliased swap `ADD a,a,b` vs
-  `ADD a,b,a` reads 0.04 while the same swap with a third-register destination
-  reads 0. Pooling written slots only would make that pair structural; the
-  inputs still reach the essence inside the results the op-cell built from
-  them. It changes every training chunk's pool input, so it is a remint of T1
-  and T2 and whether vp survives it is untested.
 
 ### 2. No-write instructions are invisible to the essence
 

@@ -165,8 +165,9 @@ def _pack_step_arrays(batch, split, *, vp, valid, imm):
         return None, None, n_instrs, shape
     n_chunks, max_ni = shape
     tok, pad, gi0, gi1, go, active = _dense_chunk_grid(split, n_chunks, max_ni)
-    # vp_head_live skips input / output slots past these bounds; they must be
-    # empty (a chunk of K instructions reads at most 2K and writes at most K).
+    # The losses iterate input / output slots only up to these bounds; the rest
+    # must be empty (a chunk of K instructions reads at most 2K and writes at
+    # most K).
     in_k, out_k = min(2 * max_ni, MAX_INPUT_SLOTS), min(max_ni, MAX_OUTPUT_SLOTS)
     assert (batch.in_slot_regs[:, in_k:] == AUX_CE_IGNORE).all()
     assert (batch.out_slot_regs[:, out_k:] == AUX_CE_IGNORE).all()
@@ -177,7 +178,7 @@ def _pack_step_arrays(batch, split, *, vp, valid, imm):
               (batch.in_slot_regs, i64), (batch.out_slot_regs, i64)]
     if vp:
         arrays += [(batch.out_regs, None), (batch.out_regs_valid, None),
-                   (batch.anchors, None)]
+                   (batch.anchors, None), (batch.out_inputs, i64)]
     if valid:
         arrays += [(batch.valid, f32)]
     if imm:
@@ -226,73 +227,100 @@ def _value_feat(x_i):
         [_value_bits(x_i), _value_smooth(x_i.float()).unsqueeze(-1)], dim=-1)
 
 
-def vp_canonical_in_vals(anchor_states_t, in_slot_regs_t):
-    """The CANONICAL input values the vp head is fed: (B, A, MAX_IN) int64.
-    `anchor_states_t` is (B, A, 32), each row's own anchors, or one (A, 32) set
-    shared by every row.
+def vp_slot_loss(comp, T, anchors_t, out_slot_regs_t, out_inputs_t, out_regs_t,
+                 mask_t, vp_smooth_weight=0.2, return_count=False, n_out=None):
+    """Value prediction evaluated PER WRITTEN SLOT.
 
-    `out_regs` is the canonical baseline — precompute_chunk relocates the
-    chunk's i-th BEHAVIORAL input to canonical position i+1 and executes there
-    — so input slot k is exactly position k+1 and the head must see
-    anchor[:, k+1], NOT the raw value at the slot's actual register. Kept
-    INTEGER: float32 loses every bit above 2^24, which is exactly what the bit
-    features exist to supervise. Unfilled slots (AUX_CE_IGNORE) feed 0.
+    For output slot k of a row, the head reads the written register's
+    description — that slot's value channels in `T` — and, for each external
+    input that output depends on (`out_inputs`, in the oracle's colour order),
+    the input's value at its own register in the row's anchor state (32 bits +
+    1 smooth scalar) and the input's structural colour from `T`, and predicts
+    that register's value after the chunk (32 bit-logits + 1 smooth scalar).
+    Nothing in the features is a register number or a position in the text:
+    the description, the colours and the gathered values are all reached
+    through one-hot gathers that a rename permutes, so a renamed twin presents
+    the same description with the same input values and the same target.
 
-    One definition, shared by the loss and every probe that scores the head —
-    a probe that rebuilds these features by hand can drift from the trainer
-    without any test noticing.
+    Args:
+      comp:             the Compressor (uses comp.vp_head, d_out, d_event)
+      T:                (B, n_regs, d_out+d_event+d_colour) the emitted state
+      anchors_t:        (B, A, 32) int32 — the register file each row was
+                        executed from
+      out_slot_regs_t:  (B, MAX_OUT) int64 — output registers (AUX_CE_IGNORE
+                        for unused slots)
+      out_inputs_t:     (B, MAX_OUT, MAX_IN) int64 — each output's external
+                        input registers in colour order (AUX_CE_IGNORE padded)
+      out_regs_t:       (B, A, 32) int32 — the register file after the chunk
+      mask_t:           (B,) bool — rows to include
+      n_out:            bound on filled output slots; slots past it are
+                        skipped (they must be AUX_CE_IGNORE)
+
+    Returns a scalar loss (per-bit BCE + vp_smooth_weight · smooth-magnitude
+    MSE) over (row, output slot, anchor) triples with a filled output slot.
     """
-    max_in = in_slot_regs_t.shape[1]
-    canon_pos = torch.arange(
-        1, max_in + 1, device=anchor_states_t.device).clamp(max=N_REGS - 1)
-    in_filled_i = (in_slot_regs_t != AUX_CE_IGNORE).to(torch.int64)
-    if anchor_states_t.dim() == 2:
-        anchor_states_t = anchor_states_t.unsqueeze(0)
-    return (anchor_states_t[..., canon_pos].to(torch.int64)
-            * in_filled_i.unsqueeze(1))
+    B, A = anchors_t.shape[0], anchors_t.shape[1]
+    d, dc = comp.d_out, comp.d_colour
+    if n_out is not None:
+        out_slot_regs_t = out_slot_regs_t[:, :n_out]
+        out_inputs_t = out_inputs_t[:, :n_out]
+    O, I = out_inputs_t.shape[1], out_inputs_t.shape[2]
+    out_valid = out_slot_regs_t != AUX_CE_IGNORE                      # (B, O)
+    out_idx = out_slot_regs_t.clamp(min=0).long()
+    desc = T[..., :d].gather(1, out_idx.unsqueeze(-1).expand(-1, -1, d))   # (B, O, d)
+    in_valid = (out_inputs_t != AUX_CE_IGNORE)                        # (B, O, I)
+    in_idx = out_inputs_t.clamp(min=0).long()
+    colours = T[..., d + comp.d_event:]                               # (B, R, dc)
+    in_col = colours.gather(
+        1, in_idx.reshape(B, -1, 1).expand(-1, -1, dc)).reshape(B, O, I, dc)
+    in_col = in_col * in_valid.unsqueeze(-1)
+    # Unfilled inputs feed value 0 and colour 0 = "no input". Kept INTEGER
+    # until the bit decomposition: float32 loses every bit above 2^24.
+    vals = anchors_t.to(torch.int64).gather(
+        -1, in_idx.reshape(B, 1, -1).expand(-1, A, -1)).reshape(B, A, O, I)
+    vals = vals * in_valid.unsqueeze(1)
+    vfeat = torch.cat([_value_feat(vals),
+                       in_col.unsqueeze(1).expand(-1, A, -1, -1, -1)], -1)
+    x = torch.cat([desc.unsqueeze(1).expand(-1, A, -1, -1),
+                   vfeat.reshape(B, A, O, I * (_VP_VALUE_BITS + 1 + dc))], -1)
+    pred = comp.vp_head(x)                                            # (B, A, O, 33)
+    target_i = out_regs_t.to(torch.int64).gather(
+        -1, out_idx.unsqueeze(1).expand(-1, A, -1))                  # (B, A, O)
+    nbits = _VP_VALUE_BITS
+    bit_loss = F.binary_cross_entropy_with_logits(
+        pred[..., :nbits], _value_bits(target_i), reduction='none').mean(-1)
+    sm_loss = (pred[..., nbits] - _value_smooth(target_i.float())) ** 2
+    per_slot = (bit_loss + vp_smooth_weight * sm_loss).mean(dim=1)   # (B, O)
+    # Mask-multiply (not boolean index / early return) so the op stays
+    # static-shape and host-sync-free — capturable in the full-step graph.
+    pm = (out_valid & mask_t.unsqueeze(-1)).float()
+    loss = (per_slot * pm).sum() / pm.sum().clamp(min=1)
+    return (loss, int(pm.sum())) if return_count else loss
 
 
-def vp_head_predict(t2, vecs, in_vals_i):
-    """Run the vp head and return (B, A, MAX_OUTPUT_SLOTS, bits+1).
-
-    One definition for the trainer and every probe: a probe that rebuilds the
-    head's inputs by hand can drift from the trainer with no test noticing.
-    """
-    return t2.vp_head(vp_head_inputs(vecs, in_vals_i)).reshape(
-        vecs.shape[0], in_vals_i.shape[1], -1, _VP_VALUE_BITS + 1)
-
-
-def vp_head_inputs(vecs, in_vals_i):
-    """Feature vector for the SHARED vp head: (B, A, d_out + MAX_IN*33).
-
-    The essence enters unit-NORMALIZED: magnitude is reserved for validity, so
-    if vp's gradient reached ‖essence‖ then "produces register output" would
-    start proxying for "is valid" (only register-writers get vp shaping). The
-    operator identity vp needs lives in the direction.
-    """
-    n_anchors = in_vals_i.shape[1]
-    B = vecs.shape[0]
-    vec_exp = F.normalize(vecs, dim=-1).unsqueeze(1).expand(-1, n_anchors, -1)
-    in_feat = _value_feat(in_vals_i).reshape(B, n_anchors, -1)
-    return torch.cat([vec_exp, in_feat], dim=-1)
-
-
-def vp_head_live(head, vecs, in_vals_i, n_in, n_out):
-    """The first n_out output slots of `head(vp_head_inputs(vecs, in_vals_i))`,
-    without its zero work, for when input slots >= n_in are all empty. The
-    first layer's essence term is the same for every anchor, the empty slots'
-    features are exact zeros, and output slots >= n_out are never supervised,
-    so those parts are skipped; only the float summation order changes.
-    Returns (B, A, n_out*(bits+1))."""
-    d = vecs.shape[-1]
-    B, A = in_vals_i.shape[:2]
-    w, b = head.inp.weight, head.inp.bias
-    x = _value_feat(in_vals_i[..., :n_in]).reshape(B, A, -1)
-    h = (F.linear(x, w[:, d:d + x.shape[-1]], b)
-         + F.linear(F.normalize(vecs, dim=-1), w[:, :d]).unsqueeze(1))
-    h = head.hidden(h)
-    keep = n_out * (_VP_VALUE_BITS + 1)
-    return F.linear(h, head.out.weight[:keep], head.out.bias[:keep])
+def vp_slot_predict(comp, T, anchors_t, out_slot_regs_t, out_inputs_t):
+    """The head's prediction per (row, anchor, output slot), (B, A, O, 33),
+    through the same features `vp_slot_loss` builds — the one definition every
+    probe that scores the head reads."""
+    B, A = anchors_t.shape[0], anchors_t.shape[1]
+    d, dc = comp.d_out, comp.d_colour
+    O, I = out_inputs_t.shape[1], out_inputs_t.shape[2]
+    out_idx = out_slot_regs_t.clamp(min=0).long()
+    desc = T[..., :d].gather(1, out_idx.unsqueeze(-1).expand(-1, -1, d))
+    in_valid = (out_inputs_t != AUX_CE_IGNORE)
+    in_idx = out_inputs_t.clamp(min=0).long()
+    colours = T[..., d + comp.d_event:]
+    in_col = colours.gather(
+        1, in_idx.reshape(B, -1, 1).expand(-1, -1, dc)).reshape(B, O, I, dc)
+    in_col = in_col * in_valid.unsqueeze(-1)
+    vals = anchors_t.to(torch.int64).gather(
+        -1, in_idx.reshape(B, 1, -1).expand(-1, A, -1)).reshape(B, A, O, I)
+    vals = vals * in_valid.unsqueeze(1)
+    vfeat = torch.cat([_value_feat(vals),
+                       in_col.unsqueeze(1).expand(-1, A, -1, -1, -1)], -1)
+    x = torch.cat([desc.unsqueeze(1).expand(-1, A, -1, -1),
+                   vfeat.reshape(B, A, O, I * (_VP_VALUE_BITS + 1 + dc))], -1)
+    return comp.vp_head(x)
 
 
 # Rotary immediate encoding (T1). POWER-OF-2 periods 2,4,...,4096: each frequency
@@ -828,7 +856,7 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
     # at a fixed-padded instruction count (B*MNI). Host-sync-free, static-shape.
     def _fwd_loss(tok, pad, w0, w1, wo, active,
                   li, lo, pc, in_slot, out_slot, out_regs, vp_mask, anchors,
-                  valid_f,
+                  out_inputs, valid_f,
                   ike, oke, imm_target, imm_mask):
         content_seq, c0, c1, co = _content(tok, pad, w0, w1, wo, active)
         T, essence = comp.encode_state(content_seq, c0, c1, co, active)
@@ -837,15 +865,14 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
         bl = binding_losses(
             comp, T, essence, live_in_t=li, live_out_t=lo, pc_writes_t=pc,
             in_slot_t=in_slot, out_slot_t=out_slot, in_k_eff=ike, out_k_eff=oke)
-        vp = (t2_value_predict_loss(
-                  comp, essence, anchors, in_slot, out_slot,
-                  out_regs, vp_mask, vp_smooth_weight=vp_smooth_weight,
-                  n_in=ike, n_out=oke)
+        vp = (vp_slot_loss(
+                  comp, T, anchors, out_slot, out_inputs, out_regs, vp_mask,
+                  vp_smooth_weight=vp_smooth_weight, n_out=oke)
               if vp_active else essence.new_zeros(()))
         # Immediate head (T1 only): linear readout of the essence must match the
         # rotary encoding of the instruction's immediate, masked to I-type rows.
         if imm_active:
-            # direction only (magnitude = validity); see t2_value_predict_loss.
+            # direction only (magnitude = validity).
             imm_pred = comp.imm_head(F.normalize(essence, dim=-1))   # (B, 2*_IMM_N_FREQ)
             imm_per = ((imm_pred - imm_target) ** 2).mean(-1)   # (B,)
             imm = (imm_per * imm_mask).sum() / imm_mask.sum().clamp(min=1)
@@ -875,14 +902,14 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
             return None
         staged = iter(stage(packed, specs))
         fixed = [next(staged) for _ in range(11)]
-        out_regs_t, vp_mask_t, anchors_t = (
-            (next(staged), next(staged), next(staged)) if vp_active
-            else (_dummy, _dummy, _dummy))
+        out_regs_t, vp_mask_t, anchors_t, out_inputs_t = (
+            (next(staged), next(staged), next(staged), next(staged)) if vp_active
+            else (_dummy, _dummy, _dummy, _dummy))
         valid_f = next(staged) if valid_active else _dummy
         imm_target_t, imm_mask_t = ((next(staged), next(staged)) if imm_active
                                     else (_dummy, _dummy))
-        return (*fixed, out_regs_t, vp_mask_t, anchors_t, valid_f, IN_K, OUT_K,
-                imm_target_t, imm_mask_t)
+        return (*fixed, out_regs_t, vp_mask_t, anchors_t, out_inputs_t, valid_f,
+                IN_K, OUT_K, imm_target_t, imm_mask_t)
 
     def _extra(item, aux):
         return {'n_chunks': N_CHUNKS, 'n_instrs': item[2]}
@@ -1086,20 +1113,24 @@ def _t1_predicted_wiring(t1, T):
     out_scores = t1.out_score_head(T).squeeze(-1)
     live_in = torch.sigmoid(t1.live_in_head(T).squeeze(-1))
     live_out = torch.sigmoid(t1.live_out_head(T).squeeze(-1))
-    # x0 is never a GP operand/output — take it out of contention.
+    # x0 is never a GP operand/output, and a register the instruction never
+    # touched (an all-zero slot) is never one either — every such slot has the
+    # same score, and a tie among them would be broken by index, which a
+    # rename does not permute. Only touched, non-x0 slots are candidates.
     not_x0 = torch.ones(n_regs, device=device)
     not_x0[X0_SLOT] = 0.0
+    candidate = (T != 0).any(-1) & (not_x0 > 0)             # (N, n_regs)
     neg = torch.finfo(in_scores.dtype).min
-    in_s = in_scores.masked_fill(not_x0 == 0, neg)
-    out_s = out_scores.masked_fill(not_x0 == 0, neg)
-    n_in = ((live_in > 0.5) * not_x0).sum(-1)               # (N,)
-    n_out = ((live_out > 0.5) * not_x0).sum(-1)
-    top2 = in_s.topk(2, dim=-1).indices                     # (N, 2): in0 then in1
-    out_top = out_s.argmax(dim=-1)                          # (N,)
-    z = torch.zeros_like(out_top)
-    in0 = torch.where(n_in >= 1, top2[:, 0], z)
-    in1 = torch.where(n_in >= 2, top2[:, 1], z)
-    out = torch.where(n_out >= 1, out_top, z)
+    in_s = in_scores.masked_fill(~candidate, neg)
+    out_s = out_scores.masked_fill(~candidate, neg)
+    n_in = ((live_in > 0.5) * candidate).sum(-1)            # (N,)
+    n_out = ((live_out > 0.5) * candidate).sum(-1)
+    top2 = in_s.topk(2, dim=-1)                             # in0 then in1
+    out_top = out_s.max(dim=-1)
+    z = torch.zeros_like(out_top.indices)
+    in0 = torch.where((n_in >= 1) & (top2.values[:, 0] > neg), top2.indices[:, 0], z)
+    in1 = torch.where((n_in >= 2) & (top2.values[:, 1] > neg), top2.indices[:, 1], z)
+    out = torch.where((n_out >= 1) & (out_top.values > neg), out_top.indices, z)
     return in0, in1, out
 
 
@@ -1200,94 +1231,6 @@ def t2_chunk_forward(t1, t2, split_outputs, n_chunks, max_n_instrs, device,
     chunk_t1, in0, in1, out, active = _t2_assemble(
         t1, split_outputs, n_chunks, max_n_instrs, device, route=route)
     return t2.encode(chunk_t1, in0, in1, out, active)
-
-
-def t2_value_predict_loss(t2, vecs, anchor_states_t,
-                          in_slot_regs_t, out_slot_regs_t,
-                          out_regs_t, mask_t, vp_smooth_weight=0.2,
-                          return_count=False, n_in=None, n_out=None):
-    """Per-anchor, per-out-slot value-prediction loss (canonical).
-
-    The head reads (vec, CANONICAL input-slot values) and predicts per-anchor
-    per-slot output values. Both the inputs fed and the target read are in the
-    canonical frame: input slot k is fed anchor[:, k+1] (the canonical position
-    precompute_chunk sourced the k-th input from) and the target is out_regs
-    (the canonical post-execution register file). So the task is "given the
-    canonical input values, predict the canonical output values" — a
-    self-consistent, register-name-free I/O function the essence must encode.
-
-    Args:
-      t2:               T2Compressor (uses t2.vp_head)
-      vecs:             (B, d) — T2 output vector
-      anchor_states_t:  (B, A, 32) int32 — each row's register file per
-                        anchor (pre-exec)
-      in_slot_regs_t:   (B, MAX_INPUT_SLOTS) int64 — input slot register IDs;
-                        used ONLY as a fill mask (which slots carry an input).
-                        The values fed are canonical (anchor[:, k+1]), not the
-                        actual registers' values.
-      out_slot_regs_t:  (B, MAX_OUTPUT_SLOTS) int64 — output slot register IDs
-                        (AUX_CE_IGNORE for unused slots)
-      out_regs_t:       (B, A, 32) int32 — register file per anchor AFTER
-                        executing each chunk
-      mask_t:           (B,) bool — rows to include (decoded successfully)
-      n_in, n_out:      bounds on filled input / output slots; when given the
-                        head is evaluated by vp_head_live (same loss, less work)
-
-    Returns a scalar loss (per-bit BCE + vp_smooth_weight · smooth-magnitude
-    MSE) over (row, output-slot, anchor) triplets where out_slot_regs is not
-    IGNORE.
-    """
-    n_anchors = anchor_states_t.shape[-2]
-    if n_out is not None:
-        out_slot_regs_t = out_slot_regs_t[:, :n_out]
-
-    # CANONICAL input values. `out_regs` is the canonical baseline:
-    # precompute_chunk relocates the chunk's i-th BEHAVIORAL input to canonical
-    # position i+1 (_canonical_state) and executes there, so out_regs depends
-    # only on operand STRUCTURE, not register names. in_slot_regs lists the same
-    # behavioral inputs in the same order, so input slot k is exactly position
-    # k+1 and the head must see anchor[:, k+1] — NOT the raw value at the slot's
-    # actual register (the old bug, which fed anchor[:, in_slot_regs] and asked
-    # the head to predict f(canon inputs) from raw inputs = uncorrelated
-    # numbers). Canonical also leaks no register identity into vp, which is the
-    # right choice for an equivariant encoder.
-    # Unfilled slots (AUX_CE_IGNORE) feed 0 = "no input".
-    in_vals_i = vp_canonical_in_vals(anchor_states_t, in_slot_regs_t)
-
-    # Target[b, a, k] = out_regs[b, a, out_slot_regs[b, k]] (int, NOT floated).
-    # Clamp IGNORE→0 for lookup; mask out via out_slot_valid below.
-    out_lookup = out_slot_regs_t.clamp(min=0).long()    # (B, MAX_OUT)
-    out_lookup_expanded = out_lookup.unsqueeze(1).expand(-1, n_anchors, -1)
-    target_i = out_regs_t.to(torch.int64).gather(
-        dim=-1, index=out_lookup_expanded)                  # (B, A, MAX_OUT) int64
-
-    out_valid = (out_slot_regs_t != AUX_CE_IGNORE)    # (B, MAX_OUT)
-    pair_mask = out_valid & mask_t.unsqueeze(-1)        # (B, MAX_OUT)
-
-    # Per-bit BCE (uniform resolution) + a bounded smooth-magnitude term. Inputs
-    # fed as bits + smooth so the head can do the arithmetic; per-bit BCE on the
-    # two's-complement target keeps the low (immediate) bit supervised. Bits
-    # decompose from int; smooth floats it (magnitude — low bits moot there).
-    B = vecs.shape[0]
-    nbits = _VP_VALUE_BITS
-    pred = (vp_head_live(t2.vp_head, vecs, in_vals_i, n_in, n_out)
-            if n_in is not None and n_out is not None
-            else t2.vp_head(vp_head_inputs(vecs, in_vals_i))).reshape(
-        B, n_anchors, -1, nbits + 1)
-    bit_loss = F.binary_cross_entropy_with_logits(
-        pred[..., :nbits], _value_bits(target_i), reduction='none').mean(-1)
-    sm_loss = (pred[..., nbits] - _value_smooth(target_i.float())) ** 2
-    per_slot = (bit_loss + vp_smooth_weight * sm_loss).mean(dim=1)  # (B, n_slots)
-
-    # Mask-multiply (not boolean index / early return) so the op stays
-    # static-shape and host-sync-free — capturable in the full-step graph.
-    # clamp(min=1) returns 0.0 for an all-masked batch, matching the old
-    # early-return.
-    pm = pair_mask.float()
-    loss = (per_slot * pm).sum() / pm.sum().clamp(min=1)
-    return (loss, int(pair_mask.sum())) if return_count else loss
-
-
 
 
 def _slot_k_eff(slot_regs_np):
@@ -1439,26 +1382,30 @@ def binding_losses(model, T, essence, *, live_in_t, live_out_t, pc_writes_t,
 
 
 def _compute_chunk_out_regs(batch):
-    """Per row of the batch, run precompute_chunk to get the post-
-    execution full register file at the row's own anchors. Returns:
+    """Per row of the batch, execute the chunk on the emulator from the
+    register files the row ships as its anchors. Returns:
       out_regs: (B, n_anchors, 32) int32
       mask:     (B,) bool — True for rows we got valid out_regs from
-    Rows that fail (decode error, memory ops, etc.) get zero out_regs."""
+    Rows that fail (decode error, memory ops, etc.) get zero out_regs. The
+    shipped `out_regs` must equal this: the anchors shipped are the register
+    files the oracle executed from, with no further placement. The oracle's
+    SSA evaluator is used rather than the emulator because the two differ on
+    intra-chunk control flow (`_eval_ssa_numpy`)."""
+    from datagen.compare import to_ssa, live_nodes, _eval_ssa_numpy
     B = batch.tokens.shape[0]
     n_anchors = batch.anchors.shape[1]
     out = np.zeros((B, n_anchors, 32), dtype=np.int32)
     mask = np.zeros(B, dtype=bool)
     for b in range(B):
         instrs = _decode_chunk_instructions(batch, b)
-        if instrs is None:
+        if instrs is None or not batch.out_regs_valid[b]:
             continue
         try:
-            pre = precompute_chunk(instrs, batch.anchors[b])
-        except NotImplementedError:
-            continue
+            ssa = to_ssa(instrs)
+            out[b], _ = _eval_ssa_numpy(ssa, len(instrs), batch.anchors[b],
+                                        live_nodes(ssa))
         except Exception:
             continue
-        out[b] = pre.out_regs
         mask[b] = True
     return out, mask
 

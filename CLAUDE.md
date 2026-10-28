@@ -117,17 +117,19 @@ not know you need.
 
 ### The invariants
 
-1. **The vp head reads its input values from the batch's own anchors, never
-   from a rebuilt set.** Every row's `out_regs` was executed at anchor states
-   drawn for that row (one draw per source chunk, shared by its twins) and
-   shipped beside it as `batch.anchors` (`build_twins`, `datagen/batch.py:540`;
-   the draw is `draw_anchor_states`, `datagen/compare.py:303`). The trainer
-   stages that field and feeds it to `t2_value_predict_loss`
-   (`compressor/train.py:1205`); a scorer must do the same. Building input values
+1. **The vp evaluator reads its input values from the batch's own anchors,
+   never from a rebuilt set.** Every row's `out_regs` was executed from the
+   register file shipped beside it as `batch.anchors`: one structured draw per
+   source chunk (`draw_anchor_states`, `datagen/compare.py`), placed on each
+   row's own input registers by `precompute_chunk`, so a twin's anchors differ
+   from its source's. The trainer stages that field and feeds it to
+   `vp_slot_loss` (`compressor/train.py`), which gathers each output's input
+   values by register through `batch.out_inputs`; a scorer must do the same
+   (`vp_slot_predict`). Re-placing shipped anchors, or building input values
    from any other set of states — a seed, a fixed table — gives wrong targets
    with no error. Score at the fixed held-out set by generating the corpus with
    `datagen --heldout-anchors` (`heldout_anchor_states`,
-   `datagen/compare.py:373`), whose states no training draw produces.
+   `datagen/compare.py`), whose states no training draw produces.
 
 2. **Fixed batch shape, derived from the rule's length cap.** Every emitted batch
    is padded to identical (B, max_tokens, max_n_instrs) so PyTorch's caching
@@ -138,42 +140,42 @@ not know you need.
    This is why a `--rule` with no cap is REJECTED (see Rule grammar). Don't add a
    code path that emits a differently-shaped batch mid-run.
 
-3. **EVERY rule ships the CANONICAL out_regs oracle (`OB == B`).**
+3. **EVERY rule ships the out_regs oracle (`OB == B`).**
    `single` (T1) and multi-instruction (T2) rules both go through `build_twins`
-   and ship the full canonical `out_regs` register file (`OB == B`, carrying
-   `n_anchors == --n-states`). There is no per-rule payload split — both tiers
-   feed one canonical value-prediction target.
+   and ship the full post-execution `out_regs` register file, the `anchors` it
+   was executed from and `out_inputs` (`OB == B`, carrying `n_anchors ==
+   --n-states`). There is no per-rule payload split — both tiers feed one
+   per-slot value-prediction target.
    (`scripts/tests/test_pipeline.py::test_out_regs_mode_header`.)
 
-4. **value_predict is CANONICAL for both tiers, in the BEHAVIORAL frame.**
-   `out_regs` is the rename-invariant canonical baseline: `precompute_chunk`
-   relocates the chunk's i-th **behavioral** input to canonical position i+1
-   (`_canonical_state`, `datagen/compare.py:382`, positions
-   `_CANON_POSITIONS = range(1, 32)` at `datagen/compare.py:69`; applied at
-   `datagen/compare.py:685`) and executes there, so `out_regs[:, r]` depends only
-   on operand structure. The vp loss (`t2_value_predict_loss`,
-   `compressor/train.py:1205`, used by BOTH T1 and T2) therefore feeds the head
-   the canonical-position values `anchor[:, k+1]` for input slot k — never the raw
-   value at the slot's actual register. Feeding raw input values against the
-   canonical target is mathematically inconsistent — the head must see canonical
-   inputs to match the canonical output.
+4. **value_predict is evaluated PER WRITTEN SLOT, in the register frame, for
+   both tiers.** The target for output slot k is the raw value of register
+   `out_slot_regs[k]` in `out_regs`; the evaluator (`vp_slot_loss`,
+   `compressor/train.py`) is handed that slot's description — its value
+   channels in `T` — plus, for each register in `out_inputs[k]`, that
+   register's value in `anchors` and its colour channels from `T`. No input
+   or output is numbered by textual order anywhere: `out_inputs` is the
+   output's external inputs in structural-colour order
+   (`datagen.signature.output_inputs`), and the encoder seeds each leaf from
+   the same colouring computed from the wiring it is given
+   (`RegisterStateMachine._prepass`, `compressor/model.py`). The oracle's
+   colouring (strings) and the encoder's (fixed random features) must agree
+   on structure: identical graph, identical colour. The one place they
+   differ by design is commutativity — the oracle's LABELS may know which
+   operations commute (`COMMUTATIVE`, used only for the signature and the
+   input order); the encoder is told nothing of it and orders every role.
+   `datagen/tests/test_signature.py` is the oracle's evidence against the
+   emulator.
 
-   **The frame must be behavioral, not syntactic, and the same one everywhere.**
-   `in_slot_regs` lists the behavioral inputs, so a canonical position spent on a
-   live-but-value-irrelevant read (e.g. `ANDI _,_,0`, or `XOR rd,rs,rs`) shifts
-   every later input off its slot. The encoder is never given such a read — T1's
-   binding heads are behavioral and correctly omit it — so the target would
-   depend on something the encoder cannot see, and two chunks with a
-   bit-identical encoder input would carry different targets. Which reads are
-   behavioral is decided per instruction at FIXED witness states
-   (`instruction_reads`, `datagen/compare.py:591`), never at the anchors: per-row
-   anchors would otherwise flip a label from one row to the next. The chunk's
-   inputs are those reads in first-read order, a dead instruction's included
-   (`_input_order`, `datagen/compare.py:617`): T1 emits them and T2's read ranks
-   number them, so skipping them would shift every later input off its rank.
-   The regression guards are `test_canonical_positions_go_to_behavioral_inputs`,
-   `test_a_dead_instructions_reads_are_inputs` and
-   `test_labels_do_not_depend_on_the_anchor_draw`.
+   **Which reads count, and liveness, are decided structurally, never at the
+   anchors.** Which reads are behavioral is decided per instruction at FIXED
+   witness states (`instruction_reads`, `datagen/compare.py`), so a per-row
+   anchor draw can never flip a label; `in_slot_regs` (the binding target)
+   lists them in first-read order, a dead instruction's included
+   (`_input_order`). A dead instruction — overwritten before anyone reads it —
+   is pruned from the colouring by a backward pass from the final writers, in
+   the oracle (`datagen.signature.live_nodes`) and in the encoder alike, so
+   its reads leave no trace in any colour; they remain in the binding.
 
 5. **x0 is fixed under relabeling.** `random_perm`/`relabel` require `perm[0]==0`
    (`datagen/generate.py:298,312`; the check is `datagen/generate.py:320-321`).

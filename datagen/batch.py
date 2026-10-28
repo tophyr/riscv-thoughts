@@ -274,6 +274,9 @@ class Batch:
     pc_writes:      np.ndarray   # (B,) bool — pc_explicit flag
     in_slot_regs:   np.ndarray   # (B, MAX_INPUT_SLOTS) int8 — reg or AUX_CE_IGNORE
     out_slot_regs:  np.ndarray   # (B, MAX_OUTPUT_SLOTS) int8
+    # Per output slot, the external input registers it depends on, in the
+    # order the evaluator gathers their values (AUX_CE_IGNORE padded).
+    out_inputs:     np.ndarray   # (B, MAX_OUTPUT_SLOTS, MAX_INPUT_SLOTS) int8
     # Full post-execution register file per anchor — the value-prediction
     # oracle target. Computed in the (parallel) gen workers from the same
     # Precomputed as the binding aux, so the trainer reads it instead of
@@ -281,9 +284,9 @@ class Batch:
     # otherwise; out_regs_valid marks decodable non-mem rows.
     out_regs:       np.ndarray   # (OB, n_anchors, N_REGS) int32
     out_regs_valid: np.ndarray   # (OB,) bool
-    # The register files each row's out_regs was executed from, drawn per
-    # source chunk and shared by its twins. The vp head is fed its canonical
-    # input values from them.
+    # The register files each row's out_regs was executed from: one structured
+    # draw per source chunk, placed on each row's own input registers. The
+    # evaluator gathers an output's input values from them by register.
     anchors:        np.ndarray   # (OB, n_anchors, N_REGS) int32
 
 
@@ -305,6 +308,8 @@ RVT_FORMAT = BinaryFormat(
                   ('B', MAX_INPUT_SLOTS)),
         BodyField('out_slot_regs', np.dtype(np.int8),
                   ('B', MAX_OUTPUT_SLOTS)),
+        BodyField('out_inputs', np.dtype(np.int8),
+                  ('B', MAX_OUTPUT_SLOTS, MAX_INPUT_SLOTS)),
     ],
     # Sanity bounds on the dimension header — reject a torn/corrupt stream
     # whose dims are garbage before sizing a read off them.
@@ -332,6 +337,7 @@ class AuxPayload:
     pc_writes: np.ndarray       # (actual_B,) bool
     in_slot_regs: np.ndarray    # (actual_B, MAX_INPUT_SLOTS) int8
     out_slot_regs: np.ndarray   # (actual_B, MAX_OUTPUT_SLOTS) int8
+    out_inputs: np.ndarray      # (actual_B, MAX_OUTPUT_SLOTS, MAX_INPUT_SLOTS) int8
 
 
 def _empty_aux(n):
@@ -346,6 +352,8 @@ def _empty_aux(n):
                              dtype=np.int8),
         out_slot_regs=np.full((n, MAX_OUTPUT_SLOTS), AUX_CE_IGNORE,
                               dtype=np.int8),
+        out_inputs=np.full((n, MAX_OUTPUT_SLOTS, MAX_INPUT_SLOTS),
+                           AUX_CE_IGNORE, dtype=np.int8),
     )
 
 
@@ -362,6 +370,7 @@ def _aux_from_precomputeds(precomputeds):
         aux.pc_writes[i] = pre.pc_explicit
         aux.in_slot_regs[i] = pre.in_slot_regs
         aux.out_slot_regs[i] = pre.out_slot_regs
+        aux.out_inputs[i] = pre.out_inputs
     return aux
 
 
@@ -488,6 +497,9 @@ def pack_batch(chunks, *,
     in_slot_arr[:actual_B] = aux.in_slot_regs
     out_slot_arr = np.full((B, MAX_OUTPUT_SLOTS), AUX_CE_IGNORE, dtype=np.int8)
     out_slot_arr[:actual_B] = aux.out_slot_regs
+    out_inputs_arr = np.full((B, MAX_OUTPUT_SLOTS, MAX_INPUT_SLOTS),
+                             AUX_CE_IGNORE, dtype=np.int8)
+    out_inputs_arr[:actual_B] = aux.out_inputs
 
     return Batch(tokens=tokens, token_lens=token_lens, valid=valid,
                  instr_lens=instr_lens,
@@ -498,7 +510,8 @@ def pack_batch(chunks, *,
                  live_out_mask=live_out_arr,
                  pc_writes=pc_writes_arr,
                  in_slot_regs=in_slot_arr,
-                 out_slot_regs=out_slot_arr)
+                 out_slot_regs=out_slot_arr,
+                 out_inputs=out_inputs_arr)
 
 
 def padding_mask(batch):
@@ -546,9 +559,9 @@ def build_twins(chunks, twins, draw_anchors, rng):
     Memory-op chunks keep no twins (their Precomputed is unavailable in
     V1 scope) and contribute an empty aux row.
 
-    draw_anchors(k) supplies the anchor states of k source chunks as one
-    (k, n_anchors, 32) array; a source's twins share its states, since a rename
-    must not change the targets.
+    draw_anchors(k) supplies the structured draws of k source chunks as one
+    (k, n_anchors, 32) array; a source's twins share its draw, which
+    `precompute_chunk` places on each row's own input registers.
 
     Returns (chunks_out, aux, out_regs, out_regs_valid, anchors) where
     chunks_out extends `chunks` with the new twins, aux is the parallel
@@ -596,10 +609,12 @@ def build_twins(chunks, twins, draw_anchors, rng):
     aux = _aux_from_precomputeds(aux_pre)
     out_regs, out_regs_valid = _out_regs_from_precomputeds(
         aux_pre, drawn.shape[1])
+    # The register file each row was executed from: the shared draw placed on
+    # that row's own input registers, so a twin's differs from its source's.
     anchors = np.zeros_like(out_regs)
-    for i, a in enumerate(row_anchors):
-        if a is not None:
-            anchors[i] = a
+    for i, pre in enumerate(aux_pre):
+        if pre is not None:
+            anchors[i] = pre.anchors
 
     return chunks_out, aux, out_regs, out_regs_valid, anchors
 

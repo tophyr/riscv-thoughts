@@ -6,12 +6,14 @@ For theoretical framework, see WHAT_IS_A_THOUGHT.md. For testbed design,
 see RISCV_DESIGN.md. For lessons from prior work, see
 TRANSFERABLE_LESSONS.md.
 
-**What to read.** Phases 14 and 15 are the live record — the current
-architecture and the open problem. Everything before Phase 14 is superseded
-design, kept because the dead ends are load-bearing: they are why the current
-architecture is shaped the way it is, and re-running them is the most common way
-to waste a week here. Read an older phase when you are about to revisit the
-question it settled.
+**What to read.** Phase 16 is the live record — the register frame and its
+open problems. Phases 14 and 15 are the first-read frame's record: the
+equivariant skeleton and the faithfulness work, whose dead ends and
+measurements are load-bearing and whose numbers are not comparable to phase
+16's. Everything before Phase 14 is superseded design, kept because the dead
+ends are why the current architecture is shaped the way it is, and re-running
+them is the most common way to waste a week here. Read an older phase when
+you are about to revisit the question it settled.
 
 | # | Phase | What it established |
 |---|---|---|
@@ -29,4 +31,5 @@ question it settled.
 | 12 | [T2 loss-set convergence](EXPERIMENT_LOG/phase-12-t2-loss-set-convergence.md) | Many head designs and output geometries converge back to one open-space vector with behavioral losses; value-prediction alone never builds an operator axis |
 | 13 | [Pairwise behavioral geometry](EXPERIMENT_LOG/phase-13-pairwise-behavioral-geometry.md) | Built and **set aside** the pairwise/twins-as-positives line. A rename is a non-abelian permutation, so no additive vector can represent it (the torsion theorem) — confirmed empirically at the random baseline |
 | 14 | [Rename-equivariant T1/T2](EXPERIMENT_LOG/phase-14-rename-equivariant-t1-t2.md) | **The current architecture.** Register-indexed state machine, equivariance exact by construction; T1 = T2 at seq_len=1; canonical vp fixed; trained GVN collapse (commutativity ~28× vs distinct) |
-| 15 | [T2 faithfulness](EXPERIMENT_LOG/phase-15-t2-faithfulness.md) | **IN PROGRESS.** A vp head trained at one fixed set of 8 anchor states stores answers at them, so anchors are drawn afresh per chunk with structure, labels come from fixed witness states, and vp is scored at held-out anchors. T1 is exact there (wiring 100%, vp 99.9999%, with read pulses computed from both operands and a three-layer vp head). Handed a perfect description of a two-instruction chunk, plain ReLU readouts of the vp head's shape are not exact and a twelve-layer residual readout with LayerNorm nearly is; with that head T2 at len=2 is 99.9993% exact after 10M training steps — 36 of 4.8M held-out output values wrong, counting every output register of 38,400 chunks at 64 anchor states — on one seed. Every write and every dead read counts in the targets, so no equivalence is imposed on the binding. Of the equivalences, only a commutative swap of fresh operands collapses, by construction; the first-read frame gives reordered independent instructions and dead code different targets from their equivalents, and computed folds do not collapse |
+| 15 | [T2 faithfulness](EXPERIMENT_LOG/phase-15-t2-faithfulness.md) | **IN PROGRESS.** A vp head trained at one fixed set of 8 anchor states stores answers at them, so anchors are drawn afresh per chunk with structure, labels come from fixed witness states, and vp is scored at held-out anchors. T1 is exact there (wiring 100%, vp 99.9999%, with read pulses computed from both operands and a three-layer vp head). Handed a perfect description of a two-instruction chunk, plain ReLU readouts of the vp head's shape are not exact and a twelve-layer residual readout with LayerNorm nearly is; with that head T2 at len=2 is 99.9993% exact after 10M training steps — 36 of 4.8M held-out output values wrong, counting every output register of 38,400 chunks at 64 anchor states — on one seed. Every write and every dead read counts in the targets, so no equivalence is imposed on the binding. Of the equivalences, only a commutative swap of fresh operands collapses, by construction; the first-read frame gives reordered independent instructions and dead code different targets from their equivalents, and computed folds do not collapse. The frame is replaced in phase 16 |
+| 16 | [The register frame](EXPERIMENT_LOG/phase-16-register-frame.md) | **IN PROGRESS.** Value prediction per written slot from the slot's description and its inputs gathered by register; leaves identified by structural colour; the essence pooled over written slots. T1 exact at held-out anchors (0 of 2.46M); rename, reordering, dead code and fresh commutative swaps collapse to exactly zero by construction; T2 at len=2 99.83% after 1M steps with the encoder told nothing about commutativity, composed slots carrying the residual, a shared-operand commutative swap not collapsed; the essence's spread between unrelated chunks fell 30× and nothing in the loss reads it |

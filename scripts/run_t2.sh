@@ -22,7 +22,7 @@ source .venv/bin/activate
 D=/home/tophy/Projects/riscv-thoughts/logs
 # The frozen lower tier. A T2 checkpoint is only interchangeable with others
 # trained on the SAME T1, so a cell that changes this must be named for it.
-T1=${T1:-runs/t1_writers_500k_resvp3/encoder.pt}
+T1=${T1:-runs/t1_register_500k/encoder.pt}
 # VP = vp-head hidden layers (residual blocks with LayerNorm). The head must
 # EVALUATE the chunk's function at the anchor points, so its capacity is a
 # confound in every vp number (METRICS.md). STEPS=10000000 is the recorded
@@ -48,6 +48,9 @@ CORPUS_SLUG=$(basename "$CONFIG" .json); CORPUS_SLUG=${CORPUS_SLUG#instr_}
 
 cell() {
   local OUT=t2_len${LEN}_d${DOUT}_s${STEPS}_dep${OC}_vp${VP}_pool${NPOOL}${TAG:+_$TAG}_${CORPUS_SLUG}
+  # A re-run with the same knobs after a code change would overwrite the
+  # recorded cell; name it with TAG instead.
+  [ -f "runs/$OUT/t2.pt" ] && { echo "runs/$OUT already holds a t2.pt; pass TAG=<name>"; return 1; }
   echo "######## $(date '+%m-%d %H:%M:%S')  -> $OUT"
   # What the run trained on, recorded before it starts: hparams.json is the
   # trainer's own arguments and says nothing about the data. The config's
@@ -77,12 +80,12 @@ cell() {
       --t2-corpus "$EVAL" --route binding --max-batches 20 \
       --gvn-chunk-len "$LEN" 2>&1 \
     | grep -vE "Warning|readline|history" | sed 's/^/   /'
-  # The criterion is exact 32-bit match with the axes crossed: per-bit flatters
-  # a broken subset (96% per-bit has been 74% exact), and either axis alone
-  # hides the cells that carry the error.
-  echo "   --- vp error budget: sources x immediate x depth ---"
-  python probes/vp_budget.py "runs/$OUT" "$T1" "$LEN" 100 \
-      configs/instr_alu_writers.json "$EVAL" 64 2>&1 \
+  # The criterion is exact 32-bit match of the per-slot evaluator at held-out
+  # anchors, with the binding and the collapse classes the structural
+  # signature defines; per-bit flatters a broken subset (96% per-bit has been
+  # 74% exact).
+  echo "   --- frame scorecard: vp per written slot, binding, collapse ---"
+  python probes/frame_scorecard.py "runs/$OUT" "$T1" "$EVAL" 100 2000 2>&1 \
     | grep -vE "Warning|readline|history" | sed 's/^/   /'
 }
 
