@@ -73,14 +73,15 @@ hard step cap. Training runs until stdin EOF (`scripts/_common.py:30-34`). Bound
 the batch count with `datagen --count N` (`datagen` has no per-worker `-n`).
 
 **Current T2 config** (writers-only happy path). The equivariant core has no
-settings to pass: read positions are canonical ranks, register slots are seeded
-from those ranks, and the pool reads each slot's write step, at every tier.
+settings to pass: register slots are seeded from their structural colour in
+the chunk's dataflow graph and the pool reads the written slots only, at every
+tier.
 
 ```bash
 python -m datagen --rule "cap=$LEN" --twins 2 --batch-size 128 --n-states 8 \
     --config configs/instr_alu_writers_chain010.json --gen-count 26 \
     --count "$STEPS" \
-  | python scripts/train_t2_encoder.py --t1-model runs/t1_writers_500k_resvp3/encoder.pt \
+  | python scripts/train_t2_encoder.py --t1-model runs/t1_register_500k/encoder.pt \
     --d-out 512 --d-event 16 --op-cell-depth 4 --vp-head-depth 12 \
     --n-pool-heads 16 --route binding \
     --n-steps "$STEPS" --out-dir "$OUT"
@@ -132,7 +133,7 @@ exists reads a partial model.
 **T1 config** (the writers-only corpus T2 is trained against). T1 and T2 run
 the same core at the same settings, so the command below differs from the T2
 cell only in its ingestion front-end and its hparams. The frozen T1 is
-`runs/t1_writers_500k_resvp3`. Its vp head has three hidden layers (the
+`runs/t1_register_500k`. Its vp head has three hidden layers (the
 trainer's default) of the residual-with-LayerNorm form every vp head takes, the
 smallest depth with which T1 reaches exact vp at held-out anchors, and that
 takes the 500k-step schedule (EXPERIMENT_LOG, "T2 faithfulness", finding 33).
@@ -158,7 +159,7 @@ without the write-step channel, or a `read_pulse` fed `[content, operand]`
 instead of the op-cell's hidden layer (with a separate `read_role`) fails at
 `load_state_dict`, and so does a checkpoint whose vp head is a plain ReLU
 stack, since `VPHead` (the residual form) is the only head the code builds.
-`runs/t1_writers_500k_resvp3` is the frozen T1.
+`runs/t1_register_500k` is the frozen T1; a checkpoint carrying `rank_emb`, or a pool sized for the write-step channel, predates the register frame and does not load.
 (A checkpoint trained when all pool heads shared one value projection is still
 remapped on load — `_tile_shared_pool_v` repeats those weights once per head,
 reproducing the old computation exactly.)

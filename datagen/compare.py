@@ -26,6 +26,7 @@ import numpy as np
 from emulator import (
     Instruction, R_TYPE, I_TYPE, B_TYPE, LOAD_TYPE, STORE_TYPE,
 )
+from .signature import output_inputs
 
 
 # ---------------------------------------------------------------------------
@@ -380,12 +381,11 @@ def heldout_anchor_states(n_states=HELDOUT_N_ANCHORS):
 
 
 def _canonical_state(anchor_states, inputs, canon_positions):
-    """Build an anchor-state copy where each row input register is
-    re-sourced from a canonical anchor position. inputs[i] takes its
-    value from anchor_states[:, canon_positions[i]]. Two rows whose
-    inputs are placed at the same canonical positions then read
-    identical values regardless of which actual register names they
-    use, so SSA evaluation is GVN-invariant under register relabeling.
+    """Place a structured draw on a chunk's input registers: inputs[i] takes
+    its value from anchor_states[:, canon_positions[i]]. The draw's copies and
+    near-immediate values sit at low positions, so this is what makes two of
+    the chunk's inputs equal, adjacent or opposite whatever registers they
+    occupy. The chunk executes on the returned register file as it is.
     """
     state = anchor_states.copy()
     for actual_reg, canon_reg in zip(inputs, canon_positions):
@@ -643,7 +643,12 @@ class Precomputed:
     inputs: list                 # all live regular inputs (syntactic)
     behavioral_inputs: list      # relevant reads in first-read order, dead included
     reg_outs: list               # written regular output regs
-    out_regs: np.ndarray         # (n_states, 32) anchor exec result
+    anchors: np.ndarray          # (n_states, 32) the register files executed from
+    out_regs: np.ndarray         # (n_states, 32) the register files after execution
+    # Per output slot (aligned with out_slot_regs), the external input
+    # registers that output depends on, in the structural-colour order the
+    # evaluator gathers their values in (datagen.signature.output_inputs).
+    out_inputs: np.ndarray       # (MAX_OUTPUT_SLOTS, MAX_INPUT_SLOTS) int8
     pc_explicit: bool            # does any live SSA op write PC
     # Per-row aux targets (T2 register-identity supervision).
     live_in_mask: np.ndarray     # (N_REGS,) bool — behavioral inputs as mask
@@ -653,8 +658,15 @@ class Precomputed:
 
 
 def precompute_chunk(chunk, anchor_states):
-    """Structural labels from the fixed witness states, and canonical execution
-    at `anchor_states` for the value-prediction target.
+    """Structural labels from the fixed witness states, and execution at
+    `anchor_states` for the value-prediction target.
+
+    `anchor_states` is a structured draw whose copies, near-immediate and
+    boundary values sit at positions 1, 2, …; it is placed onto the chunk's
+    own input registers (input i takes position i+1) and the chunk is executed
+    on that register file as drawn, register names intact. The evaluator reads
+    each output's value at its own register and gathers its inputs' values at
+    theirs, so a renamed twin executes on its own placement of the same draw.
 
     Raises NotImplementedError on memory ops (V1 scope).
     """
@@ -678,13 +690,13 @@ def precompute_chunk(chunk, anchor_states):
 
     behavioral_inputs = _input_order(chunk)
 
-    # Baseline executes on a canonical state: behavioral input i is sourced from
-    # anchor position i+1 — exactly the mapping the value-prediction head
-    # applies when it feeds input slot k the value at position k+1, and exactly
-    # the read-order frame the encoder's own state machine builds.
-    canon_state = _canonical_state(
-        anchor_states, behavioral_inputs, _CANON_POSITIONS)
-    out_regs, _ = _eval_ssa_numpy(ssa, len(chunk), canon_state, live)
+    # The structured draw lands on the chunk's actual inputs; execution is on
+    # that register file as it is, so the targets are raw register values.
+    state = _canonical_state(anchor_states, behavioral_inputs, _CANON_POSITIONS)
+    out_regs, _ = _eval_ssa_numpy(ssa, len(chunk), state, live)
+
+    out_inputs = np.full((MAX_OUTPUT_SLOTS, MAX_INPUT_SLOTS), AUX_CE_IGNORE,
+                         dtype=np.int8)
 
     # Aux targets: live-in/out masks + per-slot register IDs.
     live_in_mask = np.zeros(N_REGS, dtype=bool)
@@ -703,14 +715,19 @@ def precompute_chunk(chunk, anchor_states):
     write_ordered = sorted(actual_reg_outs,
                            key=lambda r: ssa.output_versions[r])
     out_slot_regs = np.full(MAX_OUTPUT_SLOTS, AUX_CE_IGNORE, dtype=np.int8)
+    deps = output_inputs(chunk)
     for i, r in enumerate(write_ordered[:MAX_OUTPUT_SLOTS]):
         out_slot_regs[i] = r
+        for j, src in enumerate(deps[r][:MAX_INPUT_SLOTS]):
+            out_inputs[i, j] = src
 
     return Precomputed(
         inputs=inputs,
         behavioral_inputs=behavioral_inputs,
         reg_outs=actual_reg_outs,
+        anchors=state,
         out_regs=out_regs,
+        out_inputs=out_inputs,
         pc_explicit=pc_explicit,
         live_in_mask=live_in_mask,
         live_out_mask=live_out_mask,

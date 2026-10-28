@@ -17,12 +17,15 @@ The tier-specific piece is only what produces those content vectors:
 
 The emitted object is one register-indexed state T (B, n_regs, d). A register
 rename permutes the slots exactly (no per-register parameters — the only
-register-indexed input is each input's canonical read position), so:
+register-indexed input is each leaf's structural colour, itself a function of
+the wiring alone), so:
 
-  - essence = a permutation-invariant attention pool over the register axis
-    (the operator axis; value_predict / pc_writes read it),
+  - essence = a permutation-invariant attention pool over the WRITTEN slots
+    (the chunk's multiset of value-numbers; pc_writes reads it),
   - binding = the per-slot remainder (live_in/out + in/out slot order; the
-    binding heads read it per-slot).
+    binding heads read it per-slot),
+  - a written slot's value channels are the description of that output's
+    function, which value prediction evaluates per slot.
 """
 
 import torch
@@ -32,6 +35,7 @@ import torch.nn.functional as F
 from emulator import R_TYPE, I_TYPE, B_TYPE, LOAD_TYPE, STORE_TYPE
 from tokenizer import REG_TOKEN_LO, REG_TOKEN_HI
 from datagen import N_REGS, MAX_INPUT_SLOTS, MAX_OUTPUT_SLOTS
+from datagen.signature import WL_ROUNDS
 
 
 # x0 is the hardwired-zero, non-renameable slot. Register renames permute
@@ -72,14 +76,37 @@ def instruction_wiring(instr):
     return 0, 0, 0
 
 
+# Width of a leaf's structural colour. The colouring is a fixed random-feature
+# message pass (below): wide enough that distinct colours collide only with
+# vanishing probability, narrow enough to ride in every slot's state.
+_COLOUR_DIM = 64
+
+
 class RegisterStateMachine(nn.Module):
     """Shared equivariant core of T1 (seq_len=1) and T2 (seq_len=K).
 
-    Per register slot the state is [value | event]:
+    Per register slot the state is [value | event | colour]:
       value (d_value) — set on write, PRESERVED on read; the dataflow the
-        op-cell threads (multi-hop value-numbering at T2).
+        op-cell threads (multi-hop value-numbering at T2). A written slot's
+        value is the description of that output's function.
       event (d_event) — accumulates read/write events with a read-order
         ramp, so live_in/in_slot are recoverable from the emitted object.
+      colour (_COLOUR_DIM) — the leaf's structural colour (zero on slots that
+        are not live leaves), so an evaluator can tell which input is which.
+
+    Before the steps run, a pre-pass over the wiring computes, from the wiring
+    alone: which instructions are LIVE (reach a final write), and each leaf's
+    STRUCTURAL COLOUR — a role-aware Weisfeiler–Lehman refinement over the live
+    dataflow graph, realised as `WL_ROUNDS` rounds of message passing with
+    FIXED random matrices. Every operation's two read roles are ordered: the
+    encoder is told nothing about which operations are commutative, so a
+    commutative swap is the op-cell's to learn. It is the colouring
+    `datagen.signature` computes with strings (with every role ordered), in
+    vector form: identical structure gives bit-identical colours, different
+    structure different ones (with probability one over the random features).
+    These rules are scaffolding — the learned form is the same pass with the
+    matrices trained (RISCV_DESIGN, "What is built in for good, and what is
+    built in for now").
 
     Each step, per instruction:
       r0, r1 = value[in0], value[in1]          (one-hot reads)
@@ -88,12 +115,11 @@ class RegisterStateMachine(nn.Module):
       event[in0],[in1] += read_pulse(op_cell hidden)[role]   (whole operand context)
       event[out]       += write_pulse
 
-    No per-register parameters: a slot is seeded only with the canonical read
-    position of the input it holds. Reads/writes are pure one-hot tensor ops,
-    so a register rename permutes the state exactly (equivariant by
-    construction) and any pool over the register axis is invariant.
-    Vectorized (no per-slot Python loop) so the step captures into the
-    compiled CUDA-graph train step.
+    No per-register parameters: a leaf slot is seeded, on first read, from its
+    colour. Reads/writes are pure one-hot tensor ops, so a register rename
+    permutes the state exactly (equivariant by construction) and any pool over
+    the register axis is invariant. Vectorized (no per-slot Python loop) so
+    the step captures into the compiled CUDA-graph train step.
     """
 
     def __init__(self, d_value, d_event, d_content, n_regs=32, op_cell_depth=1,
@@ -101,18 +127,14 @@ class RegisterStateMachine(nn.Module):
         super().__init__()
         self.d_value = d_value
         self.d_event = d_event
+        self.d_colour = _COLOUR_DIM
         self.n_regs = n_regs
         self.n_pool_heads = n_pool_heads
-        # An input register's leaf identity IS its canonical read position,
-        # written to its slot on first read. That is what distinguishes two
-        # inputs from each other without naming either — a per-register
-        # embedding would have to be constant to stay equivariant, which
-        # destroys distinctness. Position is assigned by read ORDER, so a
-        # rename permutes it with the slots and equivariance is exact; it is
-        # deterministic, so the essence is a deterministic function of the
-        # instruction; and it is the frame the value-prediction target is
-        # already expressed in.
-        self.rank_emb = nn.Embedding(n_regs, d_value)
+        # A leaf's identity in the value channels is a learned projection of
+        # its structural colour: deterministic, free of register identity and
+        # of instruction order, and distinct exactly where the register
+        # function distinguishes the leaves.
+        self.seed_proj = nn.Linear(_COLOUR_DIM, d_value)
         self.op_cell = nn.Sequential(
             nn.Linear(d_content + 2 * d_value, 4 * d_value), nn.ReLU(),
             nn.Linear(4 * d_value, d_value))
@@ -120,10 +142,8 @@ class RegisterStateMachine(nn.Module):
         # op-cell is reused RECURRENTLY once per instruction, so a naive deep
         # stack becomes a depth×K gradient path that won't train — the skip
         # connection (res = res + blk(res)) is the highway that keeps it
-        # trainable. depth=1 -> empty list -> op_cell is bit-identical to the
-        # shallow baseline and its state_dict is UNCHANGED, so depth-1
-        # checkpoints (incl. the frozen T1) still load. Static ModuleList loop
-        # -> unrolls at trace time, no graph break under torch.compile.
+        # trainable. Static ModuleList loop -> unrolls at trace time, no graph
+        # break under torch.compile.
         self.op_cell_blocks = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(d_value, 4 * d_value), nn.ReLU(),
@@ -135,140 +155,183 @@ class RegisterStateMachine(nn.Module):
         # as r0 == r1), which no function of one operand can see.
         self.read_pulse = nn.Linear(4 * d_value, 2 * d_event)
         self.write_pulse = nn.Parameter(torch.randn(d_event) * 0.1)
+        # Fixed random features of the colouring pass: not parameters. Seeded
+        # so every model computes one colouring; saved as buffers so a
+        # checkpoint carries its own.
+        g = torch.Generator().manual_seed(0x5EED)
+        dc = _COLOUR_DIM
+        rand = lambda *s: torch.randn(*s, generator=g) / (dc ** 0.5)
+        self.register_buffer('c_leaf', rand(dc))
+        self.register_buffer('c_op', rand(dc))
+        self.register_buffer('A', rand(dc, dc))
+        self.register_buffer('M_role', rand(2, dc, dc))      # what an op reads, by role
+        self.register_buffer('U_role', rand(2, dc, dc))      # who reads a node, by role
         # essence pool: Pooling-by-Multihead-Attention (Set Transformer). k=
         # n_pool_heads learned seed QUERIES, each doing a permutation-invariant
-        # attention pool over the register slots (softmax over slots, no
+        # attention pool over the WRITTEN register slots (softmax over slots, no
         # positional -> exactly rename-invariant). A single query (k=1) SUMS all
         # slots -> superimposes multiple output values irrecoverably; k>1 lets
         # different heads content-address different slots, keeping outputs
         # separable. Heads concatenate to an essence of the SAME width d_value
-        # (each head d_value/k), so no downstream interface changes. pool_q is
-        # stored FLAT (k*d_key,), so k=1 -> shape (d_value,) = the old
-        # single-query param exactly -> existing checkpoints load unchanged.
-        # pool_v is d_value wide and each head reads its OWN slice: one SHARED
-        # d_value/k projection would cap what the essence can carry about any
-        # single slot at d_value/k, however wide d_value is (it cost the 12-bit
-        # I-type immediate). Per-head slices also let head count and per-slot
-        # fidelity scale independently.
-        # The pool is a symmetric sum over slots, so it is structurally blind to
-        # which register was written FIRST — and the essence has to encode an
-        # ORDERED function ("output 1 is this, output 2 is that"). Each slot's
-        # write STEP is therefore appended to what the pool reads: one extra
-        # channel, register-indexed, so a rename permutes it with the slots and
-        # invariance stays exact. A commutative operand swap changes neither
-        # which slot was written nor when, so equivalence collapse is not put at
-        # risk — unlike read-order, which the pool must not see.
+        # (each head d_value/k). pool_v is d_value wide and each head reads its
+        # OWN slice: one SHARED d_value/k projection would cap what the essence
+        # can carry about any single slot at d_value/k, however wide d_value is.
+        # The pool reads written slots only: a read-only leaf's slot is
+        # interface (whether an input still sits in a register of its own), and
+        # the inputs reach the essence inside the results built from them.
+        # Neither write order nor read order reaches the pool: both are the
+        # linearization, not the function.
         assert d_value % n_pool_heads == 0, 'd_value must be divisible by n_pool_heads'
-        d_pool_in = d_value + 1
         self.pool_q = nn.Parameter(torch.randn(n_pool_heads * d_value) * 0.02)
-        self.pool_k = nn.Linear(d_pool_in, d_value)
-        self.pool_v = nn.Linear(d_pool_in, d_value)
+        self.pool_k = nn.Linear(d_value, d_value)
+        self.pool_v = nn.Linear(d_value, d_value)
+
+    def _prepass(self, oh0e, oh1e, oh_oute, active):
+        """Liveness and leaf colours from the wiring alone.
+
+        oh0e, oh1e: (B,K,R) one-hot reads with x0 masked; oh_oute: (B,K,R)
+        one-hot writes with x0 and padding masked; active (B,K).
+        Returns (leaf_colours (B,R,dc), live (B,K), written (B,R))."""
+        B, K, R = oh_oute.shape
+        dc, dev = self.d_colour, oh_oute.device
+        # Liveness, backwards from the final writers: a write is live when its
+        # register's value is still needed — as an output, or by a live reader
+        # before the next write. A dead instruction's reads add nothing.
+        written = oh_oute.sum(1).clamp(max=1.0)
+        needed = written
+        live = []
+        for k in reversed(range(K)):
+            hit = (oh_oute[:, k] * needed).sum(-1)                   # (B,)
+            live.append(hit)
+            reads = ((oh0e[:, k] + oh1e[:, k]).clamp(max=1.0)
+                     * (hit * active[:, k]).unsqueeze(-1))
+            needed = (needed - oh_oute[:, k] * hit.unsqueeze(-1) + reads).clamp(0.0, 1.0)
+        live = torch.stack(live[::-1], 1)                             # (B,K)
+        # Each read's child: the instruction that last wrote the register
+        # (a producer), else the register itself (a leaf).
+        eye = torch.eye(K, device=dev, dtype=oh_oute.dtype)
+        last_writer = torch.zeros(B, R, K, device=dev, dtype=oh_oute.dtype)
+        child_leaf, child_op = ([], []), ([], [])
+        for k in range(K):
+            for r, oh in enumerate((oh0e[:, k], oh1e[:, k])):
+                prod = (oh.unsqueeze(-1) * last_writer).sum(1)        # (B,K)
+                child_leaf[r].append(oh * (1.0 - prod.sum(-1, keepdim=True)))
+                child_op[r].append(prod)
+            w = oh_oute[:, k].unsqueeze(-1)
+            last_writer = last_writer * (1.0 - w) + w * eye[k].view(1, 1, K)
+        cl = [torch.stack(c, 1) for c in child_leaf]                  # (B,K,R)
+        co = [torch.stack(c, 1) for c in child_op]                    # (B,K,K)
+        lv = live.unsqueeze(-1)                                       # (B,K,1)
+        leaf_mask = ((cl[0] + cl[1]) * lv).sum(1).clamp(max=1.0)      # (B,R)
+        CL = leaf_mask.unsqueeze(-1) * self.c_leaf
+        CO = lv * self.c_op
+        for _ in range(WL_ROUNDS):
+            down = torch.zeros(B, K, dc, device=dev, dtype=CL.dtype)
+            upL = torch.zeros(B, R, dc, device=dev, dtype=CL.dtype)
+            upO = torch.zeros(B, K, dc, device=dev, dtype=CL.dtype)
+            for r in range(2):
+                child = (torch.einsum('bkr,brd->bkd', cl[r], CL)
+                         + torch.einsum('bkj,bjd->bkd', co[r], CO))
+                down = down + lv * (child @ self.M_role[r].t())
+                um = lv * (CO @ self.U_role[r].t())
+                upL = upL + torch.einsum('bkr,bkd->brd', cl[r], um)
+                upO = upO + torch.einsum('bkj,bkd->bjd', co[r], um)
+            CL = torch.tanh(CL @ self.A.t() + upL) * leaf_mask.unsqueeze(-1)
+            CO = torch.tanh(CO @ self.A.t() + down + upO) * lv
+        return CL, live, written
 
     def forward(self, content, in0, in1, out, active):
         """content (B,K,d_content); in0/in1/out (B,K) long; active (B,K)
         float. Returns (T, essence):
-          T (B, n_regs, d_value+d_event), essence (B, d_value)."""
+          T (B, n_regs, d_value+d_event+d_colour), essence (B, d_value)."""
         device = content.device
-        K = content.shape[1]
+        B, K = active.shape
         not_x0 = torch.ones(self.n_regs, device=device)
         not_x0[X0_SLOT] = 0.0
         not_x0_row = not_x0.view(1, -1)
+        oh0 = F.one_hot(in0, self.n_regs).to(content.dtype)          # (B,K,R)
+        oh1 = F.one_hot(in1, self.n_regs).to(content.dtype)
+        oh_out = F.one_hot(out, self.n_regs).to(content.dtype) * not_x0_row
+        oh0e = oh0 * not_x0_row
+        oh1e = oh1 * not_x0_row
+        a3 = active.unsqueeze(-1)
+        colours, live, written = self._prepass(
+            oh0e * a3, oh1e * a3, oh_out * a3, active)
+        seed = self.seed_proj(colours)                                # (B,R,d_value)
         # Slots start at exactly zero; a slot acquires its leaf identity only
-        # when first READ (see rank_emb below), so a register the chunk never
-        # touches contributes nothing to the pool.
-        value = torch.zeros(content.shape[0], self.n_regs, self.d_value,
-                            device=device)
-        event = torch.zeros(
-            content.shape[0], self.n_regs, self.d_event, device=device)
-        # Per-slot ORDER timestamps (the cross-instruction analog of read_role):
-        #   read_time  = step of FIRST read  -> decodes in_slot (first-read order)
-        #   write_time = step of LAST write  -> decodes out_slot (SSA write order)
-        # Register-INDEPENDENT step values placed by the (permuted) wiring, so a
-        # rename permutes them identically — equivariance preserved.
-        read_time = torch.zeros(content.shape[0], self.n_regs, device=device)
-        n_read = torch.zeros(content.shape[0], 1, device=device)
-        write_time = torch.zeros(content.shape[0], self.n_regs, device=device)
-        # Slots any instruction read or wrote. Every other slot is exactly zero
-        # throughout, which lets the pool skip projecting it.
-        touched = torch.zeros(content.shape[0], self.n_regs, device=device)
+        # when first READ, so a register the chunk never touches contributes
+        # nothing to any consumer.
+        value = torch.zeros(B, self.n_regs, self.d_value, device=device)
+        event = torch.zeros(B, self.n_regs, self.d_event, device=device)
+        # Per-slot ORDER timestamps, for the binding heads only (the event
+        # channels never reach the pool):
+        #   read_time  = canonical read rank  -> decodes in_slot (first-read order)
+        #   write_time = step of LAST write   -> decodes out_slot (write order)
+        read_time = torch.zeros(B, self.n_regs, device=device)
+        n_read = torch.zeros(B, 1, device=device)
+        write_time = torch.zeros(B, self.n_regs, device=device)
 
         for k in range(K):
             a = active[:, k:k + 1]                          # (B,1)
             step_sig = float(k + 1) / float(K)              # normalized step ramp
-            oh0 = F.one_hot(in0[:, k], self.n_regs).to(value.dtype)
-            oh1 = F.one_hot(in1[:, k], self.n_regs).to(value.dtype)
             c = content[:, k]
-            oh0e = oh0 * not_x0_row
-            oh1e = oh1 * not_x0_row
-            # Read-order is stamped BEFORE the operands are read, so this
-            # step's own inputs can be seeded from their positions.
-            read_time, n_read, firsts, ranks = self._stamp_reads(
-                read_time, n_read, write_time, oh0e, oh1e, a)
-            # An input's leaf identity IS its canonical position, written on
-            # first read. Indexed by read ORDER, not by register, so a rename
-            # permutes it with the slots and equivariance stays exact.
-            for fr, rk in zip(firsts, ranks):
-                e = self.rank_emb(
-                    rk.clamp(max=self.n_regs - 1).long()).squeeze(1)
+            read_time, n_read, firsts, _ = self._stamp_reads(
+                read_time, n_read, write_time, oh0e[:, k], oh1e[:, k], a)
+            # A leaf's identity IS its colour, written on first read.
+            for fr in firsts:
                 fr = fr.unsqueeze(-1)
-                value = value * (1.0 - fr) + fr * e.unsqueeze(1)
-            r0 = torch.bmm(oh0.unsqueeze(1), value).squeeze(1)   # (B,d_value)
-            r1 = torch.bmm(oh1.unsqueeze(1), value).squeeze(1)
+                value = value * (1.0 - fr) + fr * seed
+            r0 = torch.bmm(oh0[:, k].unsqueeze(1), value).squeeze(1)   # (B,d_value)
+            r1 = torch.bmm(oh1[:, k].unsqueeze(1), value).squeeze(1)
             hidden = F.relu(self.op_cell[0](torch.cat([c, r0, r1], dim=-1)))
             res = self.op_cell[2](hidden)                        # (B,d_value)
             for blk in self.op_cell_blocks:                      # residual depth
                 res = res + blk(res)
             # write value at dest (x0 write = nop), active rows only.
-            oh_out = F.one_hot(out[:, k], self.n_regs).to(value.dtype) \
-                * not_x0_row
-            w = (oh_out * a).unsqueeze(-1)                       # (B,n_regs,1)
+            w = (oh_out[:, k] * a).unsqueeze(-1)                 # (B,n_regs,1)
             value = value * (1.0 - w) + w * res.unsqueeze(1)
             # event channels: per-position read pulses (x0 reads leave no trace
             # on the x0 slot) + write pulse.
             p0, p1 = self.read_pulse(hidden).view(-1, 2, self.d_event).unbind(1)
-            event = event + (oh0e * a).unsqueeze(-1) * p0.unsqueeze(1)
-            event = event + (oh1e * a).unsqueeze(-1) * p1.unsqueeze(1)
-            event = event + (oh_out * a).unsqueeze(-1) \
+            event = event + (oh0e[:, k] * a).unsqueeze(-1) * p0.unsqueeze(1)
+            event = event + (oh1e[:, k] * a).unsqueeze(-1) * p1.unsqueeze(1)
+            event = event + (oh_out[:, k] * a).unsqueeze(-1) \
                 * self.write_pulse.view(1, 1, -1)
-            wr = oh_out * a
+            wr = oh_out[:, k] * a
             write_time = write_time * (1.0 - wr) + wr * step_sig
-            touched = torch.clamp(touched + (oh0e + oh1e + oh_out) * a, max=1.0)
         # fold the order timestamps into event channels 0 (read) and 1 (write),
         # normalized to ~(0,1].
         order = torch.stack([read_time / (2.0 * K), write_time], dim=-1)
         event = event + F.pad(order, (0, self.d_event - 2))
-        T = torch.cat([value, event], dim=-1)
+        T = torch.cat([value, event, colours], dim=-1)
 
-        # Essence pool. k seed queries; heads concatenate to width d_value. The
-        # pool reads each slot's value channels plus its write step — both
-        # register-indexed, so a rename permutes them with the slots and the
-        # pool stays exactly invariant. Read-order must NOT be added here: the
-        # pool never sees content, so it would apply read-order unconditionally
-        # and stop being blind to a commutative operand swap.
-        pool_src = torch.cat([value, write_time.unsqueeze(-1)], dim=-1)
+        # Essence pool over the written slots: k seed queries; heads concatenate
+        # to width d_value. Each head independently softmaxes over the slots;
+        # the per-head sum over slots is symmetric, hence exactly rename-
+        # invariant.
         q = self.pool_q.view(self.n_pool_heads, -1)          # (k, d_value)
-        kk, vv = self._project_touched(pool_src, touched, 3 * K)
+        kk, vv = self._project_touched(value, written, K)
         logits = kk @ q.t()                                  # (B, n_regs, k)
-        # Each head independently softmaxes over the slots; the per-head sum
-        # over slots is symmetric, hence exactly rename-invariant.
         att = torch.softmax(logits, dim=1)                   # (B, n_regs, k)
-        vv = vv.view(                                        # per-head slices
-            value.shape[0], self.n_regs, self.n_pool_heads, -1)
+        vv = vv.view(B, self.n_regs, self.n_pool_heads, -1)  # per-head slices
         heads = torch.einsum('bsk,bskd->bkd', att, vv)       # (B, k, d_value//k)
-        essence = heads.reshape(value.shape[0], -1)          # (B, d_value)
+        essence = heads.reshape(B, -1)                       # (B, d_value)
         return T, essence
 
-    def _project_touched(self, pool_src, touched, max_touched):
-        """(pool_k(pool_src), pool_v(pool_src)), projecting only the slots the
-        chunk touched. An untouched slot's pool_src row is exactly zero, so its
-        projection is exactly the bias; at most `max_touched` slots (two reads
-        and a write per instruction) carry anything else. Which untouched slots
-        fill a short row's spare picks does not matter — they project to bias."""
+    def _project_touched(self, pool_src, written, max_touched):
+        """(pool_k, pool_v) of the state with every unwritten slot zeroed,
+        projecting only the slots in `written`: an unwritten slot's projection
+        is exactly the bias, and at most `max_touched` slots (one write per
+        instruction) carry anything else. A read-only leaf's row is NOT zero
+        (it holds the leaf's seed), so the rows are masked before selection:
+        a short row's spare picks fall on the lowest-index unwritten slots,
+        x1 among them, and would otherwise project that leaf into the pool."""
         R = pool_src.shape[1]
         n = min(max_touched, R)
+        pool_src = pool_src * written.unsqueeze(-1)
         # One-hot selection rather than gather/scatter, like the core's own
         # reads and writes: same values, and a deterministic backward.
-        sel = F.one_hot(touched.topk(n, dim=1).indices, R).to(pool_src.dtype)
+        sel = F.one_hot(written.topk(n, dim=1).indices, R).to(pool_src.dtype)
         src = sel @ pool_src                                 # (B, n, d_in)
         uncovered = (1.0 - sel.sum(1)).unsqueeze(-1)         # (B, R, 1)
         return [sel.transpose(1, 2) @ proj(src) + uncovered * proj.bias
@@ -277,15 +340,12 @@ class RegisterStateMachine(nn.Module):
     def _stamp_reads(self, read_time, n_read, write_time, oh0e, oh1e, a):
         """Stamp this step's operands with their canonical read POSITION: the
         running count of distinct registers read BEFORE they are written. First
-        read sticks; operand 0 is stamped before operand 1, so two inputs of one
-        instruction get different positions (the per-position read pulses mark which
-        operand slot each filled).
+        read sticks; operand 0 is stamped before operand 1. The positions feed
+        the event channels (the binding heads' first-read order), never the
+        value channels or the pool.
 
-        A register read twice receives one position twice, which is correct —
-        it is one input. The target's canonical frame counts a dead
-        instruction's reads too, so given T1's wiring the count is the frame's
-        exactly. All values are per-chunk scalars placed through the wiring
-        one-hots, so equivariance is unaffected.
+        All values are per-chunk scalars placed through the wiring one-hots, so
+        equivariance is unaffected.
         """
         firsts, ranks = [], []
         for oh in (oh0e, oh1e):
@@ -375,7 +435,7 @@ class TokenEmbedder(nn.Module):
 
 # Head hidden capacities. Never tuned, so they live here as named constants
 # rather than constructor params. vp_head's DEPTH is not an implementation
-# detail: it is the only consumer a T2 essence has, so its capacity is an
+# detail: it is the only consumer a T2 description has, so its capacity is an
 # implicit claim about what the next tier will be able to read, and `vp = 0` at
 # a deeper head is a strictly weaker statement than at a shallow one. Quote the
 # depth with the number. T1's is the smallest that reaches correct results
@@ -426,9 +486,9 @@ class Compressor(nn.Module):
     token embeddings for T1 (via TokenEmbedder), a frozen lower tier's essence
     for T2+ (the tier contract) — threads them through the chunk's register
     state by each instruction's wiring, and emits one register-indexed state
-    T (B, n_regs, d_out+d_event). A register rename permutes the slots exactly
-    (no per-register parameters); essence = the permutation-invariant pool
-    (operator axis), the per-slot remainder = binding.
+    T (B, n_regs, d_out+d_event+d_colour). A register rename permutes the slots
+    exactly (no per-register parameters); essence = the permutation-invariant
+    pool over the written slots, the per-slot remainder = binding.
 
     n_regs and the slot widths are fixed constants (RV32I has 32 registers; the
     slot widths are the supervision schema's). The state-geometry dims
@@ -441,6 +501,7 @@ class Compressor(nn.Module):
         self.d_content = d_content
         self.d_out = d_out
         self.d_event = d_event
+        self.d_colour = _COLOUR_DIM
         self.n_regs = N_REGS
         self.max_input_slots = MAX_INPUT_SLOTS
         self.max_output_slots = MAX_OUTPUT_SLOTS
@@ -449,11 +510,11 @@ class Compressor(nn.Module):
             d_value=d_out, d_event=d_event, d_content=d_content, n_regs=N_REGS,
             op_cell_depth=op_cell_depth, n_pool_heads=n_pool_heads)
 
-        # Binding heads read the per-slot state T (d_out+d_event), one score per
-        # register slot (equivariant); pc_writes + value_predict read the
-        # rename-invariant essence. in_score is an MLP (relevance × order
-        # product a Linear can't do); the rest are Linear.
-        d_slot = d_out + d_event
+        # Binding heads read the per-slot state T, one score per register slot
+        # (equivariant); pc_writes reads the rename-invariant essence.
+        # in_score is an MLP (relevance × order product a Linear can't do); the
+        # rest are Linear.
+        d_slot = d_out + d_event + _COLOUR_DIM
         self.live_in_head = nn.Linear(d_slot, 1)
         self.live_out_head = nn.Linear(d_slot, 1)
         self.in_score_head = nn.Sequential(
@@ -461,15 +522,15 @@ class Compressor(nn.Module):
             nn.Linear(_IN_SCORE_HIDDEN, 1))
         self.out_score_head = nn.Linear(d_slot, 1)
         self.pc_writes_head = nn.Linear(d_out, 1)
-        # value-prediction (canonical): predict per-anchor per-out-slot output
-        # values from (essence, canonical input-slot values). Per slot: 32
-        # two's-complement bit-logits + 1 smooth-magnitude scalar (inputs fed
-        # likewise). Per-bit gives uniform resolution — the low bit (the +1
-        # immediate distinguisher) is equally weighted and carry-free — so the
-        # essence is pressured to retain immediates, which the older single
-        # loglog-scalar target crushed away.
-        vp_in = d_out + MAX_INPUT_SLOTS * (_VP_VALUE_BITS + 1)
-        vp_out = MAX_OUTPUT_SLOTS * (_VP_VALUE_BITS + 1)
+        # Value prediction, per WRITTEN slot: from (the slot's description, and
+        # for each of the output's inputs its value as 32 two's-complement bits
+        # + 1 smooth-magnitude scalar and its colour) predict that register's
+        # value (32 bit-logits + 1 smooth scalar). Per-bit gives uniform
+        # resolution — the low bit (the +1 immediate distinguisher) is equally
+        # weighted and carry-free — so the description is pressured to retain
+        # immediates.
+        vp_in = d_out + MAX_INPUT_SLOTS * (_VP_VALUE_BITS + 1 + _COLOUR_DIM)
+        vp_out = _VP_VALUE_BITS + 1
         self.vp_head = VPHead(vp_in, vp_out, vp_head_depth)
         # immediate head (T1 only): a LINEAR readout of a rotary/Fourier encoding
         # of the instruction's immediate. Linear so the rotary structure is
@@ -519,6 +580,7 @@ class T1Compressor(nn.Module):
         self.n_regs = self.compressor.n_regs
         self.d_out = self.compressor.d_out
         self.d_event = self.compressor.d_event
+        self.d_colour = self.compressor.d_colour
         self.max_input_slots = self.compressor.max_input_slots
         self.max_output_slots = self.compressor.max_output_slots
 
@@ -549,4 +611,3 @@ def T2Compressor(*, d_t1, d_out, d_event, op_cell_depth=1,
     return Compressor(d_content=d_t1, d_out=d_out, d_event=d_event,
                       op_cell_depth=op_cell_depth, vp_head_depth=vp_head_depth,
                       n_pool_heads=n_pool_heads)
-

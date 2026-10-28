@@ -102,9 +102,13 @@ def test_predicted_wiring_is_equivariant():
     assert [relab(x) for x in wo.tolist()] == wop.tolist()
 
 
-def test_value_preserved_on_read():
+def test_value_preserved_on_read(monkeypatch):
     """Core invariant for T2 dataflow: reading a slot never changes its
-    value channels."""
+    value channels. A leaf's colour depends on the whole chunk's graph, so the
+    one-step prefix is compared with the two-step run at a fixed colouring
+    (zero refinement rounds); the write at step 0 must survive step 1's read."""
+    import compressor.model as M
+    monkeypatch.setattr(M, 'WL_ROUNDS', 0)
     torch.manual_seed(0)
     core = RegisterStateMachine(d_value=8, d_event=4, d_content=6, n_regs=32)
     B = 3
@@ -121,10 +125,10 @@ def test_value_preserved_on_read():
 
 
 def test_pool_projects_touched_slots_like_all_slots():
-    """The pool projects only the slots a chunk read or wrote and fills the
-    rest with the projection's bias. That must be the dense projection's
-    function — essence and every parameter gradient — including chunks with
-    padding steps, repeated registers and x0 operands."""
+    """The pool projects only the slots a chunk wrote and fills the rest with
+    the projection's bias. That must equal the dense projection of the state
+    with every unwritten slot zeroed — essence and every parameter gradient —
+    including chunks with padding steps, repeated registers and x0 operands."""
     torch.manual_seed(0)
     core = RegisterStateMachine(d_value=16, d_event=4, d_content=6, n_regs=32,
                                 op_cell_depth=2, n_pool_heads=4)
@@ -138,8 +142,9 @@ def test_pool_projects_touched_slots_like_all_slots():
     active = torch.ones(B, K)
     active[2, 2] = 0                       # a padding step
 
-    def dense(pool_src, touched, max_touched):
-        return core.pool_k(pool_src), core.pool_v(pool_src)
+    def dense(pool_src, written, max_touched):
+        src = pool_src * written.unsqueeze(-1)
+        return core.pool_k(src), core.pool_v(src)
 
     def run(project):
         core.zero_grad()
@@ -169,7 +174,7 @@ def test_head_on_touched_slots_matches_the_dense_head():
     from compressor.model import apply_head_touched
     torch.manual_seed(0)
     core = RegisterStateMachine(d_value=16, d_event=4, d_content=6, n_regs=32)
-    head = torch.nn.Sequential(torch.nn.Linear(20, 8), torch.nn.ReLU(),
+    head = torch.nn.Sequential(torch.nn.Linear(16 + 4 + core.d_colour, 8), torch.nn.ReLU(),
                                torch.nn.Linear(8, 1))
     B, K = 5, 3
     content = torch.randn(B, K, 6)

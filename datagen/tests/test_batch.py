@@ -132,9 +132,9 @@ def test_round_trip():
 
 
 def test_each_row_ships_the_anchors_its_targets_were_executed_at():
-    """Anchors are drawn per source chunk, shared by its twins, and travel with
-    every row: the vp head is fed its inputs from `batch.anchors`, so out_regs
-    must have been executed there."""
+    """One structured draw per source chunk, placed on each row's own input
+    registers, travels with every row: the evaluator gathers an output's input
+    values from `batch.anchors`, so out_regs must have been executed there."""
     from datagen.generate import build_opcode_table
     rng = np.random.default_rng(3)
     alu = build_opcode_table({'R_ALU': 0.5, 'I_ALU': 0.5})   # no mem-op rows
@@ -144,14 +144,24 @@ def test_each_row_ships_the_anchors_its_targets_were_executed_at():
         draw_anchors=lambda k: draw_anchor_states(rng, k * 4).reshape(k, 4, -1), rng=rng,
         max_chunk_len=1)
     b = next(gen)
+    from datagen.compare import _input_order
+    from emulator import run as emu_run
     assert b.anchors.shape == (16, 4, 32) and (b.anchors[:, :, 0] == 0).all()
-    # rows 2k and 2k+1 are a source and its twin: shared anchors; sources differ
-    assert all(np.array_equal(b.anchors[2 * k], b.anchors[2 * k + 1]) for k in range(8))
+    # rows 2k and 2k+1 are a source and its twin: one structured draw, placed
+    # on each row's own input registers, so the twin's inputs hold the
+    # source's input values; sources differ.
+    for k in range(8):
+        src, _ = decode_instruction(b.tokens[2 * k, :b.token_lens[2 * k]].tolist(), 0)
+        twn, _ = decode_instruction(b.tokens[2 * k + 1, :b.token_lens[2 * k + 1]].tolist(), 0)
+        si, ti = _input_order([src]), _input_order([twn])
+        assert len(si) == len(ti)
+        assert np.array_equal(b.anchors[2 * k][:, si], b.anchors[2 * k + 1][:, ti])
     assert not np.array_equal(b.anchors[0], b.anchors[2])
     for i in np.nonzero(b.out_regs_valid)[0]:
         ins, _ = decode_instruction(b.tokens[i, :b.token_lens[i]].tolist(), 0)
-        pre = precompute_chunk([ins], b.anchors[i])
-        assert np.array_equal(pre.out_regs, b.out_regs[i])
+        for a in range(b.anchors.shape[1]):
+            regs = emu_run([ins], b.anchors[i, a].astype(np.int32).copy())[0].regs
+            assert np.array_equal(regs, b.out_regs[i, a])
 
 
 def test_eof_clean():
@@ -316,6 +326,7 @@ def test_pack_rejects_aux_first_dim_mismatch():
         pc_writes=np.zeros((2,), dtype=bool),
         in_slot_regs=np.full((2, 32), AUX_CE_IGNORE, dtype=np.int8),
         out_slot_regs=np.full((2, 16), AUX_CE_IGNORE, dtype=np.int8),
+        out_inputs=np.full((2, 16, 32), AUX_CE_IGNORE, dtype=np.int8),
     )
     with pytest.raises(ValueError, match='aux_payload first dim'):
         pack_batch(chunks, target_B=1,
