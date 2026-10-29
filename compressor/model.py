@@ -23,9 +23,11 @@ the wiring alone), so:
   - essence = a permutation-invariant attention pool over the WRITTEN slots
     (the chunk's multiset of value-numbers; pc_writes reads it),
   - binding = the per-slot remainder (live_in/out + in/out slot order; the
-    binding heads read it per-slot),
+    binding heads read it per-slot), including each written slot's pointer
+    into the essence,
   - a written slot's value channels are the description of that output's
-    function, which value prediction evaluates per slot.
+    function; the essence pools them, and value prediction evaluates each
+    output from the essence through that output's pointer.
 """
 
 import torch
@@ -81,11 +83,22 @@ def instruction_wiring(instr):
 # vanishing probability, narrow enough to ride in every slot's state.
 _COLOUR_DIM = 64
 
+# Width of an output's pointer into the essence: a one-hot of the output's
+# position in the content-hash order of the chunk's distinct output data paths.
+# A chunk of K instructions has at most K outputs, so only the first K
+# positions are ever used.
+_PTR_DIM = MAX_OUTPUT_SLOTS
+
+# Two output paths whose content-aware colours lie closer than this are one
+# path. Over the frozen T1, identical paths differ by at most 3e-6 (float
+# noise in its essence) and the closest distinct paths by 9e-2.
+_PATH_TIE_EPS = 1e-4
+
 
 class RegisterStateMachine(nn.Module):
     """Shared equivariant core of T1 (seq_len=1) and T2 (seq_len=K).
 
-    Per register slot the state is [value | event | colour]:
+    Per register slot the state is [value | event | colour | pointer]:
       value (d_value) — set on write, PRESERVED on read; the dataflow the
         op-cell threads (multi-hop value-numbering at T2). A written slot's
         value is the description of that output's function.
@@ -93,6 +106,9 @@ class RegisterStateMachine(nn.Module):
         ramp, so live_in/in_slot are recoverable from the emitted object.
       colour (_COLOUR_DIM) — the leaf's structural colour (zero on slots that
         are not live leaves), so an evaluator can tell which input is which.
+      pointer (_PTR_DIM) — on a written slot, which of the chunk's distinct
+        output data paths it holds: where in the essence its function is
+        filed (zero elsewhere).
 
     Before the steps run, a pre-pass over the wiring computes, from the wiring
     alone: which instructions are LIVE (reach a final write), and each leaf's
@@ -128,6 +144,7 @@ class RegisterStateMachine(nn.Module):
         self.d_value = d_value
         self.d_event = d_event
         self.d_colour = _COLOUR_DIM
+        self.d_ptr = _PTR_DIM
         self.n_regs = n_regs
         self.n_pool_heads = n_pool_heads
         # A leaf's identity in the value channels is a learned projection of
@@ -166,6 +183,12 @@ class RegisterStateMachine(nn.Module):
         self.register_buffer('A', rand(dc, dc))
         self.register_buffer('M_role', rand(2, dc, dc))      # what an op reads, by role
         self.register_buffer('U_role', rand(2, dc, dc))      # who reads a node, by role
+        # The content-aware colouring that names each output's data path: the
+        # same pass with every operation seeded from its content as well, and
+        # the fixed hash direction that sets the content-hash order of one
+        # chunk's distinct paths.
+        self.register_buffer('P_content', rand(d_content, dc))
+        self.register_buffer('u_order', rand(dc))
         # essence pool: Pooling-by-Multihead-Attention (Set Transformer). k=
         # n_pool_heads learned seed QUERIES, each doing a permutation-invariant
         # attention pool over the WRITTEN register slots (softmax over slots, no
@@ -185,13 +208,21 @@ class RegisterStateMachine(nn.Module):
         self.pool_q = nn.Parameter(torch.randn(n_pool_heads * d_value) * 0.02)
         self.pool_k = nn.Linear(d_value, d_value)
         self.pool_v = nn.Linear(d_value, d_value)
+        # Each written slot's pointer enters its pool key, so the pool can file
+        # an output's description where the pointer will look for it.
+        self.pool_ptr = nn.Linear(_PTR_DIM, d_value, bias=False)
 
-    def _prepass(self, oh0e, oh1e, oh_oute, active):
-        """Liveness and leaf colours from the wiring alone.
+    def _prepass(self, oh0e, oh1e, oh_oute, active, content):
+        """Liveness and leaf colours from the wiring alone, and each written
+        register's content-aware path colour.
 
         oh0e, oh1e: (B,K,R) one-hot reads with x0 masked; oh_oute: (B,K,R)
-        one-hot writes with x0 and padding masked; active (B,K).
-        Returns (leaf_colours (B,R,dc), live (B,K), written (B,R))."""
+        one-hot writes with x0 and padding masked; active (B,K); content
+        (B,K,d_content).
+        Returns (leaf_colours (B,R,dc), live (B,K), written (B,R),
+        path_colours (B,R,dc)). Leaf colours see only the wiring, so they say
+        nothing about any operation; a path colour also sees every operation's
+        content, so it tells apart outputs whose wiring is symmetric."""
         B, K, R = oh_oute.shape
         dc, dev = self.d_colour, oh_oute.device
         # Liveness, backwards from the final writers: a write is live when its
@@ -224,7 +255,18 @@ class RegisterStateMachine(nn.Module):
         lv = live.unsqueeze(-1)                                       # (B,K,1)
         leaf_mask = ((cl[0] + cl[1]) * lv).sum(1).clamp(max=1.0)      # (B,R)
         CL = leaf_mask.unsqueeze(-1) * self.c_leaf
-        CO = lv * self.c_op
+        leaves, _ = self._refine(CL, lv * self.c_op, cl, co, lv, leaf_mask)
+        op_seed = self.c_op + F.normalize(content, dim=-1) @ self.P_content
+        _, ops = self._refine(CL, lv * op_seed, cl, co, lv, leaf_mask)
+        # A written register's path is its final writer's operation.
+        paths = torch.einsum('brk,bkd->brd', last_writer, ops)
+        return leaves, live, written, paths * written.unsqueeze(-1)
+
+    def _refine(self, CL, CO, cl, co, lv, leaf_mask):
+        """WL_ROUNDS of role-aware refinement over the live dataflow graph,
+        from leaf colours CL (B,R,dc) and operation colours CO (B,K,dc)."""
+        B, K, dc = CO.shape[0], CO.shape[1], CO.shape[2]
+        R, dev = CL.shape[1], CO.device
         for _ in range(WL_ROUNDS):
             down = torch.zeros(B, K, dc, device=dev, dtype=CL.dtype)
             upL = torch.zeros(B, R, dc, device=dev, dtype=CL.dtype)
@@ -238,12 +280,32 @@ class RegisterStateMachine(nn.Module):
                 upO = upO + torch.einsum('bkj,bkd->bjd', co[r], um)
             CL = torch.tanh(CL @ self.A.t() + upL) * leaf_mask.unsqueeze(-1)
             CO = torch.tanh(CO @ self.A.t() + down + upO) * lv
-        return CL, live, written
+        return CL, CO
+
+    def _pointer(self, paths, written):
+        """Each written register's pointer (B,R,_PTR_DIM): a one-hot of its
+        path's position in the CONTENT-HASH ORDER of the chunk's distinct
+        paths — sorted by a fixed hash of what each path computes, never by
+        where its instructions are written. Identical paths share a position;
+        no register number or instruction position enters it, so a rename
+        permutes it with the slots and a reordering or a dead instruction
+        leaves it unchanged. The hash reads syntax, so two equivalent paths
+        spelled differently can sort differently."""
+        s = paths @ self.u_order                                      # (B,R) the hash
+        dist = (paths.unsqueeze(2) - paths.unsqueeze(1)).norm(dim=-1)  # (B,R,R)
+        pair = written.unsqueeze(2) * written.unsqueeze(1)
+        same = (dist <= _PATH_TIE_EPS).to(paths.dtype) * pair
+        n_same = same.sum(-1).clamp(min=1.0)                          # (B,R)
+        below = ((s.unsqueeze(1) < s.unsqueeze(2)).to(paths.dtype)
+                 * (1.0 - same) * pair)                                # [r,q]: q below r
+        order = (below / n_same.unsqueeze(1)).sum(-1).round().long()
+        order = order.clamp(max=_PTR_DIM - 1)
+        return F.one_hot(order, _PTR_DIM).to(paths.dtype) * written.unsqueeze(-1)
 
     def forward(self, content, in0, in1, out, active):
         """content (B,K,d_content); in0/in1/out (B,K) long; active (B,K)
         float. Returns (T, essence):
-          T (B, n_regs, d_value+d_event+d_colour), essence (B, d_value)."""
+          T (B, n_regs, d_value+d_event+d_colour+d_ptr), essence (B, d_value)."""
         device = content.device
         B, K = active.shape
         not_x0 = torch.ones(self.n_regs, device=device)
@@ -255,8 +317,9 @@ class RegisterStateMachine(nn.Module):
         oh0e = oh0 * not_x0_row
         oh1e = oh1 * not_x0_row
         a3 = active.unsqueeze(-1)
-        colours, live, written = self._prepass(
-            oh0e * a3, oh1e * a3, oh_out * a3, active)
+        colours, live, written, paths = self._prepass(
+            oh0e * a3, oh1e * a3, oh_out * a3, active, content)
+        ptr = self._pointer(paths, written)                           # (B,R,P)
         seed = self.seed_proj(colours)                                # (B,R,d_value)
         # Slots start at exactly zero; a slot acquires its leaf identity only
         # when first READ, so a register the chunk never touches contributes
@@ -303,7 +366,7 @@ class RegisterStateMachine(nn.Module):
         # normalized to ~(0,1].
         order = torch.stack([read_time / (2.0 * K), write_time], dim=-1)
         event = event + F.pad(order, (0, self.d_event - 2))
-        T = torch.cat([value, event, colours], dim=-1)
+        T = torch.cat([value, event, colours, ptr], dim=-1)
 
         # Essence pool over the written slots: k seed queries; heads concatenate
         # to width d_value. Each head independently softmaxes over the slots;
@@ -311,6 +374,7 @@ class RegisterStateMachine(nn.Module):
         # invariant.
         q = self.pool_q.view(self.n_pool_heads, -1)          # (k, d_value)
         kk, vv = self._project_touched(value, written, K)
+        kk = kk + self.pool_ptr(ptr)
         logits = kk @ q.t()                                  # (B, n_regs, k)
         att = torch.softmax(logits, dim=1)                   # (B, n_regs, k)
         vv = vv.view(B, self.n_regs, self.n_pool_heads, -1)  # per-head slices
@@ -435,7 +499,7 @@ class TokenEmbedder(nn.Module):
 
 # Head hidden capacities. Never tuned, so they live here as named constants
 # rather than constructor params. vp_head's DEPTH is not an implementation
-# detail: it is the only consumer a T2 description has, so its capacity is an
+# detail: it is the only consumer a T2 essence has, so its capacity is an
 # implicit claim about what the next tier will be able to read, and `vp = 0` at
 # a deeper head is a strictly weaker statement than at a shallow one. Quote the
 # depth with the number. T1's is the smallest that reaches correct results
@@ -486,7 +550,7 @@ class Compressor(nn.Module):
     token embeddings for T1 (via TokenEmbedder), a frozen lower tier's essence
     for T2+ (the tier contract) — threads them through the chunk's register
     state by each instruction's wiring, and emits one register-indexed state
-    T (B, n_regs, d_out+d_event+d_colour). A register rename permutes the slots
+    T (B, n_regs, d_out+d_event+d_colour+d_ptr). A register rename permutes the slots
     exactly (no per-register parameters); essence = the permutation-invariant
     pool over the written slots, the per-slot remainder = binding.
 
@@ -502,6 +566,7 @@ class Compressor(nn.Module):
         self.d_out = d_out
         self.d_event = d_event
         self.d_colour = _COLOUR_DIM
+        self.d_ptr = _PTR_DIM
         self.n_regs = N_REGS
         self.max_input_slots = MAX_INPUT_SLOTS
         self.max_output_slots = MAX_OUTPUT_SLOTS
@@ -514,7 +579,7 @@ class Compressor(nn.Module):
         # (equivariant); pc_writes reads the rename-invariant essence.
         # in_score is an MLP (relevance × order product a Linear can't do); the
         # rest are Linear.
-        d_slot = d_out + d_event + _COLOUR_DIM
+        d_slot = d_out + d_event + _COLOUR_DIM + _PTR_DIM
         self.live_in_head = nn.Linear(d_slot, 1)
         self.live_out_head = nn.Linear(d_slot, 1)
         self.in_score_head = nn.Sequential(
@@ -522,16 +587,17 @@ class Compressor(nn.Module):
             nn.Linear(_IN_SCORE_HIDDEN, 1))
         self.out_score_head = nn.Linear(d_slot, 1)
         self.pc_writes_head = nn.Linear(d_out, 1)
-        # Value prediction, per WRITTEN slot: from (the slot's description, and
-        # for each of the output's inputs its value as 32 two's-complement bits
-        # + 1 smooth-magnitude scalar and its colour) predict that register's
-        # value (32 bit-logits + 1 smooth scalar). Per-bit gives uniform
-        # resolution — the low bit (the +1 immediate distinguisher) is equally
-        # weighted and carry-free — so the description is pressured to retain
-        # immediates.
-        vp_in = d_out + MAX_INPUT_SLOTS * (_VP_VALUE_BITS + 1 + _COLOUR_DIM)
-        vp_out = _VP_VALUE_BITS + 1
-        self.vp_head = VPHead(vp_in, vp_out, vp_head_depth)
+        # Value prediction, per WRITTEN output, read from the ESSENCE: from (the
+        # unit-normalized essence, the output's pointer, and for each of the
+        # output's inputs its value as 32 two's-complement bits + 1
+        # smooth-magnitude scalar and its colour) predict that register's
+        # value (32 bit-logits + 1 smooth scalar). The output's own
+        # description is never handed over, so the essence has to carry every
+        # output's function, filed where its pointer finds it. Per-bit gives
+        # uniform resolution, so immediates are pressured to survive.
+        vp_inputs = MAX_INPUT_SLOTS * (_VP_VALUE_BITS + 1 + _COLOUR_DIM)
+        self.vp_head = VPHead(d_out + _PTR_DIM + vp_inputs, _VP_VALUE_BITS + 1,
+                              vp_head_depth)
         # immediate head (T1 only): a LINEAR readout of a rotary/Fourier encoding
         # of the instruction's immediate. Linear so the rotary structure is
         # forced to live in the essence (imm+δ -> a consistent rotation of the
@@ -581,6 +647,7 @@ class T1Compressor(nn.Module):
         self.d_out = self.compressor.d_out
         self.d_event = self.compressor.d_event
         self.d_colour = self.compressor.d_colour
+        self.d_ptr = self.compressor.d_ptr
         self.max_input_slots = self.compressor.max_input_slots
         self.max_output_slots = self.compressor.max_output_slots
 

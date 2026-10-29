@@ -15,7 +15,7 @@ The pipeline turns a random RV32I instruction stream into binary training
 batches consumed over stdin by the trainers. One generator, one format.
 
 ```
-python -m datagen     fork one worker per core → each: instrs → chunks → twins/aux
+python -m datagen     fork one worker per core → each: instrs → chunks → targets
                       → packed Batch; interleave all workers (+ external RVT
                       inputs) → stdout (RVT bytes). --count N bounds the run;
                       -v reports throughput.
@@ -32,7 +32,7 @@ pure data. (Bounding the count and measuring throughput used to be separate
 
 ## `datagen` is parallel by default — there is no single-worker mode.
 
-Generation+analysis (SSA, anchor execution, twins, value-prediction precompute)
+Generation+analysis (SSA, anchor execution, value-prediction precompute)
 is CPU-bound Python and one worker pins one core. The GPU is far faster than one
 core can supply, so a single-core generator silently starves the trainer and
 idles the GPU — historically the project's standard way to waste GPU-hours.
@@ -74,29 +74,36 @@ the batch count with `datagen --count N` (`datagen` has no per-worker `-n`).
 
 **Current T2 config** (writers-only happy path). The equivariant core has no
 settings to pass: register slots are seeded from their structural colour in
-the chunk's dataflow graph and the pool reads the written slots only, at every
-tier.
+the chunk's dataflow graph, the pool reads the written slots only, and value
+prediction reads the essence, at every tier (RISCV_DESIGN, "Value prediction
+reads the essence").
 
 ```bash
-python -m datagen --rule "cap=$LEN" --twins 2 --batch-size 128 --n-states 8 \
+python -m datagen --rule "cap=$LEN" --batch-size 384 --n-states 8 \
     --config configs/instr_alu_writers_chain010.json --gen-count 26 \
     --count "$STEPS" \
-  | python scripts/train_t2_encoder.py --t1-model runs/t1_register_500k/encoder.pt \
+  | python scripts/train_t2_encoder.py --t1-model runs/t1_essence_500k/encoder.pt \
     --d-out 512 --d-event 16 --op-cell-depth 4 --vp-head-depth 12 \
     --n-pool-heads 16 --route binding \
     --n-steps "$STEPS" --out-dir "$OUT"
 ```
 
-T2 trains at `LEN=2`, `STEPS=10000000` on the chain-rate-0.10 corpus, with a
+T2 trains at `LEN=2`, `STEPS=1000000` on the chain-rate-0.10 corpus, with a
 twelve-layer vp head (every vp head is a residual stack with LayerNorm; a
 plain Linear+ReLU stack cannot evaluate a composed chunk exactly even from a
 perfect description, EXPERIMENT_LOG, "T2 faithfulness", finding 34). The
-rate is necessary for the composed slots (finding 30); 10M steps is the budget
-at which the cell reaches its recorded held-out score, and 1M leaves two
-orders of magnitude more failing triples (finding 35). A 1M cell (~2.5 h) is
-the quick check; the 10M cell takes ~23 h at 8 ms/step. It is graded on the
-unmodified `instr_alu_writers.json`, the population the model will actually
-meet.
+rate is necessary for the composed slots (finding 30). A 1M cell takes ~4 h
+at ~14 ms/step (EXPERIMENT_LOG, "The register frame", finding 39); 10M steps
+cut the failing triples a further two orders of magnitude in the first-read
+frame (finding 35) and is not needed to judge a configuration. It is graded on
+the unmodified `instr_alu_writers.json`, the population the model will
+actually meet.
+
+**A batch is 384 distinct chunks.** Every row is its own chunk at its own
+anchor draw. The encoder is exactly rename-equivariant and the inputs of the
+value-prediction head are ordered by colour, never by register number, so a register-relabelled
+copy of a row would contribute the same loss and gradient as the row itself
+(finding 40); the generator therefore makes none.
 
 `--d-out 512` is the register-state width, and 512 is where it stays: 256 → 512
 is a real gain and 512 → 1024 buys nothing at any training budget measured, at
@@ -133,13 +140,13 @@ exists reads a partial model.
 **T1 config** (the writers-only corpus T2 is trained against). T1 and T2 run
 the same core at the same settings, so the command below differs from the T2
 cell only in its ingestion front-end and its hparams. The frozen T1 is
-`runs/t1_register_500k`. Its vp head has three hidden layers (the
+`runs/t1_essence_500k`. Its vp head has three hidden layers (the
 trainer's default) of the residual-with-LayerNorm form every vp head takes, the
 smallest depth with which T1 reaches exact vp at held-out anchors, and that
 takes the 500k-step schedule (EXPERIMENT_LOG, "T2 faithfulness", finding 33).
 
 ```bash
-python -m datagen --rule single --twins 2 --batch-size 128 --n-states 8 \
+python -m datagen --rule single --batch-size 384 --n-states 8 \
     --config configs/instr_alu_writers.json --count 500000 \
   | python scripts/train_encoder.py --d-model 128 --n-heads 4 --n-layers 2 \
     --d-out 64 --max-window 32 --imm-weight 0.3 --vp-head-depth 3 \
@@ -159,7 +166,10 @@ without the write-step channel, or a `read_pulse` fed `[content, operand]`
 instead of the op-cell's hidden layer (with a separate `read_role`) fails at
 `load_state_dict`, and so does a checkpoint whose vp head is a plain ReLU
 stack, since `VPHead` (the residual form) is the only head the code builds.
-`runs/t1_register_500k` is the frozen T1; a checkpoint carrying `rank_emb`, or a pool sized for the write-step channel, predates the register frame and does not load.
+A checkpoint without the pointer (`pool_ptr`, `P_content`, `u_order`) or
+whose vp head reads a slot's description instead of the essence predates the
+essence-addressed evaluator and does not load. `runs/t1_essence_500k` is the
+frozen T1.
 (A checkpoint trained when all pool heads shared one value projection is still
 remapped on load — `_tile_shared_pool_v` repeats those weights once per head,
 reproducing the old computation exactly.)
@@ -187,11 +197,10 @@ do not restate them here.
   again in `collect_groups` via `rule.max_len is None` (`datagen/generate.py:742`).
 
 Generation flags (per worker, first-class — NO `--` separator; defaults in
-parens, from the argparse block at `datagen/__main__.py:505-527`): `--rule`
-(`branch+cap=8`), `--twins T` (3 — relabeled equivalents per valid source
-chunk), `--batch-size B` (128 — source rows; twins extend the batch beyond B),
-`--n-states` (8 — anchor states per row, drawn per source chunk and shipped in
-the batch), `--heldout-anchors` (off — execute every row at the fixed held-out
+parens, from the argparse block at `datagen/__main__.py:508-532`): `--rule`
+(`branch+cap=8`), `--batch-size B` (384 — rows per batch, one chunk each),
+`--n-states` (8 — anchor states per row, drawn per chunk and shipped in the
+batch), `--heldout-anchors` (off — execute every row at the fixed held-out
 set instead; for scoring corpora only), `--max-invalid-window`
 (32 — the token-length cap on an injected invalid window), `--config PATH`
 (unset → the built-in `DEFAULT_DISTRIBUTION`), `--seed` (0; worker i
@@ -253,13 +262,13 @@ cmdline).
   - **Second epoch = `cat corpus.rvt corpus.rvt | trainer`.** There is no built-in
     repeat; epochs are shell-level `cat`.
 - Header fields: `B, max_tokens, max_n_instrs, n_anchors, OB` (`RVT_FORMAT`,
-  `datagen/batch.py:290-292`). `OB` is the out_regs row count — `B` in practice,
-  always, since `build_twins` returns one out_regs row per output row
-  (`datagen/batch.py:368-381`); the format still permits 0. `anchors`
+  `datagen/batch.py:293-296`). `OB` is the out_regs row count — `B` in practice,
+  always, since `build_targets` returns one out_regs row per row
+  (`datagen/batch.py:553-584`); the format still permits 0. `anchors`
   (`OB, n_anchors, 32`) carries the register files each row's `out_regs` was
   executed from, and is what the trainer feeds the vp head (INVARIANT 1).
   Body field list + dtypes are the `BodyField(...)` block at
-  `datagen/batch.py:293-308`; the per-field header sanity bounds are the
+  `datagen/batch.py:297-313`; the per-field header sanity bounds are the
   `header_bounds={...}` at `datagen/batch.py:311`, enforced on every read by
   `BinaryFormat._check_header_bounds` (`datagen/batch.py:148`).
 - The "no version field" statement is current and load-bearing in the code, not
@@ -311,7 +320,7 @@ draw one extra random number per chunk, so the stream differs byte-wise from
   readout's residual; this one holds 128 per batch. Generate it when needed
   (~5 s), at the held-out anchors and an instruction seed no training pool uses:
   ```bash
-  python -m datagen --rule cap=2 --twins 0 --batch-size 128 --n-states 64 \
+  python -m datagen --rule cap=2 --batch-size 384 --n-states 64 \
       --heldout-anchors --config configs/instr_alu_writers_chain100.json \
       --seed 1000 --count 2000 --gen-count 16 > /tmp/h64_chain100_$$.rvt
   ```
@@ -337,13 +346,13 @@ never sees the generator — so the model is recorded and the data is not.
 
 ```bash
 python scripts/record_corpus.py runs/<dir> --config configs/<corpus>.json \
-    --rule cap=2 --twins 2 --batch-size 128 --n-states 8 \
+    --rule cap=2 --batch-size 384 --n-states 8 \
     --gen-seed 0 --count 1000000
 ```
 
 It copies the config's CONTENTS, not its path, so editing that file afterwards
 cannot change what the run claims to have trained on, and it records the knobs
-that live outside the config — rule, twins, batch size, anchors per row,
+that live outside the config — rule, batch size, anchors per row,
 instruction-stream seed, batch count. `run_t2.sh` calls it before the pipeline
 starts, so a run killed mid-training is still identified. A pipeline typed by
 hand should call it too; a run without a `corpus.json` can only be attributed
@@ -403,7 +412,7 @@ Two different scripts — do not confuse them:
   into odin and run it there; there is no auto-shipping. `RULE` defaults to
   `branch+cap=8` and `WORKERS` unset → all CPU cores; `CONFIG` is REQUIRED.
 
-Both take `BATCH_SIZE TWINS N_STATES RULE` as env vars and REQUIRE
+Both take `BATCH_SIZE N_STATES RULE` as env vars and REQUIRE
 `CONFIG` (plus `GEN_SEED REMOTE_GEN LOCAL_GEN PORT` for multinode_gen, and
 `WORKERS` for gen_corpus → `--gen-count`). No env var sets an augmentation
 rate: those are the config's.

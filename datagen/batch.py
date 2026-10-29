@@ -33,7 +33,7 @@ from .compare import (
     precompute_chunk,
 )
 from .generate import (
-    chain_group, collect_groups, random_instruction, random_relabel,
+    chain_group, collect_groups, random_instruction,
     sample_injection_tuples,
 )
 
@@ -280,8 +280,8 @@ class Batch:
     # Full post-execution register file per anchor — the value-prediction
     # oracle target. Computed in the (parallel) gen workers from the same
     # Precomputed as the binding aux, so the trainer reads it instead of
-    # recomputing single-threaded. OB = B when shipped (T2 twin mode), 0
-    # otherwise; out_regs_valid marks decodable non-mem rows.
+    # recomputing single-threaded. OB = B when shipped, 0 otherwise;
+    # out_regs_valid marks decodable non-mem rows.
     out_regs:       np.ndarray   # (OB, n_anchors, N_REGS) int32
     out_regs_valid: np.ndarray   # (OB,) bool
     # The register files each row's out_regs was executed from: one structured
@@ -522,11 +522,11 @@ def padding_mask(batch):
 
 
 # ===========================================================================
-# Generation: chunks -> twins -> Batch
+# Generation: chunks -> targets -> Batch
 # ===========================================================================
 
-# Memory ops have no Precomputed in V1 scope; twin/aux construction
-# drops chunks containing them.
+# Memory ops have no Precomputed in V1 scope; target construction skips
+# chunks containing them.
 _MEM_OPS = frozenset({'LB', 'LBU', 'LH', 'LHU', 'LW', 'SB', 'SH', 'SW'})
 
 
@@ -550,73 +550,38 @@ def _make_invalid_chunk(tokens):
     return Chunk(tokens=list(tokens), valid=False, instructions=None)
 
 
-def build_twins(chunks, twins, draw_anchors, rng):
-    """Add `twins` relabeled copies of each valid source chunk and build
-    the parallel T2 register-identity aux targets.
+def build_targets(chunks, draw_anchors):
+    """Execute each valid row at its own anchor draw and build its targets.
 
-    Cluster structure: each valid source plus its twins form a cluster
-    of size (twins + 1) — twins are equivalence-preserving relabelings.
-    Memory-op chunks keep no twins (their Precomputed is unavailable in
-    V1 scope) and contribute an empty aux row.
+    Memory-op chunks get no targets (their Precomputed is unavailable in V1
+    scope) and contribute an empty aux row, as invalid windows do.
 
-    draw_anchors(k) supplies the structured draws of k source chunks as one
-    (k, n_anchors, 32) array; a source's twins share its draw, which
-    `precompute_chunk` places on each row's own input registers.
+    draw_anchors(k) supplies the structured draws of k valid chunks as one
+    (k, n_anchors, 32) array, which `precompute_chunk` places on each row's
+    own input registers.
 
-    Returns (chunks_out, aux, out_regs, out_regs_valid, anchors) where
-    chunks_out extends `chunks` with the new twins, aux is the parallel
-    AuxPayload, out_regs/out_regs_valid are the per-row post-exec register
-    file (the value-prediction oracle target, shipped from the gen workers)
-    and anchors the per-row pre-exec register files it was executed from.
+    Returns (aux, out_regs, out_regs_valid, anchors): aux is the parallel
+    AuxPayload, out_regs/out_regs_valid the per-row post-exec register file
+    (the value-prediction oracle target, shipped from the gen workers) and
+    anchors the per-row pre-exec register files it was executed from.
     """
-    # Filter out memory-op chunks at the source list — twins inherit
-    # their parent's filtering.
-    valid_sources = []
-    for ch in chunks:
-        if not ch.valid:
-            valid_sources.append(None)  # placeholder; no twins
-            continue
-        if _has_mem_ops(ch.instructions):
-            valid_sources.append(None)
-            continue
-        valid_sources.append(ch)
-
-    # Build the chunks_out list: original chunks + twins after each
-    # valid source. Track which output rows have a usable Precomputed.
-    drawn = draw_anchors(max(sum(s is not None for s in valid_sources), 1))
-    chunks_out = []
-    row_anchors = []       # one entry per output row (None: no Precomputed)
-    n_drawn = 0
-    for original, source in zip(chunks, valid_sources):
-        chunks_out.append(original)
-        if source is None:
-            row_anchors.append(None)
-            continue
-        a = drawn[n_drawn]
-        n_drawn += 1
-        row_anchors.append(a)
-        for _ in range(twins):
-            twin_instrs = random_relabel(source.instructions, rng)
-            chunks_out.append(_make_valid_chunk(twin_instrs))
-            row_anchors.append(a)
-
-    # Aux targets: rows with a usable source get their Precomputed;
-    # mem-op / invalid rows get None → empty aux row.
-    aux_pre = [
-        precompute_chunk(ch.instructions, a) if a is not None else None
-        for ch, a in zip(chunks_out, row_anchors)
-    ]
+    usable = [ch.valid and not _has_mem_ops(ch.instructions) for ch in chunks]
+    drawn = draw_anchors(max(sum(usable), 1))
+    aux_pre, n_drawn = [], 0
+    for ch, ok in zip(chunks, usable):
+        if ok:
+            aux_pre.append(precompute_chunk(ch.instructions, drawn[n_drawn]))
+            n_drawn += 1
+        else:
+            aux_pre.append(None)
     aux = _aux_from_precomputeds(aux_pre)
     out_regs, out_regs_valid = _out_regs_from_precomputeds(
         aux_pre, drawn.shape[1])
-    # The register file each row was executed from: the shared draw placed on
-    # that row's own input registers, so a twin's differs from its source's.
     anchors = np.zeros_like(out_regs)
     for i, pre in enumerate(aux_pre):
         if pre is not None:
             anchors[i] = pre.anchors
-
-    return chunks_out, aux, out_regs, out_regs_valid, anchors
+    return aux, out_regs, out_regs_valid, anchors
 
 
 # ===========================================================================
@@ -660,8 +625,7 @@ def generate_chunks(rule, rng, *, opcode_table=None, dest_regs=None,
                 yield _make_valid_chunk([instr])
 
 
-def collect_into_batches(chunks_iter, *, batch_size, twins,
-                         draw_anchors, rng,
+def collect_into_batches(chunks_iter, *, batch_size, draw_anchors,
                          invalid_rate=0.0, invalid_provider=None,
                          max_invalid_window=None,
                          max_chunk_len):
@@ -672,15 +636,14 @@ def collect_into_batches(chunks_iter, *, batch_size, twins,
     sequence (typically datagen.invalidity.generate_invalid).
 
     Each batch ends up with `n_invalid = round(batch_size * invalid_rate)`
-    invalid rows + `batch_size - n_invalid` valid source slots; twins
-    are added on top of the valid-source slots, growing the batch.
+    invalid rows + `batch_size - n_invalid` valid rows.
 
-    Every rule (single → T1, multi-instr → T2) ships the canonical out_regs
-    oracle via build_twins (the T1/T2 unification).
+    Every rule (single → T1, multi-instr → T2) ships the out_regs oracle via
+    build_targets (the T1/T2 unification).
 
-    draw_anchors(k) supplies k source chunks' anchor states — a fresh draw per
-    source for training, one fixed set for a scoring corpus. A source's twins
-    share its states, and every row's states ship with it.
+    draw_anchors(k) supplies k chunks' anchor states — a fresh draw per chunk
+    for training, one fixed set for a scoring corpus — and every row's states
+    ship with it.
 
     max_chunk_len: maximum number of instructions per chunk under the
                    chunking rule (the rule's length cap; 1 for 'single').
@@ -695,15 +658,11 @@ def collect_into_batches(chunks_iter, *, batch_size, twins,
         raise ValueError('invalid_rate > 0 requires invalid_provider')
 
     n_invalid = int(round(batch_size * invalid_rate))
-    n_valid_sources = batch_size - n_invalid
+    n_valid = batch_size - n_invalid
 
-    # Fixed-shape upper bounds derived from max_chunk_len. These match
-    # the batch shape with no mem-op filtering: all valid sources
-    # contribute (twins+1) rows; invalids contribute 1 row each. Mem-op
-    # filtering and length variation produce smaller actual shapes, which
-    # then get padded up to these targets.
-    cluster_size = twins + 1
-    target_B = n_valid_sources * cluster_size + n_invalid
+    # Fixed-shape upper bounds derived from max_chunk_len. Length variation
+    # produces smaller actual shapes, which get padded up to these targets.
+    target_B = batch_size
     target_max_n_instrs = max_chunk_len
     target_max_tokens = max_chunk_len * MAX_INSTR_TOKENS
     if max_invalid_window is not None:
@@ -712,16 +671,16 @@ def collect_into_batches(chunks_iter, *, batch_size, twins,
     buf = []
     for ch in chunks_iter:
         buf.append(ch)
-        if len(buf) >= n_valid_sources:
-            valid_sources = buf[:n_valid_sources]
-            buf = buf[n_valid_sources:]
+        if len(buf) >= n_valid:
+            valid = buf[:n_valid]
+            buf = buf[n_valid:]
             invalids = [_make_invalid_chunk(invalid_provider())
                         for _ in range(n_invalid)]
-            mixed = valid_sources + invalids
-            chunks_out, aux, out_regs, out_regs_valid, anchors = build_twins(
-                mixed, twins=twins, draw_anchors=draw_anchors, rng=rng)
+            mixed = valid + invalids
+            aux, out_regs, out_regs_valid, anchors = build_targets(
+                mixed, draw_anchors=draw_anchors)
             yield pack_batch(
-                chunks_out,
+                mixed,
                 target_B=target_B,
                 target_max_tokens=target_max_tokens,
                 target_max_n_instrs=target_max_n_instrs,

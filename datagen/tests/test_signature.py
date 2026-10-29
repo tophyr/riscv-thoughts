@@ -13,6 +13,8 @@ import itertools
 import math
 
 import numpy as np
+import random
+
 import pytest
 
 from emulator import Instruction, run as emu_run
@@ -230,6 +232,21 @@ def test_output_inputs_follow_the_graph_not_the_text():
     p, q = [Instruction('SUB', 6, 4, 3)], [Instruction('SUB', 6, 3, 4)]
     assert signature(p) == signature(q)
     assert output_inputs(p)[6].index(4) == output_inputs(q)[6].index(3)
+
+
+def test_a_rename_never_moves_an_input_between_gather_positions():
+    """out_inputs of a renamed chunk is the original's under the rename, for
+    every output and position — commutative operands included, whose order
+    would otherwise follow register numbers."""
+    rng = random.Random(41)
+    ops = ['ADD', 'SUB', 'AND', 'OR', 'XOR', 'SLT', 'SLL']
+    for _ in range(500):
+        chunk = [Instruction(rng.choice(ops), rng.randrange(1, 32), rng.randrange(1, 32),
+                             rng.randrange(1, 32)) for _ in range(2)]
+        perm = [0] + rng.sample(range(1, 32), 31)
+        renamed = [Instruction(i.opcode, *(perm[r] for r in i.args)) for i in chunk]
+        want = {perm[r]: [perm[x] for x in v] for r, v in output_inputs(chunk).items()}
+        assert output_inputs(renamed) == want, (chunk, renamed)
 
 
 def test_memory_and_control_flow_are_out_of_scope():

@@ -30,8 +30,7 @@
 #   multinode_gen.sh 260000            # → exactly 260,000 batches
 #
 # Override generation knobs via env vars:
-#   BATCH_SIZE      (default 128)
-#   TWINS           (default 3)
+#   BATCH_SIZE      (default 384)
 #   N_STATES        (default 8)
 #   RULE            (default 'single' — single-instruction chunks; the
 #                    old "--gen instr" equivalent)
@@ -55,8 +54,7 @@ set -euo pipefail
 
 PYTHON=.venv/bin/python
 TOTAL=$1
-BATCH_SIZE=${BATCH_SIZE:-128}
-TWINS=${TWINS:-3}
+BATCH_SIZE=${BATCH_SIZE:-384}
 N_STATES=${N_STATES:-8}
 RULE=${RULE:-single}
 CONFIG=${CONFIG:?set CONFIG to a corpus config under configs/ — a corpus is one reviewable file, and there is no default}
@@ -113,7 +111,7 @@ ssh ${REMOTE} "bash ${REMOTE_DIR}/scripts/multinode_remote.sh \
     --gen-count ${REMOTE_GEN} \
     --rule ${RULE} \
     --batch-size ${BATCH_SIZE} \
-    --twins ${TWINS} --n-states ${N_STATES} \
+    --n-states ${N_STATES} \
     --seed ${GEN_SEED} \
     --config ${CONFIG}" &
 SSH_PID=$!
@@ -132,7 +130,7 @@ ${PYTHON} -m datagen \
     <(nc odin ${PORT} -d | lz4 -dc) \
     --rule ${RULE} \
     --batch-size ${BATCH_SIZE} \
-    --twins ${TWINS} --n-states ${N_STATES} \
+    --n-states ${N_STATES} \
     --seed ${GEN_SEED} \
     --config ${CONFIG} \
     --count ${TOTAL} </dev/null

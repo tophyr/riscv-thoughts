@@ -329,11 +329,6 @@ def relabel(instructions, perm):
     return out
 
 
-def random_relabel(instructions, rng):
-    """Convenience: relabel under a fresh random permutation."""
-    return relabel(instructions, random_perm(rng))
-
-
 # ===========================================================================
 # Equivalence manifest — curated cross-syntax equivalence classes
 # ===========================================================================

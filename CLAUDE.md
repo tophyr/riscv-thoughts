@@ -117,15 +117,14 @@ not know you need.
 
 ### The invariants
 
-1. **The vp evaluator reads its input values from the batch's own anchors,
-   never from a rebuilt set.** Every row's `out_regs` was executed from the
+1. **The vp evaluator (the value-prediction head, `vp_head`) reads its input
+   values from the batch's own anchors, never from a rebuilt set.** Every row's `out_regs` was executed from the
    register file shipped beside it as `batch.anchors`: one structured draw per
-   source chunk (`draw_anchor_states`, `datagen/compare.py`), placed on each
-   row's own input registers by `precompute_chunk`, so a twin's anchors differ
-   from its source's. The trainer stages that field and feeds it to
-   `vp_slot_loss` (`compressor/train.py`), which gathers each output's input
-   values by register through `batch.out_inputs`; a scorer must do the same
-   (`vp_slot_predict`). Re-placing shipped anchors, or building input values
+   chunk (`draw_anchor_states`, `datagen/compare.py`), placed on that row's own
+   input registers by `precompute_chunk`. The trainer stages that field and
+   feeds it to `vp_loss` (`compressor/train.py`), which gathers each output's
+   input values by register through `batch.out_inputs`; a scorer must do the
+   same (`vp_predict`). Re-placing shipped anchors, or building input values
    from any other set of states — a seed, a fixed table — gives wrong targets
    with no error. Score at the fixed held-out set by generating the corpus with
    `datagen --heldout-anchors` (`heldout_anchor_states`,
@@ -135,35 +134,43 @@ not know you need.
    is padded to identical (B, max_tokens, max_n_instrs) so PyTorch's caching
    allocator doesn't fragment. Stochastically-varying batch shape is a real OOM
    trigger we hit (~step 500 of t1_cosine_full). The targets come from
-   `max_chunk_len = rule.max_len` (`datagen/batch.py:685-693` inside
-   `collect_into_batches`, `datagen/batch.py:648`).
+   `max_chunk_len = rule.max_len` (`datagen/batch.py:664-669` inside
+   `collect_into_batches`, `datagen/batch.py:628`).
    This is why a `--rule` with no cap is REJECTED (see Rule grammar). Don't add a
    code path that emits a differently-shaped batch mid-run.
 
 3. **EVERY rule ships the out_regs oracle (`OB == B`).**
-   `single` (T1) and multi-instruction (T2) rules both go through `build_twins`
-   and ship the full post-execution `out_regs` register file, the `anchors` it
-   was executed from and `out_inputs` (`OB == B`, carrying `n_anchors ==
-   --n-states`). There is no per-rule payload split — both tiers feed one
-   per-slot value-prediction target.
+   `single` (T1) and multi-instruction (T2) rules both go through
+   `build_targets` and ship the full post-execution `out_regs` register file,
+   the `anchors` it was executed from and `out_inputs` (`OB == B`, carrying
+   `n_anchors == --n-states`). There is no per-rule payload split — both tiers
+   feed one per-output value-prediction target.
    (`scripts/tests/test_pipeline.py::test_out_regs_mode_header`.)
 
-4. **value_predict is evaluated PER WRITTEN SLOT, in the register frame, for
-   both tiers.** The target for output slot k is the raw value of register
-   `out_slot_regs[k]` in `out_regs`; the evaluator (`vp_slot_loss`,
-   `compressor/train.py`) is handed that slot's description — its value
-   channels in `T` — plus, for each register in `out_inputs[k]`, that
-   register's value in `anchors` and its colour channels from `T`. No input
-   or output is numbered by textual order anywhere: `out_inputs` is the
-   output's external inputs in structural-colour order
-   (`datagen.signature.output_inputs`), and the encoder seeds each leaf from
-   the same colouring computed from the wiring it is given
-   (`RegisterStateMachine._prepass`, `compressor/model.py`). The oracle's
-   colouring (strings) and the encoder's (fixed random features) must agree
-   on structure: identical graph, identical colour. The one place they
-   differ by design is commutativity — the oracle's LABELS may know which
-   operations commute (`COMMUTATIVE`, used only for the signature and the
-   input order); the encoder is told nothing of it and orders every role.
+4. **value_predict is evaluated PER WRITTEN OUTPUT, from the ESSENCE, in the
+   register frame, for both tiers.** The target for output slot k is the raw
+   value of register `out_slot_regs[k]` in `out_regs`; the evaluator
+   (`vp_loss`, `compressor/train.py`) is handed the unit-normalized essence;
+   a pointer, which is a one-hot naming which of the chunk's distinct outputs
+   is asked about, read from the output register's pointer channels in `T`
+   (RISCV_DESIGN, "Value prediction reads the essence"); and, for
+   each register in `out_inputs[k]`, that register's value in `anchors` and
+   its colour channels from `T` — never the output's own description. No
+   input or output is numbered by textual order or by register number:
+   `out_inputs` lists the output's external inputs in the encoder's colour
+   order, every role ordered (`datagen.signature.output_inputs`), and the
+   encoder seeds each leaf from the same colouring computed from the wiring
+   it is given (`RegisterStateMachine._prepass`, `compressor/model.py`). The
+   oracle's colouring (strings) and the encoder's (fixed random features)
+   must agree on structure: identical graph, identical colour. The one place
+   they differ by design is commutativity — the oracle's SIGNATURE knows which
+   operations commute (`COMMUTATIVE`); the encoder and the input order are
+   told nothing of it and order every role. An input order built with the
+   commutative roles merged ties the two operands of an `ADD` and breaks the
+   tie by register number, so a rename moves values between evaluator
+   positions: no error, only a register-dependent gradient on every chunk
+   with a commutative op
+   (`test_signature.py::test_a_rename_never_moves_an_input_between_gather_positions`).
    `datagen/tests/test_signature.py` is the oracle's evidence against the
    emulator.
 
@@ -181,14 +188,14 @@ not know you need.
    (`datagen/generate.py:298,312`; the check is `datagen/generate.py:320-321`).
    x0 is hardwired zero, not a register.
 
-6. **Memory-op chunks get no twins and no aux (V1 scope).** `build_twins`
-   (`datagen/batch.py:540`) drops chunks containing LOAD/STORE from twin+aux
-   construction because their `Precomputed` is
-   unavailable — `precompute_chunk` raises NotImplementedError on memory ops
-   (`datagen/compare.py:661-662`). The chunk's tokens are still shipped (so the
-   encoder sees them for magnitude/validity), but its aux row is zero-mask /
-   `AUX_CE_IGNORE` and its value-prediction row is masked off via
-   `out_regs_valid=False` (`_out_regs_from_precomputeds`, `datagen/batch.py:368`).
+6. **Memory-op chunks get no aux (V1 scope).** `build_targets`
+   (`datagen/batch.py:553`) skips chunks containing LOAD/STORE because their
+   `Precomputed` is unavailable — `precompute_chunk` raises
+   NotImplementedError on memory ops (`datagen/compare.py:674-675`). The
+   chunk's tokens are still shipped (so the encoder sees them for
+   magnitude/validity), but its aux row is zero-mask / `AUX_CE_IGNORE` and its
+   value-prediction row is masked off via `out_regs_valid=False`
+   (`_out_regs_from_precomputeds`, `datagen/batch.py:377`).
 
 ## Anchored memory
 

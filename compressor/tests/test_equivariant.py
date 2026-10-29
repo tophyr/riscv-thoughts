@@ -174,7 +174,7 @@ def test_head_on_touched_slots_matches_the_dense_head():
     from compressor.model import apply_head_touched
     torch.manual_seed(0)
     core = RegisterStateMachine(d_value=16, d_event=4, d_content=6, n_regs=32)
-    head = torch.nn.Sequential(torch.nn.Linear(16 + 4 + core.d_colour, 8), torch.nn.ReLU(),
+    head = torch.nn.Sequential(torch.nn.Linear(16 + 4 + core.d_colour + core.d_ptr, 8), torch.nn.ReLU(),
                                torch.nn.Linear(8, 1))
     B, K = 5, 3
     content = torch.randn(B, K, 6)

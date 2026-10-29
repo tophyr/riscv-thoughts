@@ -5,9 +5,9 @@
 #   LEN=2 GEN_SEED=7 TAG=s7 bash scripts/run_t2.sh
 #   CONFIG=configs/instr_alu_writers.json bash scripts/run_t2.sh
 #
-# The equivariant core's settings are no longer knobs: read positions are
-# canonical ranks, register slots are seeded from those ranks, and the pool
-# reads each slot's write step. Those are the only values any tier uses.
+# The equivariant core's settings are not knobs: register slots are seeded
+# from their structural colour in the chunk's dataflow graph and the pool reads
+# the written slots only. Those are the only values any tier uses.
 #
 # The run directory encodes the knobs, so two cells that differ in any of them
 # cannot overwrite each other; TAG separates a re-run of an already-recorded
@@ -22,12 +22,12 @@ source .venv/bin/activate
 D=/home/tophy/Projects/riscv-thoughts/logs
 # The frozen lower tier. A T2 checkpoint is only interchangeable with others
 # trained on the SAME T1, so a cell that changes this must be named for it.
-T1=${T1:-runs/t1_register_500k/encoder.pt}
+T1=${T1:-runs/t1_essence_500k/encoder.pt}
 # VP = vp-head hidden layers (residual blocks with LayerNorm). The head must
 # EVALUATE the chunk's function at the anchor points, so its capacity is a
-# confound in every vp number (METRICS.md). STEPS=10000000 is the recorded
-# cell; 1M is the quick check (EXPERIMENT_LOG, finding 35).
-LEN=${LEN:-2} DOUT=${DOUT:-512} STEPS=${STEPS:-10000000} OC=${OC:-4} VP=${VP:-12}
+# confound in every vp number (METRICS.md). STEPS=1000000 is the cell a
+# configuration is judged at (EXPERIMENT_LOG, finding 39).
+LEN=${LEN:-2} DOUT=${DOUT:-512} STEPS=${STEPS:-1000000} OC=${OC:-4} VP=${VP:-12}
 NPOOL=${NPOOL:-16}
 # Local generator workers. Per-row anchors make a batch ~2.7x larger on the
 # wire, so generation runs on this machine rather than over the link to odin.
@@ -56,10 +56,10 @@ cell() {
   # trainer's own arguments and says nothing about the data. The config's
   # contents are copied in, so editing the file later cannot rewrite history.
   python scripts/record_corpus.py "runs/$OUT" --config "$CONFIG" \
-    --rule "cap=$LEN" --twins 2 --batch-size 128 --n-states 8 \
+    --rule "cap=$LEN" --batch-size 384 --n-states 8 \
     --gen-seed "$GEN_SEED" --count "$STEPS" \
     --generator "datagen --gen-count $GEN" || return 1
-  python -m datagen --rule "cap=$LEN" --twins 2 --batch-size 128 --n-states 8 \
+  python -m datagen --rule "cap=$LEN" --batch-size 384 --n-states 8 \
       --config "$CONFIG" --seed "$GEN_SEED" --gen-count "$GEN" \
       --count "$STEPS" 2> "$D/gen_${OUT}.log" \
     | python scripts/train_t2_encoder.py --t1-model "$T1" \
@@ -99,7 +99,7 @@ EVAL=runs/eval/t2_heldout64_len${LEN}.rvt
 if [ ! -f "$EVAL" ]; then
   mkdir -p runs/eval
   echo "generating shared eval corpus..."
-  python -m datagen --rule "cap=$LEN" --twins 2 --batch-size 128 --n-states 64 \
+  python -m datagen --rule "cap=$LEN" --batch-size 384 --n-states 64 \
       --heldout-anchors --config configs/instr_alu_writers.json --count 100 \
       > "$EVAL.part" 2>/dev/null && mv "$EVAL.part" "$EVAL"
 fi

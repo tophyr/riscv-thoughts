@@ -7,7 +7,7 @@ pools the resulting sequence into a single chunk vector. Supervision is
 value-prediction and aux register-identity heads.
 
 Usage:
-    python -m datagen --rule 'branch+cap=8' --twins 3 --batch-size 256 \\
+    python -m datagen --rule 'branch+cap=8' --batch-size 384 \\
         --count 5000 \\
         | train_t2_encoder.py --t1-model runs/t1_good/encoder.pt
 """
@@ -69,9 +69,10 @@ def main():
     p.add_argument('--out-slot-weight', type=float, default=0.1,
                    help='Mean CE over per-output-slot register heads.')
     p.add_argument('--value-predict-weight', type=float, default=1.0,
-                   help='Per-anchor per-out-slot value prediction MSE '
-                        'on shape (chunk I/O function supervision). '
-                        'The anchor states ride in each batch.')
+                   help='value prediction read from the essence: each '
+                        "output's value from the essence, the output's "
+                        "pointer and its inputs' values. The anchor states "
+                        'ride in each batch.')
     p.add_argument('--vp-smooth-weight', type=float, default=0.2,
                    help='weight on the vp smooth-magnitude (ordering) term; the '
                         'per-bit target carries resolution.')

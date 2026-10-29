@@ -227,63 +227,53 @@ def _value_feat(x_i):
         [_value_bits(x_i), _value_smooth(x_i.float()).unsqueeze(-1)], dim=-1)
 
 
-def vp_slot_loss(comp, T, anchors_t, out_slot_regs_t, out_inputs_t, out_regs_t,
-                 mask_t, vp_smooth_weight=0.2, return_count=False, n_out=None):
-    """Value prediction evaluated PER WRITTEN SLOT.
-
-    For output slot k of a row, the head reads the written register's
-    description — that slot's value channels in `T` — and, for each external
-    input that output depends on (`out_inputs`, in the oracle's colour order),
-    the input's value at its own register in the row's anchor state (32 bits +
-    1 smooth scalar) and the input's structural colour from `T`, and predicts
-    that register's value after the chunk (32 bit-logits + 1 smooth scalar).
-    Nothing in the features is a register number or a position in the text:
-    the description, the colours and the gathered values are all reached
-    through one-hot gathers that a rename permutes, so a renamed twin presents
-    the same description with the same input values and the same target.
-
-    Args:
-      comp:             the Compressor (uses comp.vp_head, d_out, d_event)
-      T:                (B, n_regs, d_out+d_event+d_colour) the emitted state
-      anchors_t:        (B, A, 32) int32 — the register file each row was
-                        executed from
-      out_slot_regs_t:  (B, MAX_OUT) int64 — output registers (AUX_CE_IGNORE
-                        for unused slots)
-      out_inputs_t:     (B, MAX_OUT, MAX_IN) int64 — each output's external
-                        input registers in colour order (AUX_CE_IGNORE padded)
-      out_regs_t:       (B, A, 32) int32 — the register file after the chunk
-      mask_t:           (B,) bool — rows to include
-      n_out:            bound on filled output slots; slots past it are
-                        skipped (they must be AUX_CE_IGNORE)
-
-    Returns a scalar loss (per-bit BCE + vp_smooth_weight · smooth-magnitude
-    MSE) over (row, output slot, anchor) triples with a filled output slot.
-    """
+def _vp_inputs(comp, T, anchors_t, out_inputs_t):
+    """Per (row, anchor, output slot) the evaluator's input features, (B, A,
+    O, MAX_IN·(33+dc)): for each external input the output depends on
+    (`out_inputs`, in the oracle's colour order), its value at its own
+    register in the row's anchor state (32 bits + 1 smooth scalar) and its
+    structural colour from `T`. Unfilled inputs feed value 0 and colour 0 =
+    "no input"."""
     B, A = anchors_t.shape[0], anchors_t.shape[1]
     d, dc = comp.d_out, comp.d_colour
-    if n_out is not None:
-        out_slot_regs_t = out_slot_regs_t[:, :n_out]
-        out_inputs_t = out_inputs_t[:, :n_out]
     O, I = out_inputs_t.shape[1], out_inputs_t.shape[2]
-    out_valid = out_slot_regs_t != AUX_CE_IGNORE                      # (B, O)
-    out_idx = out_slot_regs_t.clamp(min=0).long()
-    desc = T[..., :d].gather(1, out_idx.unsqueeze(-1).expand(-1, -1, d))   # (B, O, d)
     in_valid = (out_inputs_t != AUX_CE_IGNORE)                        # (B, O, I)
     in_idx = out_inputs_t.clamp(min=0).long()
-    colours = T[..., d + comp.d_event:]                               # (B, R, dc)
+    c0 = d + comp.d_event
+    colours = T[..., c0:c0 + dc]                                      # (B, R, dc)
     in_col = colours.gather(
         1, in_idx.reshape(B, -1, 1).expand(-1, -1, dc)).reshape(B, O, I, dc)
     in_col = in_col * in_valid.unsqueeze(-1)
-    # Unfilled inputs feed value 0 and colour 0 = "no input". Kept INTEGER
-    # until the bit decomposition: float32 loses every bit above 2^24.
+    # Kept INTEGER until the bit decomposition: float32 loses every bit above
+    # 2^24.
     vals = anchors_t.to(torch.int64).gather(
         -1, in_idx.reshape(B, 1, -1).expand(-1, A, -1)).reshape(B, A, O, I)
     vals = vals * in_valid.unsqueeze(1)
     vfeat = torch.cat([_value_feat(vals),
                        in_col.unsqueeze(1).expand(-1, A, -1, -1, -1)], -1)
-    x = torch.cat([desc.unsqueeze(1).expand(-1, A, -1, -1),
-                   vfeat.reshape(B, A, O, I * (_VP_VALUE_BITS + 1 + dc))], -1)
-    pred = comp.vp_head(x)                                            # (B, A, O, 33)
+    return vfeat.reshape(B, A, O, I * (_VP_VALUE_BITS + 1 + dc))
+
+
+def _essence_desc(comp, T, essence, out_slot_regs_t):
+    """(B, O, d+d_ptr): what the evaluator is handed for each output in place
+    of the output's own description — the unit-normalized essence (magnitude
+    is validity) and the output's pointer, read from the written register's
+    pointer channels in `T`."""
+    p0 = comp.d_out + comp.d_event + comp.d_colour
+    out_idx = out_slot_regs_t.clamp(min=0).long()
+    ptr = T[..., p0:p0 + comp.d_ptr].gather(
+        1, out_idx.unsqueeze(-1).expand(-1, -1, comp.d_ptr))          # (B, O, P)
+    ess = F.normalize(essence, dim=-1).unsqueeze(1).expand(-1, ptr.shape[1], -1)
+    return torch.cat([ess, ptr], -1)
+
+
+def _vp_bce(pred, out_slot_regs_t, out_regs_t, mask_t, vp_smooth_weight,
+            return_count):
+    """Per-bit BCE + vp_smooth_weight · smooth-magnitude MSE, averaged over
+    (row, output slot, anchor) triples with a filled output slot."""
+    A = pred.shape[1]
+    out_valid = out_slot_regs_t != AUX_CE_IGNORE                      # (B, O)
+    out_idx = out_slot_regs_t.clamp(min=0).long()
     target_i = out_regs_t.to(torch.int64).gather(
         -1, out_idx.unsqueeze(1).expand(-1, A, -1))                  # (B, A, O)
     nbits = _VP_VALUE_BITS
@@ -298,29 +288,56 @@ def vp_slot_loss(comp, T, anchors_t, out_slot_regs_t, out_inputs_t, out_regs_t,
     return (loss, int(pm.sum())) if return_count else loss
 
 
-def vp_slot_predict(comp, T, anchors_t, out_slot_regs_t, out_inputs_t):
-    """The head's prediction per (row, anchor, output slot), (B, A, O, 33),
-    through the same features `vp_slot_loss` builds — the one definition every
+def vp_loss(comp, T, essence, anchors_t, out_slot_regs_t, out_inputs_t,
+            out_regs_t, mask_t, vp_smooth_weight=0.2, return_count=False,
+            n_out=None):
+    """Value prediction read from the ESSENCE, per written output.
+
+    For output k of a row the head is handed the unit-normalized essence, the
+    output's pointer (which of the chunk's distinct output paths to evaluate;
+    it says nothing about that path's function) and, for each external input
+    the output depends on, the input's value and colour (`_vp_inputs`), and
+    predicts that register's value after the chunk (32 bit-logits + 1 smooth
+    scalar). The output's own description is never handed over, so its
+    function has to reach the head through the essence. Nothing in the
+    features is a register number or a position in the text: everything is
+    reached through one-hot gathers that a rename permutes.
+
+    Args:
+      comp:             the Compressor (uses comp.vp_head and its widths)
+      T:                (B, n_regs, d_slot) the emitted state
+      essence:          (B, d_out) the emitted essence
+      anchors_t:        (B, A, 32) int32 — the register file each row was
+                        executed from
+      out_slot_regs_t:  (B, MAX_OUT) int64 — output registers (AUX_CE_IGNORE
+                        for unused slots)
+      out_inputs_t:     (B, MAX_OUT, MAX_IN) int64 — each output's external
+                        input registers in colour order (AUX_CE_IGNORE padded)
+      out_regs_t:       (B, A, 32) int32 — the register file after the chunk
+      mask_t:           (B,) bool — rows to include
+      n_out:            bound on filled output slots; slots past it are
+                        skipped (they must be AUX_CE_IGNORE)
+
+    Returns a scalar loss (per-bit BCE + vp_smooth_weight · smooth-magnitude
+    MSE) over (row, output slot, anchor) triples with a filled output slot.
+    """
+    if n_out is not None:
+        out_slot_regs_t = out_slot_regs_t[:, :n_out]
+        out_inputs_t = out_inputs_t[:, :n_out]
+    pred = vp_predict(comp, T, essence, anchors_t, out_slot_regs_t,
+                      out_inputs_t)
+    return _vp_bce(pred, out_slot_regs_t, out_regs_t, mask_t,
+                   vp_smooth_weight, return_count)
+
+
+def vp_predict(comp, T, essence, anchors_t, out_slot_regs_t, out_inputs_t):
+    """The evaluator's prediction per (row, anchor, output slot), (B, A, O, 33),
+    through the same features `vp_loss` builds — the one definition every
     probe that scores the head reads."""
-    B, A = anchors_t.shape[0], anchors_t.shape[1]
-    d, dc = comp.d_out, comp.d_colour
-    O, I = out_inputs_t.shape[1], out_inputs_t.shape[2]
-    out_idx = out_slot_regs_t.clamp(min=0).long()
-    desc = T[..., :d].gather(1, out_idx.unsqueeze(-1).expand(-1, -1, d))
-    in_valid = (out_inputs_t != AUX_CE_IGNORE)
-    in_idx = out_inputs_t.clamp(min=0).long()
-    colours = T[..., d + comp.d_event:]
-    in_col = colours.gather(
-        1, in_idx.reshape(B, -1, 1).expand(-1, -1, dc)).reshape(B, O, I, dc)
-    in_col = in_col * in_valid.unsqueeze(-1)
-    vals = anchors_t.to(torch.int64).gather(
-        -1, in_idx.reshape(B, 1, -1).expand(-1, A, -1)).reshape(B, A, O, I)
-    vals = vals * in_valid.unsqueeze(1)
-    vfeat = torch.cat([_value_feat(vals),
-                       in_col.unsqueeze(1).expand(-1, A, -1, -1, -1)], -1)
-    x = torch.cat([desc.unsqueeze(1).expand(-1, A, -1, -1),
-                   vfeat.reshape(B, A, O, I * (_VP_VALUE_BITS + 1 + dc))], -1)
-    return comp.vp_head(x)
+    vin = _vp_inputs(comp, T, anchors_t, out_inputs_t)
+    desc = _essence_desc(comp, T, essence, out_slot_regs_t)
+    return comp.vp_head(torch.cat(
+        [desc.unsqueeze(1).expand(-1, vin.shape[1], -1, -1), vin], -1))
 
 
 # Rotary immediate encoding (T1). POWER-OF-2 periods 2,4,...,4096: each frequency
@@ -865,9 +882,9 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
         bl = binding_losses(
             comp, T, essence, live_in_t=li, live_out_t=lo, pc_writes_t=pc,
             in_slot_t=in_slot, out_slot_t=out_slot, in_k_eff=ike, out_k_eff=oke)
-        vp = (vp_slot_loss(
-                  comp, T, anchors, out_slot, out_inputs, out_regs, vp_mask,
-                  vp_smooth_weight=vp_smooth_weight, n_out=oke)
+        vp = (vp_loss(
+                  comp, T, essence, anchors, out_slot, out_inputs, out_regs,
+                  vp_mask, vp_smooth_weight=vp_smooth_weight, n_out=oke)
               if vp_active else essence.new_zeros(()))
         # Immediate head (T1 only): linear readout of the essence must match the
         # rotary encoding of the instruction's immediate, masked to I-type rows.
@@ -931,7 +948,8 @@ def train_encoder(batch_iter, *,
                   live_in_weight=0.1, live_out_weight=0.1,
                   pc_writes_weight=0.1,
                   in_slot_weight=0.1, out_slot_weight=0.1,
-                  value_predict_weight=1.0, vp_smooth_weight=0.2, imm_weight=1.0,
+                  value_predict_weight=1.0,
+                  vp_smooth_weight=0.2, imm_weight=1.0,
                   device='auto', on_log=None, save_every=10000,
                   compile_step=True):
     """Train a T1 encoder on RVT batches.
@@ -952,7 +970,7 @@ def train_encoder(batch_iter, *,
     live_in/out_weight:  BCE on the behavioral input/output register masks.
     pc_writes_weight:    BCE on the explicit-PC-write flag.
     in/out_slot_weight:  ListMLE on the input/output slot orderings.
-    value_predict_weight: MSE on per-anchor rd value prediction.
+    value_predict_weight: value prediction read from the essence (vp_loss).
     on_log:              optional callable(model, losses, train_state=None)
                          called at the first log point at or after every
                          `save_every` steps (uniform across trainers).

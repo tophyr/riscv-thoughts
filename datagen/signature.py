@@ -24,9 +24,11 @@ Colouring from the wiring alone is deliberate: the encoder computes the same
 colouring as its leaf seed from the wiring the lower tier emits
 (`RegisterStateMachine._prepass`), with every role ordered — it is told
 nothing about which operations commute, so a commutative swap is the
-op-cell's to learn. `COMMUTATIVE` below serves the oracle only: the signature
-LABELS a swap as equivalent, and `output_inputs` orders a symmetric pair
-consistently. Opcodes reach the encoder only as content, so they belong in the
+op-cell's to learn. `COMMUTATIVE` below serves the signature only: it LABELS a
+swap as equivalent. `output_inputs` orders an output's inputs by the
+encoder's colouring, every role ordered, so the evaluator is handed each input
+at a position the encoder's own colours determine and a rename never moves it.
+Opcodes reach the encoder only as content, so they belong in the
 description (the op-cell's result), not in the seed. `test_signature.py` holds
 the agreement with the emulator.
 
@@ -190,17 +192,21 @@ def signature(chunk, symmetric_ops=COMMUTATIVE):
                         for n in outputs.values()))
 
 
-def output_inputs(chunk, symmetric_ops=COMMUTATIVE):
+def output_inputs(chunk):
     """Per output register, the external input registers its value depends
-    on, in canonical order: by leaf colour, then by register number.
+    on, in canonical order: by leaf colour with every role ordered — the
+    encoder's colouring — then by register number.
 
-    This is the order an evaluator gathers a written slot's input values in.
-    Two leaves of one colour are symmetric — exchanging them cannot change the
-    output — so the register tiebreak decides nothing about the value, only
-    which of two equal roles a register is listed under."""
+    This is the order an evaluator gathers an output's input values in. With
+    the commutative roles merged, the two operands of an `ADD` would tie and
+    the register number would decide their positions, so a rename would
+    reorder what the evaluator is handed. Ordered roles leave no tie between
+    the inputs of one output at two instructions. A tie between leaves feeding
+    different operations becomes possible from three instructions, since the
+    colouring sees no opcode, and there the register number decides again."""
     edges, outputs = dataflow(chunk)
     live = live_nodes(edges, outputs)
-    col = colours(chunk, edges, live, symmetric_ops)
+    col = colours(chunk, edges, live, symmetric_ops=frozenset())
     out = {}
     for reg, node in outputs.items():
         leaves, stack, seen = set(), [node], set()

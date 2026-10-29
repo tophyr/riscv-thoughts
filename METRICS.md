@@ -13,13 +13,41 @@ file is the instrument, not the readings.
 ## vp — value prediction
 
 **What it measures.** Given the chunk's input values, can its output register
-values be recovered from what the tier emits? For each register the chunk
-writes, the evaluator reads that slot's description — its value channels in
-the emitted state — and the values and colours of the registers the output
-depends on, gathered by register, and predicts the register's value
-(`vp_slot_loss`, `compressor/train.py`). It is the metric that matters because
-the descriptions are what the essence pools and what a future T3 consumes: a
-next tier can only recover what this one preserved.
+values be recovered from the essence? For each register the chunk writes, a
+readout network — the **evaluator**, `vp_head` — is handed three things and
+predicts that register's value after the chunk (`vp_loss`,
+`compressor/train.py`):
+
+- the unit-normalized essence;
+- a **pointer**: a one-hot saying which of the chunk's outputs is being
+  asked about. It marks the output's position in a fixed ordering of the
+  chunk's distinct outputs and carries nothing about what the output computes
+  (RISCV_DESIGN, "Value prediction reads the essence");
+- for each register the output depends on, its value and its structural
+  colour. The value comes from an **anchor state**: a register file the chunk
+  is executed from to produce the target. The colour is a label computed from
+  the wiring alone (RISCV_DESIGN, "Leaf identity for input registers").
+
+Each output has a **function**: the computation that turns its input values
+into its value, such as `x+1046` or `x & ~y`. The encoder never sees a value,
+so a function is all a tier can hand on, and of the evaluator's three inputs
+only the essence should carry it. vp is the metric that matters because the
+essence is what a future T3 consumes: a next tier can only recover what this
+one preserved.
+
+**A second score checks that only the essence carries the function.** An
+output's function could also reach the evaluator by another route, a *leak*.
+Two routes exist in principle: the pointer is computed from each output's
+content through a fixed hash, so its position carries a little of that
+content, and the input colours carry the wiring. To test for a leak,
+`probes/frame_scorecard.py` scores every output a second time, handing the
+evaluator another chunk's essence while keeping the output's own pointer and
+inputs, and reports that exact-match rate as the *leak check*. With no leak,
+the evaluator is now evaluating some other chunk's function and the rate
+collapses. It does not reach zero, because two different functions agree on
+some input values (two comparisons that both return 0); that chance floor is
+not measured. Only a reading close to the model's own vp would indicate a
+leak.
 
 **The head's shape is part of what a vp number certifies, so quote it with the
 number.** vp scores the essence composed with a readout, and that readout is the
@@ -54,7 +82,7 @@ states the model never trained on**, which scores the model's own evaluator
 over a held-out corpus, by writing opcode and by input count.
 
 **A vp number in a training log is held out in its rows and in its inputs.**
-`datagen` generates every batch fresh, draws each source chunk's anchor states
+`datagen` generates every batch fresh, draws each chunk's anchor states
 afresh, and the trainer never revisits one, so a training-log vp is measured at
 input points the head has not seen. It is still noisy from batch to batch — the
 draw decides how hard a batch's values are — and it is not exact match, so
@@ -68,7 +96,7 @@ at those points instead of evaluating, and trained heads did: models exact at 8
 fixed anchors scored ~5% (T2) and 21% (T1) at states they never saw
 (EXPERIMENT_LOG, "T2 faithfulness", finding 32). **So `vp = 0` certifies a
 function only at anchor states the model never trained on.** Training draws
-fresh anchors for every source chunk and ships them in the batch (CLAUDE.md,
+fresh anchors for every chunk and ships them in the batch (CLAUDE.md,
 INVARIANT 1), so no input point repeats; scoring uses one fixed held-out set
 (`heldout_anchor_states`, a seed no generator uses), which every scorer reaches
 by generating its corpus with `datagen --heldout-anchors`;
@@ -197,7 +225,11 @@ population it targets.
 - **The frame its target was built in.** Numbers measured in the first-read
   canonical frame (every finding before 37) are not comparable to numbers in
   the register frame: a model is scored on the target it trained on, and the
-  targets differ in kind, not only on a subset of rows.
+  targets differ in kind, not only on a subset of rows. Within the register
+  frame, findings 37 and 38 grade each written slot's description and later
+  findings grade the essence; and findings 37–39 were trained and scored with
+  a commutative operation's two inputs handed to the evaluator in
+  register-number order (EXPERIMENT_LOG, "The register frame", finding 40).
 - **The chunk length.** Figures are per-instruction or per-slot and do not carry
   across lengths.
 

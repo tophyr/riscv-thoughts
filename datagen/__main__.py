@@ -188,8 +188,7 @@ def _build_batches_iter(cfg, seed):
     return collect_into_batches(
         chunks_iter,
         batch_size=cfg.batch_size,
-        twins=cfg.twins,
-        draw_anchors=draw_anchors, rng=rng,
+        draw_anchors=draw_anchors,
         invalid_rate=inv_rate, invalid_provider=invalid_provider,
         max_invalid_window=cfg.max_invalid_window,
         max_chunk_len=rule.max_len,
@@ -484,14 +483,13 @@ class WorkerPool:
 class _GenCfg:
     """Plain container of generation params handed to each forked worker.
     (Picklable-irrelevant under fork, but kept simple and primitive anyway.)"""
-    __slots__ = ('rule', 'batch_size', 'twins', 'n_states', 'heldout_anchors',
+    __slots__ = ('rule', 'batch_size', 'n_states', 'heldout_anchors',
                  'max_invalid_window',
                  'config', 'worker_log_every')
 
     def __init__(self, args):
         self.rule = args.rule
         self.batch_size = args.batch_size
-        self.twins = args.twins
         self.n_states = args.n_states
         self.heldout_anchors = args.heldout_anchors
         self.max_invalid_window = args.max_invalid_window
@@ -510,10 +508,8 @@ def main():
     g = p.add_argument_group('generation (per-worker)')
     g.add_argument('--rule', default='branch+cap=8',
                    help='Chunk-termination rule. Default: branch+cap=8.')
-    g.add_argument('--batch-size', type=int, default=128,
-                   help='Source rows per batch (twins extend the batch).')
-    g.add_argument('--twins', type=int, default=3,
-                   help='Relabeled equivalents per valid source chunk.')
+    g.add_argument('--batch-size', type=int, default=384,
+                   help='Rows per batch, one chunk each.')
     g.add_argument('--n-states', type=int, default=8,
                    help='Anchor states per batch: the input points the '
                         'value-prediction target is executed at.')

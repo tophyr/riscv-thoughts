@@ -18,8 +18,7 @@
 #
 # Override generation knobs via env vars:
 #   WORKERS         (default: all CPU cores)
-#   BATCH_SIZE      (default 128)
-#   TWINS           (default 3)
+#   BATCH_SIZE      (default 384)
 #   N_STATES        (default 8)
 #   RULE            (default 'branch+cap=8' — T2 chunks)
 #   CONFIG          (REQUIRED — the corpus config. A corpus is defined by
@@ -38,8 +37,7 @@ TOTAL=$1
 OUT=$2
 
 WORKERS=${WORKERS:-}
-BATCH_SIZE=${BATCH_SIZE:-128}
-TWINS=${TWINS:-3}
+BATCH_SIZE=${BATCH_SIZE:-384}
 N_STATES=${N_STATES:-8}
 RULE=${RULE:-branch+cap=8}
 CONFIG=${CONFIG:?set CONFIG to a corpus config under configs/ — a corpus is one reviewable file, and there is no default}
@@ -60,7 +58,7 @@ fi
 .venv/bin/python -m datagen \
     --rule "$RULE" \
     --batch-size "$BATCH_SIZE" \
-    --twins "$TWINS" --n-states "$N_STATES" \
+    --n-states "$N_STATES" \
     --config "$CONFIG" \
     --count "$TOTAL" \
     "${WORKER_ARGS[@]}" \

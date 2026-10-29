@@ -666,7 +666,7 @@ def precompute_chunk(chunk, anchor_states):
     own input registers (input i takes position i+1) and the chunk is executed
     on that register file as drawn, register names intact. The evaluator reads
     each output's value at its own register and gathers its inputs' values at
-    theirs, so a renamed twin executes on its own placement of the same draw.
+    theirs, so a renamed chunk executes on its own placement of the same draw.
 
     Raises NotImplementedError on memory ops (V1 scope).
     """

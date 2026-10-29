@@ -7,7 +7,7 @@ compressor.train.train_encoder; saves encoder.pt + hparams.json
 + losses.json into a run directory.
 
 Usage:
-    python -m datagen --rule single --twins 2 --batch-size 128 --n-states 8 \\
+    python -m datagen --rule single --batch-size 384 --n-states 8 \\
         --config configs/instr_alu_writers.json --count 50000 \\
         | train_encoder.py --n-steps 50000
 """
@@ -67,11 +67,10 @@ def main():
     p.add_argument('--out-slot-weight', type=float, default=0.1,
                    help='ListMLE on the output-slot register ordering.')
     p.add_argument('--value-predict-weight', type=float, default=1.0,
-                   help='V1 experiment: MSE on rd-value prediction '
-                        'from (shape, input register values). Tests '
-                        'whether shape encodes the I/O function of '
-                        'the operator. Requires a --rule single corpus. '
-                        'The anchor states ride in each batch.')
+                   help='value prediction read from the essence: each '
+                        "output's value from the essence, the output's "
+                        "pointer and its inputs' values. The anchor states "
+                        'ride in each batch.')
     p.add_argument('--vp-smooth-weight', type=float, default=0.2,
                    help='weight on the vp smooth-magnitude (ordering) term. The '
                         'per-bit target carries resolution; this keeps '

@@ -1,5 +1,5 @@
 """Tests for datagen.batch — Chunk + Batch containers, the
-BinaryFormat machinery (RVT), pack helpers, and twin construction."""
+BinaryFormat machinery (RVT), pack helpers, and target construction."""
 
 import io
 
@@ -10,7 +10,7 @@ from emulator import Instruction
 from datagen.batch import (
     Chunk, Batch, RVT_FORMAT, BinaryFormat,
     pack_batch, padding_mask,
-    generate_chunks, collect_into_batches, build_twins, AuxPayload,
+    generate_chunks, collect_into_batches, build_targets, AuxPayload,
     _make_valid_chunk, _make_invalid_chunk,
 )
 from datagen.compare import (
@@ -108,8 +108,8 @@ def _sample_batch():
     anchors = draw_anchor_states(np.random.default_rng(0), 4)
     gen = collect_into_batches(
         generate_chunks(length_cap(2), rng),
-        batch_size=8, twins=1,
-        draw_anchors=lambda k: draw_anchor_states(rng, k * 4).reshape(k, 4, -1), rng=rng,
+        batch_size=8,
+        draw_anchors=lambda k: draw_anchor_states(rng, k * 4).reshape(k, 4, -1),
         max_chunk_len=2,
     )
     return next(gen)
@@ -132,7 +132,7 @@ def test_round_trip():
 
 
 def test_each_row_ships_the_anchors_its_targets_were_executed_at():
-    """One structured draw per source chunk, placed on each row's own input
+    """One structured draw per chunk, placed on each row's own input
     registers, travels with every row: the evaluator gathers an output's input
     values from `batch.anchors`, so out_regs must have been executed there."""
     from datagen.generate import build_opcode_table
@@ -140,23 +140,13 @@ def test_each_row_ships_the_anchors_its_targets_were_executed_at():
     alu = build_opcode_table({'R_ALU': 0.5, 'I_ALU': 0.5})   # no mem-op rows
     gen = collect_into_batches(
         generate_chunks(single(), rng, opcode_table=alu),
-        batch_size=8, twins=1,
-        draw_anchors=lambda k: draw_anchor_states(rng, k * 4).reshape(k, 4, -1), rng=rng,
+        batch_size=8,
+        draw_anchors=lambda k: draw_anchor_states(rng, k * 4).reshape(k, 4, -1),
         max_chunk_len=1)
     b = next(gen)
-    from datagen.compare import _input_order
     from emulator import run as emu_run
-    assert b.anchors.shape == (16, 4, 32) and (b.anchors[:, :, 0] == 0).all()
-    # rows 2k and 2k+1 are a source and its twin: one structured draw, placed
-    # on each row's own input registers, so the twin's inputs hold the
-    # source's input values; sources differ.
-    for k in range(8):
-        src, _ = decode_instruction(b.tokens[2 * k, :b.token_lens[2 * k]].tolist(), 0)
-        twn, _ = decode_instruction(b.tokens[2 * k + 1, :b.token_lens[2 * k + 1]].tolist(), 0)
-        si, ti = _input_order([src]), _input_order([twn])
-        assert len(si) == len(ti)
-        assert np.array_equal(b.anchors[2 * k][:, si], b.anchors[2 * k + 1][:, ti])
-    assert not np.array_equal(b.anchors[0], b.anchors[2])
+    assert b.anchors.shape == (8, 4, 32) and (b.anchors[:, :, 0] == 0).all()
+    assert not np.array_equal(b.anchors[0], b.anchors[1])
     for i in np.nonzero(b.out_regs_valid)[0]:
         ins, _ = decode_instruction(b.tokens[i, :b.token_lens[i]].tolist(), 0)
         for a in range(b.anchors.shape[1]):
@@ -184,8 +174,8 @@ def test_reader_concatenates():
     anchors = draw_anchor_states(np.random.default_rng(0), 4)
     gen = collect_into_batches(
         generate_chunks(length_cap(2), rng),
-        batch_size=8, twins=1,
-        draw_anchors=lambda k: draw_anchor_states(rng, k * 4).reshape(k, 4, -1), rng=rng,
+        batch_size=8,
+        draw_anchors=lambda k: draw_anchor_states(rng, k * 4).reshape(k, 4, -1),
         max_chunk_len=2,
     )
     b1, b2 = next(gen), next(gen)
@@ -362,37 +352,21 @@ def test_header_bounds_reject_garbage_dims():
 
 
 # ---------------------------------------------------------------------------
-# build_twins
+# build_targets
 # ---------------------------------------------------------------------------
 
-def test_build_twins_builds_twin_clusters():
-    rng = np.random.default_rng(0)
-    anchors = draw_anchor_states(np.random.default_rng(0), 4)
-    chunks = [
-        _instrs_to_chunk([Instruction('ADDI', 1, 0, 5),
-                          Instruction('ADD', 2, 1, 1)]),
-        _instrs_to_chunk([Instruction('XOR', 3, 1, 1)]),
-        _instrs_to_chunk([Instruction('OR', 4, 1, 2)]),
-    ]
-    out, _aux, _or, _orv, _an = build_twins(
-        chunks, twins=2, draw_anchors=lambda k: np.broadcast_to(anchors, (k, *anchors.shape)), rng=rng)
-    # Each source plus its 2 twins forms a cluster of 3 → 3*3 rows.
-    assert len(out) == 3 * 3
-
-
-def test_build_twins_aux_content_and_none_rows():
-    """build_twins / _aux_from_precomputeds produce correct live masks +
+def test_build_targets_aux_content_and_none_rows():
+    """build_targets / _aux_from_precomputeds produce correct live masks +
     slot regs for a known instruction, and zero-mask / AUX_CE_IGNORE rows
     for chunks without a usable Precomputed (mem-op, invalid)."""
-    rng = np.random.default_rng(0)
     anchors = draw_anchor_states(np.random.default_rng(0), 4)
     chunks = [
         _instrs_to_chunk([Instruction('ADD', 5, 1, 2)]),   # row 0: real aux
         _make_invalid_chunk([5, 6, 7]),                    # invalid → None row
         _instrs_to_chunk([Instruction('LW', 9, 0, 3)]),    # mem-op → None row
     ]
-    out, aux, _or, _orv, _an = build_twins(chunks, twins=0, draw_anchors=lambda k: np.broadcast_to(anchors, (k, *anchors.shape)), rng=rng)
-    assert len(out) == 3  # twins=0 → no growth
+    aux, _or, orv, _an = build_targets(chunks, draw_anchors=lambda k: np.broadcast_to(anchors, (k, *anchors.shape)))
+    assert orv.tolist() == [True, False, False]
 
     # Row 0: ADD x5,x1,x2.
     assert np.nonzero(aux.live_in_mask[0])[0].tolist() == [1, 2]
@@ -412,21 +386,6 @@ def test_build_twins_aux_content_and_none_rows():
         assert (aux.out_slot_regs[r] == AUX_CE_IGNORE).all()
 
 
-def test_build_twins_drops_memory_op_chunks():
-    rng = np.random.default_rng(0)
-    anchors = draw_anchor_states(np.random.default_rng(0), 4)
-    chunks = [
-        _instrs_to_chunk([Instruction('LW', 1, 0, 0)]),
-        _instrs_to_chunk([Instruction('ADD', 2, 3, 4)]),
-        _instrs_to_chunk([Instruction('SUB', 5, 6, 7)]),
-    ]
-    out, _aux, _or, _orv, _an = build_twins(
-        chunks, twins=1, draw_anchors=lambda k: np.broadcast_to(anchors, (k, *anchors.shape)), rng=rng)
-    # The mem-op chunk gets no twins.
-    # 1 mem-op + 2 sources × 2 cluster_size = 1 + 4 = 5.
-    assert len(out) == 5
-
-
 # ---------------------------------------------------------------------------
 # Fixed-shape (allocator-fragmentation) invariant on collect_into_batches.
 # Every batch from one configured generator MUST share an identical shape so
@@ -437,7 +396,7 @@ def _drain(gen, n):
     return [next(gen) for _ in range(n)]
 
 
-def test_fixed_shape_with_twins_and_invalids():
+def test_fixed_shape_with_invalids():
     rng = np.random.default_rng(0)
     anchors = draw_anchor_states(np.random.default_rng(0), 4)
     invalid_rng = np.random.default_rng(99)
@@ -450,8 +409,8 @@ def test_fixed_shape_with_twins_and_invalids():
 
     gen = collect_into_batches(
         generate_chunks(length_cap(3), rng),
-        batch_size=8, twins=2,
-        draw_anchors=lambda k: np.broadcast_to(anchors, (k, *anchors.shape)), rng=rng,
+        batch_size=8,
+        draw_anchors=lambda k: np.broadcast_to(anchors, (k, *anchors.shape)),
         invalid_rate=0.25, invalid_provider=invalid_provider,
         max_invalid_window=20, max_chunk_len=3)
     batches = _drain(gen, 5)
@@ -479,8 +438,8 @@ def test_fixed_shape_single_rule_out_regs():
     anchors = draw_anchor_states(np.random.default_rng(0), 4)
     gen = collect_into_batches(
         generate_chunks(single(), rng),
-        batch_size=8, twins=1,
-        draw_anchors=lambda k: np.broadcast_to(anchors, (k, *anchors.shape)), rng=rng,
+        batch_size=8,
+        draw_anchors=lambda k: np.broadcast_to(anchors, (k, *anchors.shape)),
         max_chunk_len=1)
     batches = _drain(gen, 5)
 

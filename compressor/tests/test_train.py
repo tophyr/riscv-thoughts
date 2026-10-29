@@ -27,7 +27,7 @@ from compressor.train import (
     _value_smooth,
     binding_losses,
     build_optim_sched,
-    vp_slot_loss,
+    vp_loss,
 )
 
 # vp_head output width per slot: 32 two's-complement bit-logits + 1 smooth scalar.
@@ -52,7 +52,7 @@ class _ConstHead(torch.nn.Module):
 
 
 # ===========================================================================
-# vp_slot_loss (value prediction per written slot, shared by T1 and T2)
+# vp_loss (value prediction read from the essence, shared by T1 and T2)
 # ===========================================================================
 
 class _CaptureHead(torch.nn.Module):
@@ -69,17 +69,25 @@ class _CaptureHead(torch.nn.Module):
         return torch.zeros((*x.shape[:-1], self.out_dim))
 
 
-def test_vp_slot_loss_feeds_the_slot_description_and_its_inputs_by_register():
-    """For output slot k the head is fed the WRITTEN register's value channels
-    from T, and for each of the output's inputs (out_inputs, by register) that
+def _vp_comp(head, d, de):
+    from compressor.model import _COLOUR_DIM, _PTR_DIM
+    return type('C', (), {'vp_head': head, 'd_out': d, 'd_event': de,
+                          'd_colour': _COLOUR_DIM, 'd_ptr': _PTR_DIM})()
+
+
+def test_vp_loss_feeds_the_essence_the_pointer_and_the_inputs_by_register():
+    """For output slot k the head is fed the unit-normalized essence, the
+    WRITTEN register's pointer channels from T (never its value channels),
+    and for each of the output's inputs (out_inputs, by register) that
     register's value in the row's anchors as [32 bits, 1 smooth] plus the
     input's colour channels from T. Unfilled inputs feed zeros."""
-    from compressor.model import _COLOUR_DIM
+    from compressor.model import _COLOUR_DIM as dc, _PTR_DIM as P
     B, d, de, A = 1, 4, 2, 2
-    dc = _COLOUR_DIM
-    T = torch.zeros(B, 32, d + de + dc)
+    T = torch.zeros(B, 32, d + de + dc + P)
     T[0, 9, :d] = torch.tensor([1.0, 2.0, 3.0, 4.0])        # description of x9
-    T[0, 7, d + de:] = 0.5                                   # colour of leaf x7
+    T[0, 9, d + de + dc + 1] = 1.0                           # pointer of x9: order 1
+    T[0, 7, d + de:d + de + dc] = 0.5                        # colour of leaf x7
+    essence = torch.tensor([[3.0, 0.0, 4.0, 0.0]])
     anchors = torch.zeros(B, A, 32, dtype=torch.int32)
     for p in range(32):
         for a in range(A):
@@ -90,43 +98,49 @@ def test_vp_slot_loss_feeds_the_slot_description_and_its_inputs_by_register():
     out_inputs[0, 0, 0] = 7
     out_regs = torch.zeros(B, A, 32, dtype=torch.int32)
     head = _CaptureHead(_VP_SLOT)
-    comp = type('C', (), {'vp_head': head, 'd_out': d, 'd_event': de, 'd_colour': dc})()
-    vp_slot_loss(comp, T, anchors, out_slot, out_inputs, out_regs, torch.tensor([True]))
-    x = head.last                                            # (B, A, O, d + I*(33+dc))
-    assert x.shape == (B, A, MAX_OUTPUT_SLOTS, d + MAX_INPUT_SLOTS * (_VP_SLOT + dc))
-    assert torch.equal(x[0, :, 0, :d], torch.tensor([[1.0, 2.0, 3.0, 4.0]] * A))
-    feats = x[0, :, 0, d:].reshape(A, MAX_INPUT_SLOTS, _VP_SLOT + dc)
+    vp_loss(_vp_comp(head, d, de), T, essence, anchors, out_slot, out_inputs,
+            out_regs, torch.tensor([True]))
+    x = head.last                                     # (B, A, O, d + P + I*(33+dc))
+    assert x.shape == (B, A, MAX_OUTPUT_SLOTS, d + P + MAX_INPUT_SLOTS * (_VP_SLOT + dc))
+    assert torch.allclose(x[0, :, 0, :d], torch.tensor([[0.6, 0.0, 0.8, 0.0]] * A))
+    assert torch.equal(x[0, :, 0, d:d + P], F_one_hot(1, P).expand(A, -1))
+    feats = x[0, :, 0, d + P:].reshape(A, MAX_INPUT_SLOTS, _VP_SLOT + dc)
     assert torch.equal(feats[:, 0, :_VP_VALUE_BITS], _value_bits(anchors[0, :, 7].long()))
     assert torch.allclose(feats[:, 0, _VP_VALUE_BITS], _value_smooth(anchors[0, :, 7].float()))
     assert torch.all(feats[:, 0, _VP_SLOT:] == 0.5)
     assert torch.count_nonzero(feats[:, 1:]) == 0
 
 
-def test_vp_slot_loss_gather_and_mask():
+def F_one_hot(i, n):
+    return torch.nn.functional.one_hot(torch.tensor(i), n).float()
+
+
+def test_vp_loss_gather_and_mask():
     """The target is the output register's value in out_regs; only filled
     (row, slot) pairs of unmasked rows contribute, and return_count gives
     that pair count."""
-    from compressor.model import _COLOUR_DIM
+    from compressor.model import _COLOUR_DIM, _PTR_DIM
     B, d, de, A = 2, 4, 2, 2
-    T = torch.zeros(B, 32, d + de + _COLOUR_DIM)
+    T = torch.zeros(B, 32, d + de + _COLOUR_DIM + _PTR_DIM)
+    essence = torch.ones(B, d)
     anchors = torch.zeros(B, A, 32, dtype=torch.int32)
     out_slot = torch.full((B, MAX_OUTPUT_SLOTS), AUX_CE_IGNORE, dtype=torch.int64)
     out_slot[0, 0], out_slot[0, 1] = 5, 9
     out_inputs = torch.full((B, MAX_OUTPUT_SLOTS, MAX_INPUT_SLOTS), AUX_CE_IGNORE, dtype=torch.int64)
     out_regs = torch.zeros(B, A, 32, dtype=torch.int32)
     out_regs[0, :, 5] = torch.tensor([10, 20]); out_regs[0, :, 9] = torch.tensor([30, 40])
-    comp = type('C', (), {'vp_head': _ConstHead(_VP_SLOT, 0.0), 'd_out': d, 'd_event': de, 'd_colour': _COLOUR_DIM})()
-    loss, count = vp_slot_loss(comp, T, anchors, out_slot, out_inputs, out_regs,
-                               torch.tensor([True, True]), return_count=True)
+    comp = _vp_comp(_ConstHead(_VP_SLOT, 0.0), d, de)
+    loss, count = vp_loss(comp, T, essence, anchors, out_slot, out_inputs, out_regs,
+                          torch.tensor([True, True]), return_count=True)
     assert count == 2
     # Zero logits: per-bit BCE is ln 2 for every bit; smooth term (0 - s)^2.
-    import math
     want = 0.0
     for vals in ((10, 20), (30, 40)):
         per = [math.log(2) + 0.2 * float(_value_smooth(torch.tensor(float(v))) ** 2) for v in vals]
         want += sum(per) / len(per)
     assert abs(float(loss) - want / 2) < 1e-5
-    masked = vp_slot_loss(comp, T, anchors, out_slot, out_inputs, out_regs, torch.tensor([False, False]))
+    masked = vp_loss(comp, T, essence, anchors, out_slot, out_inputs, out_regs,
+                     torch.tensor([False, False]))
     assert float(masked) == 0.0
 
 
@@ -142,8 +156,8 @@ def test_gen_shipped_out_regs_matches_recompute():
     chunks = generate_chunks(either(until_branch(), length_cap(4)), rng,
                              eq_rate=0.05)
     batch = next(collect_into_batches(
-        chunks, batch_size=64, twins=3,
-        draw_anchors=lambda k: draw_anchor_states(rng, k * 8).reshape(k, 8, -1), rng=rng,
+        chunks, batch_size=256,
+        draw_anchors=lambda k: draw_anchor_states(rng, k * 8).reshape(k, 8, -1),
         max_chunk_len=4))
 
     assert batch.out_regs.shape[0] == batch.tokens.shape[0]   # OB == B (T2)
@@ -160,9 +174,9 @@ def _small_batches(n):
     rng = np.random.default_rng(0)
     chunks = generate_chunks(length_cap(2), rng)
     return list(itertools.islice(collect_into_batches(
-        chunks, batch_size=8, twins=1,
+        chunks, batch_size=16,
         draw_anchors=lambda k: draw_anchor_states(rng, k * 8).reshape(k, 8, -1),
-        rng=rng, max_chunk_len=2), n))
+        max_chunk_len=2), n))
 
 
 def test_prefetcher_keeps_stream_order_across_workers():
@@ -494,7 +508,7 @@ def test_build_optim_sched_plain_cosine_when_no_warmup():
 def test_t2compressor_forward_shape_and_padding_contract():
     """The equivariant T2 runs the register-state machine over a chunk of
     frozen-T1 essences threaded by per-instruction wiring. encode_state ->
-    (T (B,n_regs,d_out+d_event+d_colour), essence (B,d_out)); padded steps (active=0)
+    (T (B,n_regs,d_out+d_event+d_colour+d_ptr), essence (B,d_out)); padded steps (active=0)
     are no-ops, so a chunk shorter than N does not NaN."""
     torch.manual_seed(0)
     t2 = T2Compressor(d_t1=8, d_out=12, d_event=16)
@@ -506,7 +520,7 @@ def test_t2compressor_forward_shape_and_padding_contract():
     active = torch.ones(B, N); active[2, 1:] = 0.0
 
     T, essence = t2.encode_state(seq, in0, in1, out, active)
-    assert T.shape == (B, R, 12 + 16 + t2.d_colour)
+    assert T.shape == (B, R, 12 + 16 + t2.d_colour + t2.d_ptr)
     assert essence.shape == (B, 12)
     assert not torch.isnan(T).any() and not torch.isnan(essence).any()
     # encode() returns just the essence.

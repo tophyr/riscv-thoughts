@@ -55,7 +55,7 @@ def run(cmd, stdin=None, timeout=60):
     return result.stdout, result.stderr.decode(), result.returncode
 
 
-def gen(n_batches=2, batch_size=8, twins=1, n_states=4,
+def gen(n_batches=2, batch_size=16, n_states=4,
         rule='cap=2', seed=42):
     """A bounded RVT fixture: a single-worker datagen pool capped to exactly
     n_batches via --count. One worker keeps the bytes deterministic under
@@ -63,7 +63,7 @@ def gen(n_batches=2, batch_size=8, twins=1, n_states=4,
     out, err, rc = run([
         PYTHON, '-m', 'datagen', '--gen-count', '1', '--count', str(n_batches),
         '--batch-size', str(batch_size), '--rule', rule,
-        '--twins', str(twins), '--n-states', str(n_states),
+        '--n-states', str(n_states),
         '--seed', str(seed)], timeout=120)
     assert rc == 0, f'datagen failed: {err}'
     assert len(out) > 0
@@ -99,7 +99,7 @@ class TestGenBatches:
         """Every rule — single (T1) and multi-instruction (T2) — ships the
         unified CANONICAL out_regs oracle (OB == B). Both carry
         n_anchors == --n-states."""
-        out = gen(n_batches=1, batch_size=4, twins=0, n_states=4,
+        out = gen(n_batches=1, batch_size=4, n_states=4,
                   rule='single')
         B, _, _, n_anchors, OB = _first_header(out)
         assert B == 4, B
@@ -107,7 +107,7 @@ class TestGenBatches:
         assert n_anchors == 4, n_anchors
 
         # A multi-instruction rule ships the same out_regs payload.
-        multi = gen(n_batches=1, batch_size=4, twins=0, n_states=4,
+        multi = gen(n_batches=1, batch_size=4, n_states=4,
                     rule='cap=2')
         B_m, _, _, n_anchors_m, OB_m = _first_header(multi)
         assert OB_m == B_m, f'T2 mode must ship OB==B, got OB={OB_m} B={B_m}'
@@ -122,9 +122,8 @@ class TestGenRules:
                                                ('transform', 5)])
     def test_capped_rule_respects_cap(self, component, cap):
         rule = f'{component}+cap={cap}'
-        # twins=0 keeps the batch to source rows; large batch so several
-        # chunks hit the cap.
-        data = gen(n_batches=3, batch_size=16, twins=0, n_states=4,
+        # A large batch so several chunks hit the cap.
+        data = gen(n_batches=3, batch_size=16, n_states=4,
                    rule=rule, seed=7)
         assert _count_batches(data) == 3
         # Every chunk's instruction count is bounded by the cap. Read the
@@ -148,7 +147,7 @@ class TestGenRules:
         deep inside a worker."""
         out, err, rc = run([
             PYTHON, '-m', 'datagen', '--batch-size', '4',
-            '--rule', 'branch', '--twins', '0', '--n-states', '4'])
+            '--rule', 'branch', '--n-states', '4'])
         assert rc != 0, 'bare branch must fail'
         assert 'unbounded' in err.lower() and 'cap' in err.lower(), err
         assert len(out) == 0
@@ -156,7 +155,7 @@ class TestGenRules:
     def test_unknown_component_rejected(self):
         out, err, rc = run([
             PYTHON, '-m', 'datagen', '--batch-size', '4',
-            '--rule', 'frobnicate', '--twins', '0', '--n-states', '4'])
+            '--rule', 'frobnicate', '--n-states', '4'])
         assert rc != 0, 'unknown rule component must fail'
         assert 'Unknown rule component' in err and 'frobnicate' in err, err
         assert len(out) == 0
@@ -171,7 +170,7 @@ class TestGenRules:
         for flag in ('--chain-rate', '--inject-equiv', '--inject-invalid'):
             out, err, rc = run([
                 PYTHON, '-m', 'datagen', '--batch-size', '4',
-                '--rule', 'cap=2', '--twins', '0', '--n-states', '4',
+                '--rule', 'cap=2', '--n-states', '4',
                 flag, '0.5'])
             assert rc != 0, f'{flag} must not be accepted'
             assert 'unrecognized arguments' in err, err
@@ -184,8 +183,7 @@ class TestCount:
     def test_count_caps_pool_output(self):
         out, err, rc = run([
             PYTHON, '-m', 'datagen', '--gen-count', '4', '--count', '10',
-            '--batch-size', '8', '--rule', 'cap=2', '--twins', '1',
-            '--n-states', '4'], timeout=120)
+            '--batch-size', '16', '--rule', 'cap=2', '--n-states', '4'], timeout=120)
         assert rc == 0, err
         assert _count_batches(out) == 10
 
@@ -223,8 +221,7 @@ class TestMuxBatches:
         """Two generation workers, bounded to 4 batches by --count."""
         out, err, rc = run([
             PYTHON, '-m', 'datagen', '--gen-count', '2', '--count', '4',
-            '--batch-size', '8', '--rule', 'cap=2', '--twins', '1',
-            '--n-states', '4'], timeout=120)
+            '--batch-size', '16', '--rule', 'cap=2', '--n-states', '4'], timeout=120)
         assert rc == 0, err
         assert _count_batches(out) == 4
 
@@ -279,8 +276,8 @@ class TestMuxBatches:
         by parentage (fork children share the parent's argv)."""
         proc = subprocess.Popen([
             PYTHON, '-m', 'datagen', '--gen-count', '4',
-            '--rule', 'branch+cap=8', '--batch-size', '64',
-            '--twins', '3', '--n-states', '8'],
+            '--rule', 'branch+cap=8', '--batch-size', '256',
+            '--n-states', '8'],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, cwd=str(ROOT))
         workers = set()
@@ -327,8 +324,7 @@ class TestThroughput:
     def test_final_summary(self):
         _, err, rc = run([
             PYTHON, '-m', 'datagen', '--gen-count', '1', '--count', '4',
-            '--rule', 'cap=2', '--batch-size', '32', '--twins', '1',
-            '--n-states', '4', '-v'], timeout=60)
+            '--rule', 'cap=2', '--batch-size', '64', '--n-states', '4', '-v'], timeout=60)
         assert rc == 0, err
         assert 'datagen: 4 batches' in err, err
 
@@ -338,8 +334,7 @@ class TestThroughput:
         stream isn't buffered into the test; only stderr is captured."""
         r = subprocess.run([
             PYTHON, '-m', 'datagen', '--gen-count', '2', '--count', '3000',
-            '--rule', 'cap=2', '--batch-size', '32', '--twins', '2',
-            '--n-states', '4', '-v', '--log-every-sec', '0.05'],
+            '--rule', 'cap=2', '--batch-size', '96', '--n-states', '4', '-v', '--log-every-sec', '0.05'],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE, cwd=str(ROOT), timeout=60)
         err = r.stderr.decode()
@@ -370,8 +365,7 @@ class TestStdin:
         corpus = gen(n_batches=4, seed=3)
         out, err, rc = run([
             PYTHON, '-m', 'datagen', '--gen-count', '2', '--count', '12',
-            '--rule', 'cap=2', '--batch-size', '8', '--twins', '1',
-            '--n-states', '4'], stdin=corpus, timeout=120)
+            '--rule', 'cap=2', '--batch-size', '16', '--n-states', '4'], stdin=corpus, timeout=120)
         assert rc == 0, err
         assert _count_batches(out) == 12
 
@@ -409,8 +403,7 @@ class TestMalformedInputFatal:
         survives the fatal abort."""
         proc = subprocess.Popen([
             PYTHON, '-m', 'datagen', '--gen-count', '4', '--count', '100000',
-            '--rule', 'branch+cap=8', '--batch-size', '64', '--twins', '3',
-            '--n-states', '8'],
+            '--rule', 'branch+cap=8', '--batch-size', '256', '--n-states', '8'],
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE, cwd=str(ROOT))
         # Observe workers, then feed garbage to trigger the fatal path.
@@ -447,7 +440,7 @@ def _train_t1(tmp, name='t1'):
     """Produce a tiny 1-step T1 encoder checkpoint under tmp/<name>.
     Returns the encoder.pt path."""
     run_dir = str(Path(tmp) / name)
-    data = gen(n_batches=2, batch_size=8, rule='cap=2', twins=1, n_states=4)
+    data = gen(n_batches=2, batch_size=16, rule='cap=2', n_states=4)
     out, err, rc = run([
         PYTHON, 'scripts/train_encoder.py',
         '--n-steps', '1', '--log-every', '1', '--out-dir', run_dir,
@@ -465,7 +458,7 @@ def _train_t2(tmp, t1_enc, name='t2', extra_args=()):
     """Produce a tiny 1-step T2 checkpoint on top of a frozen T1.
     Returns the t2 run dir. branch+cap=8 → multi-instruction chunks."""
     run_dir = str(Path(tmp) / name)
-    data = gen(n_batches=2, batch_size=8, rule='branch+cap=8', twins=1,
+    data = gen(n_batches=2, batch_size=16, rule='branch+cap=8',
                n_states=4)
     out, err, rc = run([
         PYTHON, 'scripts/train_t2_encoder.py', '--t1-model', str(t1_enc),
@@ -491,7 +484,7 @@ class TestCorpusRecord:
             out, err, rc = run([
                 PYTHON, 'scripts/record_corpus.py', str(run_dir),
                 '--config', 'configs/instr_alu_writers_chain010.json',
-                '--rule', 'cap=2', '--twins', '2', '--batch-size', '128',
+                '--rule', 'cap=2', '--batch-size', '384',
                 '--n-states', '8', '--gen-seed', '7',
                 '--count', '1000'])
             assert rc == 0, err
@@ -509,7 +502,7 @@ class TestTraining:
     def test_encoder_train_smoke(self):
         """datagen | train_encoder smoke (single step): T1 runs the canonical
         vp on the shipped out_regs at the anchors each batch carries."""
-        data = gen(n_batches=2, batch_size=8)
+        data = gen(n_batches=2, batch_size=16)
         with tempfile.TemporaryDirectory() as tmp:
             out, err, rc = run([
                 PYTHON, 'scripts/train_encoder.py',
@@ -544,11 +537,10 @@ class TestEval:
             t1_enc = _train_t1(tmp)
             t2_dir = _train_t2(tmp, t1_enc)
             t1_corpus = Path(tmp) / 't1.rvt'      # single-instruction (T1)
-            t1_corpus.write_bytes(gen(n_batches=2, batch_size=8, rule='single',
-                                      twins=1, n_states=4, seed=98))
+            t1_corpus.write_bytes(gen(n_batches=2, batch_size=16, rule='single', n_states=4, seed=98))
             t2_corpus = Path(tmp) / 't2.rvt'      # multi-instruction (T2)
-            t2_corpus.write_bytes(gen(n_batches=2, batch_size=8,
-                                      rule='branch+cap=8', twins=1, n_states=4,
+            t2_corpus.write_bytes(gen(n_batches=2, batch_size=16,
+                                      rule='branch+cap=8', n_states=4,
                                       seed=99))
 
             out, err, rc = run([

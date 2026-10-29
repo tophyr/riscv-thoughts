@@ -40,14 +40,15 @@ the same essence — whatever their instruction order, instruction count, final
 PC, or dead and same-value writes (PC is not an output) — and the binding is a
 graph from external registers through operation roles to results.
 
-The code grades the essence in the **register frame**: value prediction is
-evaluated per written slot, from that slot's own description and the values of
+The code grades the essence in the **register frame**: value prediction reads
+the essence, recovering each written output's value from the essence, a
+pointer naming which of the chunk's outputs is asked about, and the values of
 the registers the output depends on, with no input or output numbered by the
-order the instructions are written in; each input register is identified by
-its structural colour in the chunk's dataflow graph, with every operand role
-ordered — the encoder is told nothing about which operations commute; and the
-essence is the pool over the written slots only (`compressor/model.py`,
-`compressor/train.py`, `datagen/signature.py`). Reordering independent
+order the instructions are written in or by register number; each input
+register is identified by its structural colour in the chunk's dataflow
+graph, with every operand role ordered — the encoder is told nothing about
+which operations commute; and the essence is the pool over the written slots
+only (`compressor/model.py`, `compressor/train.py`, `datagen/signature.py`). Reordering independent
 instructions, inserting dead code and adding an x0-write therefore leave the
 essence bit-identical by construction. What the code does not yet do: the
 binding is still emitted as two ordered lists rather than the graph; the
@@ -143,19 +144,19 @@ assumed: nothing reaches T2 except what T1 emitted.
 
 *Faithfulness.* Whether what T2 emits is a lossless behavioral description of
 its chunk, measured by whether each output register's value can be recovered
-from that register's emitted description and scored discretely rather than as
-a loss value. The score is the description composed with a readout that has to
-EVALUATE it — nothing in the encoder ever sees a register value, so a slot
-describes a function rather than holding a number. The input states are drawn
+from the essence and scored discretely rather than as a loss value. The score
+is the essence composed with a readout that has to EVALUATE it — nothing in
+the encoder ever sees a register value, so the essence describes functions
+rather than holding numbers. The input states are drawn
 afresh for every chunk, with structure, and the score is taken at a fixed set
 no model trains on: a readout trained on one fixed set stores answers at it
 instead of evaluating. **At one instruction it holds exactly**: T1's emitted
-wiring matches the oracle on every instruction and its description is
-evaluated exactly at 2.46 million unseen input values. **At two instructions
-it holds to 99.8322%** — 8,113 failures in 4.83 million scored values, every
+wiring matches the oracle on every instruction and its essence is evaluated
+exactly at 2.46 million unseen input values. **At two instructions
+it holds to 99.8276%** — 8,333 failures in 4.83 million scored values, every
 output register of 38,400 held-out chunks at 64 input states — after 1M
 training steps, one seed, a twelve-layer residual readout; outputs that depend
-on three inputs carry the residual at 90.3%. Beyond two instructions it is
+on three inputs carry the residual at 90.5%. Beyond two instructions it is
 untested.
 
 *Equivalence.* Two instruction sequences that compute the same function must
@@ -163,15 +164,13 @@ compress to the same point — that is the framework's definition of meaning, an
 it is required for T2 to count as done. Everything that leaves the chunk's live
 dataflow graph unchanged does, exactly and by construction: a register rename,
 reordered independent instructions, an inserted dead instruction. Everything
-that needs the op-cell to compute does not — a commutative swap among them:
-two chunks that fold two immediates into the same total land further apart
-than two chunks computing different totals, an identity beside a live
-instruction sits as far from its absence as from a different instruction, and
-the training objective is not pairwise, so nothing pushes them together. And
-the essence itself, which value prediction does not read, spans a range 30×
-narrower than the first-read frame's models did (unrelated chunks 0.028
-apart); what shapes it is an outstanding design decision, as is the pairwise
-pressure.
+that needs the op-cell to compute does not — a commutative swap among them.
+The essence describes the instructions as written: two chunks that fold two
+immediates into the same total land further apart than two chunks computing
+different totals, an identity sits further from a cancelling pair than
+unrelated chunks sit from each other, and the training objective is not
+pairwise, so nothing pushes them together. The pairwise pressure is the
+outstanding design decision.
 
 Beyond both lies T3, the first tier that must *compose* bindings rather than
 merely emit them.

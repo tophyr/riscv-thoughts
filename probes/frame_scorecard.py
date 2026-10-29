@@ -3,11 +3,15 @@
 slot at held-out anchors, the emitted binding, and equivalence collapse over
 the classes the structural signature defines.
 
-  vp        — exact 32-bit match of the per-slot evaluator's prediction, over
-              every (row, output slot, anchor) triple of the corpus, with the
-              failing count and the rate by the writing opcode and by the
-              output's input count. The corpus must be generated with
+  vp        — exact 32-bit match of the evaluator's prediction (read from
+              the essence through each output's pointer), over every (row,
+              output slot, anchor) triple of the corpus, with the failing
+              count and the rate by the writing opcode and by the output's
+              input count. The corpus must be generated with
               `datagen --heldout-anchors` so no model trained at its states.
+              The leak check hands the evaluator ANOTHER chunk's essence with
+              this output's pointer and inputs; it must fail if the function
+              reaches the evaluator only through the essence.
   binding   — T1: emitted wiring exact per instruction; T2: emitted input and
               output lists exact per chunk (scripts/eval.py's definitions).
   collapse  — essence L2 (unit-normalized) on pairs of one register function:
@@ -36,7 +40,7 @@ from compressor.eval import (encode_chunks_t2, t1_binding_accuracy,
                              t2_exact_binding)
 from compressor.model import instruction_wiring
 from compressor.train import (_split_to_per_instruction, _t2_assemble,
-                              _t1_wiring, vp_slot_predict, _value_bits)
+                              _t1_wiring, vp_predict, _value_bits)
 from datagen import RVT_FORMAT, Batch, AUX_CE_IGNORE, padding_mask
 from datagen.signature import COMMUTATIVE
 from emulator import Instruction
@@ -67,18 +71,18 @@ def batches():
 
 @torch.no_grad()
 def state(batch):
-    """The scored tier's emitted state T for a batch, or None."""
+    """The scored tier's emitted (state T, essence) for a batch, or None."""
     if T1_ONLY:
         tok = torch.from_numpy(batch.tokens).to(dev).long()
         pad = torch.from_numpy(padding_mask(batch)).to(dev)
         in0, in1, out = (torch.from_numpy(a).to(dev) for a in _t1_wiring(batch))
-        return t1.encode_state(tok, pad, in0, in1, out)[0]
+        return t1.encode_state(tok, pad, in0, in1, out)
     split = _split_to_per_instruction(batch)
     if split[0].shape[0] == 0:
         return None
     n_chunks, max_ni = batch.instr_lens.shape
     ct1, c0, c1, co, ca = _t2_assemble(t1, split, n_chunks, max_ni, dev)
-    return t2.encode_state(ct1, c0, c1, co, ca)[0]
+    return t2.encode_state(ct1, c0, c1, co, ca)
 
 
 def chunk_instrs(batch, b):
@@ -90,12 +94,14 @@ def chunk_instrs(batch, b):
 
 
 # ---- vp ---------------------------------------------------------------------
-hits = total = 0
+hits = total = leak_hits = 0
 by_op, by_nin = {}, {}
+perm_rng = torch.Generator().manual_seed(0)
 for batch in batches():
-    T = state(batch)
-    if T is None:
+    st = state(batch)
+    if st is None:
         continue
+    T, essence = st
     anchors = torch.from_numpy(batch.anchors).to(dev)
     # A chunk of K instructions writes at most K registers, so output slots
     # past the grid's instruction count are AUX_CE_IGNORE; slicing them off is
@@ -105,13 +111,18 @@ for batch in batches():
     out_slot = torch.from_numpy(batch.out_slot_regs[:, :n_out].astype(np.int64)).to(dev)
     out_inputs = torch.from_numpy(batch.out_inputs[:, :n_out].astype(np.int64)).to(dev)
     out_regs = torch.from_numpy(batch.out_regs.astype(np.int64)).to(dev)
-    with torch.no_grad():
-        pred = vp_slot_predict(comp, T, anchors, out_slot, out_inputs)   # (B,A,O,33)
     out_idx = out_slot.clamp(min=0)
-    target = out_regs.gather(-1, out_idx.unsqueeze(1).expand(-1, pred.shape[1], -1))
-    exact = ((pred[..., :32] > 0) == _value_bits(target).bool()).all(-1)  # (B,A,O)
+    target_bits = _value_bits(out_regs.gather(
+        -1, out_idx.unsqueeze(1).expand(-1, anchors.shape[1], -1))).bool()
     valid = (out_slot != AUX_CE_IGNORE) & torch.from_numpy(batch.out_regs_valid).to(dev).unsqueeze(-1)
-    ex = exact.cpu().numpy(); va = valid.cpu().numpy()
+    va = valid.cpu().numpy()
+    # The leak check hands each row ANOTHER row's essence with its own pointer
+    # and inputs: if the function reached the head any other way, it would pass.
+    other = essence[torch.randperm(essence.shape[0], generator=perm_rng).to(dev)]
+    with torch.no_grad():
+        ex, lk = (((vp_predict(comp, T, e, anchors, out_slot, out_inputs)[..., :32] > 0)
+                   == target_bits).all(-1).cpu().numpy() for e in (essence, other))   # (B,A,O)
+    leak_hits += int((lk & va[:, None, :]).sum())
     for b in np.nonzero(batch.out_regs_valid)[0]:
         instrs = chunk_instrs(batch, b)
         writer = {ins.args[0]: ins.opcode for ins in instrs}
@@ -129,6 +140,8 @@ print(f'\n  vp at held-out anchors: {100 * hits / max(total, 1):.4f}% exact  '
 for name, d in (('writing opcode', by_op), ('input count', by_nin)):
     rows = sorted(d.items(), key=lambda kv: kv[1][0] / max(kv[1][1], 1))
     print(f'    by {name}: ' + '  '.join(f'{k}:{100 * h / max(n, 1):.3f}%' for k, (h, n) in rows))
+print(f'    leak check, another chunk\'s essence: {100 * leak_hits / max(total, 1):.4f}% exact '
+      f'(must be far below the line above)')
 
 # ---- binding / symmetry -----------------------------------------------------
 if T1_ONLY:

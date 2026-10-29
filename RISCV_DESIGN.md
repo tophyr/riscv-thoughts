@@ -288,9 +288,12 @@ Realize the encoder as a register-indexed state machine over the dataflow:
   scatter, so the step captures cleanly into a compiled CUDA graph).
 - Chunk representation = the final state `S`. Essence = a
   permutation-invariant **attention pool** over the WRITTEN slots — the
-  chunk's multiset of output descriptions, nothing about where its inputs
-  sit or in what order anything happened; binding = the per-slot structure,
-  read back by the binding heads.
+  chunk's multiset of output descriptions, each filed under a **pointer**: a
+  one-hot naming which of the chunk's distinct outputs it is, computed without
+  register names or instruction order (see "Value prediction reads the
+  essence"). The essence holds nothing about where its
+  inputs sit or in what order anything happened; binding = the per-slot
+  structure, read back by the binding heads, pointers included.
 
 **The pool's per-head value width is a capacity ceiling, separate from the
 essence width.** The pool runs `k` attention heads over the 32 slots and
@@ -315,9 +318,10 @@ encoder ever sees a register's contents: the per-step content is the
 instruction's opcode and immediate, and the wiring says which slots are read and
 written. So a slot's state is a symbolic description of the computation that
 produced it, and every consumer — the pool, the binding heads, the
-value-prediction head — reads a description rather than a number. The
-value-prediction head is therefore an *evaluator*: it is handed the chunk's
-input values separately and asked to apply the described function to them.
+value-prediction head through the pool — reads descriptions rather than
+numbers. The value-prediction head is therefore an *evaluator*: it is handed
+the chunk's input values separately and asked to apply the described function
+to them.
 
 **The op-cell appends a literal to the description it reads rather than folding
 it in, and width is not what it is short of.** When a slot's operand is another
@@ -490,15 +494,72 @@ behaviors must stay apart — the essence is behavioral, not a syntactic hash.
 feeds which role and which result lands where is the chunk's interface and
 belongs in the binding (WHAT_IS_A_THOUGHT.md, "The Thought and Its
 Interface"), so no input or output is numbered by textual order anywhere in
-the supervision: value prediction is evaluated per written slot, handing the
-evaluator that slot's description and its inputs' values and colours gathered
-by register (see "Training"), and the targets are the raw register values. A
+the supervision: value prediction is evaluated per written output, handing
+the evaluator the essence, that output's pointer and its inputs' values and
+colours gathered by register (see "Value prediction reads the essence" and
+"Training"), and the targets are the raw register values. A
 frame numbered by first-read and final-write order was used before this one,
 knowingly, to establish the architecture's capacity to represent vp at all
 before the equivalence criterion was imposed on it; it graded the essence on a
 linearization and separated reordered, renumbered, dead-code-bearing and
 same-value-writing equivalents (EXPERIMENT_LOG, "T2 faithfulness", finding
 36); the code carries none of it.
+
+### Value prediction reads the essence
+
+The next tier consumes the essence, so the essence is what value prediction
+has to grade. An evaluator handed each written slot's own description
+certifies the slots and leaves the pool unshaped: on such a T2 every value is
+recovered while unrelated chunks' essences sit a thirtieth of the first-read
+frame's distance apart, the aliasing control inside that (EXPERIMENT_LOG, "The
+register frame", finding 38). So the evaluator is handed, for each written
+output, the unit-normalized essence, that output's **pointer**, and the values
+and colours of the output's inputs — never the output's own description
+(`vp_loss`, `compressor/train.py`). Each slot's description is then shaped by
+what the essence must carry, and the essence spans the first-read frame's
+range (finding 39). Exact evaluation from the essence implies the written
+slots carry their functions: a slot's row is the only route its function has
+into the essence.
+
+**The pointer names an output's function inside the essence without naming
+anything else.** A chunk with two outputs pools two functions into one
+vector, and the evaluator must be told which one it is asked about. In the
+first-read frame an output's write rank did that, at the price of the
+linearization. The pointer must be free of register names and of instruction
+order, deterministic, and narrow enough to select a function without
+describing it.
+
+The leaf colouring cannot serve. It sees only the wiring, and the wiring of
+`ADD x3,x1,x2; SUB x4,x5,x6` maps onto itself by exchanging the two
+instructions with their registers, so no colouring computed from it can tell
+x3 from x4 — only the opcodes can. So each written register's **path colour**
+comes from the same refinement pass with every operation also seeded from its
+content (the lower tier's essence at T2, the token embedding at T1), and the
+chunk's distinct paths are put in **content-hash order**: sorted by a fixed
+projection of their path colours. An output's pointer is the one-hot of its
+path's position in that order (`RegisterStateMachine._pointer`,
+`compressor/model.py`). Two paths closer than a fixed tie distance are one
+path and share a position: identical paths differ only by float noise in the
+lower tier's essence, distinct ones by what distinguishes their instructions.
+The order is a function of the labelled graph alone, so a rename permutes the
+pointers with the slots, and a reordering of independent instructions or a
+dead instruction leaves them unchanged; outputs with identical paths share a
+pointer, which is correct, since the same function applied to each output's
+own inputs answers for both. A chunk of K instructions has at most K outputs,
+so a pointer carries at most log₂ K bits about the chunk's content.
+
+The pool adds each written slot's pointer to its attention key, so it can
+file each output's description where the pointer will look; the pointer rides
+in the emitted state as part of the binding. The evaluator's input colours
+come from the wiring-only colouring, so the only route an output's function
+has to the evaluator is the essence; a scorer checks this by handing each
+output's evaluator another chunk's essence (METRICS.md, "vp").
+
+The order reads syntax. In a chunk with two or more outputs, an equivalence
+that respells one output (`ADD x3,x1,x1` for `SLLI x3,x1,1`) changes that
+path's hash and can move it past another output's, so the two equivalent
+chunks file their functions under different pointers and their essences
+cannot coincide. A chunk with one output is unaffected.
 
 ### What is built in for good, and what is built in for now
 
@@ -588,36 +649,38 @@ invariant essence):
 - `in_slot` / `out_slot`: read/write ORDER, as ListMLE (Plackett–Luce)
   over per-register scalar score heads (argsort to decode; duplicate-free).
 
-**Value-prediction (`value_predict`), per written slot.** Per-anchor, per-output-
-slot per-bit BCE (plus a bounded smooth-magnitude term): for each register the
-chunk writes, from that slot's **description** — its value channels in the
-emitted state — and, for each external input the output depends on, the
+**Value prediction (`value_predict`), read from the essence, per written
+output.** Per-anchor, per-output per-bit BCE (plus a bounded smooth-magnitude
+term): for each register the chunk writes, from the unit-normalized essence,
+that output's pointer and, for each external input the output depends on, the
 input's value at its own register (as 32 bits + a smooth scalar) and its
-colour, predict the register's raw value after the chunk (`vp_slot_loss`).
-The inputs are listed per output in colour order by the oracle
+colour, predict the register's raw value after the chunk (`vp_loss`; see
+"Value prediction reads the essence"). The inputs are listed per output in the
+encoder's colour order, every operand role ordered
 (`datagen.signature.output_inputs`, shipped as `out_inputs`); the evaluator
 gathers values and colours by register through one-hots, so nothing it sees
-is a register number or a position in the text, and a renamed twin presents
-the same description with the same values. Anchor states are drawn afresh for
-every source chunk (see the end of this section for why one fixed set fails).
+is a register number or a position in the text, and a register-relabelled
+chunk presents the same essence, pointers and values at the same positions.
+An order that merged a commutative operation's two roles would tie its
+operands and fall back on register numbers (EXPERIMENT_LOG, "The register
+frame", finding 40). Anchor states are drawn afresh for every chunk (see the
+end of this section for why one fixed set fails).
 
 **vp is the primary objective.** The evaluator is fed raw value *bits*, not
-log-compressed scalars. What it measures is a slot's description composed with
-the evaluator's ability to EVALUATE it — a slot describes a function rather
-than holding a value (above) — so a description carried perfectly can still
-score badly when applying it needs carry propagation. Driving vp to zero is
-therefore a demand on the pair, and faithfulness, the property a future T3
-actually consumes, is the weaker half of it (METRICS.md states what it
-certifies and how to measure the halves apart). The essence receives no vp
-gradient directly: it is the pool over the same descriptions vp evaluates, so
-it collapses exactly when those descriptions are canonical, and its magnitude
-is shaped only by the validity loss.
+log-compressed scalars. What it measures is the essence composed with the
+evaluator's ability to EVALUATE the function it carries — a slot describes a
+function rather than holding a value (above) — so a function carried
+perfectly can still score badly when applying it needs carry propagation.
+Driving vp to zero is therefore a demand on the pair, and faithfulness, the
+property a future T3 actually consumes, is the weaker half of it (METRICS.md
+states what it certifies and how to measure the halves apart). vp's gradient
+reaches every written slot through the pool, and the essence's magnitude is
+shaped only by the validity loss: the evaluator reads its direction.
 
-**Every output slot is predicted from its own description, and that is
-deliberate.** A slot whose value depends on another slot's gets no access to the
-other's prediction — a chunk computing `r4 = x+1042; r7 = r4+4` must produce
-`x+1046` for `r7` from `r7`'s own description, which the op-cell built from
-`r4`'s.
+**Every output is predicted from the essence and its own pointer, and that is
+deliberate.** An output whose value depends on another output's gets no
+access to the other's prediction — a chunk computing `r4 = x+1042; r7 =
+r4+4` must produce `x+1046` for `r7` from the essence and `r7`'s pointer.
 
 Chaining them is architecturally possible — the output slots have a defined SSA
 write order and the dataflow is a DAG, so the iteration would be over the output
@@ -630,19 +693,16 @@ chained head would raise the score while leaving the representation as
 deficient for the consumer that matters. The composite has to be in the essence,
 not in the readout's control flow.
 
-The operator-clustering that the flat encoder could never get from vp comes
-**for free from the equivariant core** (rename-invariant essence = the
-value-number), and the per-slot target leaves every description free to be
-canonical. GVN collapse and vp are both load-bearing — a vp gain that craters
-the GVN rows is a regression, not a win.
+GVN collapse and vp are both load-bearing — a vp gain that craters the GVN
+rows is a regression, not a win.
 
-**The anchor states are drawn afresh for every source chunk, with structure,
-placed on the chunk's own input registers, and they decide no labels.** With
+**The anchor states are drawn afresh for every chunk, with structure, placed
+on the chunk's own input registers, and they decide no labels.** With
 one fixed set the evaluator is fed the same few input values for every row, so
 it can store each instruction shape's answers at those points instead of
 evaluating the described function — and it does: heads exact at 8 fixed
 anchors score ~5% (T2) and 21% (T1) at anchors they never saw (EXPERIMENT_LOG,
-"T2 faithfulness", finding 32). A fresh draw per source chunk makes storing
+"T2 faithfulness", finding 32). A fresh draw per chunk makes storing
 impossible, so a correct prediction can only come from evaluating. What trains
 the evaluator is how many distinct input values a step sees: one shared set per
 batch needs 64 anchors to match 8 per row, at 2.7x the step time (finding 33).
@@ -656,8 +716,7 @@ lower-numbered one exactly, to within a few units, or negated
 (`draw_anchor_states`). The draw's position i+1 is then placed on the chunk's
 i-th input register (`precompute_chunk`), so the copies are what make two of a
 chunk's inputs equal, adjacent or opposite; the chunk executes on that
-register file as it is, and a renamed twin gets the same draw placed on its
-own registers.
+register file as it is.
 
 The anchors decide no structural label. Which reads an instruction's outputs
 depend on is decided once per instruction form at a fixed set of witness values
@@ -678,16 +737,14 @@ makes x7 the constant 1 and still describes a subtraction), and a same-value
 write is a description of the identity that only the op-cell can make equal to
 nothing.
 
-**Emergent equivalence.** With the behavioral targets alone, provably
-equivalent instructions/chunks collapse without any equivalence loss:
-rename-twins collapse *structurally* (the equivariant core), and a commutative
-operand swap leaves the canonical vp target unchanged. Dead code and identities
-are deliberately not given shared targets (above). Measured as GVN collapse split by pair type (EXPERIMENT_LOG,
-"Rename-equivariant T1/T2") — note the measurement covers commutative operand
-swaps only
-(`_commute_variant`), so treat the other types as expected-but-unmeasured.
-Instruction reordering is deliberately absent: it is not an essence-level
-equivalence at all (see the GVN section above). A design constraint this surfaces: a
+**Emergent equivalence.** With the behavioral targets alone, every
+equivalence that leaves the chunk's live dataflow graph unchanged — a register
+rename, a reordering of independent instructions, a dead instruction —
+collapses by construction (see "GVN"), and the scorecards read it at zero.
+Every equivalence the op-cell has to compute does not: the targets give both
+spellings one value, and value prediction is satisfied by any essence the
+evaluator can read, so nothing pushes the two together (EXPERIMENT_LOG, "The
+register frame", findings 38 and 39). A design constraint this surfaces: a
 rename-*invariant* behavioral target (e.g. a GVN-bijection distance) is the
 WRONG objective here — it would weld apart the binding distinctions the
 equivariant representation deliberately keeps recoverable.

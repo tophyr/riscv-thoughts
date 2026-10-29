@@ -9,12 +9,12 @@ pipeline so an interrupted run is still identified.
 
 The config file's CONTENTS are copied in, not its path: a config edited after
 the run would otherwise silently rewrite what the run claims to have trained
-on. Everything else a corpus depends on — the chunk rule, twins, batch size,
+on. Everything else a corpus depends on — the chunk rule, batch size,
 anchors per batch, the instruction-stream seed, and how many batches were
 drawn — is a CLI argument here because it lives outside the config file.
 
     python scripts/record_corpus.py runs/<dir> --config configs/<c>.json \
-        --rule cap=2 --twins 2 --batch-size 128 --n-states 8 \
+        --rule cap=2 --batch-size 384 --n-states 8 \
         --gen-seed 0 --count 1000000
 """
 
@@ -31,7 +31,6 @@ def main():
     p.add_argument('--config', type=Path, required=True,
                    help='Corpus config whose CONTENTS are copied in.')
     p.add_argument('--rule', required=True, help='datagen --rule.')
-    p.add_argument('--twins', type=int, required=True)
     p.add_argument('--batch-size', type=int, required=True)
     p.add_argument('--n-states', type=int, required=True)
     p.add_argument('--gen-seed', type=int, required=True,
@@ -49,7 +48,6 @@ def main():
         'config_path': str(args.config),
         'config': json.loads(args.config.read_text()),
         'rule': args.rule,
-        'twins': args.twins,
         'batch_size': args.batch_size,
         'n_states': args.n_states,
         'gen_seed': args.gen_seed,
