@@ -328,6 +328,29 @@ chunks directly and takes a distance — no fitted readout anywhere — and asse
 through the emulator that each `fusion` pair really is behaviorally identical
 and each `different` pair is not.
 
+**At T1, `probes/frame_scorecard.py` scores partner groups.** For each group
+of the equivalence manifest merged by the function computed — copying a
+register, writing zero, doubling, the sign test, loading a constant
+(`datagen.generate.PARTNER_GROUPS`) — it reports the distance between two
+different spellings bound to the same registers, which must be ~0, and between
+a spelling and the group's contrast spelling, an instruction that computes
+something else. Every spelling is checked on the emulator, so an equivalent
+row is equivalent; a row's distance is a fact about the essence.
+
+**A contrast is a near-miss, so a low separation can be correct.** Under the
+behavioral distance objective a pair is meant to sit as far apart as it
+behaves differently, and some contrasts differ from their group at a single
+input: `SLTI rd,rs,1` against the sign test differs only at rs = 0. Its small
+contrast distance is the intended geometry, not a failed collapse. Read the
+equivalent row against 0 and the contrast row against its behavioral
+distance, not the ratio.
+
+**`probes/near_miss.py` measures the grading directly.** For `ADDI` k vs k+1
+and vs k+512, `ADD` vs `SUB`, and `SLLI 3` vs `SLLI 4` it reports the essence
+distance and the target the distance term trains toward, on the same pairs.
+A graded space keeps k+1 well inside k+512; a space that only partitions puts
+every inequivalent pair near √2.
+
 ### A separation gap under ~10× is no evidence
 
 The denominator is a mean over a few hundred pairs of a near-zero quantity, so

@@ -13,7 +13,9 @@ essence"). Every equivalence that leaves the live dataflow graph unchanged
 collapses by construction and reads zero on the trained models; T1 is exact at
 held-out anchors; T2 at len=2 is 99.83% after 1M steps on one seed, with the
 essence spanning the range the first-read frame's models had (finding 39).
-Open: the composed slots' residual, every equivalence the op-cell has to
+At T1 a behavioral distance term collapses equivalent spellings and grades
+inequivalent ones by how differently they behave, at a cost of 108 failing
+vp triples on comparisons the target cannot tell apart (finding 41). Open: the composed slots' residual, every equivalence the op-cell has to
 compute — commutativity first — the binding's wire format, the pointers'
 order under an equivalence that respells one of several outputs, and the
 learned replacement for the colouring.
@@ -252,6 +254,110 @@ distinct instructions:
 
 No T2 has been trained over it; finding 39's T2 is the T2 record.
 
+**41. At T1, a behavioral distance term collapses equivalent spellings while
+keeping inequivalent ones graded by how differently they behave; InfoNCE
+collapses them but flattens everything else; and the immediate head
+fights the distance term while also masking the one place its target is
+wrong.** Four T1 arms over `runs/t1_essence_500k`'s configuration (finding 40),
+each 500k steps on the writers corpus with a quarter of every batch made of
+partner pairs (`configs/instr_alu_writers_partners025.json`): two different
+spellings of one register function on the same registers, drawn from groups
+of the equivalence manifest merged by the function computed — copying a
+register, writing zero, doubling, the sign test, loading a constant
+(`datagen.generate.PARTNER_GROUPS`, every spelling checked on the emulator).
+For the InfoNCE arms each row also carried an equivalence key, shared by rows
+computing one function: the constant written when no source matters, else the
+partner group whose spelling it is, else its structural signature, so a
+register rename shares its key. The arms differ in the collapse term:
+
+- *InfoNCE*: supervised InfoNCE on the unit-normalized essence — each row
+  pulled toward the rows sharing its key and pushed from every other row
+  (weight 0.1, temperature 0.1);
+- *InfoNCE + uniformity*: the same plus a term repelling every two rows
+  of different keys, log-mean-exp(−2·distance²) (Wang & Isola);
+- *distance*: an MSE between every two rows' essence distance (chord, 0–2) and
+  twice their **behavioral distance** (`distance_loss`, weight 1.0). The
+  behavioral distance executes both rows at 64 shared witness states, their
+  inputs placed in colour order so that inputs correspond positionally, and
+  averages log1p(log1p(d)) / log1p(log1p(max_dist)) over the states, d being
+  the wrap-around difference of the two outputs and max_dist the largest
+  difference those two outputs could ever have, from a known-bits analysis of
+  each output (`datagen/knownbits.py`: two comparisons are at most 1 apart);
+- *distance, no immediate head*: the same with the immediate head — a linear
+  readout of the essence trained to a rotary code of the written immediate —
+  switched off.
+
+Scores at the 64 held-out anchors on held-out corpora of 38,400 distinct
+instructions, `probes/frame_scorecard.py`; the T1 baseline and the two
+InfoNCE arms were scored on one regeneration of that corpus and the
+distance arms on the next, so their vp and leak rows come from different draws
+while their distance rows come from the probe's own seeded pairs. Distances
+are essence chord distances, 2,000 pairs per row; a partner-group row is two
+spellings bound to the same registers against the group's contrast spelling,
+a near-miss computing something else.
+
+| | baseline | InfoNCE | InfoNCE + uniformity | distance | distance, no imm head |
+|---|---|---|---|---|---|
+| vp failing of 2,457,600 | 0 | 2 | 6 | 23 | 108 |
+| leak check | 11.19% | 12.45% | 10.91% | 11.10% | 10.45% |
+| copy: equivalent / contrast | 0.709 / 0.963 | 0.049 / 1.475 | 0.027 / 1.462 | 0.016 / 0.952 | **0.0019** / 0.947 |
+| zero | 1.150 / 1.282 | 0.131 / 1.481 | 0.145 / 1.448 | 0.148 / 1.472 | 0.107 / 1.471 |
+| double | 1.418 / 1.042 | 0.0055 / 1.460 | 0.0001 / 1.428 | 0.0012 / 1.300 | 0.0008 / 1.302 |
+| sign | 1.172 / 0.835 | 0.0076 / 1.474 | 0.082 / 1.432 | 0.062 / 0.307 | **0.0004** / 0.295 |
+| constant | 0.196 / 1.263 | 0.0053 / 1.368 | 0.023 / 1.358 | 0.160 / 1.106 | 0.084 / 1.123 |
+| aliasing control | 0.736 | 1.130 | 1.454 | 1.156 | 1.155 |
+| unrelated instructions | 1.366 | **0.614** | 1.400 | 1.360 | 1.362 |
+
+Near-misses, 2,000 pairs each, `probes/near_miss.py` (the InfoNCE arm
+without uniformity was not probed); the target is twice the pairs' behavioral
+distance, the value the distance term trains toward:
+
+| pair | baseline | InfoNCE + uniformity | distance | distance, no imm head | target |
+|---|---|---|---|---|---|
+| `ADDI` k vs k+1 | 0.645 | 0.816 | 0.232 | **0.335** | 0.34 |
+| `ADDI` k vs k+512 | 0.654 | 0.685 | 0.742 | 0.785 | 1.27 |
+| `ADD` vs `SUB`, same registers | 1.816 | 1.451 | 1.277 | 1.277 | 1.48 |
+| `SLLI 3` vs `SLLI 4` | 0.771 | 1.287 | 1.048 | 1.059 | 1.49 |
+
+*InfoNCE* collapses every group, but rows sharing their key
+with no other row of the batch are never pulled or pushed, so unrelated
+instructions drift together (0.61). With uniformity they keep their spread,
+and every inequivalent pair is driven toward orthogonal, closest pairs
+hardest: `SLLI 3` against `SLLI 4` goes from 0.77 to 1.29 and `imm+1` sits
+further than `imm+512`. Neither term says how far apart two different
+functions should be.
+
+*The distance term* collapses the groups, keeps the unrelated spread, and
+grades the rest: `imm+1` lies well inside `imm+512`, and a contrast that
+differs from its group only at one input (`SLTI rd,rs,1` against the sign
+test) sits at 0.30 rather than at the far end. Achieved distances sit below
+their targets at the far end — the MSE plateaus near 0.03 from 50k steps —
+with the ordering kept.
+
+*The immediate head* fights the distance term wherever two equivalent
+spellings carry different immediates (`ANDI rd,rs,0` against
+`SLLI rd,x0,k`), since a linear readout cannot decode two codes from one
+point; without it copy and sign collapse a further 8× and 150×, and `imm+1`
+lands on its target. It was also holding apart pairs the distance target
+wrongly calls identical:
+
+| `k` vs `k+1` | target | pairs with target 0 | baseline | distance | no imm head |
+|---|---|---|---|---|---|
+| `SLTI` | 0.0000 | 100% | 0.647 | 0.100 | **0.0012** |
+| `SLTIU` | 0.0033 | 99.7% | 0.652 | 0.104 | 0.0063 |
+| `ADDI` | 0.169 | 0% | 0.649 | 0.240 | 0.343 |
+
+The two comparisons differ only at x = k, which no witness state holds, so the
+term pulls two different functions together, and value prediction, which
+rarely sees x = k either, fails on them: the no-head arm's 108 failures are all
+`SLTI` (99.948%), `SLTIU` (99.967%) and `ADDI` (99.998%). Averaging over states
+cannot separate functions that disagree on one input in 2³², and putting them
+close is the geometry intended; what keeps them distinguishable has to come
+from value prediction seeing the boundary.
+
+The distance arms ran at 10–12 ms/step against 4 ms, with the GPU at 71–76%:
+the targets are computed eagerly before each compiled step.
+
 ## Decisions taken
 
 - **The essence is graded in the register frame** — colour-identified leaves,
@@ -276,6 +382,19 @@ No T2 has been trained over it; finding 39's T2 is the T2 record.
   the written slots carry their functions, since each slot's row is the only
   route its function has into the essence.
 - **A batch holds distinct chunks only** (finding 40).
+- **T1 has no immediate head** (finding 41). It was added to give the essence
+  an immediate axis on which imm+δ is a consistent rotation, and to fix an
+  immediate-field vp deficit; the deficit was the essence pool's shared value
+  projection (fixed by per-head projections), the rotary composition was never
+  observed (finding 21: a chain's summed immediate is no more linearly
+  recoverable than either addend), and it pins the essence to
+  how an instruction is written, which collapse requires it not to encode. The
+  code is deleted; every kept checkpoint loads without its tensors and
+  reproduces its outputs bit for bit.
+- **Collapse at T1 is trained with the behavioral distance term** (finding
+  41): the user's requirement is a smooth space, graded by how differently two
+  functions behave, and the distance term states it; InfoNCE alone, with or
+  without uniformity, measured as flattening that grading.
 
 ## Dead ends (do not re-run)
 

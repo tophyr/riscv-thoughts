@@ -540,7 +540,6 @@ _VP_HEAD_DEPTH = 3     # vp_head hidden layers: T1's depth, the smallest that
                        # passes 12 (finding 35). Capacity here is evaluation
                        # the encoder is spared.
 _VP_VALUE_BITS = 32    # two's-complement bit width of the vp value target (RV32)
-_IMM_N_FREQ = 12       # rotary immediate: power-of-2 periods 2..4096 (2*this = target dim)
 
 
 class Compressor(nn.Module):
@@ -598,13 +597,6 @@ class Compressor(nn.Module):
         vp_inputs = MAX_INPUT_SLOTS * (_VP_VALUE_BITS + 1 + _COLOUR_DIM)
         self.vp_head = VPHead(d_out + _PTR_DIM + vp_inputs, _VP_VALUE_BITS + 1,
                               vp_head_depth)
-        # immediate head (T1 only): a LINEAR readout of a rotary/Fourier encoding
-        # of the instruction's immediate. Linear so the rotary structure is
-        # forced to live in the essence (imm+δ -> a consistent rotation of the
-        # essence's immediate subspace, opcode-independent), not hidden in a
-        # nonlinear head. Present but unused at T2 (chunk essence has no single
-        # immediate). See compressor.train._immediate_rotary.
-        self.imm_head = nn.Linear(d_out, 2 * _IMM_N_FREQ)
 
     def encode_state(self, content_seq, in0, in1, out, active):
         """content_seq (B, K, d_content), wiring (B, K) long, active (B, K)
@@ -618,7 +610,7 @@ class Compressor(nn.Module):
 
 # Compressor head/loss interface that T1Compressor delegates to its compressor.
 _COMPRESSOR_HEADS = ('live_in_head', 'live_out_head', 'in_score_head',
-                     'out_score_head', 'pc_writes_head', 'vp_head', 'imm_head')
+                     'out_score_head', 'pc_writes_head', 'vp_head')
 
 
 class T1Compressor(nn.Module):

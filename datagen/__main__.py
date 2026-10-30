@@ -50,7 +50,7 @@ from . import (
     RVT_FORMAT, generate_chunks, collect_into_batches,
     draw_anchor_states, heldout_anchor_states,
     DEFAULT_DISTRIBUTION, build_opcode_table, validate_distribution,
-    load_distribution,
+    load_distribution, sample_partner_pair,
     single, until_branch, until_transformation, length_cap, either,
     DEFAULT_TYPE_WEIGHTS, build_type_table, generate_invalid,
 )
@@ -162,6 +162,7 @@ def _build_batches_iter(cfg, seed):
     eq_cfg = dist.get('equivalences', {})
     eq_rate = eq_cfg.get('rate', 0.0)
     chain_rate = dist.get('chain', {}).get('rate', 0.0)
+    partner_rate = dist.get('partners', {}).get('rate', 0.0)
     inv_cfg = dist.get('invalidity', {})
     inv_rate = inv_cfg.get('rate', 0.0)
     inv_types = inv_cfg.get('types', DEFAULT_TYPE_WEIGHTS)
@@ -189,6 +190,8 @@ def _build_batches_iter(cfg, seed):
         chunks_iter,
         batch_size=cfg.batch_size,
         draw_anchors=draw_anchors,
+        partner_rate=partner_rate,
+        partner_sampler=lambda: sample_partner_pair(rng, dest_regs),
         invalid_rate=inv_rate, invalid_provider=invalid_provider,
         max_invalid_window=cfg.max_invalid_window,
         max_chunk_len=rule.max_len,

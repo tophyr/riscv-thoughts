@@ -152,7 +152,7 @@ _TORCH_DTYPE = {np.dtype(d): t for d, t in (
 _PACK_ALIGN = 16
 
 
-def _pack_step_arrays(batch, split, *, vp, valid, imm):
+def _pack_step_arrays(batch, split, *, vp, valid, distance):
     """Everything one training step copies to the device, as one aligned uint8
     buffer: the dense instruction grid, the binding and vp targets, and the
     validity / immediate targets when those losses are on. Runs in the
@@ -181,9 +181,8 @@ def _pack_step_arrays(batch, split, *, vp, valid, imm):
                    (batch.anchors, None), (batch.out_inputs, i64)]
     if valid:
         arrays += [(batch.valid, f32)]
-    if imm:
-        imm_np, imm_mask_np = _t1_immediates(batch)
-        arrays += [(_immediate_rotary_np(imm_np), f32), (imm_mask_np, f32)]
+    if distance:
+        arrays += [(batch.out_known_zero[:, 0], i64), (batch.out_known_one[:, 0], i64)]
     arrays = [np.ascontiguousarray(a if dt is None else a.astype(dt))
               for a, dt in arrays]
     specs, n = [], 0
@@ -230,10 +229,10 @@ def _value_feat(x_i):
 def _vp_inputs(comp, T, anchors_t, out_inputs_t):
     """Per (row, anchor, output slot) the evaluator's input features, (B, A,
     O, MAX_IN·(33+dc)): for each external input the output depends on
-    (`out_inputs`, in the oracle's colour order), its value at its own
-    register in the row's anchor state (32 bits + 1 smooth scalar) and its
-    structural colour from `T`. Unfilled inputs feed value 0 and colour 0 =
-    "no input"."""
+    (`out_inputs`, in the encoder's colour order, every role ordered), its
+    value at its own register in the row's anchor state (32 bits + 1 smooth
+    scalar) and its structural colour from `T`. Unfilled inputs feed value 0
+    and colour 0 = "no input"."""
     B, A = anchors_t.shape[0], anchors_t.shape[1]
     d, dc = comp.d_out, comp.d_colour
     O, I = out_inputs_t.shape[1], out_inputs_t.shape[2]
@@ -340,54 +339,107 @@ def vp_predict(comp, T, essence, anchors_t, out_slot_regs_t, out_inputs_t):
         [desc.unsqueeze(1).expand(-1, vin.shape[1], -1, -1), vin], -1))
 
 
-# Rotary immediate encoding (T1). POWER-OF-2 periods 2,4,...,4096: each frequency
-# is `imm mod 2^k` = the low k bits, which are directly readable from the hex
-# tokens. This is bit-aligned and non-redundant across scales — unlike an
-# arbitrary geometric ladder, which asks the encoder for `imm mod 7` / `imm mod
-# 11` (modular reductions it can't compute, so it hedges those features to ~0 —
-# the diagnosed source of the residual imm+1 collisions). angular freq = 2π/period.
-_IMM_N_FREQ = 12        # must match model._IMM_N_FREQ (head output = 2*this)
-_IMM_OMEGA = (2.0 * np.pi / (2.0 ** np.arange(1, _IMM_N_FREQ + 1))).astype(np.float32)
+# Shared witness states for the behavioral distance between rows: a fixed
+# structured draw no training anchor or held-out set uses. Every row is
+# executed at all of them, so two rows' outputs are compared at equal inputs.
+_WITNESS_SEED = 0x51D0
+_N_WITNESS = 64
+_WITNESS = {}
 
 
-def _immediate_rotary_np(imm):
-    """Rotary/Fourier encoding of integer immediates: imm (B,) int ->
-    (B, 2*_IMM_N_FREQ) float [cos.. , sin..]. imm+δ rotates each frequency's
-    (cos,sin) pair by δ·ω — a consistent, composable, opcode-independent
-    transform (the geometry we want the essence's immediate axis to have),
-    multi-scale so high ω resolves +1 and low ω carries magnitude."""
-    ph = imm[:, None].astype(np.float32) * _IMM_OMEGA[None, :]     # (B, K)
-    return np.concatenate([np.cos(ph), np.sin(ph)], axis=1).astype(np.float32)
+def _witness_states(device):
+    if device not in _WITNESS:
+        from datagen import draw_anchor_states
+        w = draw_anchor_states(np.random.default_rng(_WITNESS_SEED), _N_WITNESS)
+        _WITNESS[device] = torch.as_tensor(np.asarray(w, dtype=np.int64), device=device)
+    return _WITNESS[device]
 
 
-def _t1_immediates(batch):
-    """Per single-instruction row: the in-scope (I-type ALU) immediate value +
-    a supervision mask. Only I_TYPE ops (ADDI / logical-imm / shifts) carry a
-    ≤12-bit data immediate we supervise; every other row is masked. Trainer-side
-    decode from the tokens (no RVT change). Returns (imm (B,) int64, mask (B,)
-    float32)."""
-    B = batch.tokens.shape[0]
-    imm = np.zeros(B, dtype=np.int64)
-    mask = np.zeros(B, dtype=np.float32)
-    for b in range(B):
-        if not batch.valid[b]:
-            continue
-        L = int(batch.token_lens[b])
-        try:
-            instr, _ = decode_instruction(batch.tokens[b, :L].tolist(), 0)
-        except Exception:
-            continue
-        # I-type wiring is (rd, rs1, imm). Supervise the immediate ONLY where it
-        # is behaviorally LIVE. An x0-write (rd==0) is a no-op — the result is
-        # discarded — so its immediate is dead: `ADDI x0,rs,k` is the same no-op
-        # for every k. The essence correctly COLLAPSES those equivalents (low
-        # magnitude, immediate-independent); supervising the dead immediate would
-        # fight that collapse with a gradient it can never satisfy (the ~3% imm
-        # floor). So mask x0-writes out, like memory-ops and non-I-type already are.
-        if instr.opcode in I_TYPE and instr.args[0] != 0:
-            imm[b] = instr.args[2]
-            mask[b] = 1.0
-    return imm, mask
+def witness_outputs(tok, pad, out_inputs):
+    """Each one-instruction row's output at every witness state, (B, K) int64.
+
+    The witness state's position i+1 is placed on the row's i-th input in
+    colour order (`out_inputs`, the precompute_chunk placement convention), so
+    the inputs of two rows correspond positionally: a register rename, which
+    keeps the colour order, presents both rows the same values. Executed by the
+    GPU batch emulator. One-instruction rows only (T1)."""
+    from emulator.gpu_emulator import batch_execute, batch_parse_tokens
+    w = _witness_states(tok.device)                                   # (K, 32)
+    B, K = tok.shape[0], w.shape[0]
+    t = tok[:, 0]
+    lengths = (~pad[:, 0]).sum(-1)
+    op, rd, rs1, rs2, imm, _ = batch_parse_tokens(t, lengths, tok.device)
+    regs = torch.zeros(B, K, 32, dtype=torch.int64, device=tok.device)
+    ins = out_inputs[:, 0]                                            # (B, MAX_IN)
+    for i in range(min(2, ins.shape[1])):                             # <= 2 inputs at T1
+        reg = ins[:, i]
+        on = (reg >= 0).unsqueeze(-1).unsqueeze(-1)
+        oh = F.one_hot(reg.clamp(min=0), 32).bool().unsqueeze(1)      # (B, 1, 32)
+        regs = torch.where(on & oh, w[:, i + 1].view(1, K, 1), regs)
+    regs[..., 0] = 0
+    rep = lambda x: x.repeat_interleave(K)
+    val, _ = batch_execute(rep(op), rep(rd), rep(rs1), rep(rs2), rep(imm),
+                           regs.view(B * K, 32).to(torch.int32),
+                           torch.zeros(B * K, dtype=torch.int32, device=tok.device))
+    return val.view(B, K)
+
+
+_FULL = 1 << 32
+_HALF = 1 << 31
+_MASK32 = _FULL - 1
+
+
+def _max_wrap_distance_t(lo, hi):
+    """Vectorized `datagen.knownbits._max_wrap_distance`."""
+    first = lo + torch.remainder(_HALF - lo, _FULL)
+    peak = ((hi - lo) >= _FULL) | (first <= hi)
+    wrap = lambda t: torch.minimum(torch.remainder(t, _FULL), _FULL - torch.remainder(t, _FULL))
+    return torch.where(peak, torch.full_like(lo, _HALF), torch.maximum(wrap(lo), wrap(hi)))
+
+
+def max_distance_matrix(zero, one):
+    """(B, B) largest wrap-around distance between any value row i's output
+    allows and any row j's allows — vectorized `datagen.knownbits.max_distance`
+    over (B,) int64 known-zero / known-one masks."""
+    umin, umax = one, (~zero) & _MASK32
+    sign_known_zero, sign_known_one = (zero & _HALF) != 0, (one & _HALF) != 0
+    smin_u = one | torch.where(sign_known_zero, 0, _HALF)
+    smax_u = umax & torch.where(sign_known_one, _MASK32, _MASK32 ^ _HALF)
+    signed = lambda v: torch.where(v >= _HALF, v - _FULL, v)
+    smin, smax = signed(smin_u), signed(smax_u)
+    u = _max_wrap_distance_t(umin.unsqueeze(1) - umax.unsqueeze(0), umax.unsqueeze(1) - umin.unsqueeze(0))
+    s = _max_wrap_distance_t(smin.unsqueeze(1) - smax.unsqueeze(0), smax.unsqueeze(1) - smin.unsqueeze(0))
+    return torch.minimum(u, s)
+
+
+def pair_distance_targets(outputs, zero, one):
+    """(B, B) behavioral distance between every two rows: the mean over the
+    witness states of `datagen.knownbits.output_distance` — the wrap-around
+    difference, log1p(log1p(d)) / log1p(log1p(max_dist)), with max_dist from
+    the two outputs' known bits. 0 for rows that agree at every witness state."""
+    maxd = max_distance_matrix(zero, one).double()                    # (B, B)
+    d = torch.remainder(outputs.unsqueeze(1) - outputs.unsqueeze(0), _FULL)   # (B, B, K)
+    d = torch.minimum(d, _FULL - d).double()
+    ll = torch.log1p(torch.log1p(d))
+    den = torch.log1p(torch.log1p(maxd)).unsqueeze(-1)
+    per = torch.where(d > 0, ll / den.clamp(min=1e-12), torch.zeros_like(ll))
+    return per.mean(-1).float()
+
+
+def distance_loss(essence, target, row_mask, scale=2.0):
+    """MSE between every two valid rows' essence distance (chord on the unit
+    sphere, 0..2) and `scale` × their behavioral distance (0..1): equivalent
+    rows are pulled together, and every other pair held as far apart as it
+    behaves differently."""
+    e = F.normalize(essence, dim=-1)
+    sq = (2.0 - 2.0 * (e @ e.t())).clamp(min=0.0)
+    dist = torch.sqrt(sq + 1e-8)          # finite gradient at coincident rows
+    B = dist.shape[0]
+    valid = row_mask.bool()
+    pair = valid.unsqueeze(0) & valid.unsqueeze(1) & torch.triu(
+        torch.ones(B, B, dtype=torch.bool, device=dist.device), diagonal=1)
+    err = (dist - scale * target) ** 2
+    return (err * pair).sum() / pair.sum().clamp(min=1)
 
 
 class _LRClock:
@@ -743,7 +795,8 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
                      valid_weight=0.1, live_in_weight=0.1, live_out_weight=0.1,
                      pc_writes_weight=0.1, in_slot_weight=0.1,
                      out_slot_weight=0.1, value_predict_weight=1.0,
-                     vp_smooth_weight=0.2, imm_weight=1.0,
+                     vp_smooth_weight=0.2,
+                     distance_weight=0.0,
                      resume=None, device='auto', on_log=None, save_every=10000,
                      compile_step=True):
     """The ONE trainer for the equivariant Compressor — T1 and T2 run the SAME
@@ -813,7 +866,8 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
             f'step {r["step"]:>5d}  loss {r["total"]:.4f} '
             f'(val {r["valid"]:.4f} li {r["live_in"]:.3f} lo {r["live_out"]:.3f} '
             f'pc {r["pc_writes"]:.3f} is {r["in_slot"]:.3f} os {r["out_slot"]:.3f} '
-            f'vp {r["value_pred"]:.4f} im {r["imm"]:.4f}) '
+            f'vp {r["value_pred"]:.4f} '
+            f'ds {r["distance"]:.4f}) '
             f'B={r["n_chunks"]} I={r["n_instrs"]}  '
             f'lr {lr_now:.1e}  {ms:.0f}ms/step  '
             f'eta {timedelta(seconds=int(eta))}')
@@ -827,13 +881,18 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
         print(f'Resumed from step {step}')
 
     vp_active = value_predict_weight > 0
-    # immediate head is T1-only: one instruction = one unambiguous immediate.
-    # (T2's chunk essence has no single immediate; its imm_head stays unused.)
-    imm_active = imm_weight > 0 and ingest == 'tokens'
     valid_active = valid_weight > 0
+    # The pair targets need every row's output at shared witness states, which
+    # is executed per instruction: one-instruction rows only until an output
+    # correspondence exists for chunks.
+    distance_active = distance_weight > 0
+    if distance_active and not (vp_active and ingest == 'tokens'):
+        raise ValueError('distance_weight > 0 needs value prediction on and '
+                         'one-instruction rows (T1)')
     # Prefetcher overlaps CPU-side prep with GPU work — shared by both tiers.
     batch_source = TrainBatchPrefetcher(
-        batch_iter, pack=dict(vp=vp_active, valid=valid_active, imm=imm_active))
+        batch_iter, pack=dict(vp=vp_active, valid=valid_active,
+                              distance=distance_active))
     first, batch_source = _peek(batch_source)
     if first is None:
         return model, log.losses
@@ -874,7 +933,7 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
     def _fwd_loss(tok, pad, w0, w1, wo, active,
                   li, lo, pc, in_slot, out_slot, out_regs, vp_mask, anchors,
                   out_inputs, valid_f,
-                  ike, oke, imm_target, imm_mask):
+                  ike, oke, distance_target):
         content_seq, c0, c1, co = _content(tok, pad, w0, w1, wo, active)
         T, essence = comp.encode_state(content_seq, c0, c1, co, active)
         valid_loss = (((essence.norm(dim=-1) - valid_f) ** 2).mean()
@@ -886,15 +945,8 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
                   comp, T, essence, anchors, out_slot, out_inputs, out_regs,
                   vp_mask, vp_smooth_weight=vp_smooth_weight, n_out=oke)
               if vp_active else essence.new_zeros(()))
-        # Immediate head (T1 only): linear readout of the essence must match the
-        # rotary encoding of the instruction's immediate, masked to I-type rows.
-        if imm_active:
-            # direction only (magnitude = validity).
-            imm_pred = comp.imm_head(F.normalize(essence, dim=-1))   # (B, 2*_IMM_N_FREQ)
-            imm_per = ((imm_pred - imm_target) ** 2).mean(-1)   # (B,)
-            imm = (imm_per * imm_mask).sum() / imm_mask.sum().clamp(min=1)
-        else:
-            imm = essence.new_zeros(())
+        ds = (distance_loss(essence, distance_target, vp_mask)
+              if distance_active else essence.new_zeros(()))
         total = (valid_weight * valid_loss
                  + live_in_weight * bl['live_in']
                  + live_out_weight * bl['live_out']
@@ -902,16 +954,17 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
                  + in_slot_weight * bl['in_slot']
                  + out_slot_weight * bl['out_slot']
                  + value_predict_weight * vp
-                 + imm_weight * imm
+                 + distance_weight * ds
                  )
         metrics = {'total': total, 'valid': valid_loss,
                    'live_in': bl['live_in'], 'live_out': bl['live_out'],
                    'pc_writes': bl['pc_writes'], 'in_slot': bl['in_slot'],
                    'out_slot': bl['out_slot'], 'value_pred': vp,
-                   'imm': imm}
+                   'distance': ds}
         return total, metrics, None
 
     stage = _H2DStager(device)
+    distance_buf = [None]
 
     def _prep(item):
         packed, specs = item[0], item[1]
@@ -923,10 +976,22 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
             (next(staged), next(staged), next(staged), next(staged)) if vp_active
             else (_dummy, _dummy, _dummy, _dummy))
         valid_f = next(staged) if valid_active else _dummy
-        imm_target_t, imm_mask_t = ((next(staged), next(staged)) if imm_active
-                                    else (_dummy, _dummy))
+        if distance_active:
+            known_zero_t, known_one_t = next(staged), next(staged)
+            # Executed eagerly, outside the compiled step: the targets are data.
+            # Written into one persistent buffer, since a graph replay reads
+            # its inputs at the addresses it was captured with.
+            with torch.no_grad():
+                d = pair_distance_targets(
+                    witness_outputs(fixed[0], fixed[1], out_inputs_t),
+                    known_zero_t, known_one_t)
+                if distance_buf[0] is None:
+                    distance_buf[0] = torch.empty_like(d)
+                distance_t = distance_buf[0].copy_(d)
+        else:
+            distance_t = _dummy
         return (*fixed, out_regs_t, vp_mask_t, anchors_t, out_inputs_t, valid_f,
-                IN_K, OUT_K, imm_target_t, imm_mask_t)
+                IN_K, OUT_K, distance_t)
 
     def _extra(item, aux):
         return {'n_chunks': N_CHUNKS, 'n_instrs': item[2]}
@@ -949,7 +1014,8 @@ def train_encoder(batch_iter, *,
                   pc_writes_weight=0.1,
                   in_slot_weight=0.1, out_slot_weight=0.1,
                   value_predict_weight=1.0,
-                  vp_smooth_weight=0.2, imm_weight=1.0,
+                  vp_smooth_weight=0.2,
+                  distance_weight=0.0,
                   device='auto', on_log=None, save_every=10000,
                   compile_step=True):
     """Train a T1 encoder on RVT batches.
@@ -957,9 +1023,8 @@ def train_encoder(batch_iter, *,
     T1 is the single-instruction special case of T2 and uses the same
     rename-equivariant register-binding supervision (binding_losses):
     live_in/out + pc_writes BCE, in/out-slot ListMLE, plus value
-    prediction. There is no equivalence-collapse loss — equivalence is
-    an emergent property of the consistent per-instruction targets, not a
-    separate objective that would fight register identity.
+    prediction, and, at distance_weight > 0, the behavioral distance term
+    (distance_loss).
 
     d_event..n_pool_heads: the equivariant core's own dimensions, forwarded
                          unchanged to train_compressor — T1 and T2 share one
@@ -998,7 +1063,8 @@ def train_encoder(batch_iter, *,
         live_out_weight=live_out_weight, pc_writes_weight=pc_writes_weight,
         in_slot_weight=in_slot_weight, out_slot_weight=out_slot_weight,
         value_predict_weight=value_predict_weight,
-        vp_smooth_weight=vp_smooth_weight, imm_weight=imm_weight,
+        vp_smooth_weight=vp_smooth_weight,
+        distance_weight=distance_weight,
         device=device, on_log=on_log, save_every=save_every,
         compile_step=compile_step)
 

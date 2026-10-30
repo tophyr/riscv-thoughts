@@ -12,10 +12,10 @@ geometry — and whether search-based decoding can invert the compression.
 3. [RISCV_DESIGN.md](RISCV_DESIGN.md) — the testbed and the architecture, with
    the durable rationale for why it is shaped this way.
 4. [EXPERIMENT_LOG.md](EXPERIMENT_LOG.md) — an index over one file per phase in
-   `EXPERIMENT_LOG/`. Read the index, then the two entries it marks as the live
-   record in full: the current architecture, and the open faithfulness problem.
-   Earlier entries are superseded design kept for their dead ends — open one
-   when you are about to revisit the question it settled.
+   `EXPERIMENT_LOG/`. Read the index, then in full the phase it marks as the
+   live record: the register frame and its open problems. Earlier phases are
+   superseded design kept for their dead ends — open one when you are about to
+   revisit the question it settled.
 5. [METRICS.md](METRICS.md) — what each measurement means, what it certifies,
    how far it moves when nothing changed, and the conditions a number from it is
    only true under. Read before quoting any figure.
@@ -164,13 +164,18 @@ compress to the same point — that is the framework's definition of meaning, an
 it is required for T2 to count as done. Everything that leaves the chunk's live
 dataflow graph unchanged does, exactly and by construction: a register rename,
 reordered independent instructions, an inserted dead instruction. Everything
-that needs the op-cell to compute does not — a commutative swap among them.
-The essence describes the instructions as written: two chunks that fold two
-immediates into the same total land further apart than two chunks computing
-different totals, an identity sits further from a cancelling pair than
-unrelated chunks sit from each other, and the training objective is not
-pairwise, so nothing pushes them together. The pairwise pressure is the
-outstanding design decision.
+that needs the op-cell to compute does not emerge by itself — a commutative
+swap among them — since value prediction alone is satisfied by any essence it
+can read. The pressure is a pairwise behavioral distance: every two chunks'
+essences are held as far apart as their outputs differ at shared inputs, so
+equivalent spellings meet and near-misses stay near. At one instruction it
+collapses every spelling group tried — copies, zero, doubling, the sign test,
+constants — to within 0.11 of a point while unrelated instructions keep their
+spread, at a cost of 108 wrong values of 2.46 million, on comparisons whose
+two immediates differ by one. At two instructions it is not built yet: the T2
+models measured describe their chunks as written, two chunks that fold two
+immediates into the same total landing further apart than two that compute
+different totals.
 
 Beyond both lies T3, the first tier that must *compose* bindings rather than
 merely emit them.

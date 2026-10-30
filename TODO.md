@@ -202,59 +202,56 @@ the op-cell owes, and the objective below is about them. Training the essence
 toward the signature would separate those classes: the syntactic-hash failure
 RISCV_DESIGN.md's "GVN" section names.
 
-**The objective: an in-batch contrastive term on the essence.** Generated
-equivalent partners are placed in the same batch as marked pairs, and an
-InfoNCE term pulls each chunk's essence toward its partner's and away from
-every other chunk in the batch, so the B² pairs of a batch cost its B encoder
-passes. Value prediction stays on, and because it reads the essence, the term
-cannot be satisfied by making every chunk coincide. The term sits on the
-essence, not on the written slots' descriptions, because the requirement is
-stated on the essence: a T2 essence with one output equivalent to another
-chunk's and one different should land near that chunk, not reproduce its
-descriptions. The essence is computed from the descriptions through the pool,
-so the term's gradient still reaches the op-cell (the network applied at
-every instruction, whose output for a register's last write is that
-register's description), and the op-cell is pushed to fold `i1+i2` wherever
-that is the only way two essences can meet. Injecting equivalents without a
-pairwise term (`equivalences.rate`) is a recorded failure: value prediction is
-satisfied by any essence the evaluator can read, so seeing both spellings
-teaches nothing about where they land.
+**The objective: a behavioral distance term on the essence.** Every two
+rows' essence distance is matched, by MSE, to twice their behavioral distance:
+both rows executed at shared witness states with their inputs in colour
+order, log1p(log1p(d)) / log1p(log1p(max_dist)) averaged over the states, d
+the wrap-around difference of their outputs and max_dist the largest
+difference those outputs could ever have, from a known-bits analysis
+(`distance_loss` and `pair_distance_targets`, `compressor/train.py`;
+`datagen/knownbits.py`). Equivalent rows get target 0 whatever their spelling,
+and every other pair is held as far apart as it behaves differently, so the
+space is graded, not only partitioned. Value prediction stays on. The term
+sits on the essence, not on the written slots' descriptions, because the
+requirement is stated on the essence; the essence is computed from the
+descriptions through the pool, so the gradient still reaches the op-cell (the
+network applied at every instruction, whose output for a register's last
+write is that register's description), and pushes it to fold `i1+i2` wherever
+that is the only way two essences can meet. Generated partner pairs — two
+spellings of one function in one batch — supply the equivalent pairs a
+naturally drawn batch almost never holds. InfoNCE alone, with or without a
+uniformity term, collapses equivalents but carries no notion of how far apart
+two different functions are, and flattens that grading (EXPERIMENT_LOG, "The
+register frame", finding 41).
 
 **The order of work.**
 
-1. **T1 first.** Every T1 chunk is one instruction with one output, so an
-   equivalent pair is equivalent outright and the pointer order cannot
-   differ between partners. The manifest's single-instruction classes supply
-   the partners once they are placed as marked pairs; today
-   `equivalences.rate` inserts equivalents into the stream unpaired. Group
-   partners by the function computed, not by manifest class: copying a
-   register (`mv_via_zero_reg` with `self_op_identity`), writing zero
-   (`self_op_zero` with `write_zero_to_rd`, without `LUI`, which the writers
-   corpus does not draw), doubling (`double_is_shl1`) and the sign test
-   (`sign_test`). The commutative classes are register renames at one
-   instruction and already collapse; `neg_via_sub_x0` and
-   `not_via_xori_neg1` hold one template each, so they offer no partner; the
-   branch and x0-write classes are outside the writers-only scope. Several
-   classes also list contrast templates — near-miss instructions computing
-   something else, such as `ADDI rd,rs,1` beside the copies and `SLLI rd,rs,2`
-   beside doubling — which serve as ready-made hard negatives.
-2. **Remint T1 and score it against `runs/t1_essence_500k`** (~35 min): the
-   partner pairs fall toward 0 while vp stays exact and the aliasing control
-   and the contrast pairs stay apart.
+1. **T1 holds** (finding 41): with the immediate head removed, the distance
+   term collapses every partner group (copy 0.0019, sign 0.0004, double
+   0.0008, zero 0.11, constant 0.08 against contrasts of 0.3–1.5), keeps
+   unrelated instructions at their spread (1.36) and grades near-misses
+   (`ADDI` k vs k+1 at 0.34, its target). It costs 108 failing vp triples of
+   2.46M, on comparisons whose target is wrongly 0 (Open ideas, "Draw anchor
+   values aimed at the instruction"), and 10–12 ms/step against 4 ms, because
+   the targets are computed before each compiled step.
+2. **The distance term for chunks.** Three pieces: executing each chunk at the
+   witness states instruction by instruction on the GPU emulator; the known
+   bits of each output, which `datagen/knownbits.py` already propagates
+   through a chunk; and a correspondence between two chunks' outputs, since a
+   chunk can have several — the minimum over the at most K! assignments of
+   one chunk's outputs to the other's, with each output's inputs in colour
+   order.
 3. **A multi-instruction partner generator for T2** — folds of two literals,
    identity against a cancelling pair, commutative swaps whose operand is
-   shared or a result — emulator-verified, starting with chunks of one output
-   for the same reason as T1.
+   shared or a result — emulator-verified, starting with chunks of one output.
 
 Decisions that remain:
 
-- **Graded nearness for partial equivalence.** InfoNCE treats every chunk in
-  the batch except the partner as an equally hard negative, so a chunk sharing
-  one equivalent output with another is pushed away from it as hard as an
-  unrelated one. Excluding such pairs from each other's negatives, or a
-  target graded by how much register function two chunks share, are the
-  candidates. Settle when chunks with more than one output enter, together
-  with the pointer order (Open ideas).
+- **Combining outputs.** How the distance between two multi-output chunks is
+  built from their per-output distances (the mean over matched outputs, or
+  something that weighs an unmatched output), and how two chunks with
+  different numbers of outputs compare. Settle together with the pointer order
+  (Open ideas), since both concern chunks with more than one output.
 - **The partner fraction.** How much of a batch is partner pairs against
   naturally drawn chunks; start fixed and treat it as a tuning knob.
 - **The baseline to beat** is finding 39's 1M cell for T2 and
@@ -414,7 +411,7 @@ on the naturally drawn corpus.
 
 ### Draw anchor values aimed at the instruction
 
-Anchors are drawn per source chunk, so a draw could look at the chunk it is for.
+Anchors are drawn per chunk, so a draw could look at the chunk it is for.
 The residual of a T1 trained at fresh structured anchors is two input patterns
 the generic draw reaches only by chance: a value carrying through a long run of
 zero bits (six ADDI failures, all on one held-out input, 0x723005C9 with a
@@ -433,6 +430,26 @@ composed `SUB` chunks each a bit off at six anchors, three composed `ADD`
 chunks and 15 single-instruction slots each wrong at one anchor, nine of those
 one `SUB` operand pair at one anchor state (finding 35) — so this draw is not
 aimed at them.
+
+**A behavioral distance term makes the comparison case decisive.** That term
+(`distance_loss`, `compressor/train.py`) matches every two T1 rows' essence
+distance to their behavioral distance: the mean, over 64 shared witness
+states, of how far apart their outputs are. `SLTI x,k` and `SLTI x,k+1` differ
+only at x = k, which no witness state holds, so their target is 0 for every k
+and the term pulls two different functions onto one point. A T1 trained with
+the term and without an immediate head (`runs/t1_distance_noimm_500k`: the
+writers corpus with a quarter of each batch partner pairs, 500k steps) holds
+them 0.0012 apart and fails 108 of 2,457,600 held-out triples, every one on
+`SLTI`, `SLTIU` or `ADDI`. The geometry is not the error: the two functions
+disagree on one input in 2³², and a smooth space should hold them close. The
+error is that vp, the only pressure keeping them distinguishable, rarely sees
+an input that tells them apart, since the generic draw lands on k only by
+chance. Aiming each row's anchors at its comparison boundary — k−1, k and k+1
+on the compared input — gives vp that gradient at a cost proportional to the
+rows, not to the pairs. At T2 the boundary moves through the chain (`ADDI
+t,x,5; SLTI r,t,600` changes at x = 595), found by walking back through the
+chunk's own dataflow while it is generated; the walk only has to propose
+likely boundaries to train on, not prove where two chunks differ.
 
 ### A smaller vp head at T2
 

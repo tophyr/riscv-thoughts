@@ -134,8 +134,8 @@ not know you need.
    is padded to identical (B, max_tokens, max_n_instrs) so PyTorch's caching
    allocator doesn't fragment. Stochastically-varying batch shape is a real OOM
    trigger we hit (~step 500 of t1_cosine_full). The targets come from
-   `max_chunk_len = rule.max_len` (`datagen/batch.py:664-669` inside
-   `collect_into_batches`, `datagen/batch.py:628`).
+   `max_chunk_len = rule.max_len` (`datagen/batch.py:702-706` inside
+   `collect_into_batches`, `datagen/batch.py:653`).
    This is why a `--rule` with no cap is REJECTED (see Rule grammar). Don't add a
    code path that emits a differently-shaped batch mid-run.
 
@@ -185,17 +185,30 @@ not know you need.
    its reads leave no trace in any colour; they remain in the binding.
 
 5. **x0 is fixed under relabeling.** `random_perm`/`relabel` require `perm[0]==0`
-   (`datagen/generate.py:298,312`; the check is `datagen/generate.py:320-321`).
+   (`datagen/generate.py:313,327`; the check is `datagen/generate.py:335-336`).
    x0 is hardwired zero, not a register.
 
 6. **Memory-op chunks get no aux (V1 scope).** `build_targets`
-   (`datagen/batch.py:553`) skips chunks containing LOAD/STORE because their
+   (`datagen/batch.py:578`) skips chunks containing LOAD/STORE because their
    `Precomputed` is unavailable — `precompute_chunk` raises
    NotImplementedError on memory ops (`datagen/compare.py:674-675`). The
    chunk's tokens are still shipped (so the encoder sees them for
    magnitude/validity), but its aux row is zero-mask / `AUX_CE_IGNORE` and its
    value-prediction row is masked off via `out_regs_valid=False`
-   (`_out_regs_from_precomputeds`, `datagen/batch.py:377`).
+   (`_out_regs_from_precomputeds`, `datagen/batch.py:387`).
+
+7. **The behavioral distance compares two rows at the SAME inputs, placed by
+   colour order.** Every row is executed at one shared set of witness states,
+   its i-th input in `out_inputs` order taking the state's position i+1
+   (`witness_outputs`, `compressor/train.py`), so two rows' outputs are
+   compared at equal values on corresponding inputs. Comparing each row at its
+   own anchor draw, or placing values by register number, gives a target that
+   is nonzero for a register rename and meaningless across rows — no error,
+   only a collapse objective pulling the wrong pairs. `max_dist` comes from
+   the shipped known bits (`out_known_zero` / `out_known_one`, from
+   `datagen/knownbits.py`), never from observed values.
+   (`compressor/tests/test_train.py::test_witness_outputs_match_the_cpu_emulator`,
+   `::test_pair_distance_targets_match_the_reference_distance`.)
 
 ## Anchored memory
 

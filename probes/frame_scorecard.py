@@ -24,6 +24,10 @@ the classes the structural signature defines.
               over a different number of picks). Every commutative swap is
               the op-cell's to learn — the encoder is told nothing about which
               operations commute — and reads what training made of it.
+  partner groups (T1) — for each group of spellings of one function
+              (`datagen.generate.PARTNER_GROUPS`), two spellings on the same
+              registers, which must be ~0, against a spelling and the group's
+              contrast, a near-miss computing something else.
 
 Usage: frame_scorecard.py <t2_dir|-> <t1_path> <corpus.rvt> [n_batches] [n_pairs]
   `-` as t2_dir scores the T1 alone (the corpus must be `--rule single`).
@@ -43,6 +47,7 @@ from compressor.train import (_split_to_per_instruction, _t2_assemble,
                               _t1_wiring, vp_predict, _value_bits)
 from datagen import RVT_FORMAT, Batch, AUX_CE_IGNORE, padding_mask
 from datagen.signature import COMMUTATIVE
+from datagen.generate import PARTNER_GROUPS, materialize, sample_binding
 from emulator import Instruction
 from scripts._common import resolve_device, load_frozen_encoder, load_t2
 from tokenizer import decode_instruction, encode_instruction, PAD
@@ -282,4 +287,23 @@ X = [[rand_instr() for _ in range(L)] for _ in range(N_PAIRS)]
 Y = [[rand_instr() for _ in range(L)] for _ in range(N_PAIRS)]
 d = (encode(X) - encode(Y)).norm(dim=-1)
 print(f'    {"unrelated chunks":34s} mean={float(d.mean()):.4f}')
+
+if L == 1:
+    # One register function spelled two ways must be one point; the group's
+    # contrast spelling computes something else and must stay apart.
+    print(f'\n  partner groups ({N_PAIRS} pairs each): two spellings of one function, '
+          f'and a spelling against its contrast')
+    for g in PARTNER_GROUPS:
+        same, contrast = [], []
+        for _ in range(N_PAIRS):
+            b = sample_binding(g, rng)
+            i, j = rng.choice(len(g.canonical), size=2, replace=False)
+            same.append(([materialize(g.canonical[int(i)], b)], [materialize(g.canonical[int(j)], b)]))
+            cs = [t for t in g.contrast if t.args[0] == 'rd']
+            c = cs[int(rng.integers(len(cs)))]
+            contrast.append(([materialize(g.canonical[int(i)], b)], [materialize(c, b)]))
+        ds = (encode([p[0] for p in same]) - encode([p[1] for p in same])).norm(dim=-1)
+        dc = (encode([p[0] for p in contrast]) - encode([p[1] for p in contrast])).norm(dim=-1)
+        print(f'    {g.name:10s} equivalent mean={float(ds.mean()):.4f}  max={float(ds.max()):.2e}  '
+              f'contrast mean={float(dc.mean()):.4f}  separation={float(dc.mean() / ds.mean()):.1f}x')
 print()

@@ -71,17 +71,15 @@ def main():
                         "output's value from the essence, the output's "
                         "pointer and its inputs' values. The anchor states "
                         'ride in each batch.')
+    p.add_argument('--distance-weight', type=float, default=0.0,
+                   help='MSE between every two rows\' essence distance and '
+                        'their behavioral distance at shared witness states '
+                        '(log-log of the output difference over the largest '
+                        'difference their known bits allow); T1 only.')
     p.add_argument('--vp-smooth-weight', type=float, default=0.2,
                    help='weight on the vp smooth-magnitude (ordering) term. The '
                         'per-bit target carries resolution; this keeps '
                         'numerically-close values ordered.')
-    p.add_argument('--imm-weight', type=float, default=1.0,
-                   help='weight on the immediate head — a LINEAR readout of a '
-                        'rotary/Fourier encoding of the (I-type) immediate, so '
-                        'the essence carries the immediate directly and imm+δ '
-                        'becomes a consistent, opcode-independent rotation. '
-                        '0 disables. T1 only (T2 chunks have no single '
-                        'immediate).')
     p.add_argument('--no-compile', action='store_true',
                    help='Disable torch.compile (CUDA-graph) of the train '
                         'step. Compile is on by default (~2x faster, ~80%% '
@@ -109,7 +107,8 @@ def main():
         in_slot_weight=args.in_slot_weight,
         out_slot_weight=args.out_slot_weight,
         value_predict_weight=args.value_predict_weight,
-        vp_smooth_weight=args.vp_smooth_weight, imm_weight=args.imm_weight,
+        distance_weight=args.distance_weight,
+        vp_smooth_weight=args.vp_smooth_weight,
         device=device,
         on_log=save, save_every=args.save_every,
         compile_step=not args.no_compile,

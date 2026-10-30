@@ -196,3 +196,50 @@ def test_collect_groups_rejects_unbounded_rule():
     for rule in (until_branch(), until_transformation()):
         with pytest.raises(ValueError, match='unbounded'):
             list(collect_groups(iter(instrs), rule))
+
+
+def test_partner_groups_are_exact_on_the_emulator():
+    """Every canonical spelling in a partner group writes the same value to rd
+    on every register file tried, so any two are a true equivalent pair; every
+    contrast spelling differs from them on some register file."""
+    from datagen.compare import draw_anchor_states
+    from datagen.generate import PARTNER_GROUPS, materialize
+    from emulator import run as emu_run
+    rng = np.random.default_rng(7)
+    # Drawn states plus all-zero and all-ones register files: a contrast such
+    # as `SLTI rd,rs,1` against `SLTI rd,rs,0` differs only where rs == 0.
+    states = np.concatenate([draw_anchor_states(rng, 64),
+                             np.zeros((1, 32), np.int64), np.full((1, 32), -1)])
+    states[:, 0] = 0
+    for group in PARTNER_GROUPS:
+        for _ in range(50):
+            b = sample_binding(group, rng)
+            outs = []
+            for tpl in group.canonical:
+                ins = materialize(tpl, b)
+                outs.append([int(emu_run([ins], st.astype(np.int32).copy())[0].regs[b['rd']])
+                             for st in states])
+            assert all(o == outs[0] for o in outs), group.name
+            for tpl in group.contrast:
+                if tpl.args[0] != 'rd':
+                    continue
+                ins = materialize(tpl, b)
+                c = [int(emu_run([ins], st.astype(np.int32).copy())[0].regs[b['rd']]) for st in states]
+                assert c != outs[0], (group.name, ins)
+
+
+def test_partner_pairs_compute_one_function():
+    """A sampled partner pair writes the same value to rd on every register
+    file: two different spellings of one function."""
+    from datagen.compare import draw_anchor_states
+    from datagen.generate import sample_partner_pair
+    from emulator import run as emu_run
+    rng = np.random.default_rng(11)
+    states = draw_anchor_states(rng, 32)
+    states[:, 0] = 0
+    for _ in range(400):
+        a, b = sample_partner_pair(rng)
+        assert (a.opcode, a.args) != (b.opcode, b.args)
+        for st in states:
+            assert (emu_run([a], st.astype(np.int32).copy())[0].regs[a.args[0]]
+                    == emu_run([b], st.astype(np.int32).copy())[0].regs[b.args[0]]), (a, b)

@@ -561,6 +561,67 @@ path's hash and can move it past another output's, so the two equivalent
 chunks file their functions under different pointers and their essences
 cannot coincide. A chunk with one output is unaffected.
 
+### Collapse: a behavioral distance on the essence
+
+Two chunks that compute one function must land on one point, and two that
+compute different functions must land as far apart as they behave
+differently. The space is meant to be graded, not only partitioned: `ADDI x,k`
+and `ADDI x,k+1` should sit nearer each other than `ADDI x,k` and
+`ADDI x,k+512`. So the collapse objective is a distance regression: every two
+rows of a batch have their essence distance (the chord between unit-normalized
+essences, 0–2) matched by MSE to twice their **behavioral distance**
+(`distance_loss`, `compressor/train.py`).
+
+The behavioral distance compares the two rows' outputs at the same inputs. Both
+are executed at a fixed set of 64 structured witness states, each row's i-th
+input in colour order taking the state's position i+1, so inputs correspond by
+structural role, and a register rename, which keeps the colour order, presents
+both rows the same values (`witness_outputs`). At each state the two outputs'
+wrap-around difference d (the shorter way round mod 2³², exact in integers)
+becomes log1p(log1p(d)) / log1p(log1p(max_dist)), and the distance is the mean
+over the states (`pair_distance_targets`; `datagen/knownbits.py`,
+`output_distance`). The nested logarithm spreads small differences and
+saturates large ones: a difference of 1 is 0.17, of 10³ 0.66, of 10⁶ 0.86.
+`max_dist` is the largest difference the two outputs could ever have, from a
+known-bits analysis of each — the bits forced to 0 or 1 whatever the inputs,
+propagated one transfer function per instruction (`output_known_bits`). Two
+comparisons, which can only be 0 or 1, are at most 1 apart, so their distance
+is the fraction of states where they disagree; two full-range outputs are at
+most 2³¹ apart. Equivalent rows read 0 at every state whatever their spelling,
+so nothing has to enumerate which spellings are equivalent.
+
+Equivalent pairs are rare in a naturally drawn batch, so a fraction of each
+batch is **partner pairs**: two different spellings of one function on the
+same registers, drawn from groups of the equivalence manifest merged by the
+function computed (`datagen.generate.PARTNER_GROUPS`, each spelling checked on
+the emulator). The term sits on the essence, where the requirement is stated;
+its gradient reaches the op-cell through the pool, which is pushed to fold a
+computation wherever that is the only way two essences can meet.
+
+A same-or-different objective cannot state the grading. InfoNCE pulls each row
+toward its equivalents and pushes it from everything else with no notion of
+how far, and pushes closest pairs hardest; at T1 it collapses equivalents and
+drives every inequivalent pair toward orthogonal (EXPERIMENT_LOG, "The
+register frame", finding 41).
+
+The essence carries no immediate head, no readout trained to reproduce the
+immediate as written. Such a head pins the essence to how an instruction is
+spelled, which collapse requires it not to encode: two equivalent spellings
+with different immediates cannot share a point a linear readout decodes into
+two codes. The distance term places immediates instead, by how much they
+change the output.
+
+One limit is built into averaging over states. Two functions that disagree
+only on a vanishing set of inputs — `SLTI x,600` and `SLTI x,601`, which differ
+only at x = 600 — read distance 0 when no witness state lands there, and the
+term pulls them together. Placing them close is correct for a smooth space;
+what keeps them distinguishable is value prediction, which needs training
+anchors that reach the inputs where they differ.
+
+The targets are computed outside the compiled step, on the GPU batch emulator,
+for one-instruction rows only: chunks need an execution per instruction and a
+correspondence between two chunks' outputs.
+
 ### What is built in for good, and what is built in for now
 
 The principle is: build in what cannot be learned, learn the rest. Two things
@@ -696,6 +757,12 @@ not in the readout's control flow.
 GVN collapse and vp are both load-bearing — a vp gain that craters the GVN
 rows is a regression, not a win.
 
+**Behavioral distance (`distance_weight`), T1.** An MSE between every two
+rows' essence distance and twice their behavioral distance at shared witness
+states (see "Collapse: a behavioral distance on the essence"). It is the only
+pairwise term, and it is what makes equivalent spellings collapse: value
+prediction alone is satisfied by any essence the evaluator can read.
+
 **The anchor states are drawn afresh for every chunk, with structure, placed
 on the chunk's own input registers, and they decide no labels.** With
 one fixed set the evaluator is fed the same few input values for every row, so
@@ -741,13 +808,16 @@ nothing.
 equivalence that leaves the chunk's live dataflow graph unchanged — a register
 rename, a reordering of independent instructions, a dead instruction —
 collapses by construction (see "GVN"), and the scorecards read it at zero.
-Every equivalence the op-cell has to compute does not: the targets give both
-spellings one value, and value prediction is satisfied by any essence the
-evaluator can read, so nothing pushes the two together (EXPERIMENT_LOG, "The
-register frame", findings 38 and 39). A design constraint this surfaces: a
-rename-*invariant* behavioral target (e.g. a GVN-bijection distance) is the
-WRONG objective here — it would weld apart the binding distinctions the
-equivariant representation deliberately keeps recoverable.
+Every equivalence the op-cell has to compute does not emerge: the targets give
+both spellings one value, and value prediction is satisfied by any essence the
+evaluator can read, so nothing in them pushes the two together
+(EXPERIMENT_LOG, "The register frame", findings 38 and 39). The behavioral
+distance term does. It is rename-invariant and acts only on the essence,
+which is rename-invariant by construction; the binding lives in the
+per-register state and the term never reads it. A rename-invariant target on
+a vector that also carried the binding would weld apart the binding
+distinctions an equivariant representation keeps recoverable, which is why the
+flat encoders of EXPERIMENT_LOG phases 12–13 could not use one.
 
 **Supervise only behaviorally-live signals.** A dead value has no target, so
 giving it one asks for a gradient nothing can satisfy and fights the collapse

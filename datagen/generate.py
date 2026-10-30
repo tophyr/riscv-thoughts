@@ -23,6 +23,7 @@ batching (`single()`), T2 chunk extraction (`until_transformation()
 """
 
 import json
+import zlib
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -152,7 +153,9 @@ _CATEGORY_OPS = {
     'JALR': ['JALR'],
 }
 
-_CONFIG_EXTRA_KEYS = {'equivalences', 'invalidity', 'exclude_x0_dest', 'chain'}
+_CONFIG_EXTRA_KEYS = {'equivalences', 'invalidity', 'exclude_x0_dest', 'chain',
+                      'partners'}
+_PARTNERS_KEYS = {'rate'}
 _EQUIVALENCES_KEYS = {'rate', 'max_per_class', 'min_per_class', 'boost'}
 _CHAIN_KEYS = {'rate'}
 _INVALIDITY_KEYS = {'rate', 'types'}
@@ -165,6 +168,8 @@ def validate_distribution(dist):
     Optional: 'equivalences' sub-dict for manifest-injection settings.
     Optional: 'invalidity' sub-dict {'rate': float, 'types': {name: w}}
               for invalid-window injection.
+    Optional: 'partners' sub-dict {'rate': float}: the fraction of each
+              batch made of equivalent one-instruction pairs.
     """
     keys = set(dist.keys())
     unknown = keys - set(_CATEGORY_OPS.keys()) - _CONFIG_EXTRA_KEYS
@@ -200,6 +205,16 @@ def validate_distribution(dist):
         if 'rate' in ch and not (0 <= ch['rate'] <= 1):
             raise ValueError(
                 f"chain.rate must be in [0,1], got {ch['rate']}")
+    if 'partners' in dist:
+        pa = dist['partners']
+        if not isinstance(pa, dict):
+            raise ValueError("'partners' must be a dict")
+        pa_unknown = set(pa.keys()) - _PARTNERS_KEYS
+        if pa_unknown:
+            raise ValueError(f'Unknown partners keys: {pa_unknown}')
+        if 'rate' in pa and not (0 <= pa['rate'] <= 1):
+            raise ValueError(
+                f"partners.rate must be in [0,1], got {pa['rate']}")
     if 'invalidity' in dist:
         inv = dist['invalidity']
         if not isinstance(inv, dict):
@@ -352,7 +367,7 @@ class EquivalenceClass:
 
 
 def _sample_value(name, rng):
-    if name == 'imm':
+    if name.startswith('imm'):
         return int(rng.integers(-2048, 2048))
     if name == 'shamt':
         return int(rng.integers(0, 32))
@@ -515,6 +530,12 @@ MANIFEST = [
             _t('SLLI', 'rd', 'rs',  0),
             _t('SRLI', 'rd', 'rs',  0),
             _t('SRAI', 'rd', 'rs',  0),
+            _t('ADD',  'rd', 'rs',  0),
+            _t('OR',   'rd', 'rs',  0),
+            _t('XOR',  'rd', 'rs',  0),
+            _t('SLL',  'rd', 'rs',  0),
+            _t('SRL',  'rd', 'rs',  0),
+            _t('SRA',  'rd', 'rs',  0),
         ],
         contrast=[_t('ADDI', 'rd', 'rs', 1)],
     ),
@@ -557,6 +578,14 @@ MANIFEST = [
             _t('SLT',  'rd', 'rs', 'rs'),
             _t('SLTU', 'rd', 'rs', 'rs'),
             _t('LUI',  'rd',  0),
+            _t('ADD',  'rd',  0,    0),
+            _t('AND',  'rd', 'rs',  0),
+            _t('SLL',  'rd',  0,   'rs'),
+            _t('SRL',  'rd',  0,   'rs'),
+            _t('SRA',  'rd',  0,   'rs'),
+            _t('SLTU', 'rd', 'rs',  0),
+            _t('SLTIU', 'rd', 'rs', 0),
+            _t('ANDI', 'rd',  0,   'imm'),
         ],
         contrast=[_t('ADDI', 'rd', 0, 1)],
     ),
@@ -622,11 +651,73 @@ MANIFEST = [
     # Sign test.
     EquivalenceClass(
         name='sign_test',
-        description='SLTI rd,rs,0 ≡ SLT rd,rs,x0 (both test rs < 0).',
-        canonical=[_t('SLTI', 'rd', 'rs', 0), _t('SLT', 'rd', 'rs', 0)],
+        description='SLTI rd,rs,0 ≡ SLT rd,rs,x0 ≡ SRLI rd,rs,31 (rs < 0).',
+        canonical=[_t('SLTI', 'rd', 'rs', 0), _t('SLT', 'rd', 'rs', 0),
+                   _t('SRLI', 'rd', 'rs', 31)],
         contrast=[_t('SLTI', 'rd', 'rs', 1)],
     ),
+
+    # Load a sign-extended 12-bit constant.
+    EquivalenceClass(
+        name='load_constant',
+        description='ADDI/ORI/XORI rd,x0,imm all write sext(imm).',
+        canonical=[_t('ADDI', 'rd', 0, 'imm'), _t('ORI', 'rd', 0, 'imm'),
+                   _t('XORI', 'rd', 0, 'imm')],
+        contrast=[_t('ADDI', 'rd', 0, 'imm2')],
+        constraints=[lambda b: b['imm'] != b['imm2']],
+    ),
 ]
+
+
+# ===========================================================================
+# Partner groups — the manifest's classes merged by the function computed
+# ===========================================================================
+
+# Each group is one register function: every canonical template of every
+# listed class computes it under any consistent binding, so any two make an
+# equivalent pair. Classes overlap (`self_op_zero` is part of writing zero),
+# which is why partners are drawn by group and not by class. Opcodes the
+# writers corpora never draw are left out.
+_PARTNER_GROUP_CLASSES = {
+    'copy': ('mv_via_zero_reg', 'self_op_identity'),
+    'zero': ('write_zero_to_rd', 'self_op_zero'),
+    'double': ('double_is_shl1',),
+    'sign': ('sign_test',),
+    'constant': ('load_constant',),
+}
+_PARTNER_EXCLUDED_OPS = frozenset({'LUI'})
+
+
+def _partner_group(name):
+    by_name = {k.name: k for k in MANIFEST}
+    classes = [by_name[c] for c in _PARTNER_GROUP_CLASSES[name]]
+    canon, seen = [], set()
+    for k in classes:
+        for tpl in k.canonical:
+            key = (tpl.op, tpl.args)
+            if tpl.op not in _PARTNER_EXCLUDED_OPS and key not in seen:
+                seen.add(key)
+                canon.append(tpl)
+    return EquivalenceClass(
+        name=name, description=f'partner group {name}', canonical=canon,
+        contrast=[t for k in classes for t in k.contrast],
+        constraints=[c for k in classes for c in k.constraints])
+
+
+PARTNER_GROUPS = [_partner_group(n) for n in _PARTNER_GROUP_CLASSES]
+
+
+def sample_partner_pair(rng, dest_regs=None):
+    """Two different spellings of one register function, bound to the same
+    registers and literals: (Instruction, Instruction). `dest_regs` limits rd
+    as the corpus's own draw does."""
+    group = PARTNER_GROUPS[int(rng.integers(0, len(PARTNER_GROUPS)))]
+    i, j = rng.choice(len(group.canonical), size=2, replace=False)
+    binding = sample_binding(group, rng)
+    if dest_regs is not None:
+        binding['rd'] = int(rng.choice(list(dest_regs)))
+    return (materialize(group.canonical[int(i)], binding),
+            materialize(group.canonical[int(j)], binding))
 
 
 # ===========================================================================

@@ -454,3 +454,30 @@ def test_fixed_shape_single_rule_out_regs():
         assert b.out_regs.shape[0] == b.tokens.shape[0]
     # out_regs carries meaningful rows.
     assert any(b.out_regs_valid.any() for b in batches)
+
+
+def test_partner_rate_places_pairs_and_needs_one_instruction():
+    """The last rows of a batch at partner_rate 0.5 are pairs, each two
+    spellings of one function; a multi-instruction rule refuses a rate."""
+    from datagen.generate import sample_partner_pair
+    from emulator import run as emu_run
+    rng = np.random.default_rng(5)
+    gen = collect_into_batches(
+        generate_chunks(single(), rng), batch_size=16,
+        draw_anchors=lambda k: draw_anchor_states(rng, k * 4).reshape(k, 4, -1),
+        partner_rate=0.5, partner_sampler=lambda: sample_partner_pair(rng),
+        max_chunk_len=1)
+    b = next(gen)
+    state = draw_anchor_states(np.random.default_rng(1), 1)[0].astype(np.int32)
+    state[0] = 0
+    for i in range(8, 16, 2):
+        x, _ = decode_instruction(b.tokens[i, :b.token_lens[i]].tolist(), 0)
+        y, _ = decode_instruction(b.tokens[i + 1, :b.token_lens[i + 1]].tolist(), 0)
+        assert (emu_run([x], state.copy())[0].regs[x.args[0]]
+                == emu_run([y], state.copy())[0].regs[y.args[0]]), (x, y)
+    with pytest.raises(ValueError):
+        next(collect_into_batches(
+            generate_chunks(length_cap(2), rng), batch_size=16,
+            draw_anchors=lambda k: draw_anchor_states(rng, k * 4).reshape(k, 4, -1),
+            partner_rate=0.5, partner_sampler=lambda: sample_partner_pair(rng),
+            max_chunk_len=2))

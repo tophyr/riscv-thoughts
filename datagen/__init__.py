@@ -20,6 +20,7 @@ from .generate import (
     random_instruction, validate_distribution, load_distribution,
     DEFAULT_DISTRIBUTION, build_opcode_table,
     MANIFEST, sample_binding, materialize,
+    PARTNER_GROUPS, sample_partner_pair,
     single, until_branch, until_transformation, length_cap, either,
 )
 

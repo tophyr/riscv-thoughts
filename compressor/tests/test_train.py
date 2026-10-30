@@ -185,7 +185,7 @@ def test_prefetcher_keeps_stream_order_across_workers():
     the worker count doesn't divide."""
     from compressor.train import (TrainBatchPrefetcher, _pack_step_arrays,
                                   _split_to_per_instruction)
-    pack = dict(vp=True, valid=True, imm=False)
+    pack = dict(vp=True, valid=True, distance=True)
     batches = _small_batches(7)
     got = list(TrainBatchPrefetcher(iter(batches), pack, maxsize=6,
                                     n_workers=3))
@@ -204,8 +204,8 @@ def test_packed_step_stages_to_the_arrays_it_packed():
                                   _pack_step_arrays, _split_to_per_instruction)
     for b in _small_batches(3):
         split = _split_to_per_instruction(b)
-        packed, specs, _, shape = _pack_step_arrays(b, split, vp=True,
-                                                    valid=True, imm=True)
+        packed, specs, _, shape = _pack_step_arrays(b, split, vp=True, valid=True,
+                                                    distance=True)
         tok, pad, g0, g1, go, act = _dense_chunk_grid(split, *shape)
         L, F = torch.long, torch.float32
         want = [(tok, L), (pad, None), (g0, L), (g1, L), (go, L), (act, F),
@@ -214,7 +214,8 @@ def test_packed_step_stages_to_the_arrays_it_packed():
                 (b.out_regs_valid, None), (b.anchors, None), (b.out_inputs, L),
                 (b.valid, F)]
         got = _H2DStager('cpu')(packed, specs)
-        assert len(got) == len(want) + 2                    # + immediates
+        assert len(got) == len(want) + 2             # + known bits
+        assert torch.equal(got[-2], torch.from_numpy(b.out_known_zero[:, 0]))
         for g, (a, dt) in zip(got, want):
             w = torch.from_numpy(a) if dt is None else torch.from_numpy(a).to(dt)
             assert g.dtype == w.dtype and torch.equal(g, w)
@@ -562,3 +563,72 @@ def test_every_probe_and_entry_script_compiles():
     for f in files:
         py_compile.compile(str(f), doraise=True, cfile=str(f) + 'c')
         Path(str(f) + 'c').unlink(missing_ok=True)
+
+
+def _t1_rows(n, seed):
+    """n random one-instruction ALU rows as a dense token grid plus the
+    oracle's out_inputs and the instructions themselves."""
+    import random
+    from emulator import Instruction
+    from datagen.signature import output_inputs
+    from tokenizer import encode_instruction, PAD
+    rng = random.Random(seed)
+    R = ['ADD', 'SUB', 'XOR', 'OR', 'AND', 'SLL', 'SRL', 'SRA', 'SLT', 'SLTU']
+    Iops = ['ADDI', 'XORI', 'ORI', 'ANDI', 'SLTI', 'SLTIU', 'SLLI', 'SRLI', 'SRAI']
+    instrs = []
+    for _ in range(n):
+        rd, a, b = rng.randrange(1, 32), rng.randrange(0, 6), rng.randrange(0, 6)
+        if rng.random() < 0.5:
+            instrs.append(Instruction(rng.choice(R), rd, a, b))
+        else:
+            op = rng.choice(Iops)
+            imm = rng.randrange(32) if op in ('SLLI', 'SRLI', 'SRAI') else rng.randrange(-2048, 2048)
+            instrs.append(Instruction(op, rd, a, imm))
+    toks = [encode_instruction(i) for i in instrs]
+    L = max(map(len, toks))
+    tok = torch.full((n, 1, L), PAD, dtype=torch.long)
+    pad = torch.ones(n, 1, L, dtype=torch.bool)
+    out_inputs = torch.full((n, 1, MAX_INPUT_SLOTS), AUX_CE_IGNORE, dtype=torch.long)
+    for j, (t, ins) in enumerate(zip(toks, instrs)):
+        tok[j, 0, :len(t)] = torch.tensor(t); pad[j, 0, :len(t)] = False
+        regs = output_inputs([ins]).get(ins.args[0], [])
+        out_inputs[j, 0, :len(regs)] = torch.tensor(regs)
+    return tok, pad, out_inputs, instrs
+
+
+def test_witness_outputs_match_the_cpu_emulator():
+    """Every row executed at every witness state with its i-th input (colour
+    order) holding the state's position i+1 — on the GPU emulator — equals the
+    CPU emulator on the same register file."""
+    from compressor.train import witness_outputs, _witness_states
+    from emulator import run as emu_run
+    tok, pad, out_inputs, instrs = _t1_rows(64, 1)
+    got = witness_outputs(tok, pad, out_inputs)
+    w = _witness_states(tok.device).numpy()
+    for j, ins in enumerate(instrs):
+        for k in range(w.shape[0]):
+            regs = np.zeros(32, dtype=np.int64)
+            for i, r in enumerate(out_inputs[j, 0].tolist()):
+                if r >= 0:
+                    regs[r] = w[k, i + 1]
+            regs[0] = 0
+            want = int(emu_run([ins], regs.astype(np.int32))[0].regs[ins.args[0]])
+            assert (int(got[j, k]) - want) % (1 << 32) == 0, (ins, k)
+
+
+def test_pair_distance_targets_match_the_reference_distance():
+    from compressor.train import (max_distance_matrix, pair_distance_targets,
+                                  witness_outputs)
+    from datagen.knownbits import output_known_bits, max_distance, output_distance
+    tok, pad, out_inputs, instrs = _t1_rows(24, 2)
+    kb = [output_known_bits([i])[i.args[0]] for i in instrs]
+    zero = torch.tensor([k.zero for k in kb]); one = torch.tensor([k.one for k in kb])
+    m = max_distance_matrix(zero, one)
+    outs = witness_outputs(tok, pad, out_inputs)[:, :5]
+    D = pair_distance_targets(outs, zero, one)
+    for i in range(24):
+        for j in range(24):
+            ref = max_distance(kb[i], kb[j])
+            assert int(m[i, j]) == ref, (instrs[i], instrs[j])
+            want = np.mean([output_distance(int(outs[i, k]), int(outs[j, k]), ref) for k in range(5)])
+            assert abs(float(D[i, j]) - want) < 1e-5

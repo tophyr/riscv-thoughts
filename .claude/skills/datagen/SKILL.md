@@ -149,9 +149,24 @@ takes the 500k-step schedule (EXPERIMENT_LOG, "T2 faithfulness", finding 33).
 python -m datagen --rule single --batch-size 384 --n-states 8 \
     --config configs/instr_alu_writers.json --count 500000 \
   | python scripts/train_encoder.py --d-model 128 --n-heads 4 --n-layers 2 \
-    --d-out 64 --max-window 32 --imm-weight 0.3 --vp-head-depth 3 \
+    --d-out 64 --max-window 32 --vp-head-depth 3 \
     --n-steps 500000 --out-dir "$OUT"
 ```
+
+**T1 with the collapse term** (EXPERIMENT_LOG, "The register frame", finding
+41) adds the behavioral distance term and a corpus with partner pairs:
+
+```bash
+python -m datagen --rule single --batch-size 384 --n-states 8 \
+    --config configs/instr_alu_writers_partners025.json --count 500000 \
+  | python scripts/train_encoder.py --d-model 128 --n-heads 4 --n-layers 2 \
+    --d-out 64 --max-window 32 --vp-head-depth 3 --distance-weight 1.0 \
+    --n-steps 500000 --out-dir "$OUT"
+```
+
+It runs at 10–12 ms/step against 4 ms: the trainer executes every row at 64
+shared witness states and builds the 384×384 target before each compiled
+step. `--distance-weight` refuses anything but one-instruction rows.
 
 Both trainers expose the same model hparams — `--d-event`, `--op-cell-depth`,
 `--vp-head-depth`, `--n-pool-heads` — since T1 and T2 run the same core
@@ -176,7 +191,7 @@ reproducing the old computation exactly.)
 
 ## INVARIANTS
 
-The six invariants that silently corrupt data or training when violated live in
+The seven invariants that silently corrupt data or training when violated live in
 **CLAUDE.md** ("Data generation pipeline"), which is always loaded — you cannot
 opt into a warning you do not know you need. They are kept in one place, there;
 do not restate them here.
@@ -264,12 +279,16 @@ cmdline).
 - Header fields: `B, max_tokens, max_n_instrs, n_anchors, OB` (`RVT_FORMAT`,
   `datagen/batch.py:293-296`). `OB` is the out_regs row count — `B` in practice,
   always, since `build_targets` returns one out_regs row per row
-  (`datagen/batch.py:553-584`); the format still permits 0. `anchors`
+  (`datagen/batch.py:578-609`); the format still permits 0. `anchors`
   (`OB, n_anchors, 32`) carries the register files each row's `out_regs` was
   executed from, and is what the trainer feeds the vp head (INVARIANT 1).
+  `out_known_zero` / `out_known_one` (`B, max_n_instrs`) carry each output
+  slot's known bits, the bits forced to 0 or 1 whatever the inputs
+  (`datagen/knownbits.py`), from which the behavioral distance takes the
+  largest difference two outputs could have.
   Body field list + dtypes are the `BodyField(...)` block at
-  `datagen/batch.py:297-313`; the per-field header sanity bounds are the
-  `header_bounds={...}` at `datagen/batch.py:311`, enforced on every read by
+  `datagen/batch.py:305-322`; the per-field header sanity bounds are the
+  `header_bounds={...}` at `datagen/batch.py:326`, enforced on every read by
   `BinaryFormat._check_header_bounds` (`datagen/batch.py:148`).
 - The "no version field" statement is current and load-bearing in the code, not
   aspirational: the only per-batch schema check is magic + dtype-signature
@@ -291,7 +310,7 @@ corpus"). Validation: `datagen/generate.py:160`
 `validate_distribution`; the accepted non-opcode keys are `_CONFIG_EXTRA_KEYS`
 (`datagen/generate.py:155`) and an unknown key is a hard error.
 
-Three configs exist. Add one when a run needs a corpus none of them describes,
+Four configs exist. Add one when a run needs a corpus none of them describes,
 and delete it once nothing runs it — an unused config is a corpus nobody can
 attribute a result to.
 
@@ -313,6 +332,13 @@ attribute a result to.
 draw one extra random number per chunk, so the stream differs byte-wise from
 `instr_alu_writers.json` while keeping the same distribution. The rate is in the
   filename because another rate is another file.
+- `instr_alu_writers_partners025.json` — **T1's corpus for the collapse
+  term.** The writers corpus plus `partners: {rate: 0.25}`: a quarter of each
+  batch is pairs of one-instruction rows, two different spellings of one
+  function on the same registers (`datagen.generate.PARTNER_GROUPS`), the
+  equivalent pairs the behavioral distance term needs and a naturally drawn
+  batch almost never holds. Valid for `--rule single` only; a longer rule is
+  rejected.
 - `instr_alu_writers_chain100.json` — **a scoring corpus for composed slots,
   never trained on.** The same at `chain.rate` 1.0, so every two-instruction
   chunk's second instruction reads the first's result. A natural held-out corpus

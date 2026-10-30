@@ -32,6 +32,7 @@ from .compare import (
     AUX_CE_IGNORE, MAX_INPUT_SLOTS, MAX_OUTPUT_SLOTS, N_REGS,
     precompute_chunk,
 )
+from .knownbits import output_known_bits
 from .generate import (
     chain_group, collect_groups, random_instruction,
     sample_injection_tuples,
@@ -288,6 +289,13 @@ class Batch:
     # draw per source chunk, placed on each row's own input registers. The
     # evaluator gathers an output's input values from them by register.
     anchors:        np.ndarray   # (OB, n_anchors, N_REGS) int32
+    # Per output slot (aligned with out_slot_regs), the bits of the output
+    # forced to 0 / to 1 whatever the chunk's inputs hold
+    # (`datagen.knownbits.output_known_bits`), as 32-bit masks; both 0 for a
+    # slot that is unused or out of the analysis' scope. A chunk writes at
+    # most one register per instruction, hence max_n_instrs slots.
+    out_known_zero: np.ndarray   # (B, max_n_instrs) int64
+    out_known_one:  np.ndarray   # (B, max_n_instrs) int64
 
 
 RVT_FORMAT = BinaryFormat(
@@ -310,6 +318,8 @@ RVT_FORMAT = BinaryFormat(
                   ('B', MAX_OUTPUT_SLOTS)),
         BodyField('out_inputs', np.dtype(np.int8),
                   ('B', MAX_OUTPUT_SLOTS, MAX_INPUT_SLOTS)),
+        BodyField('out_known_zero', np.dtype(np.int64), ('B', 'max_n_instrs')),
+        BodyField('out_known_one', np.dtype(np.int64), ('B', 'max_n_instrs')),
     ],
     # Sanity bounds on the dimension header — reject a torn/corrupt stream
     # whose dims are garbage before sizing a read off them.
@@ -500,6 +510,19 @@ def pack_batch(chunks, *,
     out_inputs_arr = np.full((B, MAX_OUTPUT_SLOTS, MAX_INPUT_SLOTS),
                              AUX_CE_IGNORE, dtype=np.int8)
     out_inputs_arr[:actual_B] = aux.out_inputs
+    known_zero = np.zeros((B, max_n_instrs), dtype=np.int64)
+    known_one = np.zeros((B, max_n_instrs), dtype=np.int64)
+    for i, c in enumerate(chunks):
+        if not (c.valid and c.instructions):
+            continue
+        try:
+            kb = output_known_bits(c.instructions)
+        except NotImplementedError:
+            continue
+        for k in range(max_n_instrs):
+            r = int(out_slot_arr[i, k])
+            if r != AUX_CE_IGNORE and r in kb:
+                known_zero[i, k], known_one[i, k] = kb[r].zero, kb[r].one
 
     return Batch(tokens=tokens, token_lens=token_lens, valid=valid,
                  instr_lens=instr_lens,
@@ -511,7 +534,9 @@ def pack_batch(chunks, *,
                  pc_writes=pc_writes_arr,
                  in_slot_regs=in_slot_arr,
                  out_slot_regs=out_slot_arr,
-                 out_inputs=out_inputs_arr)
+                 out_inputs=out_inputs_arr,
+                 out_known_zero=known_zero,
+                 out_known_one=known_one)
 
 
 def padding_mask(batch):
@@ -626,6 +651,7 @@ def generate_chunks(rule, rng, *, opcode_table=None, dest_regs=None,
 
 
 def collect_into_batches(chunks_iter, *, batch_size, draw_anchors,
+                         partner_rate=0.0, partner_sampler=None,
                          invalid_rate=0.0, invalid_provider=None,
                          max_invalid_window=None,
                          max_chunk_len):
@@ -637,6 +663,12 @@ def collect_into_batches(chunks_iter, *, batch_size, draw_anchors,
 
     Each batch ends up with `n_invalid = round(batch_size * invalid_rate)`
     invalid rows + `batch_size - n_invalid` valid rows.
+
+    partner_rate>0 makes that fraction of each batch pairs of one-instruction
+    rows computing one function, two different spellings each, drawn by
+    `partner_sampler()` -> (Instruction, Instruction): the equivalent pairs
+    the collapse objective needs, which a naturally drawn batch almost never
+    holds. The rest of the valid rows come from `chunks_iter`.
 
     Every rule (single → T1, multi-instr → T2) ships the out_regs oracle via
     build_targets (the T1/T2 unification).
@@ -657,8 +689,13 @@ def collect_into_batches(chunks_iter, *, batch_size, draw_anchors,
     if invalid_rate > 0 and invalid_provider is None:
         raise ValueError('invalid_rate > 0 requires invalid_provider')
 
+    if partner_rate > 0 and (partner_sampler is None or max_chunk_len != 1):
+        raise ValueError('partner_rate > 0 requires partner_sampler and '
+                         'one-instruction chunks')
+
     n_invalid = int(round(batch_size * invalid_rate))
-    n_valid = batch_size - n_invalid
+    n_pairs = int(round(batch_size * partner_rate / 2))
+    n_valid = batch_size - n_invalid - 2 * n_pairs
 
     # Fixed-shape upper bounds derived from max_chunk_len. Length variation
     # produces smaller actual shapes, which get padded up to these targets.
@@ -676,7 +713,9 @@ def collect_into_batches(chunks_iter, *, batch_size, draw_anchors,
             buf = buf[n_valid:]
             invalids = [_make_invalid_chunk(invalid_provider())
                         for _ in range(n_invalid)]
-            mixed = valid + invalids
+            partners = [_make_valid_chunk([ins]) for _ in range(n_pairs)
+                        for ins in partner_sampler()]
+            mixed = valid + partners + invalids
             aux, out_regs, out_regs_valid, anchors = build_targets(
                 mixed, draw_anchors=draw_anchors)
             yield pack_batch(

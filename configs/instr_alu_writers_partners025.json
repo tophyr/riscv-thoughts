@@ -1,0 +1,8 @@
+{
+  "R_ALU": 0.55,
+  "I_ALU": 0.45,
+  "exclude_x0_dest": true,
+  "partners": {
+    "rate": 0.25
+  }
+}
