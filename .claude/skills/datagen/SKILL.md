@@ -164,9 +164,11 @@ python -m datagen --rule single --batch-size 384 --n-states 8 \
     --n-steps 500000 --out-dir "$OUT"
 ```
 
-It runs at 10–12 ms/step against 4 ms: the trainer executes every row at 64
-shared witness states and builds the 384×384 target before each compiled
-step. `--distance-weight` refuses anything but one-instruction rows.
+It runs at 8 ms/step against 4 ms, GPU at 98–99%: the trainer executes every
+row at 64 shared witness states and builds the 384×384 target before each
+step, replayed as one CUDA graph of its own (`GraphedDistanceTargets`,
+`compressor/train.py`). `--distance-weight` refuses anything but
+one-instruction rows.
 
 Both trainers expose the same model hparams — `--d-event`, `--op-cell-depth`,
 `--vp-head-depth`, `--n-pool-heads` — since T1 and T2 run the same core

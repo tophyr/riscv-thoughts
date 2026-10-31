@@ -632,3 +632,30 @@ def test_pair_distance_targets_match_the_reference_distance():
             assert int(m[i, j]) == ref, (instrs[i], instrs[j])
             want = np.mean([output_distance(int(outs[i, k]), int(outs[j, k]), ref) for k in range(5)])
             assert abs(float(D[i, j]) - want) < 1e-5
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='needs CUDA')
+def test_graphed_distance_targets_equal_the_eager_ones():
+    """Replayed against new contents at the captured addresses, the graph
+    gives the eager targets bit for bit."""
+    from compressor.train import (GraphedDistanceTargets, pair_distance_targets,
+                                  witness_outputs)
+    from datagen.knownbits import output_known_bits
+    dev = torch.device('cuda')
+    g = GraphedDistanceTargets()
+    bufs = None
+    for seed in (3, 4, 5):
+        tok, pad, out_inputs, instrs = _t1_rows(48, seed)
+        kb = [output_known_bits([i])[i.args[0]] for i in instrs]
+        zero = torch.tensor([k.zero for k in kb]); one = torch.tensor([k.one for k in kb])
+        L = tok.shape[-1]                 # one fixed width, as a batch has
+        tok = torch.nn.functional.pad(tok, (0, 9 - L), value=PAD)
+        pad = torch.nn.functional.pad(pad, (0, 9 - L), value=True)
+        new = [t.to(dev) for t in (tok, pad, out_inputs, zero, one)]
+        if bufs is None:
+            bufs = [torch.empty_like(t) for t in new]
+        for b, t in zip(bufs, new):
+            b.copy_(t)
+        got = g(*bufs).clone()
+        want = pair_distance_targets(witness_outputs(*bufs[:3]), *bufs[3:])
+        assert torch.equal(got, want)

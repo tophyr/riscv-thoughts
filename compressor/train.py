@@ -426,6 +426,34 @@ def pair_distance_targets(outputs, zero, one):
     return per.mean(-1).float()
 
 
+class GraphedDistanceTargets:
+    """`pair_distance_targets(witness_outputs(...))` replayed as one CUDA
+    graph. Eagerly it is some two hundred small kernels per step, and their
+    launches, not their arithmetic, held the GPU at ~75%. The graph replays
+    the same kernels, so the targets are bit-identical; its inputs must keep
+    their addresses across calls, as the stager's device buffer does."""
+
+    def __init__(self):
+        self.graph, self.out, self.sig = None, None, None
+
+    def __call__(self, tok, pad, out_inputs, zero, one):
+        args = (tok, pad, out_inputs, zero, one)
+        compute = lambda: pair_distance_targets(
+            witness_outputs(tok, pad, out_inputs), zero, one)
+        if not tok.is_cuda:
+            return compute()
+        if self.graph is None:
+            self.out = compute()          # eager once: fills the witness cache
+            torch.cuda.synchronize()
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.graph):
+                self.out.copy_(compute())
+            self.sig = _graph_signature(args)
+        assert _graph_signature(args) == self.sig
+        self.graph.replay()
+        return self.out
+
+
 def distance_loss(essence, target, row_mask, scale=2.0):
     """MSE between every two valid rows' essence distance (chord on the unit
     sphere, 0..2) and `scale` × their behavioral distance (0..1): equivalent
@@ -964,7 +992,7 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
         return total, metrics, None
 
     stage = _H2DStager(device)
-    distance_buf = [None]
+    distance_targets = GraphedDistanceTargets()
 
     def _prep(item):
         packed, specs = item[0], item[1]
@@ -978,16 +1006,12 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
         valid_f = next(staged) if valid_active else _dummy
         if distance_active:
             known_zero_t, known_one_t = next(staged), next(staged)
-            # Executed eagerly, outside the compiled step: the targets are data.
-            # Written into one persistent buffer, since a graph replay reads
-            # its inputs at the addresses it was captured with.
+            # Outside the compiled step (the targets are data), into one
+            # persistent buffer, since the step's graph replay reads its
+            # inputs at the addresses it was captured with.
             with torch.no_grad():
-                d = pair_distance_targets(
-                    witness_outputs(fixed[0], fixed[1], out_inputs_t),
-                    known_zero_t, known_one_t)
-                if distance_buf[0] is None:
-                    distance_buf[0] = torch.empty_like(d)
-                distance_t = distance_buf[0].copy_(d)
+                distance_t = distance_targets(
+                    fixed[0], fixed[1], out_inputs_t, known_zero_t, known_one_t)
         else:
             distance_t = _dummy
         return (*fixed, out_regs_t, vp_mask_t, anchors_t, out_inputs_t, valid_f,
