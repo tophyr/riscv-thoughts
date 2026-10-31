@@ -31,6 +31,7 @@ from .batch import (
 
 from .compare import (
     draw_anchor_states, heldout_anchor_states, precompute_chunk,
+    witness_states, N_WITNESS,
     N_REGS, MAX_INPUT_SLOTS, MAX_OUTPUT_SLOTS, AUX_CE_IGNORE,
 )
 

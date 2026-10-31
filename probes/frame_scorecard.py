@@ -107,7 +107,7 @@ for batch in batches():
     if st is None:
         continue
     T, essence = st
-    anchors = torch.from_numpy(batch.anchors).to(dev)
+    in_values = torch.from_numpy(batch.out_input_values).to(dev)
     # A chunk of K instructions writes at most K registers, so output slots
     # past the grid's instruction count are AUX_CE_IGNORE; slicing them off is
     # the same score at a fraction of the evaluator's work.
@@ -115,17 +115,15 @@ for batch in batches():
     assert (batch.out_slot_regs[:, n_out:] == AUX_CE_IGNORE).all()
     out_slot = torch.from_numpy(batch.out_slot_regs[:, :n_out].astype(np.int64)).to(dev)
     out_inputs = torch.from_numpy(batch.out_inputs[:, :n_out].astype(np.int64)).to(dev)
-    out_regs = torch.from_numpy(batch.out_regs.astype(np.int64)).to(dev)
-    out_idx = out_slot.clamp(min=0)
-    target_bits = _value_bits(out_regs.gather(
-        -1, out_idx.unsqueeze(1).expand(-1, anchors.shape[1], -1))).bool()
+    target_bits = _value_bits(torch.from_numpy(
+        batch.out_values[:, :, :n_out].astype(np.int64)).to(dev)).bool()
     valid = (out_slot != AUX_CE_IGNORE) & torch.from_numpy(batch.out_regs_valid).to(dev).unsqueeze(-1)
     va = valid.cpu().numpy()
     # The leak check hands each row ANOTHER row's essence with its own pointer
     # and inputs: if the function reached the head any other way, it would pass.
     other = essence[torch.randperm(essence.shape[0], generator=perm_rng).to(dev)]
     with torch.no_grad():
-        ex, lk = (((vp_predict(comp, T, e, anchors, out_slot, out_inputs)[..., :32] > 0)
+        ex, lk = (((vp_predict(comp, T, e, in_values, out_slot, out_inputs)[..., :32] > 0)
                    == target_bits).all(-1).cpu().numpy() for e in (essence, other))   # (B,A,O)
     leak_hits += int((lk & va[:, None, :]).sum())
     for b in np.nonzero(batch.out_regs_valid)[0]:

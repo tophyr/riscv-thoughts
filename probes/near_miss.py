@@ -21,10 +21,9 @@ import torch.nn.functional as F
 sys.path.insert(0, '/home/tophy/Projects/riscv-thoughts')
 
 from compressor.model import instruction_wiring
-from compressor.train import pair_distance_targets, witness_outputs
-from datagen import AUX_CE_IGNORE, MAX_INPUT_SLOTS
+from compressor.train import pair_distance_targets
+from datagen import draw_anchor_states, precompute_chunk
 from datagen.knownbits import output_known_bits
-from datagen.signature import output_inputs
 from emulator import Instruction as I
 from scripts._common import load_frozen_encoder
 from tokenizer import encode_instruction, PAD
@@ -54,14 +53,12 @@ def encode(t1, instrs):
 def target(a, b):
     """Twice the behavioral distance of each pair (a[i], b[i])."""
     rows = a + b
-    tok, pad = _grid(rows)
-    oi = torch.full((len(rows), 1, MAX_INPUT_SLOTS), AUX_CE_IGNORE)
-    for j, ins in enumerate(rows):
-        regs = output_inputs([ins]).get(ins.args[0], [])
-        oi[j, 0, :len(regs)] = torch.tensor(regs)
+    anchors = draw_anchor_states(np.random.default_rng(0), 1)
+    outs = torch.tensor(np.stack([precompute_chunk([i], anchors).witness[0]
+                                  for i in rows]).astype(np.int64))
     kb = [output_known_bits([i])[i.args[0]] for i in rows]
-    D = pair_distance_targets(witness_outputs(tok.unsqueeze(1), pad.unsqueeze(1), oi),
-                              torch.tensor([k.zero for k in kb]), torch.tensor([k.one for k in kb]))
+    D = pair_distance_targets(outs, torch.tensor([k.zero for k in kb]),
+                              torch.tensor([k.one for k in kb]))
     n = len(a)
     return 2.0 * float(torch.stack([D[i, n + i] for i in range(n)]).mean())
 

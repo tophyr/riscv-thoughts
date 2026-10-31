@@ -380,3 +380,31 @@ def test_chain_config_block_is_validated():
         with pytest.raises(ValueError):
             validate_distribution(dict(bad))
     validate_distribution({'R_ALU': 1.0, 'chain': {'rate': 0.25}})
+
+
+def test_witness_outputs_match_the_cpu_emulator():
+    """Every output of a chunk executed at every witness state, its i-th input
+    (out_inputs order) holding the state's position i+1 and every other
+    register 0, equals the CPU emulator on that register file."""
+    from emulator import run as emu_run
+    from datagen.batch import generate_chunks
+    from datagen.compare import witness_states, AUX_CE_IGNORE
+    from datagen.generate import build_opcode_table, length_cap
+    rng = np.random.default_rng(11)
+    alu = build_opcode_table({'R_ALU': 0.55, 'I_ALU': 0.45})
+    w = witness_states()
+    for L in (1, 2, 3):
+        chunks = generate_chunks(length_cap(L), rng, opcode_table=alu, chain_rate=0.5)
+        for _ in range(40):
+            chunk = next(chunks).instructions
+            pre = precompute_chunk(chunk, draw_anchor_states(rng, 4))
+            for k, r in enumerate(pre.out_slot_regs.tolist()):
+                if r == AUX_CE_IGNORE:
+                    continue
+                for s in range(0, w.shape[0], 7):
+                    regs = np.zeros(32, dtype=np.int32)
+                    for i, src in enumerate(pre.out_inputs[k].tolist()):
+                        if src != AUX_CE_IGNORE:
+                            regs[src] = w[s, i + 1]
+                    want = emu_run(chunk, regs)[0].regs[r]
+                    assert pre.witness[k, s] == want, (chunk, r, s)

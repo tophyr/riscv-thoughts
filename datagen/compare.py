@@ -380,6 +380,22 @@ def heldout_anchor_states(n_states=HELDOUT_N_ANCHORS):
                               _HELDOUT_COPIES)[:n_states].copy()
 
 
+# Shared witness states for the behavioral distance between rows: a fixed
+# structured draw no training anchor or held-out set uses. Every output is
+# executed at all of them, so two rows' outputs are compared at equal inputs.
+WITNESS_SEED = 0x51D0
+N_WITNESS = 64
+_WITNESS = []
+
+
+def witness_states():
+    """The (N_WITNESS, 32) int32 witness states, drawn once."""
+    if not _WITNESS:
+        _WITNESS.append(draw_anchor_states(np.random.default_rng(WITNESS_SEED),
+                                           N_WITNESS))
+    return _WITNESS[0]
+
+
 def _canonical_state(anchor_states, inputs, canon_positions):
     """Place a structured draw on a chunk's input registers: inputs[i] takes
     its value from anchor_states[:, canon_positions[i]]. The draw's copies and
@@ -649,6 +665,16 @@ class Precomputed:
     # registers that output depends on, in the structural-colour order the
     # evaluator gathers their values in (datagen.signature.output_inputs).
     out_inputs: np.ndarray       # (MAX_OUTPUT_SLOTS, MAX_INPUT_SLOTS) int8
+    # Per output slot, its value at each witness state with the output's i-th
+    # input (out_inputs order) holding the state's position i+1 and every
+    # other register 0: the behavioral distance compares rows here.
+    witness: np.ndarray          # (MAX_OUTPUT_SLOTS, N_WITNESS) int32
+    # Per output slot, at each anchor: its value after the chunk, and the
+    # values of its inputs in out_inputs order (0 past the last) — all value
+    # prediction reads of the register files above. A chunk of K instructions
+    # writes at most K registers, each depending on at most K+1 inputs.
+    out_values: np.ndarray       # (n_states, K) int32
+    out_input_values: np.ndarray  # (n_states, K, K+1) int32
     pc_explicit: bool            # does any live SSA op write PC
     # Per-row aux targets (T2 register-identity supervision).
     live_in_mask: np.ndarray     # (N_REGS,) bool — behavioral inputs as mask
@@ -716,10 +742,20 @@ def precompute_chunk(chunk, anchor_states):
                            key=lambda r: ssa.output_versions[r])
     out_slot_regs = np.full(MAX_OUTPUT_SLOTS, AUX_CE_IGNORE, dtype=np.int8)
     deps = output_inputs(chunk)
+    w = witness_states()
+    witness = np.zeros((MAX_OUTPUT_SLOTS, N_WITNESS), dtype=np.int32)
+    n_states, K = state.shape[0], len(chunk)
+    out_values = np.zeros((n_states, K), dtype=np.int32)
+    out_input_values = np.zeros((n_states, K, K + 1), dtype=np.int32)
     for i, r in enumerate(write_ordered[:MAX_OUTPUT_SLOTS]):
         out_slot_regs[i] = r
+        out_values[:, i] = out_regs[:, r]
+        placed = np.zeros_like(w)
         for j, src in enumerate(deps[r][:MAX_INPUT_SLOTS]):
             out_inputs[i, j] = src
+            out_input_values[:, i, j] = state[:, src]
+            placed[:, src] = w[:, j + 1]
+        witness[i] = _eval_ssa_numpy(ssa, len(chunk), placed, live)[0][:, r]
 
     return Precomputed(
         inputs=inputs,
@@ -728,6 +764,9 @@ def precompute_chunk(chunk, anchor_states):
         anchors=state,
         out_regs=out_regs,
         out_inputs=out_inputs,
+        witness=witness,
+        out_values=out_values,
+        out_input_values=out_input_values,
         pc_explicit=pc_explicit,
         live_in_mask=live_in_mask,
         live_out_mask=live_out_mask,

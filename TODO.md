@@ -254,6 +254,15 @@ Decisions that remain:
   something that weighs an unmatched output), and how two chunks with
   different numbers of outputs compare. Settle together with the pointer order
   (Open ideas), since both concern chunks with more than one output.
+- **Matching inputs.** The witness states place an output's i-th input, in
+  colour order, at the same value for every row, which matches inputs exactly
+  under a rename, a reordering and dead code. Two equivalent chunks whose
+  dataflow graphs differ in shape — `SUB t,a,b; SUB r,t,c` against
+  `ADD t,b,c; SUB r,a,t` — need not list their inputs in the same order, and
+  then the target calls them different. Candidates: the minimum over input
+  permutations (at most (K+1)! per pair), or a correspondence defined from
+  the function rather than the graph. How often colour orders disagree on
+  generated fold pairs is unmeasured.
 - **The partner fraction.** How much of a batch is partner pairs against
   naturally drawn chunks; start fixed and treat it as a tuning knob.
 - **The baseline to beat** is finding 39's 1M cell for T2: the essence spans
@@ -458,14 +467,6 @@ poor. What has to be ensured is that the encoder produces an essence the next
 tier can USE; it does not have to be ensured that T3 can EXECUTE the chunk. On
 that reading the head's size is a cost of scoring, not a property the essence
 is graded on.
-
-### Shrink the batch payload, if generation moves off this machine
-
-Per-row anchors make a batch 2.7x larger compressed, ~84 MB/s at T2's step rate
-over the link from the generator machine. Local generation keeps up at len=2
-(~468 batches/s from 26 workers against T2's ~200), so this waits until it does
-not. Shipping only the canonical input columns of the anchors and only the
-written slots of `out_regs` would remove most of it.
 
 ### Settings argued at 8 fixed anchors
 

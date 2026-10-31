@@ -113,9 +113,9 @@ def test_aiming_leaves_unaimed_states_and_the_x0_column_alone():
         np.random.default_rng(5), 8))
 
 
-def test_an_aimed_batch_ships_the_anchors_its_targets_were_executed_at():
-    """INVARIANT 1 with aiming on: every row's out_regs re-executes from its
-    shipped anchors."""
+def test_an_aimed_batch_ships_the_inputs_its_values_were_executed_from():
+    """INVARIANT 1 with aiming on: every output re-executes to its shipped
+    value from its shipped input values alone."""
     from tokenizer import decode_instruction
     rng = np.random.default_rng(6)
     alu = build_opcode_table({'R_ALU': 0.55, 'I_ALU': 0.45})
@@ -125,11 +125,12 @@ def test_an_aimed_batch_ships_the_anchors_its_targets_were_executed_at():
         aim=lambda instrs, states: aim_anchor_states(instrs, states, rng, 0.5),
         max_chunk_len=3)
     b = next(gen)
+    from datagen.tests.test_batch import _reexecuted
     for i in np.nonzero(b.out_regs_valid)[0]:
         toks, pos, chunk = b.tokens[i, :b.token_lens[i]].tolist(), 0, []
         while pos < len(toks):
             ins, pos = decode_instruction(toks, pos)
             chunk.append(ins)
-        for a in range(b.anchors.shape[1]):
-            regs = emu_run(chunk, b.anchors[i, a].astype(np.int32).copy())[0].regs
-            assert np.array_equal(regs, b.out_regs[i, a])
+        got = _reexecuted(chunk, b.out_slot_regs[i], b.out_inputs[i],
+                          b.out_input_values[i])
+        assert np.array_equal(got, b.out_values[i])

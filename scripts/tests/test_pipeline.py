@@ -82,7 +82,7 @@ def _count_batches(data):
 
 def _first_header(data):
     """Unpack the first batch's RVT dimension header:
-    (B, max_tokens, max_n_instrs, n_anchors, OB)."""
+    (B, max_tokens, max_n_instrs, n_anchors, OB, max_out_inputs)."""
     sys.path.insert(0, str(ROOT))
     from datagen import RVT_FORMAT
     off = RVT_FORMAT.batch_prefix_size
@@ -95,23 +95,18 @@ class TestGenBatches:
         data = gen()
         assert _count_batches(data) == 2
 
-    def test_out_regs_mode_header(self):
+    def test_value_targets_header(self):
         """Every rule — single (T1) and multi-instruction (T2) — ships the
-        unified CANONICAL out_regs oracle (OB == B). Both carry
-        n_anchors == --n-states."""
-        out = gen(n_batches=1, batch_size=4, n_states=4,
-                  rule='single')
-        B, _, _, n_anchors, OB = _first_header(out)
-        assert B == 4, B
-        assert OB == B, f'single must ship OB==B (canonical), got OB={OB} B={B}'
-        assert n_anchors == 4, n_anchors
-
-        # A multi-instruction rule ships the same out_regs payload.
-        multi = gen(n_batches=1, batch_size=4, n_states=4,
-                    rule='cap=2')
-        B_m, _, _, n_anchors_m, OB_m = _first_header(multi)
-        assert OB_m == B_m, f'T2 mode must ship OB==B, got OB={OB_m} B={B_m}'
-        assert n_anchors_m == 4, n_anchors_m
+        per-output value targets (OB == B), at n_anchors == --n-states, with
+        room for the K+1 inputs one output of a K-instruction chunk can
+        read."""
+        for rule, K in (('single', 1), ('cap=2', 2)):
+            out = gen(n_batches=1, batch_size=4, n_states=4, rule=rule)
+            B, _, max_n_instrs, n_anchors, OB, max_out_inputs = _first_header(out)
+            assert B == 4 and OB == B, (rule, B, OB)
+            assert n_anchors == 4, (rule, n_anchors)
+            assert max_n_instrs == K and max_out_inputs == K + 1, (
+                rule, max_n_instrs, max_out_inputs)
 
 
 class TestGenRules:

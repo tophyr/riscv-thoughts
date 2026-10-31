@@ -156,11 +156,11 @@ python -m datagen --rule single --batch-size 384 --n-states 8 \
     --n-steps 500000 --out-dir "$OUT"
 ```
 
-It runs at 8 ms/step against 4 ms, GPU at 98–99%: the trainer executes every
-row at 64 shared witness states and builds the 384×384 target before each
-step, replayed as one CUDA graph of its own (`GraphedDistanceTargets`,
-`compressor/train.py`). `--distance-weight` refuses anything but
-one-instruction rows.
+It runs at 7–8 ms/step against 4 ms, GPU at 98–99%: datagen ships each
+output's values at 64 shared witness states (`out_witness`), and the trainer
+builds the 384×384 target from them before each step, replayed as one CUDA
+graph of its own (`GraphedDistanceTargets`, `compressor/train.py`).
+`--distance-weight` refuses anything but one-instruction rows.
 
 Both trainers expose the same model hparams — `--d-event`, `--op-cell-depth`,
 `--vp-head-depth`, `--n-pool-heads` — since T1 and T2 run the same core
@@ -194,8 +194,8 @@ do not restate them here.
 
 `--rule` grammar (`datagen/__main__.py:90` `_parse_rule`, rule constructors at
 `datagen/generate.py:814-836`). Default `--rule` is `branch+cap=8`:
-- `single` — one instruction per chunk (T1). `max_len=1`. Ships canonical
-  out_regs like every other rule (the T1/T2 unification).
+- `single` — one instruction per chunk (T1). `max_len=1`. Ships the
+  per-output value targets like every other rule (the T1/T2 unification).
 - `cap=N` — fixed length N.
 - `branch+cap=N` — terminate at a branch OR length N.
 - `transform+cap=N` — terminate at a memory-op / branch / jump OR length N.
@@ -265,25 +265,29 @@ cmdline).
   path. The per-batch **dtype signature** still rejects a schema-mismatched
   stream — a body-field change shifts it and readers raise `Dtype mismatch`.
 - **No stream header — every batch is self-describing** (4-byte magic `RVT\x00` +
-  dtype signature, then a 5-uint32 dimension header, then the body). This is the
+  dtype signature, then a 6-uint32 dimension header, then the body). This is the
   load-bearing property: **RVT streams concatenate with `cat`.**
   - Combine corpora: `cat a.rvt b.rvt > both.rvt`
   - **Second epoch = `cat corpus.rvt corpus.rvt | trainer`.** There is no built-in
     repeat; epochs are shell-level `cat`.
-- Header fields: `B, max_tokens, max_n_instrs, n_anchors, OB` (`RVT_FORMAT`,
-  `datagen/batch.py:293-296`). `OB` is the out_regs row count — `B` in practice,
-  always, since `build_targets` returns one out_regs row per row
-  (`datagen/batch.py:578-609`); the format still permits 0. `anchors`
-  (`OB, n_anchors, 32`) carries the register files each row's `out_regs` was
-  executed from, and is what the trainer feeds the vp head (INVARIANT 1).
-  `out_known_zero` / `out_known_one` (`B, max_n_instrs`) carry each output
-  slot's known bits, the bits forced to 0 or 1 whatever the inputs
-  (`datagen/knownbits.py`), from which the behavioral distance takes the
-  largest difference two outputs could have.
-  Body field list + dtypes are the `BodyField(...)` block at
-  `datagen/batch.py:305-322`; the per-field header sanity bounds are the
-  `header_bounds={...}` at `datagen/batch.py:326`, enforced on every read by
-  `BinaryFormat._check_header_bounds` (`datagen/batch.py:148`).
+- Header fields: `B, max_tokens, max_n_instrs, n_anchors, OB, max_out_inputs`
+  (`RVT_FORMAT`, `datagen/batch.py:303`). `OB` is the value-target row count —
+  `B` in practice, always, since `build_targets` returns one row per row; the
+  format still permits 0. A batch carries only what value prediction reads of
+  each row's execution: per output slot at each anchor, the output's value
+  (`out_values`, `OB, n_anchors, max_n_instrs`) and its input values in
+  `out_inputs` order (`out_input_values`, `OB, n_anchors, max_n_instrs,
+  max_out_inputs`, where `max_out_inputs = max_n_instrs + 1` is the most
+  inputs one output of such a chunk can read). The trainer feeds those to the
+  vp head (INVARIANT 1); the 32-register files a row executes from never leave
+  the generator. `out_witness` (`B, max_n_instrs, 64`) is each output at the
+  shared witness states, and `out_known_zero` / `out_known_one`
+  (`B, max_n_instrs`) its known bits, the bits forced to 0 or 1 whatever the
+  inputs (`datagen/knownbits.py`); the behavioral distance is built from both
+  (INVARIANT 7). Body field list + dtypes are the `BodyField(...)` block at
+  `datagen/batch.py:306-330`; the per-field header sanity bounds are the
+  `header_bounds={...}` at `datagen/batch.py:333`, enforced on every read by
+  `BinaryFormat._check_header_bounds` (`datagen/batch.py:149`).
 - The "no version field" statement is current and load-bearing in the code, not
   aspirational: the only per-batch schema check is magic + dtype-signature
   (`datagen/batch.py:81-88,140-145`). EXPERIMENT_LOG's "format v7→v8"
@@ -411,13 +415,14 @@ Two different scripts — do not confuse them:
   configuration changes — a figure from one configuration says nothing about
   another.
 
-  **Per-row anchors make a batch ~2.7x larger on the wire** (324 KB lz4-compressed
-  at len=2, against 118 KB with one shared anchor set), ~84 MB/s at T2's step
-  rate over `nc`; odin's throughput at that size has not been re-measured. Local
-  generation keeps up at len=2 instead: `python -m datagen … --gen-count 26`
-  piped straight to the trainer delivers ~468 batches/s against T2's ~200, at
-  98% GPU utilisation, and is what `scripts/run_t2.sh` does. Check GPU
-  utilisation either way.
+  **A batch is 66 KB lz4-compressed at len=1 (T1's aimed corpus) and 154 KB
+  at len=2 (T2's corpus)**, 384 rows at 8 anchor states. Odin's default 96
+  workers deliver at least 530 batches/s at len=1 and 420 at len=2 through
+  `multinode_gen.sh` (wall time of 30,000 and 20,000 batches, startup
+  included), about 35 and 65 MB/s on the link — several times what T1 (8
+  ms/step) and T2 (~14 ms/step) consume. Local generation also keeps up at
+  len=2: `python -m datagen … --gen-count 26` piped straight to the trainer is
+  what `scripts/run_t2.sh` does. Check GPU utilisation either way.
 
   **Adding remote workers does not raise a rate the GPU is already setting.**
   At `REMOTE_GEN=120`, odin sat at a load average of ~11 out of its 128 cores

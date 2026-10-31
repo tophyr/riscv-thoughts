@@ -177,12 +177,13 @@ def _pack_step_arrays(batch, split, *, vp, valid, distance):
               (batch.live_out_mask, f32), (batch.pc_writes, f32),
               (batch.in_slot_regs, i64), (batch.out_slot_regs, i64)]
     if vp:
-        arrays += [(batch.out_regs, None), (batch.out_regs_valid, None),
-                   (batch.anchors, None), (batch.out_inputs, i64)]
+        arrays += [(batch.out_values, None), (batch.out_regs_valid, None),
+                   (batch.out_input_values, None), (batch.out_inputs, i64)]
     if valid:
         arrays += [(batch.valid, f32)]
     if distance:
-        arrays += [(batch.out_known_zero[:, 0], i64), (batch.out_known_one[:, 0], i64)]
+        arrays += [(batch.out_witness[:, 0], i64), (batch.out_known_zero[:, 0], i64),
+                   (batch.out_known_one[:, 0], i64)]
     arrays = [np.ascontiguousarray(a if dt is None else a.astype(dt))
               for a, dt in arrays]
     specs, n = [], 0
@@ -226,14 +227,14 @@ def _value_feat(x_i):
         [_value_bits(x_i), _value_smooth(x_i.float()).unsqueeze(-1)], dim=-1)
 
 
-def _vp_inputs(comp, T, anchors_t, out_inputs_t):
+def _vp_inputs(comp, T, in_values_t, out_inputs_t):
     """Per (row, anchor, output slot) the evaluator's input features, (B, A,
     O, MAX_IN·(33+dc)): for each external input the output depends on
     (`out_inputs`, in the encoder's colour order, every role ordered), its
-    value at its own register in the row's anchor state (32 bits + 1 smooth
-    scalar) and its structural colour from `T`. Unfilled inputs feed value 0
-    and colour 0 = "no input"."""
-    B, A = anchors_t.shape[0], anchors_t.shape[1]
+    value in the row's anchor state (`in_values_t`, shipped in that order;
+    32 bits + 1 smooth scalar) and its structural colour from `T`. Unfilled
+    inputs feed value 0 and colour 0 = "no input"."""
+    B, A = in_values_t.shape[0], in_values_t.shape[1]
     d, dc = comp.d_out, comp.d_colour
     O, I = out_inputs_t.shape[1], out_inputs_t.shape[2]
     in_valid = (out_inputs_t != AUX_CE_IGNORE)                        # (B, O, I)
@@ -245,8 +246,8 @@ def _vp_inputs(comp, T, anchors_t, out_inputs_t):
     in_col = in_col * in_valid.unsqueeze(-1)
     # Kept INTEGER until the bit decomposition: float32 loses every bit above
     # 2^24.
-    vals = anchors_t.to(torch.int64).gather(
-        -1, in_idx.reshape(B, 1, -1).expand(-1, A, -1)).reshape(B, A, O, I)
+    vals = F.pad(in_values_t[:, :, :O].to(torch.int64),
+                 (0, I - in_values_t.shape[-1]))
     vals = vals * in_valid.unsqueeze(1)
     vfeat = torch.cat([_value_feat(vals),
                        in_col.unsqueeze(1).expand(-1, A, -1, -1, -1)], -1)
@@ -266,15 +267,13 @@ def _essence_desc(comp, T, essence, out_slot_regs_t):
     return torch.cat([ess, ptr], -1)
 
 
-def _vp_bce(pred, out_slot_regs_t, out_regs_t, mask_t, vp_smooth_weight,
+def _vp_bce(pred, out_slot_regs_t, out_values_t, mask_t, vp_smooth_weight,
             return_count):
     """Per-bit BCE + vp_smooth_weight · smooth-magnitude MSE, averaged over
     (row, output slot, anchor) triples with a filled output slot."""
-    A = pred.shape[1]
+    O = out_slot_regs_t.shape[1]
     out_valid = out_slot_regs_t != AUX_CE_IGNORE                      # (B, O)
-    out_idx = out_slot_regs_t.clamp(min=0).long()
-    target_i = out_regs_t.to(torch.int64).gather(
-        -1, out_idx.unsqueeze(1).expand(-1, A, -1))                  # (B, A, O)
+    target_i = out_values_t[:, :, :O].to(torch.int64)                # (B, A, O)
     nbits = _VP_VALUE_BITS
     bit_loss = F.binary_cross_entropy_with_logits(
         pred[..., :nbits], _value_bits(target_i), reduction='none').mean(-1)
@@ -287,8 +286,8 @@ def _vp_bce(pred, out_slot_regs_t, out_regs_t, mask_t, vp_smooth_weight,
     return (loss, int(pm.sum())) if return_count else loss
 
 
-def vp_loss(comp, T, essence, anchors_t, out_slot_regs_t, out_inputs_t,
-            out_regs_t, mask_t, vp_smooth_weight=0.2, return_count=False,
+def vp_loss(comp, T, essence, in_values_t, out_slot_regs_t, out_inputs_t,
+            out_values_t, mask_t, vp_smooth_weight=0.2, return_count=False,
             n_out=None):
     """Value prediction read from the ESSENCE, per written output.
 
@@ -306,13 +305,13 @@ def vp_loss(comp, T, essence, anchors_t, out_slot_regs_t, out_inputs_t,
       comp:             the Compressor (uses comp.vp_head and its widths)
       T:                (B, n_regs, d_slot) the emitted state
       essence:          (B, d_out) the emitted essence
-      anchors_t:        (B, A, 32) int32 — the register file each row was
-                        executed from
+      in_values_t:      (B, A, O', I') int32 — each output's input values at
+                        each anchor, in out_inputs order (`out_input_values`)
       out_slot_regs_t:  (B, MAX_OUT) int64 — output registers (AUX_CE_IGNORE
                         for unused slots)
       out_inputs_t:     (B, MAX_OUT, MAX_IN) int64 — each output's external
                         input registers in colour order (AUX_CE_IGNORE padded)
-      out_regs_t:       (B, A, 32) int32 — the register file after the chunk
+      out_values_t:     (B, A, O') int32 — each output's value after the chunk
       mask_t:           (B,) bool — rows to include
       n_out:            bound on filled output slots; slots past it are
                         skipped (they must be AUX_CE_IGNORE)
@@ -323,65 +322,20 @@ def vp_loss(comp, T, essence, anchors_t, out_slot_regs_t, out_inputs_t,
     if n_out is not None:
         out_slot_regs_t = out_slot_regs_t[:, :n_out]
         out_inputs_t = out_inputs_t[:, :n_out]
-    pred = vp_predict(comp, T, essence, anchors_t, out_slot_regs_t,
+    pred = vp_predict(comp, T, essence, in_values_t, out_slot_regs_t,
                       out_inputs_t)
-    return _vp_bce(pred, out_slot_regs_t, out_regs_t, mask_t,
+    return _vp_bce(pred, out_slot_regs_t, out_values_t, mask_t,
                    vp_smooth_weight, return_count)
 
 
-def vp_predict(comp, T, essence, anchors_t, out_slot_regs_t, out_inputs_t):
+def vp_predict(comp, T, essence, in_values_t, out_slot_regs_t, out_inputs_t):
     """The evaluator's prediction per (row, anchor, output slot), (B, A, O, 33),
     through the same features `vp_loss` builds — the one definition every
     probe that scores the head reads."""
-    vin = _vp_inputs(comp, T, anchors_t, out_inputs_t)
+    vin = _vp_inputs(comp, T, in_values_t, out_inputs_t)
     desc = _essence_desc(comp, T, essence, out_slot_regs_t)
     return comp.vp_head(torch.cat(
         [desc.unsqueeze(1).expand(-1, vin.shape[1], -1, -1), vin], -1))
-
-
-# Shared witness states for the behavioral distance between rows: a fixed
-# structured draw no training anchor or held-out set uses. Every row is
-# executed at all of them, so two rows' outputs are compared at equal inputs.
-_WITNESS_SEED = 0x51D0
-_N_WITNESS = 64
-_WITNESS = {}
-
-
-def _witness_states(device):
-    if device not in _WITNESS:
-        from datagen import draw_anchor_states
-        w = draw_anchor_states(np.random.default_rng(_WITNESS_SEED), _N_WITNESS)
-        _WITNESS[device] = torch.as_tensor(np.asarray(w, dtype=np.int64), device=device)
-    return _WITNESS[device]
-
-
-def witness_outputs(tok, pad, out_inputs):
-    """Each one-instruction row's output at every witness state, (B, K) int64.
-
-    The witness state's position i+1 is placed on the row's i-th input in
-    colour order (`out_inputs`, the precompute_chunk placement convention), so
-    the inputs of two rows correspond positionally: a register rename, which
-    keeps the colour order, presents both rows the same values. Executed by the
-    GPU batch emulator. One-instruction rows only (T1)."""
-    from emulator.gpu_emulator import batch_execute, batch_parse_tokens
-    w = _witness_states(tok.device)                                   # (K, 32)
-    B, K = tok.shape[0], w.shape[0]
-    t = tok[:, 0]
-    lengths = (~pad[:, 0]).sum(-1)
-    op, rd, rs1, rs2, imm, _ = batch_parse_tokens(t, lengths, tok.device)
-    regs = torch.zeros(B, K, 32, dtype=torch.int64, device=tok.device)
-    ins = out_inputs[:, 0]                                            # (B, MAX_IN)
-    for i in range(min(2, ins.shape[1])):                             # <= 2 inputs at T1
-        reg = ins[:, i]
-        on = (reg >= 0).unsqueeze(-1).unsqueeze(-1)
-        oh = F.one_hot(reg.clamp(min=0), 32).bool().unsqueeze(1)      # (B, 1, 32)
-        regs = torch.where(on & oh, w[:, i + 1].view(1, K, 1), regs)
-    regs[..., 0] = 0
-    rep = lambda x: x.repeat_interleave(K)
-    val, _ = batch_execute(rep(op), rep(rd), rep(rs1), rep(rs2), rep(imm),
-                           regs.view(B * K, 32).to(torch.int32),
-                           torch.zeros(B * K, dtype=torch.int32, device=tok.device))
-    return val.view(B, K)
 
 
 _FULL = 1 << 32
@@ -414,7 +368,8 @@ def max_distance_matrix(zero, one):
 
 def pair_distance_targets(outputs, zero, one):
     """(B, B) behavioral distance between every two rows: the mean over the
-    witness states of `datagen.knownbits.output_distance` — the wrap-around
+    witness states (`outputs` (B, K), shipped as `batch.out_witness`) of
+    `datagen.knownbits.output_distance` — the wrap-around
     difference, log1p(log1p(d)) / log1p(log1p(max_dist)), with max_dist from
     the two outputs' known bits. 0 for rows that agree at every witness state."""
     maxd = max_distance_matrix(zero, one).double()                    # (B, B)
@@ -427,27 +382,24 @@ def pair_distance_targets(outputs, zero, one):
 
 
 class GraphedDistanceTargets:
-    """`pair_distance_targets(witness_outputs(...))` replayed as one CUDA
-    graph. Eagerly it is some two hundred small kernels per step, and their
-    launches, not their arithmetic, held the GPU at ~75%. The graph replays
-    the same kernels, so the targets are bit-identical; its inputs must keep
+    """`pair_distance_targets` replayed as one CUDA graph: launched eagerly,
+    its small kernels leave the GPU waiting on the host. The graph replays the
+    same kernels, so the targets are bit-identical; its inputs must keep
     their addresses across calls, as the stager's device buffer does."""
 
     def __init__(self):
         self.graph, self.out, self.sig = None, None, None
 
-    def __call__(self, tok, pad, out_inputs, zero, one):
-        args = (tok, pad, out_inputs, zero, one)
-        compute = lambda: pair_distance_targets(
-            witness_outputs(tok, pad, out_inputs), zero, one)
-        if not tok.is_cuda:
-            return compute()
+    def __call__(self, outputs, zero, one):
+        args = (outputs, zero, one)
+        if not outputs.is_cuda:
+            return pair_distance_targets(*args)
         if self.graph is None:
-            self.out = compute()          # eager once: fills the witness cache
+            self.out = pair_distance_targets(*args)
             torch.cuda.synchronize()
             self.graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(self.graph):
-                self.out.copy_(compute())
+                self.out.copy_(pair_distance_targets(*args))
             self.sig = _graph_signature(args)
         assert _graph_signature(args) == self.sig
         self.graph.replay()
@@ -910,9 +862,8 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
 
     vp_active = value_predict_weight > 0
     valid_active = valid_weight > 0
-    # The pair targets need every row's output at shared witness states, which
-    # is executed per instruction: one-instruction rows only until an output
-    # correspondence exists for chunks.
+    # One-instruction rows only, until two chunks' outputs have a
+    # correspondence.
     distance_active = distance_weight > 0
     if distance_active and not (vp_active and ingest == 'tokens'):
         raise ValueError('distance_weight > 0 needs value prediction on and '
@@ -959,7 +910,7 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
     # ONE compiled CUDA-graph step (the one-graph fold): front-end + core + losses, all
     # at a fixed-padded instruction count (B*MNI). Host-sync-free, static-shape.
     def _fwd_loss(tok, pad, w0, w1, wo, active,
-                  li, lo, pc, in_slot, out_slot, out_regs, vp_mask, anchors,
+                  li, lo, pc, in_slot, out_slot, out_values, vp_mask, in_values,
                   out_inputs, valid_f,
                   ike, oke, distance_target):
         content_seq, c0, c1, co = _content(tok, pad, w0, w1, wo, active)
@@ -970,7 +921,7 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
             comp, T, essence, live_in_t=li, live_out_t=lo, pc_writes_t=pc,
             in_slot_t=in_slot, out_slot_t=out_slot, in_k_eff=ike, out_k_eff=oke)
         vp = (vp_loss(
-                  comp, T, essence, anchors, out_slot, out_inputs, out_regs,
+                  comp, T, essence, in_values, out_slot, out_inputs, out_values,
                   vp_mask, vp_smooth_weight=vp_smooth_weight, n_out=oke)
               if vp_active else essence.new_zeros(()))
         ds = (distance_loss(essence, distance_target, vp_mask)
@@ -1000,21 +951,21 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
             return None
         staged = iter(stage(packed, specs))
         fixed = [next(staged) for _ in range(11)]
-        out_regs_t, vp_mask_t, anchors_t, out_inputs_t = (
+        out_values_t, vp_mask_t, in_values_t, out_inputs_t = (
             (next(staged), next(staged), next(staged), next(staged)) if vp_active
             else (_dummy, _dummy, _dummy, _dummy))
         valid_f = next(staged) if valid_active else _dummy
         if distance_active:
-            known_zero_t, known_one_t = next(staged), next(staged)
+            witness_t, known_zero_t, known_one_t = (next(staged), next(staged),
+                                                    next(staged))
             # Outside the compiled step (the targets are data), into one
             # persistent buffer, since the step's graph replay reads its
             # inputs at the addresses it was captured with.
             with torch.no_grad():
-                distance_t = distance_targets(
-                    fixed[0], fixed[1], out_inputs_t, known_zero_t, known_one_t)
+                distance_t = distance_targets(witness_t, known_zero_t, known_one_t)
         else:
             distance_t = _dummy
-        return (*fixed, out_regs_t, vp_mask_t, anchors_t, out_inputs_t, valid_f,
+        return (*fixed, out_values_t, vp_mask_t, in_values_t, out_inputs_t, valid_f,
                 IN_K, OUT_K, distance_t)
 
     def _extra(item, aux):
@@ -1487,35 +1438,6 @@ def binding_losses(model, T, essence, *, live_in_t, live_out_t, pc_writes_t,
         'in_slot': in_slot_loss, 'out_slot': out_slot_loss,
         'active_f': active_f,
     }
-
-
-def _compute_chunk_out_regs(batch):
-    """Per row of the batch, execute the chunk on the emulator from the
-    register files the row ships as its anchors. Returns:
-      out_regs: (B, n_anchors, 32) int32
-      mask:     (B,) bool — True for rows we got valid out_regs from
-    Rows that fail (decode error, memory ops, etc.) get zero out_regs. The
-    shipped `out_regs` must equal this: the anchors shipped are the register
-    files the oracle executed from, with no further placement. The oracle's
-    SSA evaluator is used rather than the emulator because the two differ on
-    intra-chunk control flow (`_eval_ssa_numpy`)."""
-    from datagen.compare import to_ssa, live_nodes, _eval_ssa_numpy
-    B = batch.tokens.shape[0]
-    n_anchors = batch.anchors.shape[1]
-    out = np.zeros((B, n_anchors, 32), dtype=np.int32)
-    mask = np.zeros(B, dtype=bool)
-    for b in range(B):
-        instrs = _decode_chunk_instructions(batch, b)
-        if instrs is None or not batch.out_regs_valid[b]:
-            continue
-        try:
-            ssa = to_ssa(instrs)
-            out[b], _ = _eval_ssa_numpy(ssa, len(instrs), batch.anchors[b],
-                                        live_nodes(ssa))
-        except Exception:
-            continue
-        mask[b] = True
-    return out, mask
 
 
 _PR_SET_PDEATHSIG = 1

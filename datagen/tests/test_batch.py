@@ -127,31 +127,51 @@ def test_round_trip():
     assert np.array_equal(b.instr_lens, got.instr_lens)
     assert np.array_equal(b.in_slot_regs, got.in_slot_regs)
     assert np.array_equal(b.out_slot_regs, got.out_slot_regs)
-    assert np.array_equal(b.anchors, got.anchors)
-    assert np.array_equal(b.out_regs, got.out_regs)
+    assert np.array_equal(b.out_values, got.out_values)
+    assert np.array_equal(b.out_input_values, got.out_input_values)
+
+def _reexecuted(chunk, out_slot_regs, out_inputs, input_values):
+    """Each output's value re-executed from only the input values the row
+    ships for it, every other register 0: (n_anchors, n_outputs)."""
+    from datagen.compare import to_ssa, live_nodes, _eval_ssa_numpy, AUX_CE_IGNORE
+    ssa = to_ssa(chunk)
+    A = input_values.shape[0]
+    got = np.zeros((A, input_values.shape[1]), dtype=np.int32)
+    for k, r in enumerate(out_slot_regs[:input_values.shape[1]].tolist()):
+        if r == AUX_CE_IGNORE:
+            continue
+        regs = np.zeros((A, 32), dtype=np.int32)
+        for j, src in enumerate(out_inputs[k].tolist()):
+            if src != AUX_CE_IGNORE:
+                regs[:, src] = input_values[:, k, j]
+        got[:, k] = _eval_ssa_numpy(ssa, len(chunk), regs, live_nodes(ssa))[0][:, r]
+    return got
 
 
-def test_each_row_ships_the_anchors_its_targets_were_executed_at():
-    """One structured draw per chunk, placed on each row's own input
-    registers, travels with every row: the evaluator gathers an output's input
-    values from `batch.anchors`, so out_regs must have been executed there."""
+def test_each_output_ships_the_inputs_its_value_was_executed_from():
+    """One structured draw per chunk, placed on its own input registers: the
+    evaluator reads an output's input values from `out_input_values`, so
+    re-executing from those alone must give `out_values`."""
     from datagen.generate import build_opcode_table
     rng = np.random.default_rng(3)
     alu = build_opcode_table({'R_ALU': 0.5, 'I_ALU': 0.5})   # no mem-op rows
     gen = collect_into_batches(
-        generate_chunks(single(), rng, opcode_table=alu),
-        batch_size=8,
+        generate_chunks(length_cap(3), rng, opcode_table=alu, chain_rate=0.5),
+        batch_size=32,
         draw_anchors=lambda k: draw_anchor_states(rng, k * 4).reshape(k, 4, -1),
-        max_chunk_len=1)
+        max_chunk_len=3)
     b = next(gen)
-    from emulator import run as emu_run
-    assert b.anchors.shape == (8, 4, 32) and (b.anchors[:, :, 0] == 0).all()
-    assert not np.array_equal(b.anchors[0], b.anchors[1])
+    assert b.out_values.shape == (32, 4, 3)
+    assert b.out_input_values.shape == (32, 4, 3, 4)
+    assert not np.array_equal(b.out_input_values[0], b.out_input_values[1])
     for i in np.nonzero(b.out_regs_valid)[0]:
-        ins, _ = decode_instruction(b.tokens[i, :b.token_lens[i]].tolist(), 0)
-        for a in range(b.anchors.shape[1]):
-            regs = emu_run([ins], b.anchors[i, a].astype(np.int32).copy())[0].regs
-            assert np.array_equal(regs, b.out_regs[i, a])
+        toks, pos, chunk = b.tokens[i, :b.token_lens[i]].tolist(), 0, []
+        while pos < len(toks):
+            ins, pos = decode_instruction(toks, pos)
+            chunk.append(ins)
+        got = _reexecuted(chunk, b.out_slot_regs[i], b.out_inputs[i],
+                          b.out_input_values[i])
+        assert np.array_equal(got, b.out_values[i]), chunk
 
 
 def test_eof_clean():
@@ -197,7 +217,7 @@ def test_round_trip_preserves_fields():
     got = RVT_FORMAT.read_batch(buf, Batch)
     assert np.array_equal(got.tokens, b.tokens)
     assert got.valid.tolist() == b.valid.tolist()
-    assert got.out_regs.shape[0] == 0          # OB=0, no oracle supplied
+    assert got.out_values.shape[0] == 0        # OB=0, no oracle supplied
 
 
 def test_bad_magic_raises():
@@ -317,6 +337,7 @@ def test_pack_rejects_aux_first_dim_mismatch():
         in_slot_regs=np.full((2, 32), AUX_CE_IGNORE, dtype=np.int8),
         out_slot_regs=np.full((2, 16), AUX_CE_IGNORE, dtype=np.int8),
         out_inputs=np.full((2, 16, 32), AUX_CE_IGNORE, dtype=np.int8),
+        out_witness=np.zeros((2, 16, 64), dtype=np.int32),
     )
     with pytest.raises(ValueError, match='aux_payload first dim'):
         pack_batch(chunks, target_B=1,
@@ -365,7 +386,7 @@ def test_build_targets_aux_content_and_none_rows():
         _make_invalid_chunk([5, 6, 7]),                    # invalid → None row
         _instrs_to_chunk([Instruction('LW', 9, 0, 3)]),    # mem-op → None row
     ]
-    aux, _or, orv, _an = build_targets(chunks, draw_anchors=lambda k: np.broadcast_to(anchors, (k, *anchors.shape)))
+    aux, _ov, _oiv, orv = build_targets(chunks, draw_anchors=lambda k: np.broadcast_to(anchors, (k, *anchors.shape)), max_n_instrs=1)
     assert orv.tolist() == [True, False, False]
 
     # Row 0: ADD x5,x1,x2.
@@ -432,8 +453,8 @@ def test_fixed_shape_with_invalids():
 
 
 def test_fixed_shape_single_rule_out_regs():
-    """The `single` rule (T1) ships canonical out_regs (OB==B, RB==0) like
-    every other rule (the T1/T2 unification), at a fixed batch shape."""
+    """The `single` rule (T1) ships per-output values (OB==B) like every
+    other rule (the T1/T2 unification), at a fixed batch shape."""
     rng = np.random.default_rng(1)
     anchors = draw_anchor_states(np.random.default_rng(0), 4)
     gen = collect_into_batches(
@@ -445,13 +466,12 @@ def test_fixed_shape_single_rule_out_regs():
 
     shape0 = batches[0].tokens.shape
     ilen0 = batches[0].instr_lens.shape
-    or0 = batches[0].out_regs.shape
+    ov0, oiv0 = batches[0].out_values.shape, batches[0].out_input_values.shape
     for b in batches:
         assert b.tokens.shape == shape0
         assert b.instr_lens.shape == ilen0
-        assert b.out_regs.shape == or0
-        # canonical out_regs mode: OB == B.
-        assert b.out_regs.shape[0] == b.tokens.shape[0]
+        assert b.out_values.shape == ov0 and b.out_input_values.shape == oiv0
+        assert b.out_values.shape[0] == b.tokens.shape[0]       # OB == B
     # out_regs carries meaningful rows.
     assert any(b.out_regs_valid.any() for b in batches)
 

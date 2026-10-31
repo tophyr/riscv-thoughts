@@ -155,7 +155,7 @@ analogues:
 
 ### Data pipeline
 
-Generation, SSA analysis, anchor execution and the canonical `out_regs` oracle
+Generation, SSA analysis, anchor execution and the value-prediction targets
 all run in `datagen`, which streams self-describing RVT batches to a trainer on
 stdout. Execution uses this project's own RV32I emulator (`emulator/`); no
 hardware and no external simulator. The commands, flags, wire format and
@@ -571,7 +571,8 @@ The behavioral distance compares the two rows' outputs at the same inputs. Both
 are executed at a fixed set of 64 structured witness states, each row's i-th
 input in colour order taking the state's position i+1, so inputs correspond by
 structural role, and a register rename, which keeps the colour order, presents
-both rows the same values (`witness_outputs`). At each state the two outputs'
+both rows the same values (executed in `datagen` by `precompute_chunk` and
+shipped in the batch). At each state the two outputs'
 wrap-around difference d (the shorter way round mod 2³², exact in integers)
 becomes log1p(log1p(d)) / log1p(log1p(max_dist)), and the distance is the mean
 over the states (`pair_distance_targets`; `datagen/knownbits.py`,
@@ -614,9 +615,9 @@ what keeps them distinguishable is value prediction, which needs training
 anchors that reach the inputs where they differ — the aimed anchor states
 below.
 
-The targets are computed outside the compiled step, on the GPU batch emulator,
-for one-instruction rows only: chunks need an execution per instruction and a
-correspondence between two chunks' outputs.
+Each output's values at the witness states ship in every batch, for chunks as
+for single instructions. The trainer builds the pair matrix from them for
+one-instruction rows only: two chunks' outputs have no correspondence yet.
 
 ### What is built in for good, and what is built in for now
 

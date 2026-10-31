@@ -21,7 +21,6 @@ from tokenizer import BOS, EOS, PAD, VOCAB_SIZE
 from compressor.model import T1Compressor, T2Compressor
 from compressor.train import (
     _VP_VALUE_BITS,
-    _compute_chunk_out_regs,
     _listmle_loss,
     _value_bits,
     _value_smooth,
@@ -78,9 +77,9 @@ def _vp_comp(head, d, de):
 def test_vp_loss_feeds_the_essence_the_pointer_and_the_inputs_by_register():
     """For output slot k the head is fed the unit-normalized essence, the
     WRITTEN register's pointer channels from T (never its value channels),
-    and for each of the output's inputs (out_inputs, by register) that
-    register's value in the row's anchors as [32 bits, 1 smooth] plus the
-    input's colour channels from T. Unfilled inputs feed zeros."""
+    and for each of the output's inputs (out_inputs) its shipped value at the
+    anchor as [32 bits, 1 smooth] plus the input register's colour channels
+    from T. Unfilled inputs feed zeros."""
     from compressor.model import _COLOUR_DIM as dc, _PTR_DIM as P
     B, d, de, A = 1, 4, 2, 2
     T = torch.zeros(B, 32, d + de + dc + P)
@@ -88,25 +87,23 @@ def test_vp_loss_feeds_the_essence_the_pointer_and_the_inputs_by_register():
     T[0, 9, d + de + dc + 1] = 1.0                           # pointer of x9: order 1
     T[0, 7, d + de:d + de + dc] = 0.5                        # colour of leaf x7
     essence = torch.tensor([[3.0, 0.0, 4.0, 0.0]])
-    anchors = torch.zeros(B, A, 32, dtype=torch.int32)
-    for p in range(32):
-        for a in range(A):
-            anchors[0, a, p] = 10 * p + a
+    in_values = torch.zeros(B, A, MAX_OUTPUT_SLOTS, 3, dtype=torch.int32)
+    in_values[0, :, 0, 0] = torch.tensor([70, 71], dtype=torch.int32)
     out_slot = torch.full((B, MAX_OUTPUT_SLOTS), AUX_CE_IGNORE, dtype=torch.int64)
     out_slot[0, 0] = 9
     out_inputs = torch.full((B, MAX_OUTPUT_SLOTS, MAX_INPUT_SLOTS), AUX_CE_IGNORE, dtype=torch.int64)
     out_inputs[0, 0, 0] = 7
-    out_regs = torch.zeros(B, A, 32, dtype=torch.int32)
+    out_values = torch.zeros(B, A, MAX_OUTPUT_SLOTS, dtype=torch.int32)
     head = _CaptureHead(_VP_SLOT)
-    vp_loss(_vp_comp(head, d, de), T, essence, anchors, out_slot, out_inputs,
-            out_regs, torch.tensor([True]))
+    vp_loss(_vp_comp(head, d, de), T, essence, in_values, out_slot, out_inputs,
+            out_values, torch.tensor([True]))
     x = head.last                                     # (B, A, O, d + P + I*(33+dc))
     assert x.shape == (B, A, MAX_OUTPUT_SLOTS, d + P + MAX_INPUT_SLOTS * (_VP_SLOT + dc))
     assert torch.allclose(x[0, :, 0, :d], torch.tensor([[0.6, 0.0, 0.8, 0.0]] * A))
     assert torch.equal(x[0, :, 0, d:d + P], F_one_hot(1, P).expand(A, -1))
     feats = x[0, :, 0, d + P:].reshape(A, MAX_INPUT_SLOTS, _VP_SLOT + dc)
-    assert torch.equal(feats[:, 0, :_VP_VALUE_BITS], _value_bits(anchors[0, :, 7].long()))
-    assert torch.allclose(feats[:, 0, _VP_VALUE_BITS], _value_smooth(anchors[0, :, 7].float()))
+    assert torch.equal(feats[:, 0, :_VP_VALUE_BITS], _value_bits(in_values[0, :, 0, 0].long()))
+    assert torch.allclose(feats[:, 0, _VP_VALUE_BITS], _value_smooth(in_values[0, :, 0, 0].float()))
     assert torch.all(feats[:, 0, _VP_SLOT:] == 0.5)
     assert torch.count_nonzero(feats[:, 1:]) == 0
 
@@ -116,21 +113,21 @@ def F_one_hot(i, n):
 
 
 def test_vp_loss_gather_and_mask():
-    """The target is the output register's value in out_regs; only filled
+    """The target is the output's shipped value; only filled
     (row, slot) pairs of unmasked rows contribute, and return_count gives
     that pair count."""
     from compressor.model import _COLOUR_DIM, _PTR_DIM
     B, d, de, A = 2, 4, 2, 2
     T = torch.zeros(B, 32, d + de + _COLOUR_DIM + _PTR_DIM)
     essence = torch.ones(B, d)
-    anchors = torch.zeros(B, A, 32, dtype=torch.int32)
+    in_values = torch.zeros(B, A, MAX_OUTPUT_SLOTS, 3, dtype=torch.int32)
     out_slot = torch.full((B, MAX_OUTPUT_SLOTS), AUX_CE_IGNORE, dtype=torch.int64)
     out_slot[0, 0], out_slot[0, 1] = 5, 9
     out_inputs = torch.full((B, MAX_OUTPUT_SLOTS, MAX_INPUT_SLOTS), AUX_CE_IGNORE, dtype=torch.int64)
-    out_regs = torch.zeros(B, A, 32, dtype=torch.int32)
-    out_regs[0, :, 5] = torch.tensor([10, 20]); out_regs[0, :, 9] = torch.tensor([30, 40])
+    out_values = torch.zeros(B, A, MAX_OUTPUT_SLOTS, dtype=torch.int32)
+    out_values[0, :, 0] = torch.tensor([10, 20]); out_values[0, :, 1] = torch.tensor([30, 40])
     comp = _vp_comp(_ConstHead(_VP_SLOT, 0.0), d, de)
-    loss, count = vp_loss(comp, T, essence, anchors, out_slot, out_inputs, out_regs,
+    loss, count = vp_loss(comp, T, essence, in_values, out_slot, out_inputs, out_values,
                           torch.tensor([True, True]), return_count=True)
     assert count == 2
     # Zero logits: per-bit BCE is ln 2 for every bit; smooth term (0 - s)^2.
@@ -139,31 +136,37 @@ def test_vp_loss_gather_and_mask():
         per = [math.log(2) + 0.2 * float(_value_smooth(torch.tensor(float(v))) ** 2) for v in vals]
         want += sum(per) / len(per)
     assert abs(float(loss) - want / 2) < 1e-5
-    masked = vp_loss(comp, T, essence, anchors, out_slot, out_inputs, out_regs,
+    masked = vp_loss(comp, T, essence, in_values, out_slot, out_inputs, out_values,
                      torch.tensor([False, False]))
     assert float(masked) == 0.0
 
 
-def test_gen_shipped_out_regs_matches_recompute():
-    """The out_regs the gen workers ship in the RVT batch must be bit-
-    identical to what the trainer would recompute single-threaded (the
-    gen-side shipping is a perf move, not a semantic change)."""
+def test_gen_shipped_values_re_execute_from_their_inputs():
+    """Every shipped output value re-executes from that output's shipped
+    input values alone, over register-dataflow chunks. (An output computed
+    from the PC after a jump also depends on the jump's operands, which
+    out_inputs does not list; PC effects are out of scope.)"""
     from datagen.batch import collect_into_batches, generate_chunks
     from datagen.compare import draw_anchor_states
-    from datagen.generate import either, until_branch, length_cap
+    from datagen.generate import build_opcode_table, length_cap
 
     rng = np.random.default_rng(0)
-    chunks = generate_chunks(either(until_branch(), length_cap(4)), rng,
-                             eq_rate=0.05)
+    alu = build_opcode_table({'R_ALU': 0.55, 'I_ALU': 0.45})
+    chunks = generate_chunks(length_cap(4), rng, opcode_table=alu,
+                             chain_rate=0.3, eq_rate=0.05)
     batch = next(collect_into_batches(
         chunks, batch_size=256,
         draw_anchors=lambda k: draw_anchor_states(rng, k * 8).reshape(k, 8, -1),
         max_chunk_len=4))
 
-    assert batch.out_regs.shape[0] == batch.tokens.shape[0]   # OB == B (T2)
-    ref_out, ref_valid = _compute_chunk_out_regs(batch)
-    assert np.array_equal(batch.out_regs, ref_out)
-    assert np.array_equal(batch.out_regs_valid, ref_valid)
+    from datagen.tests.test_batch import _reexecuted
+    from compressor.train import _decode_chunk_instructions
+    assert batch.out_values.shape[0] == batch.tokens.shape[0]   # OB == B (T2)
+    for i in np.nonzero(batch.out_regs_valid)[0]:
+        chunk = _decode_chunk_instructions(batch, i)
+        got = _reexecuted(chunk, batch.out_slot_regs[i], batch.out_inputs[i],
+                          batch.out_input_values[i])
+        assert np.array_equal(got, batch.out_values[i]), chunk
 
 
 def _small_batches(n):
@@ -210,11 +213,12 @@ def test_packed_step_stages_to_the_arrays_it_packed():
         L, F = torch.long, torch.float32
         want = [(tok, L), (pad, None), (g0, L), (g1, L), (go, L), (act, F),
                 (b.live_in_mask, F), (b.live_out_mask, F), (b.pc_writes, F),
-                (b.in_slot_regs, L), (b.out_slot_regs, L), (b.out_regs, None),
-                (b.out_regs_valid, None), (b.anchors, None), (b.out_inputs, L),
+                (b.in_slot_regs, L), (b.out_slot_regs, L), (b.out_values, None),
+                (b.out_regs_valid, None), (b.out_input_values, None), (b.out_inputs, L),
                 (b.valid, F)]
         got = _H2DStager('cpu')(packed, specs)
-        assert len(got) == len(want) + 2             # + known bits
+        assert len(got) == len(want) + 3     # + witness outputs, known bits
+        assert torch.equal(got[-3], torch.from_numpy(b.out_witness[:, 0]).long())
         assert torch.equal(got[-2], torch.from_numpy(b.out_known_zero[:, 0]))
         for g, (a, dt) in zip(got, want):
             w = torch.from_numpy(a) if dt is None else torch.from_numpy(a).to(dt)
@@ -566,12 +570,11 @@ def test_every_probe_and_entry_script_compiles():
 
 
 def _t1_rows(n, seed):
-    """n random one-instruction ALU rows as a dense token grid plus the
-    oracle's out_inputs and the instructions themselves."""
+    """n random one-instruction ALU rows: the instructions, and each one's
+    output at the witness states as datagen ships it."""
     import random
     from emulator import Instruction
-    from datagen.signature import output_inputs
-    from tokenizer import encode_instruction, PAD
+    from datagen import draw_anchor_states, precompute_chunk
     rng = random.Random(seed)
     R = ['ADD', 'SUB', 'XOR', 'OR', 'AND', 'SLL', 'SRL', 'SRA', 'SLT', 'SLTU']
     Iops = ['ADDI', 'XORI', 'ORI', 'ANDI', 'SLTI', 'SLTIU', 'SLLI', 'SRLI', 'SRAI']
@@ -584,47 +587,20 @@ def _t1_rows(n, seed):
             op = rng.choice(Iops)
             imm = rng.randrange(32) if op in ('SLLI', 'SRLI', 'SRAI') else rng.randrange(-2048, 2048)
             instrs.append(Instruction(op, rd, a, imm))
-    toks = [encode_instruction(i) for i in instrs]
-    L = max(map(len, toks))
-    tok = torch.full((n, 1, L), PAD, dtype=torch.long)
-    pad = torch.ones(n, 1, L, dtype=torch.bool)
-    out_inputs = torch.full((n, 1, MAX_INPUT_SLOTS), AUX_CE_IGNORE, dtype=torch.long)
-    for j, (t, ins) in enumerate(zip(toks, instrs)):
-        tok[j, 0, :len(t)] = torch.tensor(t); pad[j, 0, :len(t)] = False
-        regs = output_inputs([ins]).get(ins.args[0], [])
-        out_inputs[j, 0, :len(regs)] = torch.tensor(regs)
-    return tok, pad, out_inputs, instrs
-
-
-def test_witness_outputs_match_the_cpu_emulator():
-    """Every row executed at every witness state with its i-th input (colour
-    order) holding the state's position i+1 — on the GPU emulator — equals the
-    CPU emulator on the same register file."""
-    from compressor.train import witness_outputs, _witness_states
-    from emulator import run as emu_run
-    tok, pad, out_inputs, instrs = _t1_rows(64, 1)
-    got = witness_outputs(tok, pad, out_inputs)
-    w = _witness_states(tok.device).numpy()
-    for j, ins in enumerate(instrs):
-        for k in range(w.shape[0]):
-            regs = np.zeros(32, dtype=np.int64)
-            for i, r in enumerate(out_inputs[j, 0].tolist()):
-                if r >= 0:
-                    regs[r] = w[k, i + 1]
-            regs[0] = 0
-            want = int(emu_run([ins], regs.astype(np.int32))[0].regs[ins.args[0]])
-            assert (int(got[j, k]) - want) % (1 << 32) == 0, (ins, k)
+    anchors = draw_anchor_states(np.random.default_rng(seed), 1)
+    outs = torch.tensor(np.stack([precompute_chunk([i], anchors).witness[0]
+                                  for i in instrs]).astype(np.int64))
+    return instrs, outs
 
 
 def test_pair_distance_targets_match_the_reference_distance():
-    from compressor.train import (max_distance_matrix, pair_distance_targets,
-                                  witness_outputs)
+    from compressor.train import max_distance_matrix, pair_distance_targets
     from datagen.knownbits import output_known_bits, max_distance, output_distance
-    tok, pad, out_inputs, instrs = _t1_rows(24, 2)
+    instrs, outs = _t1_rows(24, 2)
+    outs = outs[:, :5]
     kb = [output_known_bits([i])[i.args[0]] for i in instrs]
     zero = torch.tensor([k.zero for k in kb]); one = torch.tensor([k.one for k in kb])
     m = max_distance_matrix(zero, one)
-    outs = witness_outputs(tok, pad, out_inputs)[:, :5]
     D = pair_distance_targets(outs, zero, one)
     for i in range(24):
         for j in range(24):
@@ -638,24 +614,19 @@ def test_pair_distance_targets_match_the_reference_distance():
 def test_graphed_distance_targets_equal_the_eager_ones():
     """Replayed against new contents at the captured addresses, the graph
     gives the eager targets bit for bit."""
-    from compressor.train import (GraphedDistanceTargets, pair_distance_targets,
-                                  witness_outputs)
+    from compressor.train import GraphedDistanceTargets, pair_distance_targets
     from datagen.knownbits import output_known_bits
     dev = torch.device('cuda')
     g = GraphedDistanceTargets()
     bufs = None
     for seed in (3, 4, 5):
-        tok, pad, out_inputs, instrs = _t1_rows(48, seed)
+        instrs, outs = _t1_rows(48, seed)
         kb = [output_known_bits([i])[i.args[0]] for i in instrs]
         zero = torch.tensor([k.zero for k in kb]); one = torch.tensor([k.one for k in kb])
-        L = tok.shape[-1]                 # one fixed width, as a batch has
-        tok = torch.nn.functional.pad(tok, (0, 9 - L), value=PAD)
-        pad = torch.nn.functional.pad(pad, (0, 9 - L), value=True)
-        new = [t.to(dev) for t in (tok, pad, out_inputs, zero, one)]
+        new = [t.to(dev) for t in (outs, zero, one)]
         if bufs is None:
             bufs = [torch.empty_like(t) for t in new]
         for b, t in zip(bufs, new):
             b.copy_(t)
         got = g(*bufs).clone()
-        want = pair_distance_targets(witness_outputs(*bufs[:3]), *bufs[3:])
-        assert torch.equal(got, want)
+        assert torch.equal(got, pair_distance_targets(*bufs))
