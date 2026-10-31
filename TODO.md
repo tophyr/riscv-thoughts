@@ -84,7 +84,7 @@ literal.
    holds exactly: value prediction read from its essence is 100.0000% exact on
    2,457,600 held-out triples with a three-layer residual vp head, its emitted
    wiring exact on every instruction (`probes/frame_scorecard.py`; frozen as
-   `runs/t1_distance_noimm_aim050_500k`, finding 42). A T2 over the T1 of
+   `runs/t1_distance_noimm_aim050_roles_500k`, findings 42 and 43). A T2 over the T1 of
    finding 39 — trained without the distance term, and with an evaluator input
    order that finding 40 removed — is at **99.8276%**, 8,333 failing triples of 4,834,176, after 1M
    steps, one seed, binding exact on every chunk, with outputs that depend on
@@ -227,22 +227,20 @@ register frame", finding 41).
 
 **The order of work.**
 
-1. **T1 holds** (findings 41 and 42): with the immediate head removed and half
+1. **T1 holds** (findings 41–43): with the immediate head removed and half
    of every row's anchor states aimed at its own boundaries, the distance term
    collapses every partner group (copy 0.002, sign 0.0004–0.0009, double
    0.0008, zero 0.11, constant 0.08–0.09 against contrasts of 0.3–1.5), keeps
    unrelated instructions at their spread (1.36), grades near-misses (`ADDI`
    k vs k+1 at 0.34–0.36, target 0.34), and value prediction is exact on all
-   2,457,600 held-out triples on two corpus seeds
-   (`runs/t1_distance_noimm_aim050_500k` and `_s7`). It runs at 8 ms/step
+   2,457,600 held-out triples on two corpus seeds and again with its
+   targets placed by canonical role (`runs/t1_distance_noimm_aim050_roles_500k`). It runs at 7–8 ms/step
    against 4 ms without the term.
-2. **The distance term for chunks.** Three pieces: executing each chunk at the
-   witness states instruction by instruction on the GPU emulator; the known
-   bits of each output, which `datagen/knownbits.py` already propagates
-   through a chunk; and a correspondence between two chunks' outputs, since a
-   chunk can have several — the minimum over the at most K! assignments of
-   one chunk's outputs to the other's, with each output's inputs in colour
-   order.
+2. **The distance term for chunks.** Every chunk's outputs at the witness
+   states ship in the batch, inputs placed by canonical role and outputs in
+   canonical order, so two chunks' outputs and inputs already correspond
+   (RISCV_DESIGN.md, "Collapse"). What remains is the trainer's pair matrix
+   for rows with several outputs (Combining outputs, below).
 3. **A multi-instruction partner generator for T2** — folds of two literals,
    identity against a cancelling pair, commutative swaps whose operand is
    shared or a result — emulator-verified, starting with chunks of one output.
@@ -254,23 +252,25 @@ Decisions that remain:
   something that weighs an unmatched output), and how two chunks with
   different numbers of outputs compare. Settle together with the pointer order
   (Open ideas), since both concern chunks with more than one output.
-- **Matching inputs.** The witness states place an output's i-th input, in
-  colour order, at the same value for every row, which matches inputs exactly
-  under a rename, a reordering and dead code. Two equivalent chunks whose
-  dataflow graphs differ in shape — `SUB t,a,b; SUB r,t,c` against
-  `ADD t,b,c; SUB r,a,t` — need not list their inputs in the same order, and
-  then the target calls them different. Candidates: the minimum over input
-  permutations (at most (K+1)! per pair), or a correspondence defined from
-  the function rather than the graph. How often colour orders disagree on
-  generated fold pairs is unmeasured.
+- **Canonical roles in the encoder.** The pointer orders outputs by a hash
+  of their spelling and the evaluator takes inputs in the graph's colour
+  order, both of which a respelling or a commutative swap can change. Both
+  could read canonical roles instead, if the binding heads are retrained to
+  predict them (they predict first-read and write order today); whether the
+  heads can learn that order exactly is untested. Settle before applying the
+  distance term to chunks.
+- **Canonical order flips between near-misses.** Changing one immediate by
+  one reorders a chunk's canonical inputs in 1–6% of pairs (finding 43),
+  inflating those pairs' distance targets; the size of the inflation is
+  unmeasured.
 - **The partner fraction.** How much of a batch is partner pairs against
   naturally drawn chunks; start fixed and treat it as a tuning knob.
 - **The baseline to beat** is finding 39's 1M cell for T2: the essence spans
   the first-read frame's range (unrelated chunks 0.6901). The aliasing control
   (0.5051) and the fusion `different` rows (0.3221 additive, 0.1927 `XORI`)
   are the guard — they must not fall with the rest. At T1 the frozen
-  `runs/t1_distance_noimm_aim050_500k` holds unrelated instructions at 1.360
-  and the aliasing control at 1.155 (finding 42 and its scorecard).
+  `runs/t1_distance_noimm_aim050_roles_500k` holds unrelated instructions at 1.360 and the aliasing
+  control at 1.152 (finding 43).
 - **The binding on the wire.** Per output register, its external input
   registers in the colour order the evaluator gathers them in (`out_inputs`
   already ships it); the ordered input and output lists (`in_slot`/`out_slot`

@@ -338,6 +338,7 @@ def test_pack_rejects_aux_first_dim_mismatch():
         out_slot_regs=np.full((2, 16), AUX_CE_IGNORE, dtype=np.int8),
         out_inputs=np.full((2, 16, 32), AUX_CE_IGNORE, dtype=np.int8),
         out_witness=np.zeros((2, 16, 64), dtype=np.int32),
+        witness_slots=np.full((2, 16), -1, dtype=np.int8),
     )
     with pytest.raises(ValueError, match='aux_payload first dim'):
         pack_batch(chunks, target_B=1,

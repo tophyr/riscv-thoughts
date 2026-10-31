@@ -383,13 +383,16 @@ def test_chain_config_block_is_validated():
 
 
 def test_witness_outputs_match_the_cpu_emulator():
-    """Every output of a chunk executed at every witness state, its i-th input
-    (out_inputs order) holding the state's position i+1 and every other
-    register 0, equals the CPU emulator on that register file."""
+    """Each output at every witness state, the chunk's p-th input in canonical
+    role order holding the state's position p+1 and every other register 0,
+    listed in canonical output order, equals the CPU emulator on that
+    register file."""
     from emulator import run as emu_run
     from datagen.batch import generate_chunks
-    from datagen.compare import witness_states, AUX_CE_IGNORE
+    from datagen.compare import witness_states, to_ssa, live_nodes, _eval_ssa_numpy
     from datagen.generate import build_opcode_table, length_cap
+    from datagen.roles import canonical_inputs
+    from datagen.signature import output_inputs
     rng = np.random.default_rng(11)
     alu = build_opcode_table({'R_ALU': 0.55, 'I_ALU': 0.45})
     w = witness_states()
@@ -398,13 +401,18 @@ def test_witness_outputs_match_the_cpu_emulator():
         for _ in range(40):
             chunk = next(chunks).instructions
             pre = precompute_chunk(chunk, draw_anchor_states(rng, 4))
-            for k, r in enumerate(pre.out_slot_regs.tolist()):
-                if r == AUX_CE_IGNORE:
+            outs = [r for r in pre.out_slot_regs.tolist() if r != AUX_CE_IGNORE]
+            ssa = to_ssa(chunk); live = live_nodes(ssa); deps = output_inputs(chunk)
+            roles = canonical_inputs(
+                sorted({x for r in outs for x in deps[r]}),
+                lambda regs: _eval_ssa_numpy(ssa, len(chunk), regs, live)[0][:, outs]
+                .astype(np.int64) & 0xFFFFFFFF)
+            for p, k in enumerate(pre.witness_slots.tolist()):
+                if k < 0:
                     continue
                 for s in range(0, w.shape[0], 7):
                     regs = np.zeros(32, dtype=np.int32)
-                    for i, src in enumerate(pre.out_inputs[k].tolist()):
-                        if src != AUX_CE_IGNORE:
-                            regs[src] = w[s, i + 1]
-                    want = emu_run(chunk, regs)[0].regs[r]
-                    assert pre.witness[k, s] == want, (chunk, r, s)
+                    for q, src in enumerate(roles):
+                        regs[src] = w[s, q + 1]
+                    want = emu_run(chunk, regs)[0].regs[outs[k]]
+                    assert pre.witness[p, s] == want, (chunk, p, s)

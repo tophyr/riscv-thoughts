@@ -202,17 +202,20 @@ not know you need.
    (`_values_from_precomputeds`, `datagen/batch.py:403`).
 
 7. **The behavioral distance compares two rows at the SAME inputs, placed by
-   colour order.** Every output is executed at one shared set of witness
-   states, its i-th input in `out_inputs` order taking the state's position
-   i+1 and every other register 0 (`precompute_chunk`, shipped as
-   `out_witness`), so two rows' outputs are
+   canonical role.** Every chunk is executed at one shared set of witness
+   states, its p-th input in canonical role order (`datagen/roles.py`: inputs
+   ordered by what the function does with them) taking the state's position
+   p+1 and every other register 0, its outputs listed in canonical order
+   (`precompute_chunk`, shipped as `out_witness`), so two rows' outputs are
    compared at equal values on corresponding inputs. Comparing each row at its
-   own anchor draw, or placing values by register number, gives a target that
-   is nonzero for a register rename and meaningless across rows — no error,
-   only a collapse objective pulling the wrong pairs. `max_dist` comes from
+   own anchor draw, placing values by register number, or placing them by the
+   dataflow graph's colour order, gives a target that is nonzero for a
+   register rename or for a commutative swap — no error, only a collapse
+   objective pulling the wrong pairs. `max_dist` comes from
    the shipped known bits (`out_known_zero` / `out_known_one`, from
    `datagen/knownbits.py`), never from observed values.
    (`datagen/tests/test_compare.py::test_witness_outputs_match_the_cpu_emulator`,
+   `datagen/tests/test_roles.py`,
    `compressor/tests/test_train.py::test_pair_distance_targets_match_the_reference_distance`.)
 
 ## Anchored memory
@@ -229,7 +232,7 @@ connection is what makes the lesson land:
   restructuring
 - `feedback_experiment_over_assume.md` — push back as a colleague,
   don't echo
-- `feedback_commit_at_boundaries.md` — wait for natural commit points
+- `feedback_commit_at_boundaries.md` — committing is never a goal
 - `feedback_no_storytime_comments.md` — docs are expository for a
   brand-new reader; audit against the four named categories, don't
   just intend to "write status". Comments: WHY, in 1-2 lines.

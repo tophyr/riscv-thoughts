@@ -568,11 +568,22 @@ essences, 0–2) matched by MSE to twice their **behavioral distance**
 (`distance_loss`, `compressor/train.py`).
 
 The behavioral distance compares the two rows' outputs at the same inputs. Both
-are executed at a fixed set of 64 structured witness states, each row's i-th
-input in colour order taking the state's position i+1, so inputs correspond by
-structural role, and a register rename, which keeps the colour order, presents
-both rows the same values (executed in `datagen` by `precompute_chunk` and
-shipped in the batch). At each state the two outputs'
+are executed at a fixed set of 64 structured witness states, each row's p-th
+input in **canonical role order** taking the state's position p+1, so inputs
+correspond by what the function does with them (executed in `datagen` by
+`precompute_chunk` and shipped in the batch). The order comes from the
+function, never the dataflow graph (`datagen/roles.py`): an input's
+fingerprint is the chunk's outputs over a fixed family of states in which it
+holds one value and every other input a second, so it depends only on the
+input's role; inputs are ordered by Weisfeiler–Lehman refinement over these
+and over the same fingerprints taken pairwise, and a class left with several
+inputs has one member singled out and the refinement repeated. Inputs the
+function ignores are dropped first. A chunk's outputs are then ordered by
+their values at the witness states. Two equivalent chunks therefore present
+corresponding inputs the same values whatever their spelling or graph shape.
+The graph's colour order does not: a commutative swap whose operand another
+instruction also reads changes it (EXPERIMENT_LOG, "The register frame",
+finding 43). At each state the two outputs'
 wrap-around difference d (the shorter way round mod 2³², exact in integers)
 becomes log1p(log1p(d)) / log1p(log1p(max_dist)), and the distance is the mean
 over the states (`pair_distance_targets`; `datagen/knownbits.py`,

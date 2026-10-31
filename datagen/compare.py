@@ -27,6 +27,7 @@ from emulator import (
     Instruction, R_TYPE, I_TYPE, B_TYPE, LOAD_TYPE, STORE_TYPE,
 )
 from .signature import output_inputs
+from .roles import canonical_inputs
 
 
 # ---------------------------------------------------------------------------
@@ -665,10 +666,13 @@ class Precomputed:
     # registers that output depends on, in the structural-colour order the
     # evaluator gathers their values in (datagen.signature.output_inputs).
     out_inputs: np.ndarray       # (MAX_OUTPUT_SLOTS, MAX_INPUT_SLOTS) int8
-    # Per output slot, its value at each witness state with the output's i-th
-    # input (out_inputs order) holding the state's position i+1 and every
-    # other register 0: the behavioral distance compares rows here.
+    # The chunk's outputs at each witness state, with its p-th input in
+    # canonical role order (`datagen.roles`) holding the state's position p+1
+    # and every other register 0, listed in canonical output order (sorted by
+    # these values); witness_slots[p] is position p's output slot, -1 past the
+    # last. The behavioral distance compares rows here.
     witness: np.ndarray          # (MAX_OUTPUT_SLOTS, N_WITNESS) int32
+    witness_slots: np.ndarray    # (MAX_OUTPUT_SLOTS,) int8
     # Per output slot, at each anchor: its value after the chunk, and the
     # values of its inputs in out_inputs order (0 past the last) — all value
     # prediction reads of the register files above. A chunk of K instructions
@@ -747,15 +751,25 @@ def precompute_chunk(chunk, anchor_states):
     n_states, K = state.shape[0], len(chunk)
     out_values = np.zeros((n_states, K), dtype=np.int32)
     out_input_values = np.zeros((n_states, K, K + 1), dtype=np.int32)
-    for i, r in enumerate(write_ordered[:MAX_OUTPUT_SLOTS]):
+    outs = write_ordered[:MAX_OUTPUT_SLOTS]
+    for i, r in enumerate(outs):
         out_slot_regs[i] = r
         out_values[:, i] = out_regs[:, r]
-        placed = np.zeros_like(w)
         for j, src in enumerate(deps[r][:MAX_INPUT_SLOTS]):
             out_inputs[i, j] = src
             out_input_values[:, i, j] = state[:, src]
-            placed[:, src] = w[:, j + 1]
-        witness[i] = _eval_ssa_numpy(ssa, len(chunk), placed, live)[0][:, r]
+    run = lambda regs: (_eval_ssa_numpy(ssa, len(chunk), regs, live)[0][:, outs]
+                        .astype(np.int64) & 0xFFFFFFFF)
+    roles = canonical_inputs(sorted({x for r in outs for x in deps[r]}), run)
+    placed = np.zeros_like(w)
+    for p, r in enumerate(roles):
+        placed[:, r] = w[:, p + 1]
+    at_witness = run(placed).astype(np.uint32).view(np.int32)      # (N_WITNESS, outs)
+    order = sorted(range(len(outs)), key=lambda k: at_witness[:, k].tobytes())
+    witness_slots = np.full(MAX_OUTPUT_SLOTS, -1, dtype=np.int8)
+    for p, k in enumerate(order):
+        witness[p] = at_witness[:, k]
+        witness_slots[p] = k
 
     return Precomputed(
         inputs=inputs,
@@ -765,6 +779,7 @@ def precompute_chunk(chunk, anchor_states):
         out_regs=out_regs,
         out_inputs=out_inputs,
         witness=witness,
+        witness_slots=witness_slots,
         out_values=out_values,
         out_input_values=out_input_values,
         pc_explicit=pc_explicit,

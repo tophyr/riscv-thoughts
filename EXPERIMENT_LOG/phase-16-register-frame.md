@@ -425,6 +425,63 @@ with the GPU at 98–99%; finding 41's arms ran the same targets eagerly at
 10–12 ms and 71–76%, and replaying them as one CUDA graph gives bit-identical
 targets (`GraphedDistanceTargets`, `compressor/train.py`).
 
+**43. Placing the witness states by the dataflow graph's colour order gives
+equivalent chunks different distance targets whenever a commutative swap
+changes the graph; placing them by canonical role, an order computed from
+the function, gives every equivalent pair tried identical targets.** The behavioral distance compares two
+rows at the witness states, each row's inputs placed in some order. The
+colour order is computed from the wiring with every operand role ordered, so
+swapping the operands of an `ADD` whose operand another instruction also
+reads changes it. Canonical roles (`datagen/roles.py`; RISCV_DESIGN,
+"Collapse"): each input is fingerprinted by the chunk's outputs on 64 fixed
+states where it holds one value and every other input a second, each ordered
+pair likewise with a third value; inputs are ordered by Weisfeiler–Lehman
+refinement over these fingerprints, singling out one member of any class
+left with several and refining again; inputs the function ignores are
+dropped first; outputs are ordered by their values at the witness states.
+
+Oracle only, no model. Pairs equivalent on the emulator, 300 per class: the
+fraction whose outputs at the witness states agree exactly.
+
+| class | colour order | canonical roles |
+|---|---|---|
+| commutative swap of every `ADD`/`AND`/`OR`/`XOR` in a natural chunk, len 2 / 4 / 8 | 88.3 / 62.3 / 36.3% | 100 / 100 / 100% |
+| associativity of `ADD`, `XOR`, `AND`, `OR`; `(a−b)−c` vs `a−(b+c)`; `(a−b)+c` vs `(c−b)+a`; `ADDI` folds; `+k;−k` vs `+0`; two parallel copies of one operation; renames at len 4 and 8 | 100% | 100% |
+| a chunk reading an input its function ignores against one that does not read it (four forms, 200 each) | — | 100% |
+
+The colour order's 100% rows are functions symmetric in the inputs that
+move, which any placement satisfies.
+
+Natural chunks of the writers corpus at chain rates 0.10 and 1.00, 400 per
+cell at len 2, 4 and 8: 20–54% of chunks leave a class with several inputs
+that has to be singled out, and in none of the 2,400 did the choice of
+member change the outputs at the witness states (checked at the first
+choice in each chunk). Fingerprinting on 16 states instead of 64 leaves more
+inputs tied before the singling out; 256 changes nothing. Changing one
+I-type immediate by one reorders the canonical inputs in 1.0, 1.8 and 5.8%
+of pairs with two or more inputs at len 2, 4 and 8.
+
+At len=1, canonical roles place the two operands of `SUB`, `SLT` and `SLTU`
+differently from the colour order (203 of 282 such rows over five batches of
+the T1 corpus), so the T1 distance targets move: mean change 0.0115, 2.8% of
+pairs by more than 0.1, correlation 0.953 with the targets the frozen T1
+trained on. A T1 retrained on them (`runs/t1_distance_noimm_aim050_roles_500k`, finding 42's
+configuration otherwise, 500k steps, generation on odin, 7 ms/step at 98–99%
+GPU) follows them: on the 16,819 pairs of ten writers-corpus batches whose
+target moved by more than 0.2 — almost all `SUB`, `SLT` or `SLTU` against
+another operation — its essence distance sits 0.140 from the new target and
+0.459 from the old, while finding 42's two T1s sit 0.530 and 0.529 from the
+new and 0.093 and 0.094 from the old. Everything else holds: vp exact on all
+2,457,600 held-out triples, partner groups equivalent at 0.0009–0.105
+against contrasts of 0.29–1.47, aliasing control 1.152, unrelated
+instructions 1.360, `ADDI` k vs k+1 at 0.333 (target 0.338).
+
+Computing the roles for every generated row makes one generator core take
+66, 102, 193 and 401 ms per 384-row batch at len 1, 2, 4 and 8, against 49,
+70, 125 and 239 without them, with every fingerprint of a chunk executed in
+one stacked call; odin's 96 workers deliver at least 450 and 290 batches/s
+at len 1 and 2.
+
 ## Decisions taken
 
 - **The essence is graded in the register frame** — colour-identified leaves,
@@ -465,9 +522,11 @@ targets (`GraphedDistanceTargets`, `compressor/train.py`).
 - **Training anchors are aimed at each row's boundaries, at every scale**
   (finding 42), so value prediction sees the inputs where functions the
   distance term places close together differ.
-- **The frozen T1 is `runs/t1_distance_noimm_aim050_500k`** (finding 42): the
-  distance term, no immediate head, aimed anchors. No T2 has been trained
-  over it.
+- **Distance targets place inputs by canonical role** (finding 43), never by
+  the graph's colour order.
+- **The frozen T1 is `runs/t1_distance_noimm_aim050_roles_500k`** (findings 42 and 43): the distance term
+  on canonical-role targets, no immediate head, aimed anchors. No T2 has been
+  trained over it.
 
 ## Dead ends (do not re-run)
 

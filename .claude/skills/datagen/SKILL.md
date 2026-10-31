@@ -82,7 +82,7 @@ reads the essence").
 python -m datagen --rule "cap=$LEN" --batch-size 384 --n-states 8 \
     --config configs/instr_alu_writers_chain010.json --gen-count 26 \
     --count "$STEPS" \
-  | python scripts/train_t2_encoder.py --t1-model runs/t1_distance_noimm_aim050_500k/encoder.pt \
+  | python scripts/train_t2_encoder.py --t1-model runs/t1_distance_noimm_aim050_roles_500k/encoder.pt \
     --d-out 512 --d-event 16 --op-cell-depth 4 --vp-head-depth 12 \
     --n-pool-heads 16 --route binding \
     --n-steps "$STEPS" --out-dir "$OUT"
@@ -142,8 +142,8 @@ command below differs from the T2 cell only in its ingestion front-end, its
 hparams and the behavioral distance term, which only one-instruction rows
 take. Its corpus is the writers corpus with partner pairs and half of every
 row's anchor states aimed where its output changes (EXPERIMENT_LOG, "The
-register frame", findings 41 and 42). The frozen T1 is
-`runs/t1_distance_noimm_aim050_500k`. Its vp head has three hidden layers (the
+register frame", findings 41–43). The frozen T1 is
+`runs/t1_distance_noimm_aim050_roles_500k`. Its vp head has three hidden layers (the
 trainer's default) of the residual-with-LayerNorm form every vp head takes, the
 smallest depth with which T1 reaches exact vp at held-out anchors, and that
 takes the 500k-step schedule (EXPERIMENT_LOG, "T2 faithfulness", finding 33).
@@ -281,8 +281,9 @@ cmdline).
   inputs one output of such a chunk can read). The trainer feeds those to the
   vp head (INVARIANT 1); the 32-register files a row executes from never leave
   the generator. `out_witness` (`B, max_n_instrs, 64`) is each output at the
-  shared witness states, and `out_known_zero` / `out_known_one`
-  (`B, max_n_instrs`) its known bits, the bits forced to 0 or 1 whatever the
+  shared witness states, inputs placed by canonical role and outputs in
+  canonical order — not aligned with `out_slot_regs` — and `out_known_zero` /
+  `out_known_one` (`B, max_n_instrs`) its known bits, in the same order, the bits forced to 0 or 1 whatever the
   inputs (`datagen/knownbits.py`); the behavioral distance is built from both
   (INVARIANT 7). Body field list + dtypes are the `BodyField(...)` block at
   `datagen/batch.py:306-330`; the per-field header sanity bounds are the
@@ -417,10 +418,13 @@ Two different scripts — do not confuse them:
 
   **A batch is 66 KB lz4-compressed at len=1 (T1's aimed corpus) and 154 KB
   at len=2 (T2's corpus)**, 384 rows at 8 anchor states. Odin's default 96
-  workers deliver at least 530 batches/s at len=1 and 420 at len=2 through
+  workers deliver at least 450 batches/s at len=1 and 290 at len=2 through
   `multinode_gen.sh` (wall time of 30,000 and 20,000 batches, startup
-  included), about 35 and 65 MB/s on the link — several times what T1 (8
-  ms/step) and T2 (~14 ms/step) consume. Local generation also keeps up at
+  included), about 30 and 45 MB/s on the link — several times what T1 (8
+  ms/step) and T2 (~14 ms/step) consume. One core generates a 384-row batch
+  in about 66 ms at len=1, 100 at len=2, 190 at len=4 and 400 at len=8; the
+  canonical roles of the witness placement (`datagen/roles.py`) are a
+  third to two fifths of that. Local generation also keeps up at
   len=2: `python -m datagen … --gen-count 26` piped straight to the trainer is
   what `scripts/run_t2.sh` does. Check GPU utilisation either way.
 

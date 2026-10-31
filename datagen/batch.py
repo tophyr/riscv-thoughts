@@ -287,16 +287,16 @@ class Batch:
     out_values:       np.ndarray   # (OB, n_anchors, max_n_instrs) int32
     out_input_values: np.ndarray   # (OB, n_anchors, max_n_instrs, max_out_inputs) int32
     out_regs_valid:   np.ndarray   # (OB,) bool
-    # Per output slot (aligned with out_slot_regs), the bits of the output
-    # forced to 0 / to 1 whatever the chunk's inputs hold
-    # (`datagen.knownbits.output_known_bits`), as 32-bit masks; both 0 for a
-    # slot that is unused or out of the analysis' scope. A chunk writes at
-    # most one register per instruction, hence max_n_instrs slots.
+    # The behavioral distance's fields, per output in CANONICAL output order
+    # (not aligned with out_slot_regs): each output's value at every shared
+    # witness state (`datagen.compare.witness_states`), the chunk's inputs
+    # placed by canonical role (`datagen.roles`), and the bits of the output
+    # forced to 0 / to 1 whatever the inputs hold
+    # (`datagen.knownbits.output_known_bits`), as 32-bit masks. All 0 past the
+    # last output or out of the analysis' scope. A chunk writes at most one
+    # register per instruction, hence max_n_instrs positions.
     out_known_zero: np.ndarray   # (B, max_n_instrs) int64
     out_known_one:  np.ndarray   # (B, max_n_instrs) int64
-    # Per output slot, its value at each shared witness state
-    # (`datagen.compare.witness_states`), inputs placed in out_inputs order;
-    # 0 for an unused slot. The behavioral distance is built from these.
     out_witness:    np.ndarray   # (B, max_n_instrs, N_WITNESS) int32
 
 
@@ -357,6 +357,7 @@ class AuxPayload:
     out_slot_regs: np.ndarray   # (actual_B, MAX_OUTPUT_SLOTS) int8
     out_inputs: np.ndarray      # (actual_B, MAX_OUTPUT_SLOTS, MAX_INPUT_SLOTS) int8
     out_witness: np.ndarray     # (actual_B, MAX_OUTPUT_SLOTS, N_WITNESS) int32
+    witness_slots: np.ndarray   # (actual_B, MAX_OUTPUT_SLOTS) int8
 
 
 def _empty_aux(n):
@@ -374,6 +375,7 @@ def _empty_aux(n):
         out_inputs=np.full((n, MAX_OUTPUT_SLOTS, MAX_INPUT_SLOTS),
                            AUX_CE_IGNORE, dtype=np.int8),
         out_witness=np.zeros((n, MAX_OUTPUT_SLOTS, N_WITNESS), dtype=np.int32),
+        witness_slots=np.full((n, MAX_OUTPUT_SLOTS), -1, dtype=np.int8),
     )
 
 
@@ -392,6 +394,7 @@ def _aux_from_precomputeds(precomputeds):
         aux.out_slot_regs[i] = pre.out_slot_regs
         aux.out_inputs[i] = pre.out_inputs
         aux.out_witness[i] = pre.witness
+        aux.witness_slots[i] = pre.witness_slots
     return aux
 
 
@@ -536,10 +539,11 @@ def pack_batch(chunks, *,
             kb = output_known_bits(c.instructions)
         except NotImplementedError:
             continue
-        for k in range(max_n_instrs):
-            r = int(out_slot_arr[i, k])
+        for p in range(max_n_instrs):
+            k = int(aux.witness_slots[i, p])
+            r = int(out_slot_arr[i, k]) if k >= 0 else AUX_CE_IGNORE
             if r != AUX_CE_IGNORE and r in kb:
-                known_zero[i, k], known_one[i, k] = kb[r].zero, kb[r].one
+                known_zero[i, p], known_one[i, p] = kb[r].zero, kb[r].one
 
     return Batch(tokens=tokens, token_lens=token_lens, valid=valid,
                  instr_lens=instr_lens,
