@@ -171,11 +171,11 @@ essences are held as far apart as their outputs differ at shared inputs, so
 equivalent spellings meet and near-misses stay near. At one instruction it
 collapses every spelling group tried — copies, zero, doubling, the sign test,
 constants — to within 0.11 of a point while unrelated instructions keep their
-spread, at a cost of 108 wrong values of 2.46 million, on comparisons whose
-two immediates differ by one. At two instructions it is not built yet: the T2
-models measured describe their chunks as written, two chunks that fold two
-immediates into the same total landing further apart than two that compute
-different totals.
+spread, and with its training input states aimed where each instruction's
+output changes, it still evaluates every held-out value exactly. At two
+instructions it is not built yet: the T2 models measured describe their
+chunks as written, two chunks that fold two immediates into the same total
+landing further apart than two that compute different totals.
 
 Beyond both lies T3, the first tier that must *compose* bindings rather than
 merely emit them.

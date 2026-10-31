@@ -154,7 +154,8 @@ _CATEGORY_OPS = {
 }
 
 _CONFIG_EXTRA_KEYS = {'equivalences', 'invalidity', 'exclude_x0_dest', 'chain',
-                      'partners'}
+                      'partners', 'aim'}
+_AIM_KEYS = {'fraction'}
 _PARTNERS_KEYS = {'rate'}
 _EQUIVALENCES_KEYS = {'rate', 'max_per_class', 'min_per_class', 'boost'}
 _CHAIN_KEYS = {'rate'}
@@ -170,6 +171,8 @@ def validate_distribution(dist):
               for invalid-window injection.
     Optional: 'partners' sub-dict {'rate': float}: the fraction of each
               batch made of equivalent one-instruction pairs.
+    Optional: 'aim' sub-dict {'fraction': float}: the fraction of each
+              row's anchor states aimed at its boundaries (`datagen.aim`).
     """
     keys = set(dist.keys())
     unknown = keys - set(_CATEGORY_OPS.keys()) - _CONFIG_EXTRA_KEYS
@@ -215,6 +218,16 @@ def validate_distribution(dist):
         if 'rate' in pa and not (0 <= pa['rate'] <= 1):
             raise ValueError(
                 f"partners.rate must be in [0,1], got {pa['rate']}")
+    if 'aim' in dist:
+        am = dist['aim']
+        if not isinstance(am, dict):
+            raise ValueError("'aim' must be a dict")
+        am_unknown = set(am.keys()) - _AIM_KEYS
+        if am_unknown:
+            raise ValueError(f'Unknown aim keys: {am_unknown}')
+        if 'fraction' in am and not (0 <= am['fraction'] <= 1):
+            raise ValueError(
+                f"aim.fraction must be in [0,1], got {am['fraction']}")
     if 'invalidity' in dist:
         inv = dist['invalidity']
         if not isinstance(inv, dict):

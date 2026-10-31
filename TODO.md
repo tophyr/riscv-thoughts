@@ -65,8 +65,9 @@ better; under ~10x is noise):
 
 The guard on all of this is the opposite row: pairs a transformation did NOT
 leave equivalent must stay far apart — the aliasing control (`x+x` against
-`x+y`) reads 0.5051 against 0.6901 for unrelated chunks at T2 and 0.7363
-against 1.3658 at T1 (EXPERIMENT_LOG, "The register frame", finding 40). A collapse objective that pulls those together is a
+`x+y`) reads 0.5051 against 0.6901 for unrelated chunks at T2 and 1.155
+against 1.360 at T1 (EXPERIMENT_LOG, "The register frame", findings 39 and
+42). A collapse objective that pulls those together is a
 worse failure than loose collapse (METRICS.md).
 
 **Nothing trains the op-cell rows** — that is their common cause. vp cannot
@@ -83,9 +84,9 @@ literal.
    holds exactly: value prediction read from its essence is 100.0000% exact on
    2,457,600 held-out triples with a three-layer residual vp head, its emitted
    wiring exact on every instruction (`probes/frame_scorecard.py`; frozen as
-   `runs/t1_essence_500k`, finding 40). A T2 over the T1 of finding 39 —
-   identical but for the register-dependent input order that finding 40
-   removed — is at **99.8276%**, 8,333 failing triples of 4,834,176, after 1M
+   `runs/t1_distance_noimm_aim050_500k`, finding 42). A T2 over the T1 of
+   finding 39 — trained without the distance term, and with an evaluator input
+   order that finding 40 removed — is at **99.8276%**, 8,333 failing triples of 4,834,176, after 1M
    steps, one seed, binding exact on every chunk, with outputs that depend on
    three inputs (a composed slot over disjoint inputs) at 90.5% and everything
    else above 99.86% (EXPERIMENT_LOG, "The register frame", finding 39). The
@@ -226,14 +227,15 @@ register frame", finding 41).
 
 **The order of work.**
 
-1. **T1 holds** (finding 41): with the immediate head removed, the distance
-   term collapses every partner group (copy 0.0019, sign 0.0004, double
-   0.0008, zero 0.11, constant 0.08 against contrasts of 0.3–1.5), keeps
-   unrelated instructions at their spread (1.36) and grades near-misses
-   (`ADDI` k vs k+1 at 0.34, its target). It costs 108 failing vp triples of
-   2.46M, on comparisons whose target is wrongly 0 (Open ideas, "Draw anchor
-   values aimed at the instruction"), and 10–12 ms/step against 4 ms, because
-   the targets are computed before each compiled step.
+1. **T1 holds** (findings 41 and 42): with the immediate head removed and half
+   of every row's anchor states aimed at its own boundaries, the distance term
+   collapses every partner group (copy 0.002, sign 0.0004–0.0009, double
+   0.0008, zero 0.11, constant 0.08–0.09 against contrasts of 0.3–1.5), keeps
+   unrelated instructions at their spread (1.36), grades near-misses (`ADDI`
+   k vs k+1 at 0.34–0.36, target 0.34), and value prediction is exact on all
+   2,457,600 held-out triples on two corpus seeds
+   (`runs/t1_distance_noimm_aim050_500k` and `_s7`). It runs at 8 ms/step
+   against 4 ms without the term.
 2. **The distance term for chunks.** Three pieces: executing each chunk at the
    witness states instruction by instruction on the GPU emulator; the known
    bits of each output, which `datagen/knownbits.py` already propagates
@@ -254,11 +256,12 @@ Decisions that remain:
   (Open ideas), since both concern chunks with more than one output.
 - **The partner fraction.** How much of a batch is partner pairs against
   naturally drawn chunks; start fixed and treat it as a tuning knob.
-- **The baseline to beat** is finding 39's 1M cell for T2 and
-  `runs/t1_essence_500k` for T1: the essence spans the first-read frame's
-  range (unrelated chunks 0.6901 at T2, 1.3658 at T1). The aliasing control
-  (0.5051 at T2, 0.7363 at T1) and the fusion `different` rows (0.3221
-  additive, 0.1927 `XORI`) are the guard — they must not fall with the rest.
+- **The baseline to beat** is finding 39's 1M cell for T2: the essence spans
+  the first-read frame's range (unrelated chunks 0.6901). The aliasing control
+  (0.5051) and the fusion `different` rows (0.3221 additive, 0.1927 `XORI`)
+  are the guard — they must not fall with the rest. At T1 the frozen
+  `runs/t1_distance_noimm_aim050_500k` holds unrelated instructions at 1.360
+  and the aliasing control at 1.155 (finding 42 and its scorecard).
 - **The binding on the wire.** Per output register, its external input
   registers in the colour order the evaluator gathers them in (`out_inputs`
   already ships it); the ordered input and output lists (`in_slot`/`out_slot`
@@ -409,47 +412,27 @@ What would have to be settled:
 The comparison it has to win is against the best fixed (rate, steps) pair, scored
 on the naturally drawn corpus.
 
-### Draw anchor values aimed at the instruction
+### Aimed anchors for chunks
 
-Anchors are drawn per chunk, so a draw could look at the chunk it is for.
-The residual of a T1 trained at fresh structured anchors is two input patterns
-the generic draw reaches only by chance: a value carrying through a long run of
-zero bits (six ADDI failures, all on one held-out input, 0x723005C9 with a
-negative immediate), and a comparison within a few units of the immediate
-(`SLTIU x30,x10,1492` at 1497) — 7 failing triples of 819,200 (EXPERIMENT_LOG,
-"T2 faithfulness", finding 33). At two instructions, a twelve-layer residual
-readout handed a perfect chunk description fails on the same kind of value: 130
-of its 777 misses on a composed-only corpus are one held-out state where a
-difference of 0xEFFFFEFF plus an immediate carries from bit 9 to bit 28
-(finding 34). Two classes would aim at them: a source value
-set to `imm + δ` for small δ, and a uniform value with a random span of bits
-forced to all-0 or all-1. The cost is a draw specialised to the opcode set, and
-a held-out set that would need the same classes to test them on purpose rather
-than by chance. The len=2 model's own 36 misses are not of this kind — three
-composed `SUB` chunks each a bit off at six anchors, three composed `ADD`
-chunks and 15 single-instruction slots each wrong at one anchor, nine of those
-one `SUB` operand pair at one anchor state (finding 35) — so this draw is not
-aimed at them.
+Training anchors are aimed at each row's own boundaries (`datagen/aim.py`;
+RISCV_DESIGN.md, "Training"), which makes the distance-term T1 exact
+(EXPERIMENT_LOG, "The register frame", finding 42). The generator walks a
+boundary back through chunks too, and on the chain-0.10 writers corpus at
+half the states aimed it straddles a comparison's exact threshold on nearly
+every row up to len=4 at 8 states and up to len=8 at 16; an add's carry on
+75% of rows at len=2 and 20–23% at len=8 with 8 states, 52–60% with 16.
+What it does not reach:
 
-**A behavioral distance term makes the comparison case decisive.** That term
-(`distance_loss`, `compressor/train.py`) matches every two T1 rows' essence
-distance to their behavioral distance: the mean, over 64 shared witness
-states, of how far apart their outputs are. `SLTI x,k` and `SLTI x,k+1` differ
-only at x = k, which no witness state holds, so their target is 0 for every k
-and the term pulls two different functions onto one point. A T1 trained with
-the term and without an immediate head (`runs/t1_distance_noimm_500k`: the
-writers corpus with a quarter of each batch partner pairs, 500k steps) holds
-them 0.0012 apart and fails 108 of 2,457,600 held-out triples, every one on
-`SLTI`, `SLTIU` or `ADDI`. The geometry is not the error: the two functions
-disagree on one input in 2³², and a smooth space should hold them close. The
-error is that vp, the only pressure keeping them distinguishable, rarely sees
-an input that tells them apart, since the generic draw lands on k only by
-chance. Aiming each row's anchors at its comparison boundary — k−1, k and k+1
-on the compared input — gives vp that gradient at a cost proportional to the
-rows, not to the pairs. At T2 the boundary moves through the chain (`ADDI
-t,x,5; SLTI r,t,600` changes at x = 595), found by walking back through the
-chunk's own dataflow while it is generated; the walk only has to propose
-likely boundaries to train on, not prove where two chunks differ.
+- **Comparisons of a value computed through an operation it cannot solve**
+  for one operand — `AND`/`OR`/`ANDI`/`ORI`, shifts, another comparison — are
+  straddled on about 20% of rows. Such an operation has no single input that
+  puts its result at the threshold; aiming them means choosing the nearest
+  values the operation can reach on either side.
+- **The anchor budget at length.** Each boundary takes two states, so longer
+  chunks need more states per row, and the T2 evaluator runs once per state.
+  The count for T2 is open.
+- **The held-out set is never aimed**, so the score reaches a boundary only by
+  chance; a scoring corpus aimed on purpose would test them deliberately.
 
 ### A smaller vp head at T2
 

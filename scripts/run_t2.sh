@@ -22,7 +22,7 @@ source .venv/bin/activate
 D=/home/tophy/Projects/riscv-thoughts/logs
 # The frozen lower tier. A T2 checkpoint is only interchangeable with others
 # trained on the SAME T1, so a cell that changes this must be named for it.
-T1=${T1:-runs/t1_essence_500k/encoder.pt}
+T1=${T1:-runs/t1_distance_noimm_aim050_500k/encoder.pt}
 # VP = vp-head hidden layers (residual blocks with LayerNorm). The head must
 # EVALUATE the chunk's function at the anchor points, so its capacity is a
 # confound in every vp number (METRICS.md). STEPS=1000000 is the cell a

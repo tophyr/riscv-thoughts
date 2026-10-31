@@ -82,7 +82,7 @@ reads the essence").
 python -m datagen --rule "cap=$LEN" --batch-size 384 --n-states 8 \
     --config configs/instr_alu_writers_chain010.json --gen-count 26 \
     --count "$STEPS" \
-  | python scripts/train_t2_encoder.py --t1-model runs/t1_essence_500k/encoder.pt \
+  | python scripts/train_t2_encoder.py --t1-model runs/t1_distance_noimm_aim050_500k/encoder.pt \
     --d-out 512 --d-event 16 --op-cell-depth 4 --vp-head-depth 12 \
     --n-pool-heads 16 --route binding \
     --n-steps "$STEPS" --out-dir "$OUT"
@@ -137,28 +137,20 @@ so it is kept off the 100-step log cadence). Wait on the trainer process
 exiting, or on `run_t2.sh` logging `final:`; scoring the file as soon as it
 exists reads a partial model.
 
-**T1 config** (the writers-only corpus T2 is trained against). T1 and T2 run
-the same core at the same settings, so the command below differs from the T2
-cell only in its ingestion front-end and its hparams. The frozen T1 is
-`runs/t1_essence_500k`. Its vp head has three hidden layers (the
+**T1 config.** T1 and T2 run the same core at the same settings, so the
+command below differs from the T2 cell only in its ingestion front-end, its
+hparams and the behavioral distance term, which only one-instruction rows
+take. Its corpus is the writers corpus with partner pairs and half of every
+row's anchor states aimed where its output changes (EXPERIMENT_LOG, "The
+register frame", findings 41 and 42). The frozen T1 is
+`runs/t1_distance_noimm_aim050_500k`. Its vp head has three hidden layers (the
 trainer's default) of the residual-with-LayerNorm form every vp head takes, the
 smallest depth with which T1 reaches exact vp at held-out anchors, and that
 takes the 500k-step schedule (EXPERIMENT_LOG, "T2 faithfulness", finding 33).
 
 ```bash
 python -m datagen --rule single --batch-size 384 --n-states 8 \
-    --config configs/instr_alu_writers.json --count 500000 \
-  | python scripts/train_encoder.py --d-model 128 --n-heads 4 --n-layers 2 \
-    --d-out 64 --max-window 32 --vp-head-depth 3 \
-    --n-steps 500000 --out-dir "$OUT"
-```
-
-**T1 with the collapse term** (EXPERIMENT_LOG, "The register frame", finding
-41) adds the behavioral distance term and a corpus with partner pairs:
-
-```bash
-python -m datagen --rule single --batch-size 384 --n-states 8 \
-    --config configs/instr_alu_writers_partners025.json --count 500000 \
+    --config configs/instr_alu_writers_partners025_aim050.json --count 500000 \
   | python scripts/train_encoder.py --d-model 128 --n-heads 4 --n-layers 2 \
     --d-out 64 --max-window 32 --vp-head-depth 3 --distance-weight 1.0 \
     --n-steps 500000 --out-dir "$OUT"
@@ -185,8 +177,8 @@ instead of the op-cell's hidden layer (with a separate `read_role`) fails at
 stack, since `VPHead` (the residual form) is the only head the code builds.
 A checkpoint without the pointer (`pool_ptr`, `P_content`, `u_order`) or
 whose vp head reads a slot's description instead of the essence predates the
-essence-addressed evaluator and does not load. `runs/t1_essence_500k` is the
-frozen T1.
+essence-addressed evaluator and does not load. A T1 checkpoint with an
+immediate head loads without its tensors and reproduces its outputs.
 (A checkpoint trained when all pool heads shared one value projection is still
 remapped on load — `_tile_shared_pool_v` repeats those weights once per head,
 reproducing the old computation exactly.)
@@ -200,8 +192,8 @@ do not restate them here.
 
 ## datagen reference
 
-`--rule` grammar (`datagen/__main__.py:89` `_parse_rule`, rule constructors at
-`datagen/generate.py:704-729`). Default `--rule` is `branch+cap=8`:
+`--rule` grammar (`datagen/__main__.py:90` `_parse_rule`, rule constructors at
+`datagen/generate.py:814-836`). Default `--rule` is `branch+cap=8`:
 - `single` — one instruction per chunk (T1). `max_len=1`. Ships canonical
   out_regs like every other rule (the T1/T2 unification).
 - `cap=N` — fixed length N.
@@ -304,15 +296,16 @@ cmdline).
 
 **A config file IS a corpus definition, and nothing outside it can change
 one.** It carries the opcode-category mix (weights must sum to 1.0) plus the
-optional `equivalences`, `invalidity`, `chain` and `exclude_x0_dest` keys, and
+optional `equivalences`, `invalidity`, `chain`, `partners`, `aim` and
+`exclude_x0_dest` keys, and
 no CLI flag or env var overrides any of them. So a sweep over corpus
 composition is a file per arm — each arm reviewable in a diff, and each run
 able to record what it was trained on (see "What a run records about its
-corpus"). Validation: `datagen/generate.py:160`
+corpus"). Validation: `datagen/generate.py:165`
 `validate_distribution`; the accepted non-opcode keys are `_CONFIG_EXTRA_KEYS`
-(`datagen/generate.py:155`) and an unknown key is a hard error.
+(`datagen/generate.py:156`) and an unknown key is a hard error.
 
-Four configs exist. Add one when a run needs a corpus none of them describes,
+Five configs exist. Add one when a run needs a corpus none of them describes,
 and delete it once nothing runs it — an unused config is a corpus nobody can
 attribute a result to.
 
@@ -334,13 +327,19 @@ attribute a result to.
 draw one extra random number per chunk, so the stream differs byte-wise from
 `instr_alu_writers.json` while keeping the same distribution. The rate is in the
   filename because another rate is another file.
-- `instr_alu_writers_partners025.json` — **T1's corpus for the collapse
-  term.** The writers corpus plus `partners: {rate: 0.25}`: a quarter of each
-  batch is pairs of one-instruction rows, two different spellings of one
-  function on the same registers (`datagen.generate.PARTNER_GROUPS`), the
-  equivalent pairs the behavioral distance term needs and a naturally drawn
-  batch almost never holds. Valid for `--rule single` only; a longer rule is
-  rejected.
+- `instr_alu_writers_partners025.json` — the writers corpus plus `partners:
+  {rate: 0.25}`: a quarter of each batch is pairs of one-instruction rows, two
+  different spellings of one function on the same registers
+  (`datagen.generate.PARTNER_GROUPS`), the equivalent pairs the behavioral
+  distance term needs and a naturally drawn batch almost never holds. Valid
+  for `--rule single` only; a longer rule is rejected. It is the unaimed arm
+  of finding 42.
+- `instr_alu_writers_partners025_aim050.json` — **T1's corpus for the
+  collapse term.** The partners corpus plus `aim: {fraction: 0.5}`: half of
+  every row's anchor states are rewritten in pairs to straddle the inputs
+  where the row's output changes (`datagen/aim.py`).
+  Without it the distance term's T1 fails comparisons near their immediate
+  (finding 42). A scoring corpus (`--heldout-anchors`) is never aimed.
 - `instr_alu_writers_chain100.json` — **a scoring corpus for composed slots,
   never trained on.** The same at `chain.rate` 1.0, so every two-instruction
   chunk's second instruction reads the first's result. A natural held-out corpus

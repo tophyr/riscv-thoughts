@@ -575,7 +575,7 @@ def _make_invalid_chunk(tokens):
     return Chunk(tokens=list(tokens), valid=False, instructions=None)
 
 
-def build_targets(chunks, draw_anchors):
+def build_targets(chunks, draw_anchors, aim=None):
     """Execute each valid row at its own anchor draw and build its targets.
 
     Memory-op chunks get no targets (their Precomputed is unavailable in V1
@@ -583,7 +583,9 @@ def build_targets(chunks, draw_anchors):
 
     draw_anchors(k) supplies the structured draws of k valid chunks as one
     (k, n_anchors, 32) array, which `precompute_chunk` places on each row's
-    own input registers.
+    own input registers. aim(instructions, states), when given, rewrites a
+    row's draw to straddle that chunk's boundaries (`datagen.aim`) before it
+    is executed, so the shipped anchors are still the ones executed from.
 
     Returns (aux, out_regs, out_regs_valid, anchors): aux is the parallel
     AuxPayload, out_regs/out_regs_valid the per-row post-exec register file
@@ -595,7 +597,10 @@ def build_targets(chunks, draw_anchors):
     aux_pre, n_drawn = [], 0
     for ch, ok in zip(chunks, usable):
         if ok:
-            aux_pre.append(precompute_chunk(ch.instructions, drawn[n_drawn]))
+            states = drawn[n_drawn]
+            if aim is not None:
+                states = aim(ch.instructions, states)
+            aux_pre.append(precompute_chunk(ch.instructions, states))
             n_drawn += 1
         else:
             aux_pre.append(None)
@@ -650,7 +655,7 @@ def generate_chunks(rule, rng, *, opcode_table=None, dest_regs=None,
                 yield _make_valid_chunk([instr])
 
 
-def collect_into_batches(chunks_iter, *, batch_size, draw_anchors,
+def collect_into_batches(chunks_iter, *, batch_size, draw_anchors, aim=None,
                          partner_rate=0.0, partner_sampler=None,
                          invalid_rate=0.0, invalid_provider=None,
                          max_invalid_window=None,
@@ -675,7 +680,7 @@ def collect_into_batches(chunks_iter, *, batch_size, draw_anchors,
 
     draw_anchors(k) supplies k chunks' anchor states — a fresh draw per chunk
     for training, one fixed set for a scoring corpus — and every row's states
-    ship with it.
+    ship with it. `aim` is passed to build_targets.
 
     max_chunk_len: maximum number of instructions per chunk under the
                    chunking rule (the rule's length cap; 1 for 'single').
@@ -717,7 +722,7 @@ def collect_into_batches(chunks_iter, *, batch_size, draw_anchors,
                         for ins in partner_sampler()]
             mixed = valid + partners + invalids
             aux, out_regs, out_regs_valid, anchors = build_targets(
-                mixed, draw_anchors=draw_anchors)
+                mixed, draw_anchors=draw_anchors, aim=aim)
             yield pack_batch(
                 mixed,
                 target_B=target_B,

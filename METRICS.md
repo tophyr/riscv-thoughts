@@ -103,7 +103,8 @@ by generating its corpus with `datagen --heldout-anchors`;
 `probes/frame_scorecard.py` reads such a corpus. Its value classes and copy rates are pinned
 separately from the training draw's, so tuning the training draw does not move
 the criterion; it contains no negated pairs, so it exercises full-width carries
-only through its uniform values.
+only through its uniform values, and it is never aimed at a row's boundaries
+(`datagen/aim.py`), so it reaches a comparison's threshold only by chance.
 
 **Near exact, a few of the 64 held-out states carry most of the residual.** On a
 corpus where every chunk is composed, one state carried 160 of a twelve-layer

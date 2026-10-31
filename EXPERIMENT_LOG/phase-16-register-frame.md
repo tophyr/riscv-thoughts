@@ -14,8 +14,9 @@ collapses by construction and reads zero on the trained models; T1 is exact at
 held-out anchors; T2 at len=2 is 99.83% after 1M steps on one seed, with the
 essence spanning the range the first-read frame's models had (finding 39).
 At T1 a behavioral distance term collapses equivalent spellings and grades
-inequivalent ones by how differently they behave, at a cost of 108 failing
-vp triples on comparisons the target cannot tell apart (finding 41). Open: the composed slots' residual, every equivalence the op-cell has to
+inequivalent ones by how differently they behave (finding 41), and with half
+of each row's anchor states aimed at its boundaries it is exact at held-out
+anchors (finding 42). Open: the composed slots' residual, every equivalence the op-cell has to
 compute — commutativity first — the binding's wire format, the pointers'
 order under an equivalence that respells one of several outputs, and the
 learned replacement for the colouring.
@@ -238,7 +239,7 @@ chunks), and a test pins the property
 carry 384 distinct chunks and no copies; the generator with copies set to zero
 and the generator without them emit byte-identical batches on one seed. The
 models of findings 37–39 were trained and scored with the register-dependent
-order. The frozen T1, `runs/t1_essence_500k`, is finding 39's T1 trained with
+order. `runs/t1_essence_500k` is finding 39's T1 trained with
 the encoder's input order on batches of distinct chunks (500k steps, 4 ms/step,
 86–90% GPU), scored on held-out corpora regenerated the same way, 38,400
 distinct instructions:
@@ -358,6 +359,72 @@ from value prediction seeing the boundary.
 The distance arms ran at 10–12 ms/step against 4 ms, with the GPU at 71–76%:
 the targets are computed eagerly before each compiled step.
 
+**42. A T1 trained with the behavioral distance term evaluates exactly at
+held-out anchors once half of each row's anchor states straddle its own
+boundaries at every scale; straddling only the step where an output flips
+leaves the comparisons misplaced by hundreds.** The distance term grades
+`SLTI k` against `SLTI k+δ` by how many witness states fall between the two
+thresholds, which is few for any δ inside the immediate's range, so it puts
+their essences close together, as intended:
+
+| `SLTI` pair | target | no distance term (`runs/t1_essence_500k`) | distance, unaimed | distance, aimed at every scale |
+|---|---|---|---|---|
+| k vs k+1 | 0.0001 | 0.644 | 0.0010 | 0.0103 |
+| k vs k+64 | 0.0125 | 0.645 | 0.0154 | 0.0227 |
+| k vs k+256 | 0.0436 | 0.627 | 0.0472 | 0.0458 |
+| k vs k+1024 | 0.2086 | 0.633 | 0.2002 | 0.1997 |
+
+(chord distances between unit-normalized essences, 500 pairs per row on shared
+registers; the target is twice the pairs' behavioral distance.) The evaluator
+then has to place k to the unit from that geometry, and a structured draw puts
+an input within 256 of k on about 0.4% of states.
+
+The aiming (`datagen/aim.py`; RISCV_DESIGN, "Training") rewrites a fraction
+of each row's states in pairs, each pair straddling one of the row's
+boundaries: a comparison's threshold exactly (k−1 and k), the same threshold
+at a distance δ drawn log-uniformly from 2 to 2¹¹ (k−δ and k−1+δ), and an add
+whose result crosses 2ʰ, for h drawn from 4 to 32. Three arms over finding
+41's distance arm without the immediate head, each 500k steps, everything else
+equal:
+
+- *unaimed*: `runs/t1_distance_noimm_500k` (finding 41);
+- *exact threshold*: a quarter of the states aimed, enough for one pair, so
+  comparisons get only k−1 and k and adds their carry;
+- *every scale*: half the states aimed, so a comparison gets both pairs
+  (`configs/instr_alu_writers_partners025_aim050.json`), trained on two
+  instruction-stream seeds (`runs/t1_distance_noimm_aim050_500k`, and
+  `_s7` on a separately drawn corpus).
+
+All four are scored on one regeneration of the held-out corpus
+(`runs/eval/t1_heldout64_single.rvt`, 38,400 distinct instructions at the 64
+held-out states, which are never aimed), with `probes/frame_scorecard.py` and
+`probes/near_miss.py`; the unaimed arm reads 106 failing triples here and 108
+on the regeneration finding 41 used.
+
+| | unaimed | exact threshold | every scale, seed 0 | every scale, seed 7 |
+|---|---|---|---|---|
+| vp failing of 2,457,600 | 106 | 181 | **0** | **0** |
+| — `SLTI` / `SLTIU` / `ADDI` | 99.949 / 99.968 / 99.998% | 99.929 / 99.927 / 100% | 100% | 100% |
+| leak check | 10.43% | 11.18% | 10.75% | 10.83% |
+| copy / zero / double / sign / constant, equivalent | 0.0019 / 0.109 / 0.0008 / 0.0004 / 0.084 | 0.0024 / 0.109 / 0.0016 / 0.0003 / 0.078 | 0.0019 / 0.108 / 0.0008 / 0.0009 / 0.094 | 0.0022 / 0.108 / 0.0008 / 0.0004 / 0.079 |
+| aliasing control (`x+x` vs `x+y`) | 1.155 | 1.155 | 1.155 | 1.154 |
+| unrelated instructions | 1.362 | 1.360 | 1.360 | 1.362 |
+| `ADDI` k vs k+1 (target 0.338) / k vs k+512 (target 1.272) | 0.335 / 0.785 | 0.315 / 0.808 | 0.358 / 0.813 | 0.339 / 0.790 |
+
+The carry pair alone fixes `ADDI`. The exact threshold alone removes every
+failure at x = k or k−1 (12 in the unaimed arm, 0 with it) and leaves the
+comparisons worse overall: 142 of its 181 failures, like 50 of the unaimed
+arm's 104 comparison failures, sit 8 to 4,096 from k, on a handful of
+mid-range held-out inputs (8 and 13 distinct values). Aiming at every scale
+removes them on both seeds, and the collapse, the partner contrasts and the
+near-miss grading stay where finding 41 left them.
+
+The aimed corpus costs 14% more generator time per batch at len=1 (one
+process, 384-row batches, 8 states). The distance arms here ran at 8 ms/step
+with the GPU at 98–99%; finding 41's arms ran the same targets eagerly at
+10–12 ms and 71–76%, and replaying them as one CUDA graph gives bit-identical
+targets (`GraphedDistanceTargets`, `compressor/train.py`).
+
 ## Decisions taken
 
 - **The essence is graded in the register frame** — colour-identified leaves,
@@ -395,6 +462,12 @@ the targets are computed eagerly before each compiled step.
   41): the user's requirement is a smooth space, graded by how differently two
   functions behave, and the distance term states it; InfoNCE alone, with or
   without uniformity, measured as flattening that grading.
+- **Training anchors are aimed at each row's boundaries, at every scale**
+  (finding 42), so value prediction sees the inputs where functions the
+  distance term places close together differ.
+- **The frozen T1 is `runs/t1_distance_noimm_aim050_500k`** (finding 42): the
+  distance term, no immediate head, aimed anchors. No T2 has been trained
+  over it.
 
 ## Dead ends (do not re-run)
 
@@ -404,3 +477,6 @@ the targets are computed eagerly before each compiled step.
 - **Grading the essence through each written slot's description alone**
   (finding 38). Nothing reads the pool, so the essence's range falls to a
   thirtieth of the first-read frame's while value prediction stays exact.
+- **Aiming a comparison's anchors only at the step where it flips** (finding
+  42). It fixes the step and leaves the threshold misplaced by hundreds
+  under the distance term.

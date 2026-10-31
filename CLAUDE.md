@@ -120,8 +120,10 @@ not know you need.
 1. **The vp evaluator (the value-prediction head, `vp_head`) reads its input
    values from the batch's own anchors, never from a rebuilt set.** Every row's `out_regs` was executed from the
    register file shipped beside it as `batch.anchors`: one structured draw per
-   chunk (`draw_anchor_states`, `datagen/compare.py`), placed on that row's own
-   input registers by `precompute_chunk`. The trainer stages that field and
+   chunk (`draw_anchor_states`, `datagen/compare.py`), partly rewritten to
+   straddle that chunk's boundaries when the config aims it
+   (`aim_anchor_states`, `datagen/aim.py`), placed on that row's own input
+   registers by `precompute_chunk`. The trainer stages that field and
    feeds it to `vp_loss` (`compressor/train.py`), which gathers each output's
    input values by register through `batch.out_inputs`; a scorer must do the
    same (`vp_predict`). Re-placing shipped anchors, or building input values

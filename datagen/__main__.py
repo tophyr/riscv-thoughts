@@ -54,6 +54,7 @@ from . import (
     single, until_branch, until_transformation, length_cap, either,
     DEFAULT_TYPE_WEIGHTS, build_type_table, generate_invalid,
 )
+from .aim import aim_anchor_states
 
 
 def binary_stdout():
@@ -163,6 +164,12 @@ def _build_batches_iter(cfg, seed):
     eq_rate = eq_cfg.get('rate', 0.0)
     chain_rate = dist.get('chain', {}).get('rate', 0.0)
     partner_rate = dist.get('partners', {}).get('rate', 0.0)
+    # A scoring corpus executes every row at the fixed held-out set, unaimed.
+    aim_fraction = dist.get('aim', {}).get('fraction', 0.0)
+    aim = None
+    if aim_fraction > 0 and not cfg.heldout_anchors:
+        aim = lambda instrs, states: aim_anchor_states(
+            instrs, states, rng, aim_fraction)
     inv_cfg = dist.get('invalidity', {})
     inv_rate = inv_cfg.get('rate', 0.0)
     inv_types = inv_cfg.get('types', DEFAULT_TYPE_WEIGHTS)
@@ -190,6 +197,7 @@ def _build_batches_iter(cfg, seed):
         chunks_iter,
         batch_size=cfg.batch_size,
         draw_anchors=draw_anchors,
+        aim=aim,
         partner_rate=partner_rate,
         partner_sampler=lambda: sample_partner_pair(rng, dest_regs),
         invalid_rate=inv_rate, invalid_provider=invalid_provider,

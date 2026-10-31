@@ -121,17 +121,12 @@ Each transformation type produces a different kind of "paraphrase" —
 analogous to cross-lingual translation in the natural language setting.
 The compressor should map all equivalent sequences to the same point.
 
-**The two reordering transformations are essence-level equivalences that the
-current supervision does not honour.** Reordering independent instructions
-(and non-overlapping loads/stores) leaves the function from input registers to
-output registers unchanged, so the essence must not move. The value-prediction
-target is built in a frame that numbers inputs by first read and outputs by
-final write (see "Training"), and reordering permutes both, so the two chunks
-receive **different** vp targets and the supervision separates them. Which
-register fills which role is the chunk's interface and belongs in the binding
-(WHAT_IS_A_THOUGHT.md, "The Thought and Its Interface"); the frame puts the
-textual order of two independent instructions into the essence's coordinate
-system instead (see "GVN: the invariant essence is the value-number").
+**The reordering transformations are essence-level equivalences.**
+Reordering independent instructions (and non-overlapping loads/stores) leaves
+the function from input registers to output registers unchanged, so the
+essence must not move. Register-only reordering leaves the live dataflow graph
+unchanged, so it collapses by construction (see "GVN: the invariant essence is
+the value-number"); memory ops are out of scope.
 
 ### Near-equivalence pairs (controlled distance)
 
@@ -616,7 +611,8 @@ only on a vanishing set of inputs — `SLTI x,600` and `SLTI x,601`, which diffe
 only at x = 600 — read distance 0 when no witness state lands there, and the
 term pulls them together. Placing them close is correct for a smooth space;
 what keeps them distinguishable is value prediction, which needs training
-anchors that reach the inputs where they differ.
+anchors that reach the inputs where they differ — the aimed anchor states
+below.
 
 The targets are computed outside the compiled step, on the GPU batch emulator,
 for one-instruction rows only: chunks need an execution per instruction and a
@@ -692,8 +688,9 @@ These are real work, each additive over a stable "register-indexed state; the
 **Evolved through extensive experimentation** (EXPERIMENT_LOG, from "Gate
 training on a frozen encoder" through "Rename-equivariant T1/T2"). The settled approach is one **behavioral loss set shared by
 T1 and T2** (`compressor.train.binding_losses`) — T1 is the
-single-instruction special case. No pairwise distance-matching, no explicit
-equivalence loss, no syntactic CE heads: equivalence is **emergent**.
+single-instruction special case, plus the behavioral distance term at T1
+(below). No syntactic CE heads and no loss toward a hand-written equivalence
+label.
 
 **Magnitude / validity loss.** Soft `(‖v‖ − is_valid)²`: ‖v‖→1 for a
 valid thought (one complete instruction at T1; a well-formed chunk at T2),
@@ -785,6 +782,25 @@ i-th input register (`precompute_chunk`), so the copies are what make two of a
 chunk's inputs equal, adjacent or opposite; the chunk executes on that
 register file as it is.
 
+**A fraction of each row's states are aimed at the chunk's own boundaries**
+(`datagen/aim.py`; half, in T1's corpus for the distance term), because a
+structured draw still reaches them only by chance. A boundary is a node and two values on either side of where an output
+changes: a comparison's threshold (`SLTI x,k` at k−1 and k, `SLT a,b` at
+a = b−1 and a = b), the same threshold straddled again at a distance drawn
+log-uniformly up to 2¹¹, a computed operand's wrap-around point, and an add
+whose result crosses a power of two, where it carries through every lower bit.
+Each boundary takes a pair of states. A boundary on a computed value is moved
+to an input register by walking the dataflow back through operations that can
+be solved for one operand — `ADD`, `ADDI`, `SUB`, `XOR`, `XORI` — with the
+other operand held at its value in that state. Every aimed state is executed
+and kept only if the node takes the intended value, so a wrong walk costs a
+generic state and never a wrong target. The exact threshold alone is not
+enough: under the behavioral distance term a T1 puts `SLTI k` and `SLTI k+256`
+0.05 apart, and a readout trained only at the step where the output flips misplaces
+the threshold by hundreds (EXPERIMENT_LOG, "The register frame", finding 42).
+The aim is a function of the chunk's structure, so a register rename aims the
+same draw, and the held-out scoring set is never aimed.
+
 The anchors decide no structural label. Which reads an instruction's outputs
 depend on is decided once per instruction form at a fixed set of witness values
 — every pair of 0, 1, -1 and one generic value, which agrees with several
@@ -860,9 +876,7 @@ Metric: cosine similarity between equivalence pair compressed points.
 Target: > 0.99.
 
 *Instruction reordering belongs on this list* — two orderings of independent
-instructions compute one function of their registers. The first-read canonical
-frame currently supervises the essence to separate them (see "GVN"), so the row
-measures a defect of the frame until the frame changes.
+instructions compute one function of their registers.
 
 ### 2. Distance preservation (smoothness)
 
