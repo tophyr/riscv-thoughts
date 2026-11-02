@@ -35,7 +35,6 @@ from .compare import (
 from .knownbits import output_known_bits
 from .generate import (
     chain_group, collect_groups, random_instruction,
-    sample_injection_tuples,
 )
 
 
@@ -648,15 +647,9 @@ def _yield_random_instructions(rng, opcode_table=None, dest_regs=None):
 
 
 def generate_chunks(rule, rng, *, opcode_table=None, dest_regs=None,
-                    eq_rate=0.0, eq_max_per_class=8, eq_min_per_class=0,
-                    eq_boost=None, chain_rate=0.0):
+                    chain_rate=0.0):
     """Yield Chunk objects (all valid) from a random-instruction stream
     grouped by `rule`.
-
-    If eq_rate > 0, after each grouped chunk emit, with probability
-    eq_rate, also emit a fresh tuple of MANIFEST-equivalent instructions
-    as additional chunks. This biases the stream toward chunks that the
-    encoder must learn to collapse together.
 
     If chain_rate > 0, that fraction of groups is rewritten so each
     instruction reads its predecessor's result (`chain_group`), raising the
@@ -670,12 +663,6 @@ def generate_chunks(rule, rng, *, opcode_table=None, dest_regs=None,
         if chain_rate > 0 and rng.random() < chain_rate:
             group = chain_group(group, rng)
         yield _make_valid_chunk(group)
-        if eq_rate > 0 and rng.random() < eq_rate:
-            tuple_instrs = sample_injection_tuples(
-                target_count=2, max_per_class=eq_max_per_class, rng=rng,
-                min_per_class=eq_min_per_class, boost=eq_boost)
-            for instr in tuple_instrs:
-                yield _make_valid_chunk([instr])
 
 
 def collect_into_batches(chunks_iter, *, batch_size, draw_anchors, aim=None,
@@ -712,8 +699,8 @@ def collect_into_batches(chunks_iter, *, batch_size, draw_anchors, aim=None,
                    max_tokens, max_n_instrs all padded to deterministic
                    upper bounds derived from it. This prevents PyTorch's
                    caching allocator from fragmenting over a long training
-                   run with stochastically-varying batch shapes (a real
-                   OOM trigger we hit at ~step 500 of t1_cosine_full).
+                   run with stochastically-varying batch shapes, which
+                   leads to OOM.
     """
     if invalid_rate > 0 and invalid_provider is None:
         raise ValueError('invalid_rate > 0 requires invalid_provider')

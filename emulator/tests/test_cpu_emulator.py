@@ -490,10 +490,10 @@ class TestJALR:
 class TestLoadWidthSignExtension:
     """LB/LBU/LH/LHU on a known byte pattern via SparseMemory.
 
-    Regression guard: SparseMemory.__getitem__ used to return np.uint8,
-    so TinyFive's multi-byte loads (which shift high bytes left by 8/16)
-    silently overflowed numpy's 8-bit type to 0. These pin the correct
-    little-endian assembly and signed/unsigned extension.
+    TinyFive's multi-byte loads shift high bytes left by 8/16, which
+    silently overflows to 0 if SparseMemory.__getitem__ returns np.uint8.
+    These pin the correct little-endian assembly and signed/unsigned
+    extension.
     """
 
     def _mem(self, bytes_at_100):

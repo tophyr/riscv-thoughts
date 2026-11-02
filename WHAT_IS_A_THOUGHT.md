@@ -114,8 +114,8 @@ arithmetic cannot fail, which contradicts the intuition that some
 compositions *don't mean anything*. Something has to distinguish
 a valid-thought region from the rest of the space.
 
-The choice we've made for T1: valid thoughts live near the surface
-of the unit ball (`||T1|| ≈ 1`); invalid inputs — partial data,
+The choice made here, starting at the first tier (T1): valid thoughts
+live near the surface of the unit ball (`||T1|| ≈ 1`); invalid inputs — partial data,
 spanning-boundary data, corrupted data, degenerate compositions —
 collapse toward the origin (`||T1|| ≈ 0`). Magnitude is validity.
 Direction is semantics. The origin is the "not-a-thought" point:
@@ -147,8 +147,8 @@ composition worked. Magnitude carries coherence; throwing it
 away takes us back to a geometry where arithmetic is claimed to
 always succeed, which it doesn't.
 
-The philosophical payoff: we no longer need a separate
-"invalidity" machinery bolted onto the thought-space. The
+The philosophical payoff: no separate
+"invalidity" machinery has to be bolted onto the thought-space. The
 geometry itself distinguishes between thoughts and non-thoughts,
 continuously and differentiably. Validity is learned alongside
 meaning, from the same training data, and lives at the same
@@ -196,10 +196,10 @@ distances alone.
   vector. There is no corresponding operation on a binding — role
   assignments are discrete references, and the group that permutes
   them is non-abelian, so it has no additive shadow to exploit.
-  This was learned the hard way — an additive objective gave
-  held-out consistency at the random baseline (EXPERIMENT_LOG,
-  "Pairwise behavioral geometry") — which is why the symmetry was
-  built into the architecture rather than trained into a flat vector.
+  An additive objective trained for it gives held-out consistency at
+  the random baseline (EXPERIMENT_LOG, "Pairwise behavioral
+  geometry"), which is why the symmetry is built into the
+  architecture rather than trained into a flat vector.
 
 - **The hierarchy carries a vector space plus a graph.** T_(n+1)
   cannot consume a bare essence; it needs the binding to know how
@@ -360,8 +360,7 @@ Modern language models generate autoregressively: emit token one, then
 token two conditioned on token one, then token three conditioned on
 the previous two, and so on. When this style of model is used as the
 proposer for expression search, the search inherits this left-to-right
-shape — and that turns out to be badly matched to what the search
-actually needs.
+shape, which is badly matched to what the search actually needs.
 
 The problem: left-to-right generation starts with the least informative
 tokens. "The Kingdom of Tethra..." — "The" carries zero bits about the

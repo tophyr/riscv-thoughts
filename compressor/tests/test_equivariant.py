@@ -206,8 +206,8 @@ def test_head_shapes():
     T, ess = m.encode_state(tok, pad, in0, in1, out)
     assert ess.shape == (1, m.d_out)
     core = m.compressor.core
-    assert core.apply_slot_head(m.live_in_head, T).shape == (1, m.n_regs)
-    assert core.apply_slot_head(m.in_score_head, T).shape == (1, m.n_regs)
+    assert m.live_in_head(T).squeeze(-1).shape == (1, m.n_regs)
+    assert m.in_score_head(T).squeeze(-1).shape == (1, m.n_regs)
     assert m.pc_writes_head(ess).shape == (1, 1)
 
 

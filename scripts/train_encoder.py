@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Train a T1 encoder via magnitude-validity + register-identity aux +
-value-prediction on RVT batches.
+"""Train a T1 encoder on RVT batches of single instructions: magnitude
+validity, the binding heads, value prediction, and (with --distance-weight)
+the behavioral distance term.
 
-Step 1 of the piecemeal-assembly plan. CLI shell over
-compressor.train.train_encoder; saves encoder.pt + hparams.json
-+ losses.json into a run directory.
+CLI shell over compressor.train.train_encoder; saves encoder.pt +
+hparams.json + losses.json into a run directory.
 
-Usage:
+Usage (the frozen T1's command):
     python -m datagen --rule single --batch-size 384 --n-states 8 \\
-        --config configs/instr_alu_writers.json --count 50000 \\
-        | train_encoder.py --n-steps 50000
+        --config configs/instr_alu_writers_partners025_aim050.json \\
+        --count 500000 \\
+      | train_encoder.py --d-model 128 --n-heads 4 --n-layers 2 \\
+        --d-out 64 --max-window 32 --vp-head-depth 3 --distance-weight 1.0 \\
+        --n-steps 500000 --out-dir "$OUT"
 """
 
 import argparse
@@ -35,9 +38,8 @@ def main():
                         'the longest chunk (9 tokens × max instructions).')
 
     # The equivariant core's settings. T1 and T2 run the SAME core, so these
-    # have to be reachable from both entry points; defaults reproduce the
-    # pre-Phase-15 T1 exactly. See scripts/train_t2_encoder.py for the
-    # counterparts.
+    # have to be reachable from both entry points. See
+    # scripts/train_t2_encoder.py for the counterparts.
     p.add_argument('--d-event', type=int, default=16,
                    help='Per-slot event-channel width (read/write trace).')
     p.add_argument('--op-cell-depth', type=int, default=1,

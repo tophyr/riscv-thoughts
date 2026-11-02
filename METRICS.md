@@ -64,9 +64,12 @@ cannot evaluate a perfectly described chunk exactly measures its own limit
 rather than the essence's, and at two instructions every plain ReLU readout of
 the vp head's shape is such a readout (EXPERIMENT_LOG, "T2 faithfulness",
 finding 34). A T2 vp figure is therefore read against the same head on a
-perfect description of the chunk, which, after 10M steps, gets 8 of 4.8M
+perfect description of the chunk: in the first-read frame (targets that
+number a chunk's inputs and outputs by textual first-read and final-write
+order, every finding before 37; see "Conditions a vp number is only true
+under"), after 10M steps, that head got 8 of 4.8M
 held-out output values wrong (a value is one output register of one chunk at
-one anchor state) where T2's essence gets 36 wrong (finding 35). Until a
+one anchor state) where T2's essence got 36 wrong (finding 35). Until a
 smaller head is shown to reach the same score, a T2 figure certifies less than
 a T1 figure of the same value.
 
@@ -125,7 +128,8 @@ and immediate and the wiring — so a register slot holds a symbolic description
 of the function that produced it and the head must EVALUATE that description at
 the anchor points. vp scores the composition.
 
-How much the evaluation costs depends on the head. A T1 trained at fresh
+How much the evaluation costs depends on the head. The figures in this
+paragraph were measured in the first-read frame. A T1 trained at fresh
 structured anchors is 99.9999% exact at held-out anchors with a three-hidden-
 layer head (finding 33), so at one instruction a small head evaluates it. Fed
 ground-truth instruction features instead of an essence, no one-hidden-layer
@@ -166,9 +170,8 @@ the criterion.
 ### Reading the error budget
 
 `probes/frame_scorecard.py` reports the rate by writing opcode and by input
-count; the finer budget below was measured by a probe of the first-read frame
-(`probes/vp_budget.py`, in git history) and its axes remain the ones that
-decide a slot:
+count. No current scorer reports the finer budget below; its axes are the ones
+that decide a slot at len=2:
 
 - **sources** — `cross-instr` when the chunk's two instructions read a common
   register, `distinct` otherwise. One instruction reading the same register
@@ -180,7 +183,7 @@ decide a slot:
   result.
 
 The counting unit throughout is the **(row, output slot, anchor) triple** that
-vp supervises. Each bucket is reported both as a rate and as **err mass**, its
+vp supervises. Report each bucket both as a rate and as **err mass**, its
 share of all failing triples. **A rate and a mass are different facts and
 neither implies the other**: a rare cell can be terrible and carry almost none
 of the error, a common one excellent and carry most of it.
@@ -189,6 +192,11 @@ of the error, a common one excellent and carry most of it.
 were each verified on their own axis with the others held at an easy setting,
 and the cell where two conditions hold at once appeared in none of them — and
 was 90% of the error.
+
+**The axes are len=2-specific.** Depth cannot exceed 2 at len=2; a longer chunk
+admits deeper composition and more ways for two instructions to share a
+source, so the axes themselves need revisiting before the budget means the
+same thing at another length.
 
 ### A difference is only real against a measured floor
 
@@ -210,8 +218,17 @@ Neither are rows trained against different oracles. Pooling them to reach a
 usable `n` manufactures confidence, and can count the same quantity as signal in
 one comparison and as noise in another.
 
-The floors measured so far are in "Current calibration" at the end of this
-file. Inherit them only within the configuration they were measured on.
+**No floor is measured for the current models.** Every null intervention on
+record was run over a frozen T1 not kept in `runs/`, in the first-read frame,
+so none carries over (EXPERIMENT_LOG, "T2 faithfulness", findings 25, 31 and
+35, record them with their scope). The T2 of finding 50 is one seed: a claim
+against it needs its replicate first. A floor is unknown, not approximate,
+once the chunk length, the frozen lower tier or the oracle changes.
+
+**An arm testing whether a new term can replace an existing one trains the new
+term alone.** Trained on top of the term it may replace, a good result cannot
+show the new term suffices, a bad one cannot show it falls short, and any
+change in the geometry may belong to either term.
 
 **An aggregate that does not move is not evidence that nothing happened.** Two
 interventions have moved individual constructed arms by 15–25 points while the
@@ -220,10 +237,10 @@ population it targets.
 
 ### Conditions a vp number is only true under
 
-- **The corpus it ran on.** An R-only corpus excludes the `SLTIU rd,rs,-k` shape
-  entirely, and reading 8.8× lower error there than on the mixed corpus was
-  taken as a property of the model for a whole phase of work. Quote the
-  mixed-corpus figure for statements about the model.
+- **The corpus it ran on.** An R-only corpus excludes the `SLTIU rd,rs,-k`
+  shape entirely and reads several times lower error than the mixed corpus, a
+  property of the corpus rather than the model. Quote the mixed-corpus figure
+  for statements about the model.
 - **The frame its target was built in.** Numbers measured in the first-read
   canonical frame (every finding before 37) are not comparable to numbers in
   the register frame: a model is scored on the target it trained on, and the
@@ -250,7 +267,7 @@ can recover it (vp scores T1∘T2, above).
 `(in0, in1, out)` equals the oracle's first two input slots in order and its
 first output slot, x0 where absent. **"Solved" is 100%.** It also lists every
 opcode-and-operand form below 100% — x0 in either source, aliased sources, a
-destination aliasing a source — because the defects found so far each occupy
+destination aliasing a source — because a binding defect typically occupies
 whole forms at 0% while the aggregate stays near 98.5%.
 
 Do not score the binding per register. A per-register average over 32 slots
@@ -287,7 +304,7 @@ must land on the same point. A class is scored as the distance between
 equivalent essences against the distance between inequivalent ones —
 **separation**, larger is better.
 
-`scripts/eval.py` reports four distances between essences, and they are not the
+`scripts/eval.py` reports three distances between essences, and they are not the
 same kind of quantity:
 
 - **rename** — a chunk against the same chunk with its registers relabeled,
@@ -295,23 +312,14 @@ same kind of quantity:
   exact by construction, so this reads ~0 for any model at all. It asserts the
   core is intact; it is not a measure of training quality.
 - **behavioral** — a chunk against a variant with a commutative instruction's
-  operands swapped, **split** by whether the swap preserved the chunk's
-  function as the targets define it. In the register frame a commutative swap
-  never changes the register function, so the non-equivalent subset is empty
-  there; in the first-read frame about 2% of pairs renumbered a later
-  instruction's inputs and were separated by the target. The equivalent subset
-  is two populations (`probes/swap_classes.py`, `probes/frame_scorecard.py`):
+  operands swapped, which never changes the chunk's function. The row is two
+  populations (`probes/swap_classes.py`, `probes/frame_scorecard.py`):
   swaps of fresh operands with a third-register destination, or with an
   aliased destination, which are invariant by construction and read float
   noise; and swaps whose operand is already another instruction's input or
   result, which only the op-cell's training can collapse. The row's mean is
   mostly the first population's zeros, so a small value does not say the
   second collapses — the probes report it separately.
-- **behav-diff** — the non-equivalent subset above. It should be LARGE. A model
-  that collapses it is failing to distinguish different functions, which is a
-  worse failure than loose collapse.
-- **behav-mixed** — both pooled. Not interpretable on its own; kept only for
-  continuity with older records.
 - **distinct** — unrelated chunks. The separation denominator.
 
 **Pass `--gvn-chunk-len` matching the model's chunk length.** `gvn_collapse`
@@ -362,13 +370,14 @@ it is tail-dominated. Two corpus draws of one configuration give 46.6× and
 concentrated in the denominator, so two draws can report a ratio as 0.8 and 1.0
 when they are one number.
 
-Rank configurations on vp exact match instead, against the floor that matches
-the comparison ("Current calibration").
+Rank configurations on vp exact match instead, against a floor measured on the
+arm under test ("A difference is only real against a measured floor").
 
 **Collapse and vp are both load-bearing.** A vp gain that craters the collapse
-rows is a regression, not a win — and the converse: every collapse gain measured
-so far has traded against discriminativeness, so `behav-diff` is the guard on
-any collapse objective.
+rows is a regression, not a win — and the converse: a collapse objective can
+buy its gain by pulling inequivalent chunks together, so the aliasing
+control (`x+x` against `x+y`, `probes/frame_scorecard.py`) and the
+near-miss rows are the guard on any collapse objective.
 
 ---
 
@@ -389,14 +398,20 @@ over a chunk, so two lengths are not comparable.
 ## Probe methodology
 
 A probe is a small readout trained on a frozen model to test what a
-representation contains. Several conclusions drawn from one had to be withdrawn,
-in two recurring ways — **a probe scoring below the model's own trained head is
+representation contains. It misleads in two recurring ways — **a probe scoring below the model's own trained head is
 measuring the probe** (an under-powered or data-starved readout read as missing
 information), and **a probe scoring near the majority-class frequency has
 learned nothing** (at an 88% base rate, 88% means it answers by default, so the
 minority case needs separate treatment). Both are cheap to prevent: calibrate
 every probe against a quantity known independently, and check its score against
-the base rate before believing it.
+the base rate before believing it. A third: **a probe read through a fixed
+consumer reports the lesser of the consumer's ceiling and the representation's
+quality**, so before running one, check that the consumer's ceiling on perfect
+inputs, for the population where the compared models differ, clears the spread
+between them. Handed a perfect description of the chunk, a plain four-layer
+vp head reaches 92.13% on depth-2 slots after 1M steps (EXPERIMENT_LOG, "T2
+faithfulness", finding 34), so at that budget it cannot rank essences on
+depth-2 slots.
 
 **A hard subset is a harder question, so scoring it lower proves nothing on its
 own.** What breaks that confound:
@@ -438,70 +453,3 @@ one thing.
 **Diagnose before training.** Probe frozen checkpoints until the diagnosis
 yields a *falsifiable* hypothesis, then spend GPU time only to test that
 mechanism. One round of probing found in hours what ten training runs had not.
-
----
-
-## Current calibration
-
-**Everything in this section is a measurement, not a rule, and it is scoped to
-the configuration named.** The rules above outlive any model; these numbers do
-not. When the configuration changes — a different chunk length, a different
-frozen lower tier, a changed oracle — they become unknown rather than
-approximate, and the null intervention has to be re-run. Do not inherit a floor
-across that boundary.
-
-Scope for all of it: chunks of 2 instructions, `d_out` 512, over the frozen
-`runs/t1_writers_250k_rank`, on `configs/instr_alu_writers.json`, scored at the 8
-training anchor states — so these are floors on a stored-answer score, and none
-carries over to a model trained with anchors redrawn per batch. The runs
-behind each row are in EXPERIMENT_LOG, "T2 faithfulness" (findings 25 and 31); this
-table is the operative copy, that is the evidence. Neither T1 named in this
-section is kept in `runs/`, so these floors stand as recorded and cannot be
-re-run.
-
-| quantity | value | measured over |
-|---|---|---|
-| retraining the T2 on a fresh corpus moves exact match | 0.002–0.009 points | two configurations, each replicated |
-| retraining the frozen T1 beneath it moves exact match | 0.023 points (σ) | five same-config T1s |
-| the same, on depth-2 exact match | 0.24 points | the same five |
-| spread between two configurations' own floors | 20× | the two above |
-| one T2 cell against another of the same config, chain rate 0.10 | 0.011 points (σ per cell) | nine cells, `vp_budget` on one shared corpus |
-| two corpus draws at 2M steps, chain rate 0.10 | 0.0025 points | two cells, `vp_budget` on one shared corpus |
-| two corpus draws at 2M steps, chain rate 0 | 0.0003 points | two cells, `vp_budget` on one shared corpus |
-
-At held-out anchors the floor is larger. Over `runs/t1_writers_250k_ctxpulse`,
-len=2, chain rate 0.10, four-layer vp head, 1M steps, scored on 300 batches × 16
-held-out anchors:
-
-| quantity | value | measured over |
-|---|---|---|
-| two instruction-stream seeds of one T2 configuration | 0.04–0.08 points | two configurations, each at seeds 0 and 7 |
-| a null intervention's cost | ~65 min | one len=2 cell at 1M steps, ~3.9 ms/step, scoring included |
-
-With the twelve-layer residual vp head — the only form the code builds — over
-the plain-headed three-layer T1 of finding 33 (not the frozen
-`runs/t1_writers_500k_resvp3`), len=2, chain rate 0.10, 1M steps, every cell
-scored on `runs/eval/t2_heldout64_len2.rvt` at all 64 held-out anchors
-(EXPERIMENT_LOG, "T2 faithfulness", finding 35):
-
-| quantity | value | measured over |
-|---|---|---|
-| two instruction-stream seeds of one T2 configuration | 0.002 points (5,511 against 5,418 failing triples of 4.8M) | seeds 0 and 7 |
-| the same configuration with a plain four-layer vp head | 0.155 points | seeds 0 and 7 |
-| a null intervention's cost | ~8 ms/step, so ~2.3 h at 1M steps | one len=2 cell, 26 local generator workers |
-
-The 10M-step cell over the frozen T1 (36 failing triples) is one seed, so no
-floor is measured for it; a claim against it needs its replicate first.
-
-So: unless the specific cell has been replicated, take the floor from the table
-whose configuration matches — ~0.01 for a plain-headed cell at 8 anchors, 0.002
-for a residual-headed cell at 1M steps — and 0.023 for anything comparing one T1
-against another. With a per-cell σ of 0.011, the mean of a two-cell pair moves
-by ~0.008, so two such pairs cannot be told apart below ~0.02. No T1
-configuration measured is distinguishable from any other.
-
-**The error-budget axes are also len=2-specific.** `sources × immediate ×
-depth` crosses the three properties that decide a len=2 slot. Depth cannot
-exceed 2 there; a longer chunk admits deeper composition and more ways for two
-instructions to share a source, so the axes themselves need revisiting before
-the budget means the same thing.

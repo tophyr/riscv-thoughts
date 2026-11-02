@@ -11,7 +11,7 @@ from datagen.generate import (
     DEFAULT_DISTRIBUTION, build_opcode_table,
     random_instruction,
     random_perm, relabel,
-    MANIFEST, sample_binding, sample_injection_tuples,
+    MANIFEST, sample_binding,
     single, until_branch, until_transformation, length_cap, either,
     collect_groups,
 )
@@ -96,15 +96,6 @@ def test_sample_binding_satisfies_constraints():
         b = sample_binding(klass, rng)
         for c in klass.constraints:
             assert c(b)
-
-
-def test_sample_injection_tuples_returns_whole_tuples():
-    rng = np.random.default_rng(6)
-    out = sample_injection_tuples(target_count=20, max_per_class=8, rng=rng)
-    assert len(out) >= 20
-    # Every emission is a real Instruction.
-    for instr in out:
-        assert isinstance(instr, Instruction)
 
 
 # ---------------------------------------------------------------------------

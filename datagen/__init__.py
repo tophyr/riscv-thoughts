@@ -2,7 +2,7 @@
 
 Four modules:
     datagen.generate    — instruction generation, relabeling,
-                          equivalences, group-collection rules
+                          partner pairs, group-collection rules
     datagen.batch       — Chunk + Batch + RVT format, pack,
                           target construction, full pipeline
     datagen.compare     — SSA analysis, anchor execution, aux targets

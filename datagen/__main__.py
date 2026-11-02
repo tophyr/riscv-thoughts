@@ -124,10 +124,9 @@ _PR_SET_PDEATHSIG = 1  # <linux/prctl.h>
 
 
 def _arm_pdeathsig():
-    """Ask the kernel to SIGKILL this process when its parent dies. The single
-    load-bearing fix for the orphan-worker hazard: it fires even when the
-    parent is `kill -9`'d, which the old terminate()-on-clean-exit path could
-    not cover."""
+    """Ask the kernel to SIGKILL this process when its parent dies. This is
+    what makes orphan workers impossible: it fires even when the parent is
+    `kill -9`'d, where no parent-side cleanup runs."""
     try:
         libc = ctypes.CDLL(None, use_errno=True)
         libc.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL)
@@ -160,8 +159,6 @@ def _build_batches_iter(cfg, seed):
     # a corpus is defined by one reviewable file, so a run's corpus can be
     # reproduced from the config it names (scripts/record_corpus.py copies it
     # into the run directory).
-    eq_cfg = dist.get('equivalences', {})
-    eq_rate = eq_cfg.get('rate', 0.0)
     chain_rate = dist.get('chain', {}).get('rate', 0.0)
     partner_rate = dist.get('partners', {}).get('rate', 0.0)
     # A scoring corpus executes every row at the fixed held-out set, unaimed.
@@ -187,10 +184,6 @@ def _build_batches_iter(cfg, seed):
 
     chunks_iter = generate_chunks(
         rule, rng, opcode_table=opcode_table, dest_regs=dest_regs,
-        eq_rate=eq_rate,
-        eq_max_per_class=eq_cfg.get('max_per_class', 8),
-        eq_min_per_class=eq_cfg.get('min_per_class', 0),
-        eq_boost=eq_cfg.get('boost', None),
         chain_rate=chain_rate,
     )
     return collect_into_batches(
@@ -283,9 +276,8 @@ class _Writer:
     """The single output chokepoint. Every mux mode funnels batches through
     here, so the two producer-native features live in ONE place: the `--count`
     cap (stop after N batches) and, under `-v`, windowed throughput reporting
-    (folds in the old standalone bench tool — under backpressure datagen's emit
-    rate IS the delivered rate, so this answers "is generation the
-    bottleneck?")."""
+    (under backpressure datagen's emit rate IS the delivered rate, so this
+    answers "is generation the bottleneck?")."""
 
     def __init__(self, out, *, count=None, verbose=False, log_every_sec=5.0):
         self.out = out
@@ -532,13 +524,13 @@ def main():
     g.add_argument('--max-invalid-window', type=int, default=32,
                    help='Token-length cap on injected invalid windows.')
     # The corpus's composition — opcode mix, exclude_x0_dest, and the
-    # equivalence / invalidity / chain rates — lives here and ONLY here. There
+    # invalidity / chain / partners / aim blocks — lives here and ONLY here. There
     # is deliberately no CLI override for any of those rates: a corpus is one
     # reviewable file, which is what lets a run record what it trained on
     # (scripts/record_corpus.py).
     g.add_argument('--config', type=str, default=None,
                    help='JSON corpus config: opcode mix + exclude_x0_dest + '
-                        'equivalences / invalidity / chain rates. Unset: the '
+                        'invalidity / chain / partners / aim blocks. Unset: the '
                         'built-in DEFAULT_DISTRIBUTION.')
 
     # Pool + mux flags.

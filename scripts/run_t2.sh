@@ -29,13 +29,13 @@ T1=${T1:-runs/t1_distance_cosbal_500k/encoder.pt}
 # configuration is judged at (EXPERIMENT_LOG, finding 39).
 LEN=${LEN:-2} DOUT=${DOUT:-512} STEPS=${STEPS:-1000000} OC=${OC:-4} VP=${VP:-12}
 NPOOL=${NPOOL:-16}
-# Weight of the behavioral distance term on the essence (0 = off); it pairs
-# rows with one output, so its corpus should carry partner chunk pairs.
+# Weight of the behavioral distance term on the essence (0 = off); its
+# equivalent pairs come from the corpus's partner chunk pairs.
 DIST=${DIST:-1.0}
 # Local generator workers.
 GEN=${GEN:-26}
-# The corpus is ONE file: opcode mix, exclude_x0_dest, and the equivalence /
-# invalidity / chain rates all live in it, and no flag can override any of
+# The corpus is ONE file: opcode mix, exclude_x0_dest, and the invalidity /
+# chain / partners / aim blocks all live in it, and no flag can override any of
 # them. A sweep over corpus composition is therefore a config per arm, and the
 # run directory is named after the config so two arms cannot collide.
 CONFIG=${CONFIG:-configs/instr_alu_writers_chain010_rewrites050_aim050.json}

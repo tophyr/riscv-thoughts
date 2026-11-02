@@ -410,12 +410,6 @@ class RegisterStateMachine(nn.Module):
             ranks.append(n_read)
         return read_time, n_read, firsts, ranks
 
-    def apply_slot_head(self, head, T):
-        """Per-slot readout: Linear(d_slot,1) over every register slot ->
-        (B, n_regs). Equivariant (a rename permutes the slots, permuting the
-        scores identically)."""
-        return head(T).squeeze(-1)
-
 
 def apply_head_touched(head, T, max_touched):
     """head over T's register axis (B, R, d) -> (B, R, out), evaluated only on
@@ -607,8 +601,7 @@ class T1Compressor(nn.Module):
     (seq_len=1). Both are trained jointly. Delegates the compressor's head /
     dim interface (so it is interchangeable with a bare Compressor for
     binding_losses, value-prediction, and eval) and adds a tokens-in encode
-    path. (Checkpoint compat: an old flat T1 state_dict splits cleanly into
-    `embedder.*` + `compressor.*` — see compressor.train._split_t1_state.)
+    path.
     """
 
     def __init__(self, *, vocab_size, d_model, n_heads, n_layers, max_window,

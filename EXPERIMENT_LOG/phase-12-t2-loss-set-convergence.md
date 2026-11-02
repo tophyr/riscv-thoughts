@@ -1,73 +1,70 @@
 # Phase 12: T2 loss-set convergence, value-prediction, and the operator-axis finding
 
-The phases between 11 and here explored many head designs and output
-geometries (per-register pair-MSE, syntactic dest/src CE heads, Sinkhorn
-binding, register-indexed pools, shape/binding sub-vector splits,
-unit-sphere normalization). They converged back to a **single open-space
-vector with behavioral losses**. This section records the settled design
-and the results that matter; the dead-ends are not re-narrated.
+Phase 11's T2 did not discriminate operands. This phase tried many head
+designs and output geometries for T2 (per-register pair MSE, syntactic
+destination/source CE heads, Sinkhorn binding, register-indexed pools, split
+shape/binding sub-vectors, unit-sphere normalization) and converged on a
+**single open-space vector trained with behavioral losses**. This entry records
+that design and the results that bear on it; the individual dead ends are not
+recorded.
 
-## Settled loss set — T1 is the single-instruction special case of T2
+## The loss set — T1 is the single-instruction case of T2
 
-Removed: pair-MSE / `reg_effect_loss`, explicit `equivalence_loss`,
-syntactic dest+src CE heads, `rename_equiv`. The behavioral-distance
-machinery (`behavioral_distance` / Hungarian bijection) is demoted to a
-dormant offline oracle — not used in generation or training.
-
-Current losses (shared `compressor.train.binding_losses`, identical for
-T1 and T2):
-- **magnitude-validity**: `(‖v‖ − is_valid)²` — a *soft* loss, NOT
+The loss set contains no pair MSE, no explicit equivalence loss, no syntactic
+destination/source heads and no rename-equivalence term; the behavioral
+distance with a Hungarian register bijection is not used in generation or
+training. The losses, identical for T1 and T2:
+- **magnitude-validity**: `(‖v‖ − is_valid)²` — a *soft* loss, not
   `F.normalize`.
 - **live_in / live_out**: BCE on which registers are read / written.
 - **pc_writes**: BCE on whether the chunk writes PC.
-- **in_slot / out_slot**: ListMLE (Plackett–Luce) over per-register
-  scalar score heads → read/write ORDER. Duplicate-free by `argsort`.
-- **value_predict (vp)**: per-anchor per-out-slot MSE — predict each
-  output register's value from the vector + input-slot values, on 8
-  sampled anchor states.
+- **in_slot / out_slot**: ListMLE (Plackett–Luce) over per-register scalar
+  score heads, giving the order in which registers are first read / last
+  written. `argsort` of the scores makes the order duplicate-free.
+- **value_predict (vp)**: per-anchor, per-output-slot MSE — predict each output
+  register's value from the vector plus the input-slot values, at 8 sampled
+  anchor states.
 
-T1 uses the same losses and heads (one output register = a single output
-slot). **Equivalence is now EMERGENT** — there is no equivalence loss;
-equivalent instructions/chunks collapse from the behavioral targets alone.
+T1 is the case with one instruction (one output slot). **Equivalence is
+emergent**: no loss names equivalent pairs, so equivalent instructions and
+chunks collapse only from the behavioral targets.
 
-## Architecture (settled)
+## Architecture
 
-Single open-space `d_out=512` vector. No shape/binding partition — the
-merged vector learns everything (cap=4: in_slot 99.2% / out_slot 99.2% /
-dup 0). Structural splitting was a diagnostic, not a keeper. Magnitude
-carries validity (soft loss), direction carries semantics; binding heads
-read `F.normalize(vec)`, vp reads the raw vector.
+A single open-space vector, `d_out=512`, with no shape/binding partition — the
+merged vector learns everything (chunk-length cap 4: in_slot 99.2% / out_slot
+99.2% / duplicate slot predictions 0). Splitting the vector served as a
+diagnostic only. Magnitude carries validity (soft loss) and direction carries
+semantics; the binding heads read `F.normalize(vec)`, vp reads the raw vector.
 
-## Resolved: unit-sphere vs out_slot
+## Unit sphere versus out_slot
 
-A *hard* `F.normalize` on the output breaks out_slot (→ 3–7%); a *soft*
+A *hard* `F.normalize` on the output breaks out_slot (3–7%); a *soft*
 `(‖v‖−1)²` magnitude loss on an open-space output gives the same surface
-geometry AND keeps out_slot ~99%. Train TOWARD the surface, don't project
-ONTO it. (Supersedes the "unit-sphere is an open mystery" handoff note.)
+geometry and keeps out_slot at ~99%. Train toward the surface; do not project
+onto it.
 
 ## Slot difficulty is loss geometry, not capacity
 
-out_slot is **intrinsically easy** — structural last-write ordering. In a
-controlled tri-split with no vp on the bindings it reaches 0.005 (perfect)
-while in_slot is dead; adding vp **flips** it (in_slot revives because it
-depends on vp's input-sensitivity representation; out_slot starves under
-vp's 10:1 weight). The long-standing "out_slot needs more capacity" read
-was vp competition, not capacity.
+out_slot is **intrinsically easy** — it is structural last-write ordering. In a
+controlled three-way split with no vp on the binding sub-vector it reaches loss
+0.005 while in_slot does not learn; adding vp **flips** that: in_slot learns,
+because it depends on vp's input-sensitive representation, and out_slot starves
+under vp's 10:1 weight. A slow out_slot is vp competition, not missing
+capacity.
 
-## Infrastructure: GPU saturation
+## GPU saturation
 
-Full-step `torch.compile` (reduce-overhead / CUDA graphs) + pinned
-non-blocking H2D + ListMLE truncation → **~95% GPU util** for T1, T2, and
-the decoder (was ~32–50%). The compiled forward+loss+backward, optimizer,
-scheduler, logging, and resume are lifted into one shared
-`run_train_loop`; the decoder was made fixed-shape (pad to corpus-constant,
-invalid rows CE-ignored) so its step is capturable. Trains until stdin
-EOF; `--n-steps` shapes only the cosine schedule.
+Whole-step `torch.compile` (reduce-overhead, CUDA graphs), pinned non-blocking
+host-to-device copies and truncated ListMLE bring T1, T2 and the decoder from
+~32–50% to **~95% GPU utilization**. The decoder was made fixed-shape (padded
+to a corpus-wide constant, invalid rows ignored by the CE) so its step can be
+captured.
 
-## Converged T2 run — `runs/t2_d512_cap4_2M`
+## Converged T2 run
 
-2M steps, d=512 n=4, cap=4, vp weight 1.0 vs 0.1 per binding loss,
-~10 ms/step, GPU ~96%. Final windowed losses:
+2M steps, d=512, n=4, chunk cap 4, vp weight 1.0 against 0.1 per binding
+loss, ~10 ms/step at ~96% GPU. Windowed losses:
 
 | loss | start | final |
 |------|-------|-------|
@@ -78,14 +75,13 @@ EOF; `--n-steps` shapes only the cosine schedule.
 | pc_writes | ~0.4 | 0.00 |
 | magnitude | — | 0.02 |
 
-vp converged ~4× past the earlier 504k verification run
-(`runs/t2_d512_cap4_500k_newt1`, vp ~0.72 → 0.18). out_slot plateaus ~0.16
-(vp-starved, not failed).
+vp ends ~4× below a 504k-step verification run (~0.72 → 0.18).
+out_slot plateaus at ~0.16, starved by vp rather than failed.
 
-## THE result: value-prediction does NOT build an operator/effect axis
+## Value prediction does not build an operator/effect axis
 
-Binding-controlled geometry probe (cosine of T2 vectors), holding the
-register binding fixed and varying only the function:
+A geometry probe holding the register binding fixed and varying only the
+function, reading the cosine between T2 vectors, at 504k and 2M steps:
 
 | pair type | 504k | 2M |
 |-----------|------|----|
@@ -95,57 +91,50 @@ register binding fixed and varying only the function:
 | rename (same op, different binding) | 0.754 | 0.801 |
 | random (unrelated) | 0.579 | 0.652 |
 
-Converging vp 4× did NOT grow the operator axis — it **shrank**
-(+0.029 → +0.011). At fixed binding, flipping the function moves the
-vector ~0.01; changing the binding moves it ~0.18. **Binding dominates the
-geometry ~16× over operator-essence**, and more vp made everything more
-similar, not more separated.
+Training vp 4× further *shrinks* the operator axis (+0.029 → +0.011). At fixed
+binding, changing the function moves the vector ~0.01; changing the binding
+moves it ~0.18. **Binding dominates the geometry ~16× over the operator**, and
+more vp makes everything more similar, not more separated.
 
-Structural reason: vp predicts outputs from `(vector, inputs)` through a
-shared head — a per-chunk **reconstruction** objective with no term that
-pulls behaviorally-equivalent chunks together. Two same-effect chunks can
-hold different vectors as long as the head decodes each; nothing
-co-locates them, and the binding heads actively separate by register. vp
-cannot induce operator-clustering no matter how long it trains.
+The reason is structural: vp predicts outputs from `(vector, inputs)` through a
+shared head — a per-chunk **reconstruction** objective with no term pulling
+behaviorally equivalent chunks together. Two same-effect chunks can hold
+different vectors as long as the head decodes each, and the binding heads
+actively separate by register. vp cannot induce operator clustering however
+long it trains.
 
-## VP hard probe — it works, as a reconstructor
+## vp as a predictor
 
-312k `(chunk, anchor, out-slot)` triplets: compressed-space R² 0.96, corr
-0.98. Decompressed, recovery is exact for small outputs (|val|≤15, 36% of
-cases: 94.8% within 10%) but hopeless for the 59% of outputs >1M (random
-int32 arithmetic). vp is a competent per-chunk predictor — which is
-exactly why it cannot serve as the operator axis.
+On 312k `(chunk, anchor, output-slot)` triplets: R² 0.96 and correlation 0.98
+in the compressed value space. Decompressed, recovery is accurate for small
+outputs (|val| ≤ 15, 36% of cases: 94.8% within 10%) and fails for the 59% of
+outputs above 1M (random int32 arithmetic). vp is a competent per-chunk
+predictor — which is why it cannot serve as the operator axis.
 
 ## Dimensionality — the vector is barely used
 
-T2 output effective rank (participation ratio) ≈ **13 of 512**; 90% of
-variance in 33 dims; only ~63 dims carry >0.1% variance (~87% dead).
-Per-loss read width: in_score ~22, vp ~15, out_score / live_out ~6,
-pc_writes ~3; the union of all heads ≈ 14 — they share one ~13-d subspace,
-they don't expand it. Through the stack, rank peaks at the 2nd transformer
-layer (~23) then **compresses** to ~13 at the output. **Capacity is not
-the bottleneck anywhere** — d_out=512 is ~37× the dimensionality in use;
-the geometry is starved of structure, not size. (Caveat: PR/variance is a
-linear measure; counts are lower bounds.)
+The 2M T2's output effective rank (participation ratio) is **~13 of 512**; 90%
+of variance lies in 33 dims; only ~63 dims carry >0.1% of variance (~87% dead).
+Per-loss read width: in_slot score ~22, vp ~15, out_slot score / live_out ~6,
+pc_writes ~3; the union of all heads is ~14 — they share one ~13-dim subspace
+rather than expanding it. Through the stack, rank peaks at the second
+transformer layer (~23) and **compresses** to ~13 at the output. Capacity is
+not the bottleneck: d_out=512 is ~37× the dimensionality in use. Participation
+ratio and variance are linear measures, so these counts are lower bounds.
 
-## Vestigial value compression
+## The vp value transform
 
-vp regresses against `_value_compress = sign(x)·log1p(log1p|x|)`. The
-double-log is the `behavioral_distance` Hungarian-cost metric, carried
-over now that behavioral_distance is dormant. It crushes 59% of targets into a
-0.41-wide saturation band — a likely contributor to the low rank. A single
-signed log would keep conditioning sane with ~18× more large-value
-resolution; untested.
+vp regresses against `sign(x)·log1p(log1p|x|)`, the double log of the
+Hungarian-bijection behavioral distance. It crushes 59% of targets into a
+0.41-wide saturation band, a likely contributor to the low rank. A single
+signed log would keep ~18× more resolution on large values; untested in this
+phase.
 
-## Conclusion and indicated next step
+## Handed to the next phase
 
-The decisive lever is the **oracle `out_regs` pairwise loss**: push T2
-vectors together/apart by their actual register-file outputs on the shared
-anchors (rename-SENSITIVE behavioral distance, no Hungarian bijection —
-cheap). It is the only proposed objective that forces behavioral
-separation into the empty dimensions. vp convergence is *not* the missing
-ingredient. Orthogonal tests queued: `out_slot_weight = vp_weight`
-(starvation vs ratio), small-d to convergence (capacity vs optimization),
-single-log vp.
+The objective proposed to open the operator axis is a **pairwise loss on the
+oracle's register-file outputs** at shared anchors: push T2 vectors together
+or apart by their actual outputs, register by register (rename-sensitive, no
+Hungarian bijection). vp convergence is not the missing ingredient.
 
 ---

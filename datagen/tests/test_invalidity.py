@@ -68,7 +68,7 @@ def test_bogus_rarely_valid(rng):
         toks = gen_bogus(rng, max_window=32)
         if _is_complete(toks):
             valid += 1
-    # Empirically ~3% on prior runs; assert < 10% to catch regressions.
+    # Measured ~3%; the 10% bound catches a generator emitting valid windows.
     assert valid / n < 0.10, f'{valid}/{n} bogus windows parsed as valid'
 
 

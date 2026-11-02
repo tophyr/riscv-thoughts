@@ -1,19 +1,17 @@
 # Decoder Strategy
 
 > **Status: unproven theory, and not the current objective.** Decode-back is
-> an explicit non-goal of the current work — the live objective is `vp = 0`.
-> The encoder this document assumes has also been replaced: it is
-> now the rename-equivariant register-state machine in RISCV_DESIGN.md. No
-> decoder exists in the tree.
+> an explicit non-goal of the current work, whose objective is faithful,
+> equivalence-collapsing compression. No decoder exists in the tree.
+> The measurements cited below were made on single-instruction encoders that
+> predate the rename-equivariant register-state machine of RISCV_DESIGN.md;
+> none has been repeated on it.
 >
-> **There is history of ONE POSSIBLE decoder at the tag
-> `tombstones/transformer_based_decoder_example`** — an autoregressive
-> transformer trained with teacher-forced cross-entropy against a frozen
-> encoder. It is an example of *a* decoder, nothing more. Its architecture is
-> **not** correct, **not** validated, and **not** a goal direction: it was
-> never made to work against the equivariant encoder, and the proposer +
-> verifier search this document describes is a different shape entirely. Read
-> it to see what one attempt looked like; do not read it as a starting point.
+> **The tag `tombstones/transformer_based_decoder_example` holds one possible
+> decoder** — an autoregressive transformer trained with teacher-forced
+> cross-entropy against a frozen encoder. Its architecture is **not**
+> validated against the equivariant encoder and **not** a goal direction; the
+> proposer + verifier search this document describes is a different shape.
 > `git show tombstones/transformer_based_decoder_example` is the commit that
 > removed it, so the diff carries the full code.
 
@@ -92,13 +90,12 @@ distance landscape is smooth enough to navigate by gradient. If it
 fails, the geometry is the problem, not the search method, and no
 learned decoder will do better.
 
-### What it showed
+### Evidence
 
-Validated on an early T0→T1 model, with the measurements in EXPERIMENT_LOG
-("Gradient decoder"). The durable consequence for this design: **a decoding
-failure indicts the encoder geometry, not the search method** — search recovers
-the original or an execution-equivalent instruction wherever the geometry is
-smooth and fails wherever it is not.
+On a single-instruction encoder (EXPERIMENT_LOG, "Gradient decoder"), gradient
+search recovers the original or an execution-equivalent instruction wherever
+the geometry is smooth and fails wherever it is not: **a decoding failure
+indicts the encoder geometry, not the search method.**
 
 ---
 
@@ -109,14 +106,11 @@ answer in one forward pass. An autoregressive transformer decoder
 with cross-attention to the emission vector, trained with
 cross-entropy against the original tokens on a frozen encoder.
 
-The "compressor-as-loss" framing from stage 1 is
-unnecessary in practice. Simple CE against the original tokens
-produces a decoder that generalizes to held-out instructions and
-emerges equivalence tolerance automatically — the encoder's
-equivalence-collapsing geometry shows through at decode time,
-without needing the compressor as a verifier.
-
-See EXPERIMENT_LOG.md for empirical results.
+On a single-instruction encoder (EXPERIMENT_LOG.md, phases 5–8), plain
+cross-entropy (CE) against the original tokens produces a
+decoder that generalizes to held-out instructions and tolerates equivalence:
+the encoder's equivalence-collapsing geometry shows through at decode time,
+without the compressor as a loss or a verifier.
 
 ### Architecture
 
@@ -144,8 +138,8 @@ Given a (tokens, T1) pair, train the decoder to reproduce the
 tokens autoregressively conditioned on T1. Standard supervised
 learning on automatically-generated pairs — no human labels needed.
 
-Alternative signals were investigated and rejected as primary
-training loss:
+Two alternative signals, measured on the same single-instruction encoder, are
+weaker as the primary training loss:
 
 - **Compressor-as-loss (Gumbel-softmax / round-trip):** decoder
   outputs re-compress near the target, but the decoder learns to
@@ -161,12 +155,11 @@ training loss:
   slower than CE. Useful as a fine-tune on top of CE, not as
   primary training.
 
-CE was initially suspect because it appears to fight execution
-equivalence (penalizing valid alternatives). Empirically, the
-encoder's equivalence-collapsing geometry means the T1 vectors
-for equivalents are close, so CE-trained decoders still produce
-equivalent alternatives on held-out data — the equivalence
-tolerance is inherited from the encoder, not learned by the
+CE appears to fight execution equivalence, since it penalizes valid
+alternatives. It does not in practice: the encoder's equivalence-collapsing
+geometry puts the T1 vectors of equivalents close together, so CE-trained
+decoders still produce equivalent alternatives on held-out data — the
+equivalence tolerance is inherited from the encoder, not learned by the
 decoder.
 
 ### Temperature and Diversity

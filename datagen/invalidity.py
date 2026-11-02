@@ -36,7 +36,6 @@ DEFAULT_TYPE_WEIGHTS = {
     'bogus': 0.1,
 }
 
-VALID_TYPES = frozenset(DEFAULT_TYPE_WEIGHTS.keys())
 
 # First non-special token id — anything below this is PAD/BOS/EOS/NEG.
 _FIRST_NON_SPECIAL = 4

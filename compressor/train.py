@@ -53,26 +53,6 @@ def load_checkpoint(path, device):
     return {k.removeprefix('_orig_mod.'): v for k, v in state.items()}
 
 
-# Token front-end submodule prefixes (live in TokenEmbedder); everything else
-# in a T1 checkpoint (core + heads) lives in the Compressor.
-_T1_EMBEDDER_KEYS = ('tok_emb.', 'win_pos_emb.', 'content_encoder.')
-
-
-def _split_t1_state(state):
-    """Map a T1 state_dict to the T1Compressor layout (`embedder.*` +
-    `compressor.*`). Old flat checkpoints (pre-`TokenEmbedder` split) keyed the
-    front-end + core + heads at the top level; route the embedder submodules to
-    `embedder.` and the rest to `compressor.`. Already-split checkpoints (any
-    key starts with `embedder.`/`compressor.`) pass through unchanged."""
-    if any(k.startswith(('embedder.', 'compressor.')) for k in state):
-        return state
-    out = {}
-    for k, v in state.items():
-        pre = 'embedder.' if k.startswith(_T1_EMBEDDER_KEYS) else 'compressor.'
-        out[pre + k] = v
-    return out
-
-
 def encode_instrs(model, instrs, device):
     """Tokenize, pad, and encode a list of Instructions to their essence
     vectors. Registers enter as wiring (instruction_wiring) only — the essence
@@ -844,15 +824,12 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
     route_binding = (route == 'binding')
 
     # Optional resume: a run-dir (model + train_state.pt) continues
-    # optimizer/schedule/step/RNG; a bare .pt loads weights only. T1 state is
-    # split-remapped (old flat -> embedder./compressor.) if needed.
+    # optimizer/schedule/step/RNG; a bare .pt loads weights only.
     resume_train_state = None
     if resume is not None:
         ckpt_path = Path(resume)
         weights_path = ckpt_path / model_file if ckpt_path.is_dir() else ckpt_path
         state = load_checkpoint(weights_path, device)
-        if ingest == 'tokens':
-            state = _split_t1_state(state)
         model.load_state_dict(state, strict=False)
         if ckpt_path.is_dir():
             ts = ckpt_path / 'train_state.pt'
@@ -885,8 +862,6 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
 
     vp_active = value_predict_weight > 0
     valid_active = valid_weight > 0
-    # One-instruction rows only, until two chunks' outputs have a
-    # correspondence.
     distance_active = distance_weight > 0
     if distance_active and not vp_active:
         raise ValueError('distance_weight > 0 needs value prediction on')
@@ -1139,38 +1114,14 @@ def _split_to_per_instruction(batch):
             instr_in0, instr_in1, instr_out)
 
 
-def _decode_chunk_instructions(batch, row_idx):
-    """Decode all instructions in chunk row_idx back to Instruction
-    objects. Returns the list, or None if any decode fails or the
-    chunk is empty/invalid. Caller masks via batch.valid."""
-    if not batch.valid[row_idx]:
-        return None
-    instr_lens = batch.instr_lens[row_idx]
-    tokens = batch.tokens[row_idx]
-    instrs = []
-    offset = 0
-    for j in range(len(instr_lens)):
-        L = int(instr_lens[j])
-        if L == 0:
-            continue
-        toks = tokens[offset:offset + L].tolist()
-        try:
-            instr, _ = decode_instruction(toks, 0)
-        except Exception:
-            return None
-        instrs.append(instr)
-        offset += L
-    return instrs if instrs else None
-
-
 @torch.no_grad()
 def _t1_predicted_wiring(t1, T):
     """Per instruction, derive the GP wiring (in0, in1, out) for T2 from the
     FROZEN T1's own binding PREDICTIONS — never decoded tokens. This is the
     tier-recursion routing: T2 consumes only T1's emitted output
     (essence + binding), so the experiment actually tests "is T1's emission
-    sufficient for the next tier?". With token wiring (the old diagnostic path) T2
-    would score identically given a useless T1, so it tested nothing.
+    sufficient for the next tier?". With token wiring T2 would score
+    identically given a useless T1, so it would test nothing.
 
       out      = argmax out_score over predicted-written regs (gated by
                  predicted live_out count; absent => x0).
@@ -1261,14 +1212,14 @@ def _t2_assemble(t1, split_outputs, n_chunks, max_n_instrs, device,
 
     route: 'binding' (default) derives T2's per-instruction wiring from
     T1's PREDICTED binding (_t1_predicted_wiring) — the tier-recursion path.
-    'tokens' uses the token-decoded wiring carried in split_outputs (the old
-    diagnostic path) — kept ONLY as a diagnostic A/B, not a valid recursion result.
+    'tokens' uses the token-decoded wiring carried in split_outputs — a
+    diagnostic A/B only, not a valid recursion result.
     Either way the wiring fed to T1 itself is token-derived (T1 ingesting its
     own instruction); only what flows to T2 changes.
 
     t1_encode: optional compiled `t1.encode_state` (the register-state machine
-    has many small ops; eager per-step launch of them over ~all-chunk
-    instructions was the T2 trainer's CPU bottleneck — the trainer passes a
+    has many small ops, and launching them eagerly over every chunk
+    instruction leaves the T2 trainer CPU-bound; the trainer passes a
     compiled, dynamic-shape version so they fuse). Must return (T, essence)."""
     (instr_tokens, instr_pad, chunk_idx, slot_idx, n_per_chunk,
      in0, in1, out) = split_outputs
@@ -1410,8 +1361,7 @@ def binding_losses(model, T, essence, *, live_in_t, live_out_t, pc_writes_t,
 
     Every target derives from one dataflow analysis, so these losses are
     mutually consistent — no objective collapses what another must keep
-    distinct (this is what the old equivalence_loss vs src-register CE
-    could not jointly satisfy).
+    distinct.
 
     `model` must expose live_in_head / live_out_head / pc_writes_head /
     in_score_head / out_score_head and n_regs / max_input_slots /

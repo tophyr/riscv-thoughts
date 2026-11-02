@@ -153,11 +153,10 @@ _CATEGORY_OPS = {
     'JALR': ['JALR'],
 }
 
-_CONFIG_EXTRA_KEYS = {'equivalences', 'invalidity', 'exclude_x0_dest', 'chain',
-                      'partners', 'aim'}
+_CONFIG_EXTRA_KEYS = {'invalidity', 'exclude_x0_dest', 'chain', 'partners',
+                      'aim'}
 _AIM_KEYS = {'fraction'}
 _PARTNERS_KEYS = {'rate', 'rewrites'}
-_EQUIVALENCES_KEYS = {'rate', 'max_per_class', 'min_per_class', 'boost'}
 _CHAIN_KEYS = {'rate'}
 _INVALIDITY_KEYS = {'rate', 'types'}
 
@@ -166,7 +165,6 @@ def validate_distribution(dist):
     """Validate a config dict.
 
     Required: opcode-category keys with weights summing to 1.0.
-    Optional: 'equivalences' sub-dict for manifest-injection settings.
     Optional: 'invalidity' sub-dict {'rate': float, 'types': {name: w}}
               for invalid-window injection.
     Optional: 'partners' sub-dict {'rate': float, 'rewrites': [str]}: the
@@ -183,22 +181,6 @@ def validate_distribution(dist):
     total = sum(weights.values())
     if abs(total - 1.0) > 1e-6:
         raise ValueError(f'Distribution weights sum to {total}, not 1.0')
-    if 'equivalences' in dist:
-        eq = dist['equivalences']
-        if not isinstance(eq, dict):
-            raise ValueError("'equivalences' must be a dict")
-        eq_unknown = set(eq.keys()) - _EQUIVALENCES_KEYS
-        if eq_unknown:
-            raise ValueError(f'Unknown equivalences keys: {eq_unknown}')
-        if 'rate' in eq and not (0 <= eq['rate'] <= 1):
-            raise ValueError(
-                f"equivalences.rate must be in [0,1], got {eq['rate']}")
-        if 'max_per_class' in eq and eq['max_per_class'] < 1:
-            raise ValueError(
-                "equivalences.max_per_class must be >= 1, got "
-                f"{eq['max_per_class']}")
-        if 'boost' in eq and not isinstance(eq['boost'], dict):
-            raise ValueError("equivalences.boost must be a dict")
     if 'chain' in dist:
         ch = dist['chain']
         if not isinstance(ch, dict):
@@ -421,63 +403,9 @@ def _t(op, *args):
     return InstructionTemplate(op, args)
 
 
-def _select_templates(klass, max_per_class, rng):
-    """Pick canonical templates from a class, capping at max_per_class."""
-    canon = klass.canonical
-    if len(canon) > max_per_class:
-        indices = rng.choice(len(canon), size=max_per_class, replace=False)
-        return [canon[int(i)] for i in indices]
-    return list(canon)
 
 
-def sample_injection_tuples(target_count, max_per_class, rng,
-                            min_per_class=0, boost=None):
-    """Sample canonical tuples from MANIFEST. Returns a flat list of
-    materialized Instructions, always emitting whole tuples.
 
-    Three passes: guaranteed (every class with >=2 templates gets at
-    least min_per_class tuples), boost (classes named in `boost` get
-    extra), random fill (until target_count instructions reached).
-    """
-    if target_count <= 0 or not MANIFEST:
-        return []
-
-    out = []
-
-    if min_per_class > 0:
-        for klass in MANIFEST:
-            templates = _select_templates(klass, max_per_class, rng)
-            if len(templates) < 2:
-                continue
-            for _ in range(min_per_class):
-                binding = sample_binding(klass, rng)
-                for tpl in _select_templates(klass, max_per_class, rng):
-                    out.append(materialize(tpl, binding))
-
-    if boost:
-        by_name = {k.name: k for k in MANIFEST}
-        for class_name, extra in boost.items():
-            klass = by_name.get(class_name)
-            if klass is None:
-                continue
-            templates = _select_templates(klass, max_per_class, rng)
-            if len(templates) < 2:
-                continue
-            for _ in range(int(extra)):
-                binding = sample_binding(klass, rng)
-                for tpl in _select_templates(klass, max_per_class, rng):
-                    out.append(materialize(tpl, binding))
-
-    while len(out) < target_count:
-        klass = MANIFEST[int(rng.integers(0, len(MANIFEST)))]
-        templates = _select_templates(klass, max_per_class, rng)
-        if len(templates) < 2:
-            continue
-        binding = sample_binding(klass, rng)
-        for tpl in templates:
-            out.append(materialize(tpl, binding))
-
-    return out
 
 
 MANIFEST = [

@@ -32,11 +32,10 @@ execution on concrete inputs and provable via symbolic execution for
 bounded sequences.
 
 **Computable distance.** The "semantic distance" between two instruction
-sequences is the difference in their output machine states. This can be
-measured as: number of registers with different values, Hamming distance
-across the register file, L1/L2 distance on register values treated as
-vectors, or memory diff size. This gives a continuous, exact distance
-metric — no probes, no approximation, no coverage gaps.
+sequences is the difference in their output machine states when both run on
+the same inputs. It is continuous and exact — no probes, no approximation, no
+coverage gaps. The distance this project trains on is defined in "Collapse: a
+behavioral distance on the essence".
 
 **Free training data.** Generate random instruction sequences, execute
 them, record machine states. Generate equivalent sequences via known
@@ -60,8 +59,8 @@ The level-by-level units we test against:
   (branch/jump). Termination at memory ops keeps T2 bounded —
   inside a thought, only register state evolves, which is finite.
   Termination at control flow is the standard basic-block boundary.
-- **T3 thought** = function-like unit (sequence of T2 blocks).
-  TBD when we get there.
+- **T3 thought** = function-like unit (sequence of T2 blocks), not yet
+  defined further.
 
 These are chosen unit definitions for benchmarking the recursive
 shift-reduce machinery, not declarations about cognition. See
@@ -98,67 +97,48 @@ make every immediate an unrelated symbol.
 
 ### Equivalence pairs (paraphrases)
 
-Generate instruction sequence S. Apply known semantic-preserving
-transformations to produce S'. Execute both, verify identical output
-states.
+Two instruction sequences are equivalent when they compute the same function
+from input registers to output registers. Transformations that preserve it:
 
-Transformations with provable equivalence:
 - **Register renaming**: swap all uses of x5 with x7 (and vice versa),
   adjusting all reads and writes. Output semantics identical modulo
   register naming.
 - **Instruction reordering**: reorder independent instructions (no
-  data dependency between them). Output identical.
-- **Strength reduction**: `slli x5, x3, 1` ↔ `add x5, x3, x3`
-  (shift left by 1 = multiply by 2 = add to self).
-- **Identity insertion/removal**: insert `add x0, x0, x0` (no-op,
-  since x0 is hardwired to zero). Remove without semantic change.
-- **Immediate decomposition**: `addi x5, x0, 1000` ↔
-  `addi x5, x0, 500; addi x5, x5, 500`.
+  data dependency between them).
+- **Dead or no-op instructions**: insert an instruction whose result is
+  overwritten before anything reads it, or one that writes x0 (hardwired to
+  zero).
+- **Respelling**: one function written with different opcodes —
+  `slli x5, x3, 1` ↔ `add x5, x3, x3`, `xor x5, x5, x5` ↔ `addi x5, x0, 0`.
+- **Commutative operand swaps**: `add x5, x3, x7` ↔ `add x5, x7, x3`.
+- **Folds, cancellations and reassociations**: `addi x5, x3, 500; addi x5,
+  x5, 500` ↔ `addi x5, x3, 1000`, and their kin.
+- **Same-value writes**: `addi x5, x5, 0` against its absence.
 - **Load-store reordering**: reorder loads/stores to non-overlapping
   memory addresses.
 
 Each transformation type produces a different kind of "paraphrase" —
 analogous to cross-lingual translation in the natural language setting.
-The compressor should map all equivalent sequences to the same point.
-
-**The reordering transformations are essence-level equivalences.**
-Reordering independent instructions (and non-overlapping loads/stores) leaves
-the function from input registers to output registers unchanged, so the
-essence must not move. Register-only reordering leaves the live dataflow graph
-unchanged, so it collapses by construction (see "GVN: the invariant essence is
-the value-number"); memory ops are out of scope.
+The compressor should map all equivalent sequences to the same point. The
+first three leave the chunk's live dataflow graph unchanged, so the encoder
+collapses them by construction (see "GVN: the invariant essence is the
+value-number"); the next four are trained as partner pairs (see "Collapse");
+memory ops are out of scope.
 
 ### Near-equivalence pairs (controlled distance)
 
-Generate S. Modify one instruction to produce S' with a slightly
-different output state. The machine-state difference is the exact
-semantic distance.
-
-Examples:
-- Change `addi x5, x0, 42` to `addi x5, x0, 43` — one register
-  differs by 1.
-- Change `add x5, x3, x7` to `sub x5, x3, x7` — one register has
-  a different value (magnitude depends on inputs).
-- Insert an additional `addi x10, x0, 1` — one register that was
-  zero is now 1.
-
-These provide the graded distance signal for training smoothness. The
-exact machine-state distance is the ground truth label.
-
-### Contradiction pairs (semantically opposite)
-
-Harder to define for computation than for natural language. Possible
-analogues:
-- Same inputs, different outputs (different computation entirely).
-- Same structure but operations inverted (add ↔ sub, sll ↔ srl).
-- These should be far apart in the compressed space.
+Modifying one instruction — `addi x5, x0, 42` → `addi x5, x0, 43`, or
+`add` → `sub` — gives a chunk whose outputs differ from the original's by a
+measurable amount. The behavioral distance between every two chunks of a
+batch is the graded target that trains smoothness (see "Collapse").
 
 ### Data pipeline
 
-Generation, SSA analysis, anchor execution and the value-prediction targets
-all run in `datagen`, which streams self-describing RVT batches to a trainer on
-stdout. Execution uses this project's own RV32I emulator (`emulator/`); no
-hardware and no external simulator. The commands, flags, wire format and
+Generation, dataflow analysis, execution at anchor states (the input
+register files a chunk's value-prediction targets are computed at) and the
+training targets all run in `datagen`, which streams self-describing batches
+(the RVT wire format) to a trainer on stdout. Execution uses this project's
+own RV32I emulator (`emulator/`); no hardware and no external simulator. The commands, flags, wire format and
 multinode operation are the `datagen` skill.
 
 ---
@@ -189,21 +169,23 @@ vocabulary.
 
 The encoder is the **rename-equivariant register-state machine** described in
 the next section — one shared core for every tier, trained end-to-end with the
-behavioral loss set, no separate token-transformer + pooling stage. Output
-dimensionality follows the information content: a single T1 instruction is
-bounded (opcode ~6 bits, up to 3 registers ~5 bits each, immediate ~12 bits ≈
-~30 bits), so T1's `d_out` is small (64); T2 carries multi-instruction binding
-plus essence and needs more (512). Err toward too small rather than too large —
-overcomplete spaces enable shortcut solutions (see TRANSFERABLE_LESSONS.md
-lesson 6).
+behavioral loss set. It emits an *essence* (what the unit computes) and a
+*binding* (which registers it reads and writes). At T1 a small transformer
+(`TokenEmbedder`, `compressor/model.py`) turns each instruction's opcode and
+immediate tokens, with the register tokens masked out, into the content the
+core threads; registers reach the core only as wiring. The essence width
+(`d_out`) follows the information content: a single T1 instruction is bounded
+(opcode ~6 bits, up to 3 registers ~5 bits each, immediate ~12 bits ≈ ~30
+bits), so T1's is small (64); a T2 chunk composes several functions and
+needs more (512). Err toward too small rather than too large — overcomplete
+spaces enable shortcut solutions (see TRANSFERABLE_LESSONS.md lesson 6).
 
 ---
 
 ## Rename-Equivariant Compressor
 
-The settled design. It is the architecture validated in EXPERIMENT_LOG
-("Rename-equivariant T1/T2"); this section is the durable rationale for *why*
-it is shaped the way it is.
+The encoder at every tier. Its evidence is in EXPERIMENT_LOG, phases 14–16;
+this section is the rationale for *why* it is shaped the way it is.
 
 ### The nuisance variable is register naming
 
@@ -231,10 +213,9 @@ any transposition t, `t∘t = identity` ⇒ `0 = v_id = 2·v_t` ⇒ `v_t = 0`, a
 since transpositions generate S₃₂, **every** v_π = 0. `(ℝ^d, +)` is
 torsion-free, but permutations are built from finite-order elements; a
 homomorphism into it kills all torsion → kills everything. This is not a
-training difficulty — it is a theorem, and it was confirmed empirically: an
-additive "consistent displacement" objective gave held-out-π displacement
-consistency at the random baseline (`R ≈ 0.09`; EXPERIMENT_LOG, "Pairwise
-behavioral geometry").
+training difficulty — it is a theorem. An additive "consistent displacement"
+objective trained against it scores held-out renames at the random baseline
+(EXPERIMENT_LOG, phase 13, "Pairwise behavioral geometry").
 
 The right structure is an **orthogonal / permutation representation**:
 `ρ(π) = R_π`, a permutation matrix acting on **register-indexed**
@@ -260,7 +241,9 @@ unstructured flat vector equivariant by construction.
 
 ### SSA makes the split structural
 
-The chunk's SSA dataflow DAG already isolates register identity. A physical
+The chunk's dataflow graph in static single assignment (SSA) form — every
+computed value a node with its own id, every read an edge to the node that
+produced it — already isolates register identity. A physical
 register name appears in exactly two places — the **input leaves** (live-in
 registers) and the **output bindings** (which register holds each final
 value); everything in between references operands by SSA id, the
@@ -273,7 +256,8 @@ structure, surfaced — not a split we invent.
 
 Realize the encoder as a register-indexed state machine over the dataflow:
 
-- State `S ∈ ℝ^{n_regs × d}` — the running essence bound to each register.
+- State `S ∈ ℝ^{n_regs × d_value}` — the running essence bound to each
+  register; `d_value` is also the essence width (`d_out`).
 - Seed each input register with its **structural colour** in the chunk's
   dataflow graph (below) — distinct, anonymous, deterministic, and free of the
   order the instructions are written in.
@@ -303,12 +287,9 @@ standard multi-head attention, which makes a slot's image in the essence
 `d_value` rather than `d_value / k`. This also decouples two things that would
 otherwise trade against each other: heads exist to content-address *different*
 written slots, and under a shared projection adding heads to separate more slots
-narrowed what each one could carry.
-
-The ceiling binds on whichever field carries the most entropy. Operation
-identity is a choice among ten opcodes and survives a narrow channel; a 12-bit
-immediate does not, which is why a shared projection showed up as an I-type-only
-deficit.
+narrows what each one can carry. The ceiling binds on whichever field carries
+the most entropy: an opcode survives a narrow channel, a 12-bit immediate does
+not (EXPERIMENT_LOG, finding 16).
 
 **A slot describes a function, it does not hold a value.** Nothing in the
 encoder ever sees a register's contents: the per-step content is the
@@ -320,22 +301,16 @@ numbers. The value-prediction head is therefore an *evaluator*: it is handed
 the chunk's input values separately and asked to apply the described function
 to them.
 
-**The op-cell appends a literal to the description it reads rather than folding
-it in, and width is not what it is short of.** When a slot's operand is another
-instruction's result, the description it builds has to combine two operations
-that each carry a 12-bit literal. Both literals survive — each is recoverable
-from the emitted essence at 99.08% or better — while their SUM is not, at 84.48%,
-so the chain is described as two separate offsets instead of one. An evaluator
-handed the sum predicts the chunk's output at 99.95%; handed the two addends
-instead it reaches 79.80%, because decoding a literal out of a continuous code
-and carry-propagating it are operations that do not compose in one readout pass.
-
-Doubling `d_value` from 256 to 512 improves those cells once; doubling again to
-1024 leaves the worst of them unchanged to three decimal places. What the
-description is short of is the fold, not room. That makes folding a chain's
-literals an encoder-side property worth having for its own sake, and not only
-for the equivalence collapse that motivates it (see "GVN" below): it is what
-would let a description be evaluated in one step.
+**Folding a chain's literals serves evaluation as well as collapse.** When a
+slot's operand is another instruction's result, its description combines two
+operations that each carry a 12-bit literal. A description that holds the two
+literals separately, rather than their sum, makes the evaluator decode each
+literal out of a continuous code and carry-propagate it, and those operations
+do not compose in one readout pass; widening `d_value` does not substitute for
+the fold (EXPERIMENT_LOG, findings 17 and 21, measured on encoders trained
+without the collapse objective). So folding is an encoder-side property worth having for
+its own sake, not only for the equivalence collapse that motivates it (see
+"Collapse"): it is what lets a description be evaluated in one step.
 
 This is equivariant by construction: renaming registers permutes which slots
 are read and written, so `S` permutes and the symmetric-pool essence is
@@ -346,20 +321,24 @@ alone, and reads/writes are pure one-hot tensor ops. Anything added to the
 pool's input must likewise be register-indexed, or the invariance stops being
 exact.
 
-Two channel groups per slot, both equivariant: **value channels** (set on
-write, preserved on read — the dataflow state the op-cell threads, which makes
-multi-hop value-numbering correct) and **event channels** (accumulate
-read/write events with order timestamps, so `live_in`/`in_slot`/`out_slot`
-are recoverable from the emitted object; a pure value-state records only
-writes). The read pulse is content-dependent, so a behaviorally-irrelevant
+Each slot carries four channel groups, all placed through the register
+one-hots and so all equivariant: **value channels** (set on write, preserved
+on read — the dataflow state the op-cell threads, which makes multi-hop
+value-numbering correct), **event channels** (accumulate read/write events
+with order timestamps, so which registers are read and written, and in what
+order, are recoverable from the emitted object; a pure value-state records
+only writes), the leaf's **colour** (below) and the output's **pointer**
+(see "Value prediction reads the essence"). Only the value channels and the
+pointer reach the pool. The read pulse is content-dependent, so a behaviorally-irrelevant
 read (`AND rs1,x0`) is distinguishable from a relevant one.
 
 **Operand order is consumed by the op-cell and nowhere else.** The op-cell sees
 the opcode (as content) and both operands in one activation, so it can use the
 roles for `SUB`/`SLT`/`SRL` and symmetrize them for `ADD`/`AND`/`OR`/`XOR` —
-every commutativity is left to it, and value prediction alone leaves it
-incompletely learned (finding 36). The pool is a symmetric sum that never
-sees `content`, so any channel fed to it is used unconditionally; no order of
+every commutativity is left to it. Value prediction alone leaves it
+incompletely learned (EXPERIMENT_LOG, finding 36); the collapse objective
+teaches it (see "Collapse"). The pool is a symmetric sum that never
+sees the instruction content, so any channel fed to it is used unconditionally; no order of
 any kind reaches it.
 
 **Leaf identity for input registers (subtle but essential).** The state machine
@@ -372,8 +351,7 @@ equivariant, which destroys distinctness. The seed must be **deterministic**:
 the random-node-feature trick from graph learning — a tag sampled fresh per
 chunk — satisfies the first two but is redrawn on every forward pass, so the
 same instruction compresses to a slightly different point each time it is seen
-(max |Δ| 1.8e-2, minimum cosine 0.9992 over four draws of one trained encoder),
-which contradicts the framework's foundational claim that a compressor is a
+(EXPERIMENT_LOG, phase 14), which contradicts the framework's foundational claim that a compressor is a
 deterministic function (WHAT_IS_A_THOUGHT.md) and leaves invariance to the seed
 a *learned* property a change can silently regress. And the seed must be **free
 of the linearization**: a seed taken from textual first-read order makes two
@@ -411,8 +389,9 @@ emits an `(essence, binding)` object: an essence vector (rename-invariant,
 "what this unit computes") and binding references (which registers, in which
 roles, as equivariant indices into the register axis). The binding is a graph —
 which external register feeds which operation role and which receives which
-result; the ordered input and output lists the heads emit today are that graph
-flattened along the first-read frame's linearization (see "GVN").
+result. The binding heads emit it flattened into two ordered lists: the inputs
+in first-read order and the outputs in final-write order (`in_slot`,
+`out_slot`; see "Training").
 
 A tier's emission is therefore a **pair, not a single vector** — there is no
 concatenation step, and `encode_state` returns the two separately. Across the
@@ -441,22 +420,21 @@ what escapes to outside.
   opcode" does **not** license "so T2 can embed opcodes itself.")
 
 T1 is therefore literally T2 with `seq_len=1`: the only legitimate difference
-between the tiers is the ingestion front-end and the hparams.
+between the tiers is the ingestion front-end and the hyperparameters.
 
 **The lower tier's loss set IS the contract, and it is under-specified.** A tier
 is frozen before the next one trains, so whatever its own losses shaped into its
-emission is exactly what the next tier receives — `value_predict` defines the
-essence's content, the binding losses define the interface, and the next tier
-gets no vote. Two consequences follow, and both are load-bearing:
+emission is exactly what the next tier receives — value prediction and the
+behavioral distance term define the essence's content, the binding losses
+define the interface, and the next tier gets no vote. Two consequences follow, and both are load-bearing:
 
-- The binding losses carry weight 0.1 against `value_predict`'s 1.0, yet the
+- The binding losses carry weight 0.1 against value prediction's 1.0, yet the
   binding is what the next tier routes its wiring on. The interface is optimised
   at a tenth of the priority of the content it carries.
-- Satisfying the contract does not determine downstream usability. Six T1s each
-  scoring 100.0000% on their own single-instruction value prediction yielded T2s
-  spanning 0.059 points of exact match — an order of magnitude beyond T2-level
-  run-to-run spread — with their binding accuracies ranked ANTI-correlated to
-  their T2s (EXPERIMENT_LOG, "T2 faithfulness", finding 25).
+- Satisfying the contract does not determine downstream usability. T1s that
+  are each exact on their own value prediction yield T2s that differ by more
+  than T2-level run-to-run spread, and the T1s' binding accuracies do not rank
+  them (EXPERIMENT_LOG, finding 25).
 
 So the only real test of a tier's emission is training the tier above it. A
 lower-tier scorecard verifies that tier is intact; it cannot rank candidates.
@@ -492,38 +470,36 @@ behaviors must stay apart — the essence is behavioral, not a syntactic hash.
 feeds which role and which result lands where is the chunk's interface and
 belongs in the binding (WHAT_IS_A_THOUGHT.md, "The Thought and Its
 Interface"), so no input or output is numbered by textual order anywhere in
-the supervision: value prediction is evaluated per written output, handing
+the essence's supervision — only the binding heads' order targets use it:
+value prediction is evaluated per written output, handing
 the evaluator the essence, that output's pointer and its inputs' values and
 colours gathered by register (see "Value prediction reads the essence" and
-"Training"), and the targets are the raw register values. A
-frame numbered by first-read and final-write order was used before this one,
-knowingly, to establish the architecture's capacity to represent vp at all
-before the equivalence criterion was imposed on it; it graded the essence on a
-linearization and separated reordered, renumbered, dead-code-bearing and
-same-value-writing equivalents (EXPERIMENT_LOG, "T2 faithfulness", finding
-36); the code carries none of it.
+"Training"), and the targets are the raw register values. Numbering inputs
+and outputs by first-read and final-write order instead grades the essence on
+one linearization of the chunk and separates reordered, dead-code-bearing and
+same-value-writing equivalents (EXPERIMENT_LOG, finding 36).
 
 ### Value prediction reads the essence
 
-The next tier consumes the essence, so the essence is what value prediction
-has to grade. An evaluator handed each written slot's own description
-certifies the slots and leaves the pool unshaped: on such a T2 every value is
-recovered while unrelated chunks' essences sit a thirtieth of the first-read
-frame's distance apart, the aliasing control inside that (EXPERIMENT_LOG, "The
-register frame", finding 38). So the evaluator is handed, for each written
-output, the unit-normalized essence, that output's **pointer**, and the values
-and colours of the output's inputs — never the output's own description
-(`vp_loss`, `compressor/train.py`). Each slot's description is then shaped by
-what the essence must carry, and the essence spans the first-read frame's
-range (finding 39). Exact evaluation from the essence implies the written
+Value prediction (vp) trains a head, the *evaluator*, to predict each output
+register's value after the chunk from the chunk's input values. The next tier
+consumes the essence, so the essence is what value prediction has to grade. An evaluator handed each written slot's own description
+certifies the slots and leaves the pool unshaped: every value is recovered
+while the essences of unrelated chunks barely separate (EXPERIMENT_LOG,
+finding 38). So the evaluator is handed, for each written output, the
+unit-normalized essence, that output's **pointer**, and the values and colours
+of the output's inputs — never the output's own description (`vp_loss`,
+`compressor/train.py`). Each slot's description is then shaped by what the
+essence must carry, and unrelated chunks' essences separate (finding 39).
+Exact evaluation from the essence implies the written
 slots carry their functions: a slot's row is the only route its function has
 into the essence.
 
 **The pointer names an output's function inside the essence without naming
 anything else.** A chunk with two outputs pools two functions into one
-vector, and the evaluator must be told which one it is asked about. In the
-first-read frame an output's write rank did that, at the price of the
-linearization. The pointer must be free of register names and of instruction
+vector, and the evaluator must be told which one it is asked about. An
+output's write rank would say, but write rank is a property of the
+linearization, not of the function. The pointer must be free of register names and of instruction
 order, deterministic, and narrow enough to select a function without
 describing it.
 
@@ -547,14 +523,12 @@ about the chunk's content.
 
 Ordering by description is what lets two equivalent chunks with several
 outputs file each function in the same place: once the op-cell describes the
-two spellings of an output alike, they sort alike. A fixed hash of each
-output's dataflow path with its opcodes, the order this replaced, reads the
-spelling, so a commutative swap of an operand that is shared or composed put
-two equivalent chunks' outputs under different pointers in about 40% of cases;
-the description order does so in 15–18%, and in under 1% where the op-cell
-already describes the spellings alike (EXPERIMENT_LOG, "The register frame",
-findings 45 and 46). The order moves while the descriptions train, and settles
-as they do.
+two spellings of an output alike, they sort alike. An order fixed by a hash of
+each output's dataflow path and opcodes cannot do this, since it reads the
+spelling: a commutative swap of an operand that is shared or composed files
+two equivalent chunks' outputs under different pointers (EXPERIMENT_LOG,
+findings 45 and 46). The description order moves while the descriptions
+train, and settles as they do.
 
 The pool adds each written slot's pointer to its attention key, so it can
 file each output's description where the pointer will look; the pointer rides
@@ -648,14 +622,16 @@ the other lacks counting 1; two rows with no outputs are 0 apart.
 
 Equivalent pairs are rare in a naturally drawn batch, so a fraction of each
 batch is **partner pairs**: two different spellings of one function on the
-same registers. For single instructions they come from groups of the
-equivalence manifest merged by the function computed
+same registers. For single instructions they come from a curated list of
+single-instruction equivalence classes (`MANIFEST`), merged into groups by the
+function computed
 (`datagen.generate.PARTNER_GROUPS`); for chunks, each pair is one rewrite —
 a commutative swap, a respelling within such a group, a fold of two literals,
 a cancelling pair, a reassociation, or a same-value write against its absence
 — embedded in random context whose registers it reads half the time, so
-every operand context is drawn (`sample_chunk_partner_pair`). Every rewrite
-is checked on the emulator. The mix carries every rewrite at once: a
+every operand context is drawn (`sample_chunk_partner_pair`). The test suite
+checks every group and every rewrite on the emulator
+(`datagen/tests/test_generate.py`). The mix carries every rewrite at once: a
 collapse lapses when its pairs leave the mix, and a rewrite never trained
 collapses only partly (EXPERIMENT_LOG, "The register frame", findings 47–50).
 The term sits on the essence, where the requirement is stated;
@@ -681,12 +657,10 @@ only at x = 600 — read distance 0 when no witness state lands there, and the
 term pulls them together. Placing them close is correct for a smooth space;
 what keeps them distinguishable is value prediction, which needs training
 anchors that reach the inputs where they differ — the aimed anchor states
-below.
-
-Each output's values at the witness states ship in every batch, for chunks as
-for single instructions. The trainer builds the pair matrix from them for
-rows with one output, at either tier; how several outputs combine into one
-distance is not settled.
+(see "Training"). A floor on the distance of pairs known to differ would hold
+them apart instead, but it needs either a label saying which pairs are
+equivalent, which means enumerating the equivalences, or a disagreement found
+at boundary states, which does not scale past one instruction.
 
 ### What is built in for good, and what is built in for now
 
@@ -716,17 +690,15 @@ The state machine is the bottom-up half of the same pass; the learned
 pre-pass is its top-down half, and with it nothing in the encoder depends on
 the order the instructions were written in.
 
-The exact rules go first so that a failure of the frame cannot be confused
-with a pass that has not learned liveness or symmetry yet. They are a known
-simplification taken on purpose — the same tactic as establishing value
-prediction before equivalence collapse — and their removal is owed: once the
-collapse scorecard holds with them, the learned pass replaces them, is checked
-against them, and they are deleted.
+The exact rules are a deliberate simplification, so that a failure of the
+register frame cannot be confused with a pass that has not yet learned
+liveness or symmetry. They also give the learned pass a reference to be
+checked against before it replaces them.
 
 ### Open problems (additive over the equivariance skeleton)
 
-These are real work, each additive over a stable "register-indexed state; the
-32 GP registers are the permutable slots" skeleton:
+Each is additive over the skeleton "register-indexed state; the 32
+general-purpose (GP) registers are the permutable slots":
 
 - **PC / branches.** PC is not an independent output of a chunk: two chunks
   with identical externally visible register inputs and outputs are equivalent
@@ -738,9 +710,8 @@ These are real work, each additive over a stable "register-indexed state; the
 - **Memory (loads/stores).** Modelled as another non-renameable slot;
   structurally clean, but whether the essence can capture value-dependent
   memory dataflow / aliasing is genuinely unproven — the real expressiveness
-  risk. Currently out of scope (`precompute_chunk` raises on memory ops).
-- **Immediates.** Rename-invariant content; enrich T1's essence, orthogonal
-  to equivariance. Low risk.
+  risk. Out of scope: `precompute_chunk` raises on memory ops, so a chunk
+  containing one ships tokens but no value-prediction or distance target.
 - **Validity / parse.** The equivariant intake needs a *valid parse*, so
   validity moves from a learned magnitude toward a parse-level gate. How an
   equivariant T1 integrates with the streaming shift-reduce parser (which
@@ -755,30 +726,33 @@ These are real work, each additive over a stable "register-indexed state; the
 
 ### Loss terms
 
-**Evolved through extensive experimentation** (EXPERIMENT_LOG, from "Gate
-training on a frozen encoder" through "Rename-equivariant T1/T2"). The settled approach is one **behavioral loss set shared by
-T1 and T2** (`compressor.train.binding_losses`) — T1 is the
-single-instruction special case, plus the behavioral distance term on the
-essence at both tiers (below). No syntactic CE heads and no loss toward a hand-written equivalence
-label.
+T1 and T2 train one **behavioral loss set** (`train_compressor`,
+`compressor/train.py`) — T1 is the single-instruction special case — with the
+behavioral distance term on the essence at both tiers. Every target is read
+off execution and dataflow; there is no cross-entropy head on the syntax and
+no loss toward a hand-written equivalence label. The weights: value
+prediction and the distance term 1.0, the validity and binding losses 0.1
+each.
 
-**Magnitude / validity loss.** Soft `(‖v‖ − is_valid)²`: ‖v‖→1 for a
-valid thought (one complete instruction at T1; a well-formed chunk at T2),
-→0 otherwise. Vectors live in open space (no `F.normalize` on the output);
-magnitude carries validity, direction carries semantics. A *hard*
-normalize onto the unit sphere breaks `out_slot` — train TOWARD the
-surface with this soft loss, don't project ONTO it.
+**Magnitude / validity loss.** Soft `(‖v‖ − is_valid)²` on the essence:
+‖v‖→1 for a valid thought (one complete instruction at T1; a well-formed
+chunk at T2), →0 otherwise. The output is not normalized; magnitude carries
+validity, direction carries semantics, and every other consumer of the
+essence reads its unit-normalized direction. Training *toward* the unit
+sphere with this soft loss, rather than projecting *onto* it, keeps validity
+readable from the vector (EXPERIMENT_LOG, phase 10).
 
 **Behavioral binding losses** (the binding heads read the equivariant
 per-slot state `T`, one score per register slot; `pc_writes` reads the
 invariant essence):
 - `live_in` / `live_out`: BCE on which registers are read / written.
 - `pc_writes`: BCE on whether the chunk writes PC.
-- `in_slot` / `out_slot`: read/write ORDER, as ListMLE (Plackett–Luce)
-  over per-register scalar score heads (argsort to decode; duplicate-free).
+- `in_slot` / `out_slot`: the inputs in first-read order and the outputs in
+  final-write order, as ListMLE (Plackett–Luce) over per-register scalar
+  score heads (argsort to decode; duplicate-free).
 
-**Value prediction (`value_predict`), read from the essence, per written
-output.** Per-anchor, per-output per-bit BCE (plus a bounded smooth-magnitude
+**Value prediction, read from the essence, per written output.** Per-anchor,
+per-output per-bit binary cross-entropy (BCE) (plus a bounded smooth-magnitude
 term): for each register the chunk writes, from the unit-normalized essence,
 that output's pointer and, for each external input the output depends on, the
 input's value at its own register (as 32 bits + a smooth scalar) and its
@@ -790,16 +764,16 @@ at the same positions, which the graph's colour order does not (finding 43);
 interchangeable inputs tie on role and are ordered by the encoder's colour,
 every operand role ordered, never by register number, so a
 register-relabelled chunk presents the same essence, pointers and values at
-the same positions (EXPERIMENT_LOG, "The register frame", finding 40). Anchor states are drawn afresh for every chunk (see the
-end of this section for why one fixed set fails).
+the same positions (EXPERIMENT_LOG, "The register frame", finding 40). Anchor
+states are drawn afresh for every chunk (below).
 
-**vp is the primary objective.** The evaluator is fed raw value *bits*, not
+**What vp measures.** The evaluator is fed raw value *bits*, not
 log-compressed scalars. What it measures is the essence composed with the
 evaluator's ability to EVALUATE the function it carries — a slot describes a
 function rather than holding a value (above) — so a function carried
 perfectly can still score badly when applying it needs carry propagation.
 Driving vp to zero is therefore a demand on the pair, and faithfulness, the
-property a future T3 actually consumes, is the weaker half of it (METRICS.md
+property the next tier consumes, is the weaker half of it (METRICS.md
 states what it certifies and how to measure the halves apart). vp's gradient
 reaches every written slot through the pool, and the essence's magnitude is
 shaped only by the validity loss: the evaluator reads its direction.
@@ -820,25 +794,25 @@ chained head would raise the score while leaving the representation as
 deficient for the consumer that matters. The composite has to be in the essence,
 not in the readout's control flow.
 
-GVN collapse and vp are both load-bearing — a vp gain that craters the GVN
-rows is a regression, not a win.
+Collapse and vp are both load-bearing — a vp gain that separates equivalent
+chunks is a regression, not a win.
 
-**Behavioral distance (`distance_weight`).** An MSE between every two rows'
-essence distance and √(2d), d their behavioral distance at shared witness
-states, equivalent pairs and the rest averaged separately (see "Collapse: a behavioral distance on the essence"). It is the only
-pairwise term, and it is what makes equivalent spellings collapse: value
+**Behavioral distance.** An MSE between every two rows' essence distance and
+√(2d), d their behavioral distance at shared witness states, equivalent pairs
+and the rest averaged separately (see "Collapse: a behavioral distance on the
+essence"). It is the only pairwise term, and it is what makes equivalent spellings collapse: value
 prediction alone is satisfied by any essence the evaluator can read.
 
 **The anchor states are drawn afresh for every chunk, with structure, placed
 on the chunk's own input registers, and they decide no labels.** With
 one fixed set the evaluator is fed the same few input values for every row, so
 it can store each instruction shape's answers at those points instead of
-evaluating the described function — and it does: heads exact at 8 fixed
-anchors score ~5% (T2) and 21% (T1) at anchors they never saw (EXPERIMENT_LOG,
-"T2 faithfulness", finding 32). A fresh draw per chunk makes storing
-impossible, so a correct prediction can only come from evaluating. What trains
-the evaluator is how many distinct input values a step sees: one shared set per
-batch needs 64 anchors to match 8 per row, at 2.7x the step time (finding 33).
+evaluating the described function, and it does: heads exact at a fixed set
+fail at anchors they never saw (EXPERIMENT_LOG, finding 32). A fresh draw per
+chunk makes storing impossible, so a correct prediction can only come from
+evaluating. What trains the evaluator is how many distinct input values a step
+sees, so a draw per row needs far fewer anchors per row than one shared set
+per batch does, at a fraction of the step time (finding 33).
 
 Uniform 32-bit values are poor witnesses: a comparison against a 12-bit
 immediate is constant over them, two registers almost never hold equal values,
@@ -852,9 +826,9 @@ chunk's inputs equal, adjacent or opposite; the chunk executes on that
 register file as it is.
 
 **A fraction of each row's states are aimed at the chunk's own boundaries**
-(`datagen/aim.py`; half, in T1's corpus for the distance term), because a
-structured draw still reaches them only by chance. A boundary is a node and two values on either side of where an output
-changes: a comparison's threshold (`SLTI x,k` at k−1 and k, `SLT a,b` at
+(`datagen/aim.py`; the fraction is set by the corpus config), because a
+structured draw still reaches them only by chance. A boundary is a dataflow
+node and two values on either side of where an output changes: a comparison's threshold (`SLTI x,k` at k−1 and k, `SLT a,b` at
 a = b−1 and a = b), the same threshold straddled again at a distance drawn
 log-uniformly up to 2¹¹, a computed operand's wrap-around point, and an add
 whose result crosses a power of two, where it carries through every lower bit.
@@ -864,9 +838,9 @@ be solved for one operand — `ADD`, `ADDI`, `SUB`, `XOR`, `XORI` — with the
 other operand held at its value in that state. Every aimed state is executed
 and kept only if the node takes the intended value, so a wrong walk costs a
 generic state and never a wrong target. The exact threshold alone is not
-enough: under the behavioral distance term a T1 puts `SLTI k` and `SLTI k+256`
-0.05 apart, and a readout trained only at the step where the output flips misplaces
-the threshold by hundreds (EXPERIMENT_LOG, "The register frame", finding 42).
+enough: the behavioral distance term places `SLTI k` and `SLTI k+256` close,
+and a readout trained only at the step where the output flips misplaces the
+threshold by hundreds (EXPERIMENT_LOG, "The register frame", finding 42).
 The aim is a function of the chunk's structure, so a register rename aims the
 same draw, and the held-out scoring set is never aimed.
 
@@ -901,34 +875,20 @@ distance term does. It is rename-invariant and acts only on the essence,
 which is rename-invariant by construction; the binding lives in the
 per-register state and the term never reads it. A rename-invariant target on
 a vector that also carried the binding would weld apart the binding
-distinctions an equivariant representation keeps recoverable, which is why the
-flat encoders of EXPERIMENT_LOG phases 12–13 could not use one.
+distinctions an equivariant representation keeps recoverable, which is why an
+encoder whose output is one flat vector cannot use one (EXPERIMENT_LOG,
+phases 12–13).
 
-**Supervise only behaviorally-live signals.** A dead value has no target, so
-giving it one asks for a gradient nothing can satisfy and fights the collapse
-the essence is supposed to perform. The existing instance is the `rd==x0`
-immediate mask: `ADDI x0,rs,k` is the same no-op for every `k`, so its immediate
-is not supervised.
-
-Dead-end objectives explored on the way here (collapse losses, pairwise
-distance-matching, additive king−queen equivariance, unit-sphere
-normalization, syntactic CE heads) are recorded in EXPERIMENT_LOG.md; the
-behavioral loss set above superseded them all.
+Objectives rejected for this encoder — collapse losses on flat vectors,
+additive rename equivariance, projection onto the unit sphere, syntactic
+cross-entropy heads, an immediate-reproduction head, InfoNCE — are recorded
+with their evidence in EXPERIMENT_LOG.
 
 ### Training data volume
 
 Effectively unlimited. Each training step can generate fresh random
 sequences, execute them, and apply transformations on the fly. No
 fixed dataset — the generator IS the dataset.
-
-### Compute requirements
-
-The encoder-compressor is tiny (2-4 layers, d_model=128-256, vocab ~90).
-The RISC-V emulator is fast (millions of
-instructions per second). The entire training loop — generate, encode,
-compress, compute loss, backprop — should be dominated by the
-transformer forward/backward passes, not by data generation. RTX 4090
-should handle this easily.
 
 ---
 
@@ -938,14 +898,12 @@ should handle this easily.
 
 Do provably equivalent sequences compress to the same point?
 - Register renaming equivalences
+- Reorderings of independent instructions
 - Commutative operand swaps
 - Strength reduction equivalences
 
 Metric: cosine similarity between equivalence pair compressed points.
 Target: > 0.99.
-
-*Instruction reordering belongs on this list* — two orderings of independent
-instructions compute one function of their registers.
 
 ### 2. Distance preservation (smoothness)
 
@@ -1006,8 +964,8 @@ inversion, free verification.
 
 Does the compressor correctly handle transformation types not seen
 during training?
-- Train on register renaming and commutative swaps only
-- Evaluate on strength reduction equivalences (held out)
+- Withhold one kind of partner pair (see "Collapse") from training
+- Evaluate collapse on the withheld kind
 - If the compressor maps unseen equivalence types to the same point,
   it has learned execution semantics, not transformation patterns.
 

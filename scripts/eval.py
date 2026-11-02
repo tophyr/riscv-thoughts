@@ -100,24 +100,13 @@ def main():
                 print(f'    {k:<60} {100 * acc:7.2f}%  of {n}')
         g = E.gvn_collapse(t1, t2, device=device, route=args.route,
                            n=args.gvn_pairs, chunk_len=args.gvn_chunk_len)
-        rr = g['rename_ratio']; br = g['behavioral_ratio']
+        rr = g['rename_ratio']
         print(f'GVN collapse (n={g["n_pairs"]}, distinct={g["n_distinct"]}):')
         print(f'  rename     mean={g["rename_mean"]:.4f} '
               f'ratio={rr:.4f}' if rr is not None else
               f'  rename     mean={g["rename_mean"]:.4f}')
-        if g['behavioral_eq_mean'] is not None:
-            print(f'  behavioral mean={g["behavioral_eq_mean"]:.4f}   '
-                  f'(commutative swap, pairs that ARE equivalent; n='
-                  f'{g["n_behavioral_eq"]}) <- judge collapse on this')
-        if g['behavioral_ne_mean'] is not None:
-            print(f'  behav-diff mean={g["behavioral_ne_mean"]:.4f}   '
-                  f'(swap changed the function; n={g["n_behavioral_ne"]} — '
-                  f'SHOULD be large)')
-        print(f'  behav-mixed mean={g["behavioral_mean"]:.4f} '
-              f'ratio={br:.4f}   (both kinds pooled — kept for continuity '
-              f'with older records; not interpretable on its own)'
-              if br is not None else
-              f'  behav-mixed mean={g["behavioral_mean"]:.4f}')
+        print(f'  behavioral mean={g["behavioral_mean"]:.4f}   '
+              f'(commutative swap: always equivalent)')
         print(f'  distinct   mean={g["distinct_mean"]:.4f}')
 
 

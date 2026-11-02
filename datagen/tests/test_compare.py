@@ -355,7 +355,7 @@ def test_chain_rate_raises_composed_density_without_moving_opcodes():
 
 
 def test_every_augmentation_rate_comes_from_the_config_alone():
-    """A corpus is ONE reviewable file. `chain.rate`, `equivalences.rate` and
+    """A corpus is ONE reviewable file. `chain.rate`, `partners.rate` and
     `invalidity.rate` are read from the config and nothing else can set them,
     which is what makes the config a run copies into its directory
     (scripts/record_corpus.py) a complete description of what it trained on."""
@@ -366,7 +366,7 @@ def test_every_augmentation_rate_comes_from_the_config_alone():
     # a corpus with no chain block chains nothing
     plain = load_distribution('configs/instr_alu_writers.json')
     assert plain.get('chain', {}).get('rate', 0.0) == 0.0
-    assert plain.get('equivalences', {}).get('rate', 0.0) == 0.0
+    assert plain.get('partners', {}).get('rate', 0.0) == 0.0
     assert plain.get('invalidity', {}).get('rate', 0.0) == 0.0
 
 

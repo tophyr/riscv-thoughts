@@ -1,195 +1,134 @@
 # Phase 10: Magnitude-as-Validity Encoder Retrain
 
-Implements the design decisions from Phase 9: T1 lives in the
-unit ball B^d (no `F.normalize` on encoder output). Magnitude
-encodes validity/confidence; direction encodes semantics.
-Encoder trained with both a direction loss (existing pair MSE
-+ dest CE on valid rows only, using normalized direction) and
-a magnitude loss (MSE of `||T1||` against a binary target —
-1 for valid single instructions, 0 for partial / spanning /
-multi / bogus invalid windows).
+Phase 9 found that the frozen T1 does not carry instruction completeness, so
+no gate trained on it can find instruction boundaries. This phase retrains T1
+in the unit ball B^d (no `F.normalize` on the encoder output): magnitude
+encodes validity, direction encodes semantics. The encoder is trained with a
+direction loss (pair MSE + destination CE on valid rows only, computed on the
+normalized direction) and a magnitude loss (MSE of ‖T1‖ against a binary
+target — 1 for a valid single instruction, 0 for a partial, spanning,
+multi-instruction or bogus window).
 
-## Architecture changes
+## Architecture
 
-**Encoder.** Drop `F.normalize` in `_encode_fn` and
-`encode_soft`. Encoder outputs `proj(last_repr)` raw. Default
-`max_window` reduced from 64 to 32 (the prior default was
-oversized — single instructions are ≤9 tokens, multi-instr
-windows ≤27).
+**Encoder.** The output is `proj(last_repr)` with no normalization. The
+maximum window is 32 tokens: a single instruction is ≤9 tokens and a
+multi-instruction window ≤27.
 
-**Consumer split.** Two distinct policies for what reads from
-T1:
+**Consumer split.** Two policies for what reads T1:
 
-- **Classification heads (dest_type, dest_reg) read direction
-  (T1 / ||T1||).** They classify what the instruction *is*;
-  magnitude shouldn't enter that. Reading raw T1 gave heads a
-  gradient incentive to inflate magnitude (linear classifiers
-  prefer larger inputs) and produced magnitude-dependent
-  behavior on streaming inputs at inference time. Direction is
-  semantically the right input.
-- **Decoder (when recon enabled) reads raw T1.** Its
-  conditioning strength should scale with magnitude — at
-  ||T1|| ≈ 1 it reconstructs confidently; at ||T1|| ≈ 0
-  cross-attention's K/V projections collapse to ~0, the
-  residual stream runs as an unconditioned language model, and
-  the decoder produces high-entropy output sampled from the
-  marginal distribution. No threshold needed for "invalid"
-  handling — degradation is continuous and automatic.
+- **Classification heads (destination type, destination register) read the
+  direction T1 / ‖T1‖.** They classify what the instruction *is*, which does
+  not depend on confidence. Reading raw T1 gives a linear classifier a gradient
+  incentive to inflate magnitude and makes its behavior on streaming inputs
+  depend on magnitude.
+- **The decoder reads raw T1.** Its conditioning strength scales with
+  magnitude: at ‖T1‖ ≈ 1 it reconstructs confidently; at ‖T1‖ ≈ 0 the
+  cross-attention keys and values collapse to ~0, the residual stream runs as
+  an unconditioned language model, and the output is high-entropy samples
+  from the marginal distribution. Degradation on invalid input is continuous,
+  with no threshold.
 
-## Pipeline changes
+## Invalid windows
 
-**RVB v2.** Bumped format version from 1 to 2; added
-`valid_mask: (B,) bool` as the 7th field. V1 files are no
-longer readable (regenerate; cheap).
+Each batch carries a per-row valid mask. Invalid windows come from four
+generators:
+- **partial**: `encode(A)[j:k]`, excluding the full instruction.
+- **spanning**: `encode(A)[j:] + encode(B)[:k]`, excluding full A + full B.
+- **multi**: 2-3 complete instructions concatenated.
+- **bogus**: random tokens from the non-special vocabulary.
 
-**Invalid-window generators** (datagen/invalidity.py):
-- `partial`: `encode(A)[j:k]` excluding the full-instruction
-  case.
-- `spanning`: `encode(A)[j:] + encode(B)[:k]` excluding
-  full-A + full-B.
-- `multi`: 2-3 complete instructions concatenated.
-- `bogus`: random tokens drawn from the non-special
-  vocabulary.
-
-Configured per-batch via the existing config-dict mechanism
-under `invalidity` (mirrors `equivalences`):
-
-    "invalidity": {
-      "rate": 0.2,
-      "types": { "partial": 0.4, "spanning": 0.3,
-                 "multi": 0.2, "bogus": 0.1 }
-    }
-
-`produce_instruction_batch` zeros out execution-state fields
-(data_vals, pc_vals, dest_types, dest_regs) on invalid rows;
-the training loop is responsible for filtering via valid_mask.
+In this phase 20% of rows are invalid, split partial 0.4 / spanning 0.3 /
+multi 0.2 / bogus 0.1. Execution-state targets are zeroed on invalid rows and
+the trainer masks them out.
 
 ## Experiment 34: 50K-step encoder retrain
 
-Configuration: d_model=128, n_heads=4, n_layers=2, d_out=64,
-max_window=32. Loss = mag_loss (w=1.0) + mse_loss + dt_loss +
-dr_loss + 0.05·eq_loss. No recon (decoder not trained in this
-run). Invalidity rate 0.2 with the default type weights.
-Batch size 4096. 50K steps at LR 3e-4 with cosine decay.
-Training time ~1h15m at ~85ms/step (CUDA, RTX 4090, 69% GPU
-utilization — CPU-bound on the data pipeline).
+d_model=128, n_heads=4, n_layers=2, d_out=64, max window 32. Loss = magnitude
+(weight 1.0) + pair MSE + destination-type CE + destination-register CE +
+0.05·equivalence. No reconstruction loss (decoder not trained). Invalidity rate
+0.2 with the split above. Batch 4096, 50K steps, LR 3e-4 cosine. ~1h15m at
+~85 ms/step on an RTX 4090 at 69% GPU utilization (CPU-bound on the data
+pipeline).
 
-**Convergence trajectory** (||T1|| means; valid / invalid):
-- step 100:    0.96 / 0.84 (drift up; dest heads still
-  pulling on magnitude before they saturate)
+**Convergence** (mean ‖T1‖, valid / invalid):
+- step 100:    0.96 / 0.84 (the destination heads still pull on magnitude
+  before they saturate)
 - step 200:    1.26 / 0.65
-- step 20000:  1.00 / 0.02 (steady state reached)
-- step 50000:  1.00 / 0.01 (final)
+- step 20000:  1.00 / 0.02 (steady state)
+- step 50000:  1.00 / 0.01
 
-**Final probe** against 10K held-out windows (2K per class,
-five classes: valid / partial / spanning / multi / bogus):
+**Probe** on 10K held-out windows (2K per class):
 
-| class    | mean ||T1|| | std    |
-|----------|-------------|--------|
-| valid    | 1.000       | 0.010  |
-| partial  | 0.007       | 0.009  |
-| spanning | 0.006       | 0.004  |
-| multi    | 0.004       | 0.002  |
-| bogus    | 0.007       | 0.039  |
+| class    | mean ‖T1‖ | std    |
+|----------|-----------|--------|
+| valid    | 1.000     | 0.010  |
+| partial  | 0.007     | 0.009  |
+| spanning | 0.006     | 0.004  |
+| multi    | 0.004     | 0.002  |
+| bogus    | 0.007     | 0.039  |
 
-Magnitude-threshold accuracy (||T1|| > 0.5 ⇒ valid):
-**99.8%.** Linear probe on raw T1 reaches only 88.6% — the
-validity signal is purely radial, and a linear-over-direction
-classifier can't read it. The magnitude-only check is the
-clean signal.
+Magnitude threshold (‖T1‖ > 0.5 ⇒ valid): **99.8%** accuracy. A linear probe
+on raw T1 reaches only 88.6%: the validity signal is radial, and a linear
+classifier cannot read a norm.
 
-**Equivalence eval at 50K:** 11/13 PASS, 1 WEAK
-(commutative_xor at 0.385 — just over the 0.3 threshold),
-1 FAIL (sign_test at 0.826 — same known failure mode as
-Exp 26, requires state-precondition injection rather than
-more training). Comparable to the prior encoder which
-reached 13/13 PASS at 100K. The geometry recovered without
-regression while gaining the validity signal.
+**Equivalence eval at 50K:** 11/13 PASS, 1 WEAK (commutative_xor at 0.385,
+just over the 0.3 threshold), 1 FAIL (sign_test at 0.826 — the Exp 26 failure
+mode, which needs state-precondition injection rather than more training). The
+preceding T1 encoder, trained on valid instructions only, reached 13/13 PASS at 100K
+steps, so the semantic geometry holds while gaining the validity signal.
 
-## Comparative perf
+## Cost of the reconstruction loss
 
-A/B run before launch:
+| config                                    | ms/step (steady) |
+|-------------------------------------------|------------------|
+| no reconstruction, no invalid rows        | 159              |
+| reconstruction, 20% invalid rows (smoke)  | 550              |
 
-| config                          | ms/step (steady) |
-|---------------------------------|------------------|
-| recon=0, invalidity=0           | 159              |
-| recon=1, invalidity=0.2 (smoke) | 550              |
+The 3.5× is the reconstruction REINFORCE loop (10 sampled decoder forwards and
+80 batch executions per step). The ball-versus-sphere change itself is not
+measurable. Experiment 34 ran without reconstruction, fed by a chunked pipeline
+generating on a remote CPU host and streaming lz4-compressed batches over the
+network.
 
-The 3.5× difference is the recon REINFORCE loop (K=10 sample
-decoder forwards + 80 batch_execute calls per step). The
-ball-vs-sphere change itself isn't measurable.
+## Consequence for the gates
 
-For this validity-only run, recon was off. With the chunked
-data pipeline (CPU-side gen on remote + lz4+nc transport)
-and no decoder loop, the 50K run completed in ~1h15m.
+Once magnitude carries validity, **the gates have nothing semantic to learn at
+T1**: emit thresholds ‖T1‖, accept thresholds it the other way (plus
+has-input-remaining), and evict at T1 reduces to "has this token already been
+emitted" — bookkeeping. Evict becomes a real cross-level signal only at T2+
+("has T(n+1) absorbed this emission yet"). T1 gate training is therefore near
+trivial, and the next phase moves to T2.
 
-## Architectural inference
+## T2 unit definition
 
-Once magnitude carries validity, **the gates have nothing
-semantic to learn at T1.** The previous gate-training plan
-(Step 5: REINFORCE accept/evict, supervised emit on parser
-ground-truth) becomes a near-trivial exercise:
-- emit just thresholds ||T1||
-- accept thresholds it the other way (plus has-input-remaining)
-- evict at T1 is purely a structural state-tracker that has
-  no semantic content to extract from (T1, gru_h)
+A T2 thought is a **register-state transformation block**: a maximal
+contiguous run of instructions where only the LAST may be a memory access
+(load/store) or a control-flow change (branch/jump); all earlier instructions
+are register ALU ops. Ending at memory ops keeps a thought bounded — only the
+finite register state evolves inside it; ending at control flow is the
+standard basic-block boundary. Examples: `[ADD, SUB, SLT, JAL]`, `[LW]`,
+`[ADDI, ADD, SW]` are each one T2 thought.
 
-Evict is genuinely cross-level: at T1 with no T2, "should
-this token be evicted" reduces to "has it already been
-emitted," which is bookkeeping. At T2+ it becomes "has T(n+1)
-absorbed this emission yet" — that's a real cross-level
-signal worth learning. T1 evict supervision would just be
-memorizing a structural rule.
+This is a unit chosen to benchmark the recursive shift-reduce machinery at
+level 2, not a claim about cognition (WHAT_IS_A_THOUGHT.md, "Method vs.
+Cognition": prescribe boundaries and verify the algorithm first, weaken
+supervision second, apply to natural language last).
 
-Implication for the roadmap: Step 5 (T1 gates) is either a
-near-trivial training exercise for architectural consistency
-or skippable entirely. The research frontier moves to T2.
+## Transferable lessons
 
-## T2 design crystallized
-
-A T2 thought is a **register-state transformation block**: a
-maximal contiguous subsequence of instructions where only the
-LAST may be a memory access (load/store) or control-flow
-change (branch/jump). All preceding instructions are pure
-register ALU ops.
-
-Termination at memory ops keeps T2 thoughts bounded — only
-register state evolves inside a thought, which is finite.
-Termination at control flow is the standard basic-block
-boundary. Examples:
-- `[ADD, SUB, SLT, JAL]` — one T2 thought (3 ALU + jump).
-- `[LW]` alone — one T2 thought.
-- `[ADDI, ADD, SW]` — one T2 thought.
-
-**Phase framing.** This is a chosen unit definition for
-benchmarking the recursive shift-reduce machinery at level 2,
-not a declaration about cognition. See WHAT_IS_A_THOUGHT.md
-"Method vs. Cognition" for the Phase 1/2/3 framing. Phase 1
-prescribes boundaries and verifies the algorithm; Phase 2
-weakens supervision and observes emergence; Phase 3 applies
-to natural language. The order matters — you can't do Phase
-3 without first verifying the algorithm works.
-
-## Transferable lessons from Phase 10
-
-- **Magnitude-as-validity transfers across consumers
-  asymmetrically.** Classifiers want magnitude-invariant
-  inputs (semantic properties don't depend on confidence);
-  generators want magnitude-scaled inputs (graceful
-  degradation via cross-attention K/V scaling). The same
-  output vector serves both with different normalization
-  policies at the consumer side.
-- **A test that "just works" can be the failure mode.** The
-  v1 retrain converged to clean 0/1 magnitudes despite the
-  dest-head magnitude-pulling pressure — the heads saturated
-  and stopped pushing. We almost concluded the consumer
-  split wasn't needed. The deeper architectural reason
-  (inference-time behavior on intermediate magnitudes,
-  T2-composition coherence) made it the right change anyway.
-- **Heavy-handed unit definitions are appropriate during
-  method validation.** The discomfort of "I'm prescribing
-  what a thought is" belongs to the natural-language stage,
-  not to the prescribed-boundary design choices that exercise
-  the method (WHAT_IS_A_THOUGHT.md, "Method vs. Cognition").
+- **Magnitude-as-validity serves consumers asymmetrically.** Classifiers want
+  magnitude-invariant inputs (semantics do not depend on confidence);
+  generators want magnitude-scaled inputs (graceful degradation through
+  cross-attention scaling). One output vector serves both with different
+  normalization at the consumer.
+- **Clean training metrics do not justify a design.** An encoder whose
+  classification heads read raw T1 also converges to clean 0/1 magnitudes,
+  because the heads saturate and stop pulling on magnitude. The consumer split
+  is justified by behavior at intermediate magnitudes (streaming inference, T2
+  composition), which training metrics do not exercise.
+- **Prescribed unit definitions are appropriate during method validation.**
+  Discomfort with prescribing what a thought is belongs to the
+  natural-language stage, not to the choices that exercise the method.
 
 ---

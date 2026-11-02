@@ -32,11 +32,10 @@
 # Override generation knobs via env vars:
 #   BATCH_SIZE      (default 384)
 #   N_STATES        (default 8)
-#   RULE            (default 'single' — single-instruction chunks; the
-#                    old "--gen instr" equivalent)
+#   RULE            (default 'single' — single-instruction chunks)
 #   CONFIG          (REQUIRED — the corpus config. A corpus is defined by
 #                    that one file: opcode mix, exclude_x0_dest, and the
-#                    equivalence / invalidity / chain rates. There is no
+#                    invalidity / chain / partners / aim blocks. There is no
 #                    default and no env override for any rate, so the file a
 #                    run names is the whole corpus definition and
 #                    scripts/record_corpus.py can copy it into the run dir.)

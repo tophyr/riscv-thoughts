@@ -367,17 +367,6 @@ def gvn_collapse(t1, t2, *, device, route='binding', n=200, chunk_len=4,
     eb, et, ec = enc(bases), enc(twins), enc(commutes)
     d_rename = (eb - et).norm(dim=-1)
     d_behav = (eb - ec).norm(dim=-1)
-    # Swapping a commutative op's operands changes the chunk's first-read order.
-    # If a later instruction reads one of the swapped registers, the canonical
-    # input positions shift and the two chunks compute genuinely DIFFERENT
-    # functions — ~2% of pairs, and they sit at the `distinct` scale, so they
-    # dominate the mean. Separating them is correct behaviour, so the equivalent
-    # subset is the row to judge collapse on.
-    eq_flag = torch.tensor(
-        [_behaviorally_equal(b, c, anchors) is True
-         for b, c in zip(bases, commutes)], device=d_behav.device)
-    d_behav_eq = d_behav[eq_flag]
-    d_behav_ne = d_behav[~eq_flag]
     # distinct: pair base i with base j (i != j) only where behaviorally !=.
     perm = rng.permutation(len(bases))
     d_distinct = []
@@ -389,15 +378,11 @@ def gvn_collapse(t1, t2, *, device, route='binding', n=200, chunk_len=4,
             d_distinct.append((eb[i] - eb[j]).norm().item())
     d_distinct = torch.tensor(d_distinct) if d_distinct else torch.zeros(1)
 
-    rn, bh, ds = (float(d_rename.mean()), float(d_behav.mean()),
-                  float(d_distinct.mean()))
+    rn, ds = float(d_rename.mean()), float(d_distinct.mean())
     return {
-        'rename_mean': rn, 'behavioral_mean': bh, 'distinct_mean': ds,
-        'behavioral_eq_mean': float(d_behav_eq.mean()) if d_behav_eq.numel() else None,
-        'behavioral_ne_mean': float(d_behav_ne.mean()) if d_behav_ne.numel() else None,
-        'n_behavioral_eq': int(eq_flag.sum()), 'n_behavioral_ne': int((~eq_flag).sum()),
+        'rename_mean': rn, 'distinct_mean': ds,
+        'behavioral_mean': float(d_behav.mean()),
         'rename_ratio': rn / ds if ds > 1e-9 else None,
-        'behavioral_ratio': bh / ds if ds > 1e-9 else None,
         'n_pairs': len(bases), 'n_distinct': len(d_distinct) if isinstance(
             d_distinct, list) else int((d_distinct > 0).sum()),
     }

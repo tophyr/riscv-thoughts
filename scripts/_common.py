@@ -16,7 +16,7 @@ from pathlib import Path
 import torch
 
 from compressor.model import T1Compressor, T2Compressor
-from compressor.train import load_checkpoint, resolve_device, _split_t1_state
+from compressor.train import load_checkpoint, resolve_device
 from tokenizer import VOCAB_SIZE
 
 
@@ -73,35 +73,10 @@ def open_run_dir(args, model_name, *, suffix=''):
 # ---------------------------------------------------------------------------
 
 
-def _tile_shared_pool_v(state, model):
-    """Widen a checkpoint's single shared pool value projection into the
-    per-head projections the pool now uses.
-
-    The pool used to give every head one shared projection of width
-    d_value/n_pool_heads; it now gives each head its own slice of a d_value-wide
-    projection. Repeating the shared weights once per head reproduces the old
-    computation exactly, so a checkpoint trained under the shared projection
-    keeps its behaviour and only gains the freedom to differentiate the heads if
-    it is trained further. Checkpoints with one pool head already match.
-    """
-    for prefix in ('', 'compressor.'):
-        key = f'{prefix}core.pool_v.weight'
-        if key not in state:
-            continue
-        want = model.state_dict()[key].shape[0]
-        have = state[key].shape[0]
-        if have != want:
-            reps = want // have
-            for suffix in ('weight', 'bias'):
-                k = f'{prefix}core.pool_v.{suffix}'
-                state[k] = state[k].repeat(reps, *([1] * (state[k].dim() - 1)))
-    return state
-
-
 def load_frozen_encoder(model_path, device):
     """Build a T1Compressor (TokenEmbedder + Compressor) from the encoder's
-    companion hparams.json (next to model_path), load the checkpoint (old flat
-    state dicts are split-remapped to embedder./compressor.), eval(), freeze.
+    companion hparams.json (next to model_path), load the checkpoint, eval(),
+    freeze.
 
     model_path: path to encoder.pt; its sibling hparams.json supplies the arch
                 (d_model, n_heads, n_layers, d_out, max_window, d_event).
@@ -119,8 +94,7 @@ def load_frozen_encoder(model_path, device):
         vp_head_depth=hp['vp_head_depth'],
         n_pool_heads=hp.get('n_pool_heads', 1),
     ).to(device)
-    encoder.load_state_dict(_tile_shared_pool_v(
-        _split_t1_state(load_checkpoint(model_path, device)), encoder))
+    encoder.load_state_dict(load_checkpoint(model_path, device))
     encoder.eval()
     for p in encoder.parameters():
         p.requires_grad = False
@@ -138,7 +112,6 @@ def load_t2(t2_dir, t1, device):
         vp_head_depth=hp['vp_head_depth'],
         n_pool_heads=hp.get('n_pool_heads', 1),
     ).to(device)
-    t2.load_state_dict(_tile_shared_pool_v(
-        load_checkpoint(t2_dir / 't2.pt', device), t2))
+    t2.load_state_dict(load_checkpoint(t2_dir / 't2.pt', device))
     t2.eval()
     return t2, hp

@@ -1,6 +1,6 @@
 # Transferable Lessons from HATA
 
-[HATA](https://github.com/tophyr/hata) was (is?) an experimental ML research
+[HATA](https://github.com/tophyr/hata) is an experimental ML research
 project aimed at finding a way to compress long-form prose into not just
 fewer words - existing LLMs are good at that - but a *single embedding* in a
 continuously-smooth "thought space". Its various attempts and experiments

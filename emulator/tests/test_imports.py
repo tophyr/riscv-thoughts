@@ -31,9 +31,9 @@ def _run(code):
 def test_import_tokenizer_first():
     """Importing tokenizer in a fresh process must not fail.
 
-    This is the order that previously broke: tokenizer loads
-    emulator, which in the old non-lazy init eagerly loaded
-    gpu_emulator, which re-imported the half-loaded tokenizer.
+    This is the order the cycle breaks: tokenizer loads emulator,
+    and an eager emulator init would load gpu_emulator, which
+    re-imports the half-loaded tokenizer.
     """
     result = _run('from tokenizer import VOCAB_SIZE, encode_instruction')
     assert result.returncode == 0, (
@@ -72,7 +72,6 @@ def test_import_compressor_train_first():
     """Importing compressor.train in a fresh process must work.
 
     compressor.train pulls in tokenizer and emulator transitively.
-    This is the import chain that originally revealed the bug.
     """
     result = _run('from compressor.train import load_checkpoint')
     assert result.returncode == 0, (

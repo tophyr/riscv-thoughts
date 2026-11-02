@@ -1,12 +1,12 @@
 # Probes
 
 Diagnostics that read a frozen checkpoint and answer one question each. None
-train a model; the usage line in each docstring gives its arguments. Each file's docstring is the authority on how to
-read its output — this index only says which one to reach for.
+train a model; the usage line in each docstring gives its arguments. Each
+file's docstring is the authority on how to read its output — this index only
+says which one to reach for.
 
-How to trust what a probe reports, and the failure modes that have produced
-withdrawn conclusions here, are in [METRICS.md](../METRICS.md) ("Probe
-methodology").
+How far to trust what a probe reports, and the ways a probe can mislead, are in
+[METRICS.md](../METRICS.md) ("Probe methodology").
 
 Run them with the venv active:
 
@@ -17,11 +17,7 @@ python probes/frame_scorecard.py runs/<t2_dir> runs/<t1_dir>/encoder.pt runs/eva
 
 The scorecard reads its anchor states from the batches it scores, which must
 be generated with `datagen --heldout-anchors`, so a score is at input states no
-model trained on (METRICS.md). Probes that rebuilt one fixed anchor set from a
-seed, and the probes of the first-read frame (`vp_budget.py`, `vp_stage.py`,
-`vp_miss_kind.py`, `vp_head_refit.py`, `vp_gt_depth.py`, `vp_gt_misses.py`,
-`t1_scorecard.py`), are deleted; their findings are in EXPERIMENT_LOG, and one
-can be recovered from git history and ported to the register frame.
+model trained on (METRICS.md).
 
 | probe | the question it answers |
 |---|---|

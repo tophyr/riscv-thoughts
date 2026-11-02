@@ -38,7 +38,11 @@ list. "Two token sequences mean the
 same thing if and only if they compress to the same point" is the framework's
 definition of meaning (WHAT_IS_A_THOUGHT.md), so an essence that separates
 `ADDI r1,r1,256; ADDI r1,r1,-16` from `ADDI r1,r1,32; ADDI r1,r1,208` is not a
-thought vector regardless of its vp.
+thought vector regardless of its vp. Collapse has to follow from the function,
+not from a list: two chunks meet because they compute the same thing, including
+equivalences no generator enumerates. Two families of functions traced through
+the space meet where the functions become equivalent. Collapsing the classes
+the training mix enumerates is necessary, not sufficient.
 
 Where each equivalence class stands. The essence is graded in the register
 frame (RISCV_DESIGN.md, "GVN"): every class that leaves the chunk's live
@@ -83,7 +87,9 @@ worse failure than loose collapse (METRICS.md).
 
 2. **[VALIDATING] Computed equivalents collapse at len=2.** Every class tried
    collapses at vp 99.79%, one seed (Mission's table; finding 50); the
-   decisions that produced it are under review (task 1). Settled
+   decisions that produced it are under review (task 1). Whether collapse reaches
+equivalences outside the partner mix is unmeasured; a rewrite held out of
+training collapses only partly (finding 49). Settled
    before chunks get longer because every added instruction multiplies the
    equivalences a chunk participates in.
 
@@ -108,9 +114,13 @@ work.
 ### 1. Validate milestone 2
 
 The collapse at len=2 (finding 50) rests on decisions that each change what
-the encoder is asked to learn, measured on one seed. Each is examined for
-whether it is right, not only whether it worked, before the len=4 work builds
-on it.
+the encoder is asked to learn, measured on one seed. Before the len=4 work
+builds on them, each is examined for whether it is founded, not only whether it
+worked: whether it shapes the essence toward a space the next tier can use, or
+only toward the probes that score it, as a model that memorizes its training
+data passes a test without learning the function. The requirement is a usefully
+shaped space; the target geometry, the behavioral metric, the canonical orders
+and the loss weighting are the best choices so far, not requirements.
 
 - **The balanced distance loss** (finding 49) is the critical one, and
   nonstandard: squared errors of equivalent pairs (target 0) and of all other
@@ -238,7 +248,7 @@ The evaluator concatenates an output's inputs in canonical role order,
 interchangeable inputs ordered by the encoder's colour. From three
 instructions two interchangeable inputs can also share a colour, and the
 register number then decides their positions, so a rename would move values
-between positions again (EXPERIMENT_LOG, "The register frame", finding 40).
+between positions (EXPERIMENT_LOG, "The register frame", finding 40).
 Embedding each (colour, value) pair with one shared layer and summing the
 results removes the order entirely, and removes most of the evaluator's input
 layer as well (next idea). It changes the evaluator's architecture, so it
@@ -265,8 +275,8 @@ finding 30). A static rate is a guess at a trade a controller could manage
 continuously: generate less of what the model has mastered, more of what it is
 still learning, and raise a cell's rate again if its accuracy slips.
 
-The lever has to be on the DATA side. Reweighting the loss toward hard slots
-(`--vp-depth-weight`) failed because it amplifies gradient from the same rare
+The lever has to be on the DATA side. Reweighting the loss toward hard
+(depth-2) slots failed because it amplifies gradient from the same rare
 rows, while generation supplies new ones (finding 17).
 
 Prior work to start from: Teacher–Student Curriculum Learning (Matiisen et al.,

@@ -41,8 +41,8 @@ echo "=== remote-half started $(date -u +%FT%TZ) pid=$$ ===" >> "$LOG"
 #
 # MALLOC_ARENA_MAX=2 cuts glibc malloc's per-thread arena count to 2;
 # the default is 8 * num_cpus, which on a 64-core box means hundreds
-# of arenas per worker process and massive page-zeroing churn (the
-# `clear_page_erms` kernel function was the #1 hotspot before this).
+# of arenas per worker process and massive page-zeroing churn
+# (`clear_page_erms` in a kernel profile).
 export MALLOC_ARENA_MAX=2
 # </dev/null: this is a pure generator — never auto-mux an inherited ssh stdin.
 "$REMOTE_PYTHON" -m datagen "$@" </dev/null 2>>"$LOG" \

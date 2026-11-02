@@ -81,6 +81,6 @@ now; expensive backtracking avoided.
 
 ## When the mission lands
 
-Update the docs and the memory notes to match what is now true — correct the
+Update the docs to match what is now true — correct the
 claim in place, do not append a note about the correction — then hand off to a
 fresh session rather than rolling on.

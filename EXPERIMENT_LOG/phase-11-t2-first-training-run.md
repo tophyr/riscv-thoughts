@@ -1,77 +1,56 @@
 # Phase 11: T2 Compressor — First Training Run
 
-Builds the T2 encoder, splits the chunker into a CPU-side data-pipe
-tool, and trains T2 to completion on the pipeline. T2 lives in the
-unit ball with the same magnitude-as-validity geometry as T1. The
-encoder consumes a sequence of T1 emission vectors (one per
-instruction) and emits a single T2 vector per chunk.
+Phase 10 gave T1 magnitude-as-validity and defined the T2 unit. This phase
+builds the T2 encoder, moves chunking out of the trainer into a CPU-side
+pipeline stage, and trains T2 to completion. T2 lives in the unit ball with the
+same magnitude-as-validity geometry as T1: it consumes the sequence of T1
+vectors for a chunk (one per instruction) and emits one T2 vector.
 
-## Architecture decisions (Exp 35-37)
+## Architecture (Exp 35-37)
 
-**Unit definition.** A T2 thought is a register-state transformation
-block: a maximal contiguous subsequence of instructions where only
-the LAST may be a memory access (load/store) or control-flow change
-(branch/jump). Termination at memory ops keeps T2 bounded — only
-register state evolves inside a thought, which is finite. A
-16-instruction max-length cap forces a split for ALU runs that
-don't naturally terminate. See WHAT_IS_A_THOUGHT.md
-"Method vs. Cognition" for the framing.
+**Unit.** A T2 thought is a register-state transformation block: a maximal
+contiguous run of instructions where only the LAST may be a memory access or a
+control-flow change (Phase 10). A 16-instruction cap splits ALU runs that do
+not terminate on their own.
 
-**Aux heads.** Three heads on T2 output, all read normalized
-direction `T2 / ||T2||` (magnitude-invariant, same consumer-split
-fix as T1):
+**Aux heads.** Three heads on the T2 output, all reading the direction
+T2 / ‖T2‖ (the Phase 10 consumer split):
 
-- `reg_effect_head`: 32-D linear. Per-register pairwise MSE
-  generalizes T1's scalar pair-MSE to a per-register dimension.
-  For each pair `(a, b)` of valid chunks and each register `r`,
-  the encoder is trained such that
-  `|reg_effect_head(T2_dir[a])[r] - reg_effect_head(T2_dir[b])[r]|`
-  matches `mean_s log1p(log1p(|delta_r[a, s] - delta_r[b, s]|))`.
-- `modified_regs_head`: 32-D BCE on whether each register was
-  modified in any probed input state. Disambiguates "agreed on a
-  value" from "neither touched the register" (both produce zero
-  pair-MSE distance otherwise).
-- `terminator_type_head`: 5-class CE on terminator category
-  (ALU-only / LOAD / STORE / BRANCH / JUMP). T1's `dest_type`
-  analog lifted to chunks.
+- **Register-effect head**, 32-D linear: a per-register generalization of T1's
+  scalar pair MSE. For each pair `(a, b)` of valid chunks and each register `r`,
+  `|head(T2_dir[a])[r] − head(T2_dir[b])[r]|` is trained to match
+  `mean_s log1p(log1p(|delta_r[a, s] − delta_r[b, s]|))` over probed input
+  states s.
+- **Modified-registers head**, 32-D BCE on whether each register was modified
+  in any probed input state. It separates "agreed on a value" from "neither
+  touched the register", which give the same zero pair distance.
+- **Terminator-type head**, 5-class CE on the terminator category (ALU-only /
+  LOAD / STORE / BRANCH / JUMP) — T1's destination type lifted to chunks.
 
-**Loss composition (4 terms):** `mag_loss` (MSE of `||T2||` against
-valid_mask, all rows) + `reg_effect_loss` (per-register pair-MSE,
-valid only) + `modified_regs_loss` (BCE, valid only) +
-`term_type_loss` (CE, valid only).
+**Loss (4 terms):** magnitude (MSE of ‖T2‖ against the valid mask, all rows) +
+register-effect pair MSE + modified-registers BCE + terminator-type CE (the last
+three on valid rows only).
 
-## Pipeline architecture (Exp 38-39)
+## Pipeline (Exp 38-39)
 
-The chunker started in-process with the trainer, but pure data-prep
-(boundary detection, invalidity augmentation) shouldn't consume
-training-loop wallclock. Refactored into a three-stage pipe:
+Chunking (boundary detection and invalidity augmentation) is pure data
+preparation, so it runs as its own CPU process between the instruction-sequence
+generator and the trainer:
 
 ```
-gen_seq_batches.py  →  chunk_t2.py  →  train_t2.py
-   (RVS)              (CPU only,         (GPU; runs T1
-                      RVC format)         on per-instr
-                                          tokens)
+sequence generator  →  chunker (CPU)  →  T2 trainer (GPU; runs frozen T1
+                                         on per-instruction tokens)
 ```
 
-- **`datagen/chunkgen.py`**: pure-CPU boundary detection +
-  invalidity augmentation + RVC binary I/O. New format,
-  registered in `scripts/_batch_util.py`.
-- **`scripts/chunk_t2.py`**: pipe tool, RVS → RVC. Mux-friendly.
-- **`compressor/chunker.py`**: shrunk to ~100 lines. Just
-  `encode_chunkbatch(rvc_batch, t1_encoder)` — runs T1 batched on
-  per-instruction tokens, returns a `T2Batch` of T1 emissions.
-- **`compressor/train.py:train_t2()`**: reads RVC, accumulates
-  chunks across batches until target_valid_chunks_per_step,
-  trains.
+The trainer only runs T1 batched over each chunk's per-instruction tokens and
+accumulates chunks across batches up to a target count of valid chunks per
+step. The chunker runs in parallel with training, and several generators can
+be multiplexed into one stream.
 
-This decoupling let the chunker run in parallel with training and
-opened the door to multi-process generation via `mux_batches.py`.
+## Throughput (Exp 40)
 
-## Where the throughput went (Exp 40)
-
-The naive in-process chunker bottlenecked the training loop
-(~200ms/step at target=1024). What each change bought, to 99% GPU
-utilization:
+With the chunker in-process the step was ~200 ms at a target of 1024 valid
+chunks. Step time and GPU utilization by configuration:
 
 | stage | step time at target=4K | GPU util |
 |---|---|---|
@@ -83,185 +62,122 @@ utilization:
 | **target=8K, chunked pair-MSE** | 1032ms | **99%** |
 | target=16K, chunked pair-MSE | 3120ms | 99% |
 
-**Key findings:**
-- bf16 autocast halves per-register pair-MSE memory; T1's
-  exec-distance metric already used bf16 — direct precedent.
-- The chunked pair-MSE memory footprint scales as
-  `O(chunk_size × B)` rather than `O(B²)`, allowing larger B.
-  Implemented via `torch.utils.checkpoint` for autograd correctness;
-  ~8% wallclock overhead.
-- `torch.compile` on T2's forward gave ~15% step-time improvement
-  at small batch (target=1K) and larger gains at higher batches.
-- The unchunked full pair-MSE OOMs at target=4K (33GB shared
-  memory spilled), even with bf16. Chunked path is the
-  permanent answer.
-- At target=8K chunked, the GPU is already at 99% util. Larger
-  batches (16K) maintain util but trade per-step cost for cleaner
-  pair-MSE gradients.
+- bf16 autocast halves the per-register pair-MSE memory.
+- Computing the pair MSE in chunks makes its memory `O(chunk_size × B)` rather
+  than `O(B²)`, using `torch.utils.checkpoint` for autograd, at ~8% wallclock.
+  The unchunked pair MSE runs out of memory at target=4K (33GB spilled to shared
+  memory) even under bf16.
+- `torch.compile` on T2's forward gives ~15% at target=1K and more at larger
+  batches.
+- At target=8K the GPU is at 99%; 16K keeps utilization and trades per-step
+  cost for cleaner pair-MSE gradients.
 
-The live-pipeline performance with 4 parallel `gen_seq_batches`
-workers via `mux_batches.py` matches corpus-replay speed within
-noise, confirming this single 16-core machine can sustain the GPU
-without external data generation (no need for the remote-data-gen
-pattern T1 used).
+Four multiplexed generators feeding the live pipeline match corpus-replay speed
+within noise, so one 16-core machine sustains the GPU without remote data
+generation.
 
 ## Experiment 41: T2 first training run
 
-Configuration: T2Compressor with d_model=256, n_heads=4, n_layers=2,
-d_out=256, max_chunk_len=24. Frozen T1 encoder (`runs/20260424_190609`,
-d_out=64). Pipeline: 4 mux'd seq generators → chunker → trainer.
-Target 16,384 valid chunks per training step (pair-MSE chunked at
-chunk_size=128). Invalidity rate 0.2 (spanning/multi/overlong).
-5000 steps with cosine-anneal LR 3e-4 → 1e-6. Total wall: ~4 hours.
-
-Saved: `runs/20260427_022927_t2/t2.pt`.
+d_model=256, n_heads=4, n_layers=2, d_out=256, max chunk length 24 tokens.
+Frozen T1 with d_out=64. Four multiplexed generators → chunker → trainer.
+16,384 valid chunks per step (pair MSE in chunks of 128). Invalidity rate 0.2
+(spanning / multi / overlong). 5000 steps, cosine LR 3e-4 → 1e-6, ~4 hours.
 
 **Final-step training metrics:**
 
 | metric | value |
 |--------|-------|
 | total loss | 1.124 |
-| mag_loss | 0.004 |
-| reg_effect_loss | 0.905 |
-| modified_regs_loss | 0.201 |
-| term_type_loss | 0.013 |
+| magnitude | 0.004 |
+| register-effect | 0.905 |
+| modified-registers | 0.201 |
+| terminator-type | 0.013 |
 | ‖T2‖ valid (mean) | 0.99 |
 | ‖T2‖ invalid (mean) | 0.09 |
 | ‖T2‖ max | 1.20 |
 
-Three of four losses settled cleanly to near-zero. `reg_effect_loss`
-plateaued at ~0.91 from early in training and barely moved.
+Three of four losses settle near zero; the register-effect loss plateaus at
+~0.91 early and barely moves.
 
 ## Experiment 42: T2 validity probe
 
-Generated 500 chunks per class (one valid + three invalid types:
-spanning, multi, overlong). Encoded each through frozen T1 + trained
-T2; measured `‖T2‖`.
+500 chunks per class (valid, and three invalid types), encoded through the
+frozen T1 and the trained T2:
 
-**Per-class magnitude statistics:**
-
-| class | mean | std |
+| class | mean ‖T2‖ | std |
 |-------|------|-----|
 | valid | 0.979 | 0.121 |
 | spanning | 0.091 | 0.047 |
 | multi | 0.118 | 0.120 |
 | overlong | 0.054 | 0.009 |
 
-**Magnitude-threshold (`‖T2‖ > 0.5`) accuracy: 99.0%.**
-Linear-probe-on-raw-T2 accuracy: 98.8%. Comparable to T1's 99.8%
-threshold accuracy from Phase 10. The magnitude-as-validity geometry
-transferred from T1 to T2 cleanly.
+Magnitude threshold (‖T2‖ > 0.5): **99.0%** accuracy; a linear probe on raw T2:
+98.8%. T1's threshold accuracy in Phase 10 is 99.8%: magnitude-as-validity
+transfers from T1 to T2.
 
 ## Experiment 43: T2 equivalence probe
 
-Constructed 200 randomized pairs each across five categories of
-instruction-level transformations. The first four are
-execution-equivalent transformations (T2 should collapse them);
-the fifth is a negative control that should NOT collapse.
+200 random pairs in each of five categories of instruction-level
+transformation, plus random pairs across the batch for scale. The table gives
+the within-pair directional distance `‖T2_dir[a] − T2_dir[b]‖`.
 
-**Within-pair directional distance `||T2_dir[a] - T2_dir[b]||`:**
+| class | mean | std | reading |
+|-------|------|-----|---------|
+| commutative_swap (rs1↔rs2 in commutative ops) | 0.003 | 0.002 | equivalent; collapsed |
+| double_to_shl1 (`ADD x,y,y` ≡ `SLLI x,y,1`) | 0.003 | 0.001 | equivalent; collapsed |
+| x0_writes_nop (different ops writing x0) | 0.026 | 0.013 | equivalent; partially collapsed |
+| indep_reorder (independent ALU ops swapped) | 0.074 | 0.030 | different ordered I/O functions; separated |
+| **one source register changed (control)** | **0.002** | **0.001** | **not equivalent; collapsed — wrong** |
+| random pairs | 0.594 | 0.615 | separated |
 
-| class | mean | std | interpretation |
-|-------|------|-----|----------------|
-| commutative_swap (rs1↔rs2 in commutative ops) | 0.003 | 0.002 | tight collapse ✓ |
-| double_to_shl1 (`ADD x,y,y` ≡ `SLLI x,y,1`) | 0.003 | 0.001 | tight collapse ✓ |
-| x0_writes_nop (different op writes to x0) | 0.026 | 0.013 | partial collapse |
-| indep_reorder (independent ALU op order) | 0.074 | 0.030 | partial collapse |
-| **NON_EQUIV (one source register changed)** | **0.002** | **0.001** | **WRONG: collapsed** |
-| random pairs across batch | 0.594 | 0.615 | (well-separated) |
+Reordering independent instructions preserves behavior only with register
+identity attached. Without it, the reorder permutes the first-read input order
+and the write order, so the two chunks are different ordered I/O functions and a
+nonzero distance is correct (RISCV_DESIGN.md, "GVN: the invariant essence is the
+value-number").
 
-**CORRECTION (later): `indep_reorder` was mis-categorized here.** It sits in
-this table among classes expected to collapse, and its 0.074 is labelled
-"partial collapse" — i.e. read as a shortfall. It is not one. Reordering
-independent instructions is equivalent only *with register identity attached*;
-in the canonical identity-free frame it permutes the first-read input order and
-the write order, so the two chunks are different ordered I/O functions and the
-canonical `out_regs` oracle gives them **different** per-output-slot vp targets
-(verified directly; see RISCV_DESIGN.md "GVN: the invariant essence is the
-value-number"). The supervision therefore separates them on purpose, and a
-nonzero distance is correct behavior. Note the row immediately below it in the
-"What T2 *did* learn" list already reads the same number the right way
-("instruction order matters"), so this table and that list were in conflict.
-The measurement stands; only the interpretation changes.
+**Result: T2 is nearly blind to source-register operand changes within a fixed
+chunk shape.** The control pair differs in exactly one source register of one
+instruction, and T2 places them 0.002 apart — within the spread of the truly
+equivalent classes.
 
-**Result: T2 has weak sensitivity to source-register operand changes
-within a fixed chunk shape.** The non-equivalent control differs by
-exactly one source register in one instruction, but T2 maps both
-to nearly identical points (distance 0.002 — within noise of the
-truly-equivalent classes).
+T2 does learn magnitude-as-validity (Exp 42); coarse chunk structure
+(instruction order shifts T2 by ~0.07, opcode identity by ~0.03, shape by
+~0.59); and two specific equivalences (commutative swap and double-to-shift
+collapse). It does not learn operand-level semantics: changing which register
+is read does not move T2.
 
-What T2 *did* learn:
-- Magnitude-as-validity (Exp 42).
-- Coarse chunk structure: instruction order matters
-  (indep_reorder shifts T2 by ~0.07), opcode identity matters
-  (x0_writes_nop with different opcodes shifts by ~0.03), shape
-  changes matter (random pairs at 0.59).
-- Some specific structural equivalences: commutative-swap and
-  double-to-shl1 collapse cleanly, suggesting T2 can learn
-  per-equivalence-class structure when training signal supports it.
+## Candidate causes of the register-effect plateau (unmeasured)
 
-What T2 did *not* learn:
-- Fine-grained operand-level semantics. Changing which register
-  is read doesn't shift T2's output.
+The register-effect loss is the one that should separate per-register effects,
+and it stalls at ~0.91. Three candidate causes, none isolated in this phase:
 
-## Diagnosis: under-converged reg_effect_loss
+- **Loss-weight imbalance.** The structural losses saturate fast and dominate
+  early optimizer steps; by the time they are done the learning rate has
+  decayed.
+- **Pair-target noise.** The target averages over only 4 random input states;
+  for chunks that affect the same registers similarly, the per-state target
+  varies widely.
+- **Pair sparsity.** Even at ~13K valid chunks per step, pairs that differ only
+  in one operand are rare; most pairs differ in many ways at once.
 
-The equivalence probe result is consistent with the training
-trajectory: `reg_effect_loss` plateaued at 0.91 from early in
-training and barely moved. That's the loss that should have pushed
-T2 to discriminate per-register effects. It didn't drop because:
+## Conclusions
 
-- **Loss-weight imbalance.** At end of training, `mag_loss=0.004`,
-  `term_type_loss=0.013`, `modified_regs_loss=0.201`,
-  `reg_effect_loss=0.905`. The structural aux losses saturated
-  fast and dominated optimizer steps in early training; by the
-  time they were done, learning rate had decayed and
-  reg_effect_loss couldn't catch up.
-- **Pair-MSE noise floor.** The execution-distance target is
-  `mean_s log1p(log1p(|delta_r[a,s] - delta_r[b,s]|))` averaged
-  over n_inputs=4 random input states. For pairs of chunks that
-  affect the same registers similarly, the per-input target
-  varies a lot — the mean is noisy.
-- **Pair sampling sparsity.** Even at B_v ≈ 13K per step, any
-  specific operand-level discrimination ("differ on rs2 only")
-  is rare among pairs. Most pairs differ in many ways
-  simultaneously, masking the operand-only signal.
+Established: the recursive shift-reduce design works at level 2;
+magnitude-as-validity transfers from T1 to T2; the three-stage pipeline
+(generate → chunk → train) holds a single 16-core machine's GPU at 99%. Left
+for the next phase: T2 does not discriminate operands, and whether the
+register-effect plateau is a noise floor of the metric or encoder underfitting
+is unresolved.
 
-## Phase 11 conclusions
-
-**Architecturally validated:**
-- Recursive shift-reduce works at level 2.
-- Magnitude-as-validity transfers from T1 to T2.
-- Chunker-as-pipe-tool architecture composes cleanly.
-- Three-stage pipeline (gen → chunk → train) sustains GPU at
-  99% utilization on a single 16-core machine.
-
-**Open and worth investigating:**
-- Operand-level semantic discrimination is undercooked in T2.
-  Possible follow-ups: longer training; higher reg_effect_weight;
-  more probed input states for cleaner pair-MSE targets; loss-
-  curriculum that doesn't let aux losses drown the directional
-  signal; richer per-register loss formulation.
-- The `reg_effect_loss` plateau may also reflect a real noise
-  floor of the metric. Measuring the distribution of pair-MSE
-  targets vs predictions per-register could distinguish "metric
-  noise" from "encoder underfitting".
-
-**Transferable lessons from Phase 11:**
-- **Probe-driven validation matters.** The raw training metrics
-  showed a "successful" run (clean magnitudes, three losses
-  saturated). Only the equivalence probe surfaced that T2 learned
-  syntax (chunk shape) better than semantics (operand identity).
-  Without a targeted probe of execution-equivalent vs non-equivalent
-  pairs, the run would have been declared a clean success.
-- **Loss weights need active management when goals differ across
-  losses.** Magnitude-as-validity saturates fast; pair-MSE-style
-  losses don't. With equal weights, the easy losses get optimized
-  first, then the LR schedule decays before the harder loss
-  converges.
-- **Pipe-architecture decoupling pays off.** Splitting the chunker
-  out of the trainer freed CPU work to run in parallel and made
-  the data path inspectable + parallelizable. The same
-  architectural pattern T1's batchgen tools follow.
+**Transferable lessons:**
+- **Probe before declaring success.** The training metrics read as a clean run
+  (clean magnitudes, three losses saturated); only the equivalence probe showed
+  that T2 learned chunk shape rather than operand semantics.
+- **Losses with different difficulty need active weighting.** With equal
+  weights the easy losses are optimized first and the LR schedule decays
+  before the hard one converges.
+- **Decoupling data preparation into a pipe stage pays off**: it runs in
+  parallel with training and makes the data path inspectable.
 
 ---

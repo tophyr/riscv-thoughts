@@ -2,14 +2,19 @@
 """Train a T2 encoder on top of a frozen T1 encoder over
 multi-instruction RVT chunks.
 
-For each chunk, T1 encodes each instruction individually; T2 attention-
-pools the resulting sequence into a single chunk vector. Supervision is
-value-prediction and aux register-identity heads.
+For each chunk, the frozen T1 encodes each instruction and (under
+--route binding) emits its wiring; T2 runs the register-state core over the
+chunk with that wiring and pools the written slots into an essence.
+Supervision is value prediction, the binding heads, and (with
+--distance-weight) the behavioral distance term.
 
-Usage:
-    python -m datagen --rule 'branch+cap=8' --batch-size 384 \\
-        --count 5000 \\
-        | train_t2_encoder.py --t1-model runs/t1_good/encoder.pt
+Usage (scripts/run_t2.sh is the canonical launcher):
+    python -m datagen --rule cap=2 --batch-size 384 --n-states 8 \\
+        --config configs/instr_alu_writers_chain010_rewrites050_aim050.json \\
+        --count 1000000 \\
+      | train_t2_encoder.py --t1-model runs/t1_distance_cosbal_500k/encoder.pt \\
+        --d-out 512 --op-cell-depth 4 --vp-head-depth 12 --n-pool-heads 16 \\
+        --distance-weight 1.0 --n-steps 1000000 --out-dir "$OUT"
 """
 
 import argparse
@@ -89,9 +94,10 @@ def main():
                         "'tokens': decoded-token wiring (diagnostic A/B, not "
                         'a valid recursion result).')
     p.add_argument('--resume', type=str, default=None,
-                   help='Path to a t2.pt checkpoint to resume from. '
-                        'Loads weights into a freshly-built T2 (model '
-                        'hparams must match). Optimizer state is reset.')
+                   help='Resume from a run directory (weights plus its '
+                        'train_state.pt: optimizer, LR schedule, step and RNG '
+                        'continue) or from a bare t2.pt (weights only, fresh '
+                        'optimizer). Model hparams must match.')
     p.add_argument('--no-compile', action='store_true',
                    help='Disable torch.compile (CUDA-graph) of the train '
                         'step. Compile is on by default (saturates the GPU); '

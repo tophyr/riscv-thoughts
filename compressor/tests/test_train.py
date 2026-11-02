@@ -16,7 +16,7 @@ import numpy as np
 import torch
 
 from datagen import AUX_CE_IGNORE, MAX_INPUT_SLOTS, MAX_OUTPUT_SLOTS
-from tokenizer import BOS, EOS, PAD, VOCAB_SIZE
+from tokenizer import BOS, EOS, PAD, VOCAB_SIZE, decode_instruction
 
 from compressor.model import T1Compressor, T2Compressor
 from compressor.train import (
@@ -153,20 +153,43 @@ def test_gen_shipped_values_re_execute_from_their_inputs():
     rng = np.random.default_rng(0)
     alu = build_opcode_table({'R_ALU': 0.55, 'I_ALU': 0.45})
     chunks = generate_chunks(length_cap(4), rng, opcode_table=alu,
-                             chain_rate=0.3, eq_rate=0.05)
+                             chain_rate=0.3)
     batch = next(collect_into_batches(
         chunks, batch_size=256,
         draw_anchors=lambda k: draw_anchor_states(rng, k * 8).reshape(k, 8, -1),
         max_chunk_len=4))
 
     from datagen.tests.test_batch import _reexecuted
-    from compressor.train import _decode_chunk_instructions
     assert batch.out_values.shape[0] == batch.tokens.shape[0]   # OB == B (T2)
     for i in np.nonzero(batch.out_regs_valid)[0]:
         chunk = _decode_chunk_instructions(batch, i)
         got = _reexecuted(chunk, batch.out_slot_regs[i], batch.out_inputs[i],
                           batch.out_input_values[i])
         assert np.array_equal(got, batch.out_values[i]), chunk
+
+
+def _decode_chunk_instructions(batch, row_idx):
+    """Decode all instructions in chunk row_idx back to Instruction
+    objects. Returns the list, or None if any decode fails or the
+    chunk is empty/invalid. Caller masks via batch.valid."""
+    if not batch.valid[row_idx]:
+        return None
+    instr_lens = batch.instr_lens[row_idx]
+    tokens = batch.tokens[row_idx]
+    instrs = []
+    offset = 0
+    for j in range(len(instr_lens)):
+        L = int(instr_lens[j])
+        if L == 0:
+            continue
+        toks = tokens[offset:offset + L].tolist()
+        try:
+            instr, _ = decode_instruction(toks, 0)
+        except Exception:
+            return None
+        instrs.append(instr)
+        offset += L
+    return instrs if instrs else None
 
 
 def _small_batches(n):
@@ -347,8 +370,7 @@ class _StubBindingModel:
 def test_binding_losses_jointly_satisfiable():
     """The whole point of mirroring T2: every binding target can be met at
     once. With heads predicting each target near-perfectly, all five losses
-    go to ~0 simultaneously — there is no irreducible two-loss floor (which
-    the old equivalence_loss vs src-register CE could not avoid)."""
+    go to ~0 simultaneously — there is no irreducible two-loss floor."""
     n_regs = 8
     # One row: reads regs {1,2} (slot order 1 then 2), writes {5}, no pc.
     live_in = torch.zeros(1, n_regs); live_in[0, [1, 2]] = 1.0
@@ -396,8 +418,8 @@ def test_binding_losses_excludes_all_zero_mask_rows():
 
 
 def test_t1_compressor_uses_t2_binding_heads():
-    """T1 carries the per-slot binding heads (and not the removed syntactic
-    CE heads), so the shared binding_losses runs on a real (T, essence)."""
+    """T1 carries the per-slot binding heads, so the shared binding_losses
+    runs on a real (T, essence)."""
     from emulator import Instruction
     from tokenizer import encode_instruction
     from compressor.model import instruction_wiring

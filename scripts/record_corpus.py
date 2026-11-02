@@ -41,7 +41,8 @@ def main():
     p.add_argument('--count', type=int, required=True,
                    help='Batches drawn (datagen --count).')
     p.add_argument('--generator', default='multinode_gen.sh',
-                   help='Which front-end produced the stream.')
+                   help='Which front-end produced the stream, as a command '
+                        "(scripts/run_t2.sh passes 'datagen --gen-count N').")
     args = p.parse_args()
 
     record = {

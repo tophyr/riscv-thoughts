@@ -9,32 +9,30 @@ which of the chunk's distinct outputs to evaluate) and the
 values and colours of the output's inputs
 gathered by register, never the output's own description (RISCV_DESIGN, "GVN",
 "Leaf identity for input registers" and "Value prediction reads the
-essence"). Every equivalence that leaves the live dataflow graph unchanged
-collapses by construction and reads zero on the trained models; T1 is exact at
-held-out anchors; T2 at len=2 is 99.83% after 1M steps on one seed, with the
-essence spanning the range the first-read frame's models had (finding 39).
-At T1 a behavioral distance term collapses equivalent spellings and grades
-inequivalent ones by how differently they behave (finding 41), and with half
-of each row's anchor states aimed at its boundaries it is exact at held-out
-anchors (finding 42). The distance term's witness states and the evaluator's
-inputs are placed by canonical role, an order computed from the function
-(finding 43). At T2, the term on one-output rows with partner chunk pairs
-collapses every kind of pair it trains on while vp stays at 99.84%, and leaves
-untouched the equivalences outside that coverage (finding 44). Ordering the
-evaluator's pointers by a projection of each output's description keeps two
-equivalent chunks' pointers in agreement more often than a content hash
-(findings 45 and 46). With a distance target over every output, partner
-chunk pairs drawing every rewrite in every operand context, the target chord
-√(2d) and equivalent pairs averaged apart from the rest, a T2 at len=2
-collapses every equivalence class tried at vp 99.79%, one seed (findings
-47–50). Open: whether the decisions behind that collapse hold up — the
-balanced loss, the order outputs are paired in, the pointer order — a second
-seed, rewrites never trained, the composed slots' residual, the binding's
-wire format, and the learned replacement for the colouring.
+essence"). Every equivalence that leaves the live dataflow graph unchanged —
+rename, reordering, dead code — collapses by construction and reads zero on
+every trained model. Without a collapse objective, value prediction from the
+essence is exact at T1 and 99.83% at T2 len=2, and nothing the op-cell has to
+compute collapses (findings 37–39). Collapse is trained with a behavioral
+distance term: every two rows' essence distance is matched to how differently
+they behave at shared witness states, their inputs placed by canonical role,
+an order computed from the function (findings 41 and 43); training anchors
+aimed at each row's boundaries keep value prediction exact under it (finding
+42). The frozen T1, `runs/t1_distance_cosbal_500k`, is exact at held-out
+anchors. A T2 at len=2 over it, trained on partner chunk pairs drawing every
+rewrite with the distance target's chord √(2d) and equivalent pairs averaged
+apart from the rest, collapses every equivalence class tried at vp 99.79%,
+one seed (finding 50); a collapse holds only while its pairs stay in the
+training mix (finding 47). Open: whether the decisions behind that collapse
+hold up — the balanced loss, the order outputs are paired in, the pointer
+order — a second seed, rewrites never trained, the composed slots' residual,
+the binding's wire format, and the learned replacement for the colouring.
 
-The run directories and corpus configs of the T2s in findings 39, 44 and
-46–49 and of the T1s in finding 43 are deleted; each finding records its
-configuration.
+Of the runs named below only `runs/t1_distance_cosbal_500k` and finding 50's
+T2 are kept, and of the corpus configs only those still in `configs/`; a
+deleted name is the record of what was measured, not a loadable artifact.
+`runs/eval/` holds the latest regeneration of the held-out corpora; a finding
+that cites them scored the regeneration current at the time.
 
 Findings 1–36 (phases 14 and 15) were measured in the first-read canonical
 frame; their numbers are not comparable to these (METRICS.md).
@@ -42,23 +40,23 @@ frame; their numbers are not comparable to these (METRICS.md).
 **37. In the register frame — with the encoder told which operations
 commute — T1 is exact and every structural equivalence collapses to zero; T2
 at len=2 reaches 99.8385% after 1M steps, with the composed slots carrying the
-residual, and its essence varies 30× less between unrelated chunks than
-before.** The models here carried a list of commutative opcodes into the
-encoder: T1 learned to emit a symmetry bit against it and T2's colouring
-treated such an operation's two roles as one, which is what made the
-commutative-swap rows below exactly zero. The list reaches only the oracle
-in the code (Decisions); the swap rows are the only figures it touched. Every
-figure is at the fixed held-out anchor
-set, 64 states, on corpora generated with `datagen --heldout-anchors` from
+residual, and its essence varies 30× less between unrelated chunks than in
+the first-read frame.** The models here carried a list of commutative
+opcodes into the encoder: T1 learned to emit a symmetry bit against it and
+T2's colouring treated such an operation's two roles as one, which is what
+made the commutative-swap rows below exactly zero. The list reaches only the
+oracle in the code (Decisions); the swap rows are the only figures it
+touched. Every figure is at the fixed held-out anchor set, 64 states, on
+corpora generated with `datagen --heldout-anchors` from
 `configs/instr_alu_writers.json`: `runs/eval/t1_heldout64_single.rvt` and
 `runs/eval/t2_heldout64_len2.rvt`, 100 batches of 384 rows each (twins
 included). Scores are `probes/frame_scorecard.py`'s; a value is one output
 register of one row at one anchor state; essence distances are L2 between
 unit-normalized essences, 2,000 pairs per class.
 
-*The frozen T1*, `runs/t1_frame_500k`: `d_model` 128, `d_out` 64,
+*The T1*, `runs/t1_frame_500k`: `d_model` 128, `d_out` 64,
 `imm_weight` 0.3, `sym_weight` 0.1, three-layer residual vp head, 500k steps
-at 4 ms/step (33 min), 24 local generator workers, GPU at 96–97%.
+at 4 ms/step (33 min).
 
 | T1 | value |
 |---|---|
@@ -73,8 +71,7 @@ at 4 ms/step (33 min), 24 local generator workers, GPU at 96–97%.
 `scripts/run_t2.sh` at len=2, `d_out` 512, op-cell depth 4, 16 pool heads,
 twelve-layer residual vp head, chain rate 0.10, 1M steps at 15 ms/step (4.0 h;
 8 ms in the first-read frame — the evaluator's input is 3,616 wide per slot
-and the colouring runs eight rounds), 26 local workers, GPU at 99%, one
-instruction-stream seed.
+and the colouring runs eight rounds), one instruction-stream seed.
 
 | T2 | value |
 |---|---|
@@ -102,8 +99,8 @@ to two slots, both 0.0000; `ADDI r,r,0` against `ADD r,r,x0` 0.0227, against
 denominators 0.0181 (`ADDI r,r,1`) and 0.0071 (`+k;-k+1`). `probes/swap_classes.py`:
 the non-fresh swap rows at 1.6e-3 and 6.6e-4 trained against 2.4e-2 and
 5.5e-2 at random initialisation. So nothing the op-cell has to compute
-collapses, as before; what the frame changed is that nothing the graph
-determines is left to training.
+collapses, as in the first-read frame; in the register frame nothing the
+graph determines is left to training.
 
 *The essence's dynamic range.* Unrelated chunks sit 0.0233 apart, against
 0.67–1.19 in the first-read frame, and the aliasing control at 0.0192 is
@@ -111,33 +108,32 @@ within that. The essence receives no vp gradient: value prediction reads the
 written slot's description in `T`, and the only losses on the essence are the
 validity magnitude and `pc_writes`, so its direction is shaped by nothing
 that asks it to tell chunks apart. The ratios between classes are of the
-same order as before (the aliasing control and the fusion rows separate by
-similar factors), so the structure may survive at a thirtieth of the scale
-rather than be gone; what shaped it in the first-read frame was vp reading
-the essence (the opcode clustering) and T1's immediate head (the rotary
-immediate axis), which T1 still trains and T2 never had. Finding 39 gives
-the essence that pressure back.
+same order as in the first-read frame (the aliasing control and the fusion
+rows separate by similar factors), so the structure may survive at a
+thirtieth of the scale rather than be gone; what shaped it in the first-read
+frame was vp reading the essence (the opcode clustering) and T1's immediate
+head (the rotary immediate axis), which this T1 trains and T2 does not have.
+Finding 39 has value prediction read the essence.
 
-*A pool defect found by the scorecard and fixed before scoring.* The pool
-projects only the written slots and fills a short row's spare picks from the
-lowest-index unwritten slots, which assumed those rows are zero; a read-only
-leaf's row is not (it holds the leaf's seed), and x1 is the first candidate,
-so a chunk with one written slot that read x1 projected that leaf into the
-pool. Dead-code pairs whose inserted instruction read x1 sat 0.02 apart. The
-rows are masked before selection now (`_project_touched`,
-`compressor/model.py`); the T2 cell above was trained with the defect — it
-touches rows with one written slot that read x1 — and scored after the fix;
-T1 is unaffected (one instruction, one write, no spare pick).
+*A pool defect.* The pool projects only the written slots and fills a short
+row's spare picks from the lowest-index unwritten slots, which is sound only
+if those rows are zero; a read-only leaf's row is not (it holds the leaf's
+seed), and x1 is the first candidate, so a chunk with one written slot that
+read x1 projected that leaf into the pool, and dead-code pairs whose inserted
+instruction read x1 sat 0.02 apart. The rows are masked before selection
+(`_project_touched`, `compressor/model.py`). The T2 cell above was trained
+with the defect — it touches rows with one written slot that read x1 — and
+scored with the mask; T1 is unaffected (one instruction, one write, no spare
+pick).
 
 **38. Without the commutative list in the encoder: T1 exact, T2 at len=2
 99.8322% after 1M steps, every graph-identity class exactly zero, and a swap
 whose operand is shared stays apart.** Same corpora, scorer, cell and budget
 as finding 37; the only change is that every operand role is ordered in the
-colouring, the list reaching only the oracle's labels, and the pool fix is in
-for training as well as scoring. T1 `runs/t1_register_500k`: vp 100.0000%
-(0 of 2,457,600), wiring 100.0000%. T2
-`runs/t2_len2_d512_s1000000_dep4_vp12_pool16_alu_writers_chain010` (this
-directory held finding 37's cell and was overwritten by this one):
+colouring, the list reaching only the oracle's labels, and the pool's rows are
+masked in training as well as scoring. T1 `runs/t1_register_500k`: vp
+100.0000% (0 of 2,457,600), wiring 100.0000%. T2: finding 37's cell
+configuration:
 
 | T2 | value |
 |---|---|
@@ -160,13 +156,14 @@ essence's range is as in finding 37 (0.028 between unrelated chunks).
 **39. With value prediction read from the essence through each output's
 pointer, T1 is exact, T2 at len=2 is as faithful as finding 38's per-slot
 cell, and the essence spans the first-read frame's range — 25× finding 38's;
-nothing the op-cell has to compute collapses, and the essence now separates
+nothing the op-cell has to compute collapses, and the essence separates
 those equivalents by their spelling.** Each written output carries a pointer,
-a one-hot built in three steps: each output's data path is coloured by the
-leaf colouring's pass with every operation also seeded from its content; the
-chunk's distinct paths are sorted by a fixed projection of that colour (their
-content-hash order); and the pointer marks the output's position in that
-order. The pool adds each written slot's pointer
+a one-hot naming its position among the chunk's distinct outputs. In this
+finding and findings 40–45 the order is a content hash: each output's data
+path is coloured by the leaf colouring's pass with every operation also
+seeded from its content, and the chunk's distinct paths are sorted by a fixed
+projection of that colour; finding 46 replaces it with an order by the
+outputs' descriptions. The pool adds each written slot's pointer
 to its attention key, and the evaluator is handed the unit-normalized essence,
 the pointer and the inputs' values and colours in place of the slot's
 description (`vp_loss`, `compressor/train.py`). Training used only this term;
@@ -181,8 +178,8 @@ with the row's own pointer and inputs; it tests that the function reaches the
 evaluator only through the essence, and its chance floor is not measured
 (METRICS.md, "vp").
 
-*The frozen T1*, `runs/t1_essonly_500k`: as finding 38's T1, 500k steps at
-3–4 ms/step, 96–97% GPU.
+*The T1*, `runs/t1_essonly_500k`: as finding 38's T1, 500k steps at
+3–4 ms/step.
 
 | T1 | finding 38 (per-slot evaluator) | essence evaluator |
 |---|---|---|
@@ -194,7 +191,7 @@ evaluator only through the essence, and its chance floor is not measured
 | unrelated instructions | 0.9197 | 1.3688 |
 
 *The T2 cell*, `runs/t2_len2_d512_s1000000_dep4_vp12_pool16_essonly_alu_writers_chain010`:
-as finding 38's cell, 1M steps at 14 ms/step (3.9 h), GPU at 99%.
+as finding 38's cell, 1M steps at 14 ms/step (3.9 h).
 
 | T2 | finding 38 | essence evaluator |
 |---|---|---|
@@ -229,7 +226,7 @@ fusion pair sits further apart; an identity sits further from a cancelling
 pair than unrelated chunks sit from each other. The essence describes the
 instructions as written: the pressure that makes it carry every output's
 function does not make it fold one, as in the first-read frame (ratios
-0.8–1.0×), now at full scale.
+0.8–1.0×), and here at that frame's scale.
 
 **40. Register-relabelled copies of a chunk carried training signal only
 through a register-number leak in the evaluator's input order; with the order
@@ -242,22 +239,22 @@ differed by up to 2.8× (cosine down to −0.64); two unrelated chunks differ by
 0.90. All 12 contained `ADD`, `AND`, `OR` or `XOR`, and in each the two
 operands of that operation were listed in the other order in `out_inputs`,
 the per-output list of input registers in the order the evaluator reads them:
-`datagen.signature.output_inputs` ordered an output's inputs by the oracle's
-colouring, which merges a commutative operation's two roles, and broke the
-resulting tie by register number, while the encoder colours the two roles
-apart — so a rename moved the two values between evaluator positions. With the
-order computed from the colouring with every role ordered, on a batch drawn
-from the same seed, every copy matches its source (relative gradient
-difference ≤ 2.2e-4, cosine ≥ 0.99999976, against 0.81 between unrelated
-chunks), and a test pins the property
-(`test_a_rename_never_moves_an_input_between_gather_positions`). Batches now
-carry 384 distinct chunks and no copies; the generator with copies set to zero
-and the generator without them emit byte-identical batches on one seed. The
-models of findings 37–39 were trained and scored with the register-dependent
-order. `runs/t1_essence_500k` is finding 39's T1 trained with
-the encoder's input order on batches of distinct chunks (500k steps, 4 ms/step,
-86–90% GPU), scored on held-out corpora regenerated the same way, 38,400
-distinct instructions:
+that order came from the oracle's colouring, which merges a commutative
+operation's two roles, with the resulting tie broken by register number,
+while the encoder colours the two roles apart — so a rename moved the two
+values between evaluator positions. With the order computed from the
+colouring with every role ordered (`datagen.signature.output_inputs`), on a
+batch drawn from the same seed, every copy matches its source (relative
+gradient difference ≤ 2.2e-4, cosine ≥ 0.99999976, against 0.81 between
+unrelated chunks), and a test pins the property
+(`test_a_rename_never_moves_an_input_between_gather_positions`,
+`datagen/tests/test_signature.py`); the canonical role order of finding 43
+keeps it (`datagen/tests/test_roles.py`). Batches carry 384 distinct chunks
+and no copies. The models of findings 37–39 were trained and scored with the
+register-dependent order. `runs/t1_essence_500k` is finding 39's T1 trained
+with the encoder's input order on batches of distinct chunks (500k steps, 4
+ms/step), scored on held-out corpora regenerated the same way,
+38,400 distinct instructions:
 
 | T1 | finding 39's T1 | `runs/t1_essence_500k` |
 |---|---|---|
@@ -268,7 +265,7 @@ distinct instructions:
 | aliasing control | 0.6308 | 0.7363 |
 | unrelated instructions | 1.3688 | 1.3658 |
 
-No T2 has been trained over it; finding 39's T2 is the T2 record.
+No T2 was trained over it.
 
 **41. At T1, a behavioral distance term collapses equivalent spellings while
 keeping inequivalent ones graded by how differently they behave; InfoNCE
@@ -292,9 +289,11 @@ register rename shares its key. The arms differ in the collapse term:
 - *InfoNCE + uniformity*: the same plus a term repelling every two rows
   of different keys, log-mean-exp(−2·distance²) (Wang & Isola);
 - *distance*: an MSE between every two rows' essence distance (chord, 0–2) and
-  twice their **behavioral distance** (`distance_loss`, weight 1.0). The
+  twice their **behavioral distance** (weight 1.0; the target form in
+  findings 41–48, which findings 48–50 change). The
   behavioral distance executes both rows at 64 shared witness states, their
-  inputs placed in colour order so that inputs correspond positionally, and
+  inputs placed in colour order (finding 43 replaces it with canonical role
+  order) so that inputs correspond positionally, and
   averages log1p(log1p(d)) / log1p(log1p(max_dist)) over the states, d being
   the wrap-around difference of the two outputs and max_dist the largest
   difference those two outputs could ever have, from a known-bits analysis of
@@ -371,8 +370,9 @@ cannot separate functions that disagree on one input in 2³², and putting them
 close is the geometry intended; what keeps them distinguishable has to come
 from value prediction seeing the boundary.
 
-The distance arms ran at 10–12 ms/step against 4 ms, with the GPU at 71–76%:
-the targets are computed eagerly before each compiled step.
+The distance arms ran at 10–12 ms/step against 4 ms, with the GPU at 71–76%,
+their targets computed eagerly before each compiled step (finding 42 replays
+them as one CUDA graph).
 
 **42. A T1 trained with the behavioral distance term evaluates exactly at
 held-out anchors once half of each row's anchor states straddle its own
@@ -480,10 +480,9 @@ of pairs with two or more inputs at len 2, 4 and 8.
 At len=1, canonical roles place the two operands of `SUB`, `SLT` and `SLTU`
 differently from the colour order (203 of 282 such rows over five batches of
 the T1 corpus), so the T1 distance targets move: mean change 0.0115, 2.8% of
-pairs by more than 0.1, correlation 0.953 with the targets the frozen T1
+pairs by more than 0.1, correlation 0.953 with the targets finding 42's T1s
 trained on. A T1 retrained on them (`runs/t1_distance_noimm_aim050_roles_500k`, finding 42's
-configuration otherwise, 500k steps, generation on odin, 7 ms/step at 98–99%
-GPU) follows them: on the 16,819 pairs of ten writers-corpus batches whose
+configuration otherwise, 500k steps, 7 ms/step) follows them: on the 16,819 pairs of ten writers-corpus batches whose
 target moved by more than 0.2 — almost all `SUB`, `SLT` or `SLTU` against
 another operation — its essence distance sits 0.140 from the new target and
 0.459 from the old, while finding 42's two T1s sit 0.530 and 0.529 from the
@@ -495,7 +494,7 @@ instructions 1.360, `ADDI` k vs k+1 at 0.333 (target 0.338).
 Computing the roles for every generated row makes one generator core take
 66, 102, 193 and 401 ms per 384-row batch at len 1, 2, 4 and 8, against 49,
 70, 125 and 239 without them, with every fingerprint of a chunk executed in
-one stacked call; odin's 96 workers deliver at least 450 and 290 batches/s
+one stacked call; 96 generator workers deliver at least 450 and 290 batches/s
 at len 1 and 2.
 
 The evaluator takes each output's inputs in the same canonical role order,
@@ -503,7 +502,7 @@ so two equivalent chunks of different dataflow shapes present corresponding
 inputs at the same positions; a class of interchangeable inputs is ordered by
 the encoder's colour, the singled-out member first, which leaves a
 commutative operation's two operands in the colour order the evaluator had.
-On a held-out corpus in that order, the T1 of the previous paragraph scores
+On a held-out corpus in that order, `runs/t1_distance_noimm_aim050_roles_500k` scores
 87.87%, every failure on `SUB` (8.7%), `SLT` (31.5%) or `SLTU` (41.2%), whose
 two operands the roles re-pair; retrained with it
 (`runs/t1_distance_noimm_aim050_canon_500k`, otherwise as above), T1 is exact
@@ -512,7 +511,7 @@ on all 2,457,600 held-out triples, with partner groups equivalent at
 unrelated instructions 1.361 and `ADDI` k vs k+1 at 0.377.
 
 **44. A T2 trained with the behavioral distance term on one-output rows and
-partner chunk pairs is as faithful as the T2 record and collapses every kind
+partner chunk pairs is as faithful as finding 39's T2 and collapses every kind
 of partner pair it trained on, by 5× to 3,500× against a near-miss; it does
 not collapse a commutative swap whose operand is the previous instruction's
 result, a shape no partner kind produces, and it pushes the identity away
@@ -523,7 +522,7 @@ steps, one seed) over `runs/t1_distance_noimm_aim050_canon_500k`, on
 writers corpus with a quarter of each batch partner chunk pairs and half the
 anchor states aimed — with the distance term at weight 1.0 on every two rows
 that write one register (`runs/t2_len2_d512_s1000000_dep4_vp12_pool16_dist1.0_alu_writers_chain010_partners025_aim050`;
-20 ms/step, GPU at 98–99%, 5.5 h). Scored with `probes/frame_scorecard.py` on
+20 ms/step, 5.5 h). Scored with `probes/frame_scorecard.py` on
 the regenerated `runs/eval/t2_heldout64_len2.rvt`, and with
 `probes/partner_chunks.py`, `probes/additive_fusion.py` and
 `probes/write_position.py`, 1,000–2,000 pairs per row, beside finding 39's T2
@@ -538,8 +537,9 @@ finding 40 removed).
 | rename / reorder / dead code / fresh swap | 0 (≤ 1.5e-6) | 0 |
 | aliasing control / unrelated chunks | 1.024 / 1.332 | 0.505 / 0.690 |
 
-Partner kinds (`sample_chunk_partner_pair`), equivalent pair against the
-second spelling with one immediate +1 or its first operation changed:
+The corpus's five partner kinds (a generator since replaced by finding 48's
+rewrites), equivalent pair against the second spelling with one immediate +1
+or its first operation changed:
 
 | kind | distance term | finding 39's T2 |
 |---|---|---|
@@ -571,11 +571,12 @@ never places it.
 
 **45. Two equivalent two-output chunks file their functions under different
 pointers in about 40% of commutative swaps whose operand is shared or
-composed, and almost never otherwise.** The pointer orders a chunk's outputs
-by a fixed hash of each output's content-aware path colour (RISCV_DESIGN,
-"Value prediction reads the essence"), so whether it flips depends on the
-frozen T1 and the fixed hash, not on T2's training. Equivalent pairs of
-two-output len-2 chunks, checked on the emulator, over
+composed, and almost never otherwise, when pointers are ordered by content
+hash; an order by a projection of each output's description agrees far more
+often.** The content-hash pointer (finding 39) orders a chunk's outputs by a
+fixed hash of each output's content-aware path colour, so whether it flips
+depends on the T1 and the fixed hash, not on T2's training. Equivalent pairs
+of two-output len-2 chunks, checked on the emulator, over
 `runs/t1_distance_noimm_aim050_canon_500k` (read through finding 44's T2);
 1,000 pairs per row; a flip is any output register whose pointer differs:
 
@@ -608,17 +609,18 @@ within 1% of the median gap. This T2 was never trained on two-output pairs.
 
 **46. Ordering pointers by a projection of each output's description keeps
 two-output equivalents' pointers in agreement more often than the hash and
-settles as training runs, but the swaps it was meant to unblock still do not
-collapse, because the op-cell does not describe a commutative operation
-alike when one operand is another instruction's result — with one output and
+settles as training runs, but does not by itself collapse the swaps whose
+operand is shared or composed, because the op-cell does not describe a
+commutative operation alike when one operand is another instruction's result — with one output and
 no pointer to disagree on, that swap stays where it was.** Finding 44's T2,
 its pointer replaced by the description order (`RegisterStateMachine._pointer`:
 a fixed unit direction, ties within 1e-4 sharing a position) and its distance
-target by the root-mean-square over canonically ordered outputs with
-same-value writes dropped (`chunk_distance_targets`, `compressor/train.py`),
+target by the root-mean-square over canonically ordered outputs
+(`chunk_distance_targets`, `compressor/train.py`), same-value writes dropped
+from the outputs (`precompute_chunk`, `datagen/compare.py`),
 trained 100k steps more (learning rate 5e-5, 2k warmup, cosine) on its corpus
 with a partner kind added that swaps one commutative instruction of a chunk
-of any shape (`runs/t2_ptrdesc_rms_resume100k`, 21 ms/step, GPU at 98–100%).
+of any shape (`runs/t2_ptrdesc_rms_resume100k`, 21 ms/step).
 Tracked every 10k steps on fixed sets of finding 45's pairs (1,000 per class)
 and 2,000 natural chunks; vp on 20 held-out batches:
 
@@ -632,8 +634,8 @@ and 2,000 natural chunks; vp on 20 held-out batches:
 (churn: the natural chunks whose pointer assignment changed since the last
 snapshot; respellings flip 0.4–2.5% throughout; unrelated chunks 1.34–1.36.)
 At step 0 the description order flips 15.5% and 21.3% where the hash flips
-41–44%, and churn decays as the learning rate does. The flips do not fall
-further. `probes/partner_chunks.py` on the same two models:
+41–44%; churn decays as the learning rate does, and the flips stay between
+15.4% and 21.3%. `probes/partner_chunks.py` on the same two models:
 
 | | step 0 | step 100k |
 |---|---|---|
@@ -657,7 +659,7 @@ the producer's inputs — on 500 of 500 generated pairs (37% of swaps of any
 shape), so the two chunks hand the op-cell different seeds and it has to
 describe them alike regardless. Finding 46's final T2 trained a further 100k
 steps (learning rate 5e-5, cosine) on a corpus whose partner pairs, half of
-every batch, are all such swaps (`composed_swap`, `datagen.generate`;
+every batch, are all such swaps (a partner kind not kept in the generator;
 `configs/instr_alu_writers_chain010_composedswap050_aim050.json`;
 `runs/t2_composedswap_resume100k`). `probes/partner_chunks.py`, before and
 after:
@@ -691,7 +693,7 @@ reassociation — embedded in random context whose registers it reads half the
 time; cancellation held out), 1M steps
 (`runs/t2_len2_d512_s1000000_dep4_vp12_pool16_dist1.0_alu_writers_chain010_rewrites050_nocancel_aim050`,
 `configs/instr_alu_writers_chain010_rewrites050_nocancel_aim050.json`, 22
-ms/step, GPU at 99%). vp 99.8229% at held-out anchors (outputs with three
+ms/step). vp 99.8229% at held-out anchors (outputs with three
 inputs 91.0%), binding exact; the scorecard's shared-operand swap 0.170
 against unrelated chunks 1.318 (finding 44: 0.659 / 1.332); natural swaps on
 a composed operand 0.207 with one output, 0.182 with two (0.289 / 0.598).
@@ -726,8 +728,9 @@ the rewrite held out, at unchanged vp and aliasing control.** Equivalent pairs
 averaged over all pairs they carry under 1% of the gradient. Finding 48's √2
 arm, resumed identically except that the squared errors of target-0 pairs
 and of all other pairs are each averaged and the two means summed
-(`distance_loss(balance=True)`, `compressor/train.py`;
-`runs/t2_rewrites_resume100k_scale141_bal`), against that arm:
+(the balancing in `distance_loss`, `compressor/train.py`, here on the
+√2 × distance target; `runs/t2_rewrites_resume100k_scale141_bal`), against
+that arm:
 
 | | balanced | averaged over all pairs |
 |---|---|---|
@@ -744,22 +747,26 @@ and of all other pairs are each averaged and the two means summed
 The identity `ADDI r,r,0` against the empty chunk stays at 0.856: no partner
 pair relates a same-value write to its absence.
 
-**50. With the settled distance term and every rewrite in the partner mix,
-a T2 at len=2 collapses every equivalence class tried — folds, cancellations,
-reassociations, respellings, identities and commutative swaps in every
-operand context — at vp 99.79%.** The T1 is finding 42's configuration
-retrained under the settled term (target chord √(2d), equivalent pairs
-averaged apart; `runs/t1_distance_cosbal_500k`): vp exact on all 2,457,600
+**50. With the distance term matching the chord to √(2d), equivalent pairs
+averaged apart, and every rewrite in the partner mix, a T2 at len=2 collapses
+every equivalence class tried — folds, cancellations, reassociations,
+respellings, identities and commutative swaps in every operand context — at
+vp 99.79%.** The target chord √(2d) makes d the target cosine distance, so
+rows that behave entirely differently are held orthogonal, never antipodal
+(`distance_loss`, `compressor/train.py`). The T1 is finding 43's canonical-role
+configuration retrained under this term
+(`configs/instr_alu_writers_partners025_aim050.json`;
+`runs/t1_distance_cosbal_500k`): vp exact on all 2,457,600
 held-out triples, wiring exact, partner groups equivalent at 0.0001–0.0068
 against contrasts of 0.48–1.30, aliasing control 1.088, unrelated
 instructions 1.213. The T2 over it is finding 44's cell with the
-description-ordered pointer, the root-mean-square target over every row, the
-settled term, and half of every batch rewrite partner pairs drawing every
+description-ordered pointer, the root-mean-square target over every row,
+this term, and half of every batch rewrite partner pairs drawing every
 rewrite — commutative swap, respelling, fold, cancellation, reassociation, a
 same-value write against its absence
 (`configs/instr_alu_writers_chain010_rewrites050_aim050.json`;
 `runs/t2_len2_d512_s1000000_dep4_vp12_pool16_dist1.0_cosbal_alu_writers_chain010_rewrites050_aim050`,
-1M steps, 24 ms/step, GPU at 99–100%). Scored by `scripts/run_t2.sh` on the
+1M steps, 24 ms/step). Scored by `scripts/run_t2.sh` on the
 regenerated held-out corpus and by the probes, against finding 44's cell:
 
 | | this T2 | finding 44 |
@@ -794,11 +801,9 @@ difference is 0.056 points, over a different T1 and on one seed each.
 - **The encoder is told nothing about which operations commute.** Every
   operand role is ordered in its colouring and in the evaluator's input
   order; the list of commutative opcodes reaches only the oracle's
-  signature. Finding 37's models carried that list into the encoder (a
-  symmetry bit T1 emitted and T2's colouring consumed), which is why their
-  swap rows read exactly zero; the user's ruling is that commutativity has to
-  be learned, under a collapse objective, and finding 38 is the same cells
-  without the list.
+  signature. Commutativity is to be learned under a collapse objective (the
+  user's ruling); finding 37's swap rows read zero only because its encoder
+  carried the list.
 - **The structural signature is the collapse label** (`datagen/signature.py`)
   and never a target.
 - **Value prediction reads the essence, never a written slot's description**
@@ -807,15 +812,13 @@ difference is 0.056 points, over a different T1 and on one seed each.
   the written slots carry their functions, since each slot's row is the only
   route its function has into the essence.
 - **A batch holds distinct chunks only** (finding 40).
-- **T1 has no immediate head** (finding 41). It was added to give the essence
-  an immediate axis on which imm+δ is a consistent rotation, and to fix an
-  immediate-field vp deficit; the deficit was the essence pool's shared value
-  projection (fixed by per-head projections), the rotary composition was never
-  observed (finding 21: a chain's summed immediate is no more linearly
-  recoverable than either addend), and it pins the essence to
-  how an instruction is written, which collapse requires it not to encode. The
-  code is deleted; every kept checkpoint loads without its tensors and
-  reproduces its outputs bit for bit.
+- **T1 has no immediate head** (finding 41). Its purposes do not hold: the
+  immediate-field vp deficit it targeted came from the essence pool's shared
+  value projection (fixed by per-head projections), the rotary composition of
+  immediates it was to give the essence is not observed (finding 21: a chain's
+  summed immediate is no more linearly recoverable than either addend), and it
+  pins the essence to how an instruction is written, which collapse requires
+  it not to encode.
 - **Collapse at T1 is trained with the behavioral distance term** (finding
   41): the user's requirement is a smooth space, graded by how differently two
   functions behave, and the distance term states it; InfoNCE alone, with or
@@ -828,10 +831,10 @@ difference is 0.056 points, over a different T1 and on one seed each.
 - **The evaluator takes inputs in canonical role order** (finding 43), ties
   between interchangeable inputs by colour.
 - **The frozen T1 is `runs/t1_distance_cosbal_500k`** (finding 50): the
-  settled distance term on canonical-role targets, the evaluator in
+  √(2d) balanced distance term on canonical-role targets, the evaluator in
   canonical role order, no immediate head, aimed anchors.
 - **The distance term matches the chord to √(2d) and averages equivalent
-  pairs apart from the rest** (findings 48 and 49).
+  pairs apart from the rest** (findings 48–50).
 - **The T2 record is finding 50's cell**, trained on rewrite partner pairs
   drawing every rewrite.
 - **T2 trains with the distance term on every row and partner chunk pairs**

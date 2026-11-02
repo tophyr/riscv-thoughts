@@ -71,9 +71,8 @@ def gen(n_batches=2, batch_size=16, n_states=4,
 
 
 def _count_batches(data):
-    """Count batches in an RVT blob, in-process (replaces the deleted
-    `batch_slice --info`). A clean parse also confirms the bytes are valid
-    RVT — the reader raises otherwise."""
+    """Count batches in an RVT blob, in-process. A clean parse also confirms
+    the bytes are valid RVT — the reader raises otherwise."""
     import io
     sys.path.insert(0, str(ROOT))
     from datagen import RVT_FORMAT, Batch
@@ -183,8 +182,8 @@ class TestCount:
         assert _count_batches(out) == 10
 
     def test_count_on_pure_mux(self):
-        """--count also bounds a pure-mux (--gen-count 0) pass over inputs —
-        the old `batch_slice --count` on a stream."""
+        """--count also bounds a pure-mux (--gen-count 0) pass over
+        inputs."""
         with tempfile.NamedTemporaryFile(suffix='.rvt') as f1, \
              tempfile.NamedTemporaryFile(suffix='.rvt') as f2:
             f1.write(gen(n_batches=3, seed=1))
@@ -263,7 +262,7 @@ class TestMuxBatches:
             assert _count_batches(out2) == 6
 
     def test_no_orphan_workers_after_kill(self):
-        """The project's #1 recurring hazard, now OS-enforced. datagen
+        """Orphan workers are impossible by OS enforcement. datagen
         forks generation workers that arm PR_SET_PDEATHSIG, so a `kill -9`
         of the parent (no clean shutdown, no reaping code runs) takes the
         whole pool with it. Start a pool, observe its worker children,
@@ -347,7 +346,7 @@ class TestStdin:
 
     def test_stdin_passthrough_pure_mux(self):
         """`cat corpus | datagen --gen-count 0` passes the piped corpus
-        straight through (no generation) — the old corpus-replay path."""
+        straight through (no generation)."""
         corpus = gen(n_batches=4, seed=3)
         out, err, rc = run([PYTHON, '-m', 'datagen', '--gen-count', '0'],
                             stdin=corpus)

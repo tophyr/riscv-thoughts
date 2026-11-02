@@ -24,8 +24,8 @@ geometry — and whether search-based decoding can invert the compression.
 [DECODER_STRATEGY.md](DECODER_STRATEGY.md) and
 [STREAMING_COMPRESSOR.md](STREAMING_COMPRESSOR.md) describe deferred, unbuilt
 layers — read their status banners and skip the rest unless you are working on
-them. [TRANSFERABLE_LESSONS.md](TRANSFERABLE_LESSONS.md) is background from the
-predecessor project. [probes/README.md](probes/README.md) indexes the frozen-
+them. [TRANSFERABLE_LESSONS.md](TRANSFERABLE_LESSONS.md) is background from HATA, the
+natural-language project this one builds on (*Ancestry*, below). [probes/README.md](probes/README.md) indexes the frozen-
 checkpoint diagnostics. The data-generation pipeline and the commands for
 running a training cell are documented in the `datagen` skill
 (`.claude/skills/datagen/SKILL.md`); its silent-corruption invariants live in
@@ -58,11 +58,6 @@ what is built in for now"). The equivalences that need the op-cell to
 compute — commutative swaps on shared or composed operands, identity
 spellings, cancellations, folds of two literals — are not collapsed by
 construction; a training objective collapses them (*Equivalence*, below).
-
-A frame numbered by textual first-read and final-write order preceded this
-one, taken knowingly so that the first question — can the architecture
-represent a chunk's output values exactly at all? — could be answered before
-the equivalence criterion was imposed. EXPERIMENT_LOG.md records both.
 
 ## The Idea
 
@@ -187,11 +182,11 @@ merely emit them.
 
 **Infrastructure.** The frozen-T1 encode, predicted-binding routing, T2 state
 machine and losses fold into one compiled CUDA-graph step at a fixed-padded
-instruction count (verified bit-identical to the ragged path). Training is a
+instruction count, bit-identical to computing each chunk at its own length.
+Training is a
 streaming pipeline — `datagen | train_t2_encoder` — where CPU workers generate
-and analyze chunks and the trainer only does forward/backward; on the GPU box
-those workers are offloaded to a second machine so they do not contend with the
-trainer. There is one RVT wire format and no version field: each batch is
+and analyze chunks and the trainer only does forward/backward; the workers
+can run on a second machine so they do not contend with the trainer for CPU. There is one RVT wire format and no version field: each batch is
 self-describing (magic + dtype signature + 5-field header), so a schema change
 is immediate and global. The `datagen` skill covers the pipeline, its flags, and
 how to judge whether the GPU is actually saturated.
@@ -221,9 +216,11 @@ emulator/       RV32I emulator + GPU batch emulator (all opcodes via
 tokenizer/      Structural tokenizer
 datagen/        RVT batch format + chunk analysis: SSA, anchor
                 execution, the structural signature (signature.py),
-                behavioral binding targets, equivalence manifest.
-compressor/     Equivariant Compressor (T1/T2), decoder, shared training
-                loop (train.py), held-out eval (eval.py)
+                canonical input roles (roles.py), behavioral binding
+                and value targets, curated equivalence classes and the
+                partner pairs drawn from them (generate.py)
+compressor/     Equivariant Compressor (T1/T2), shared training loop
+                (train.py), binding and collapse scoring (eval.py)
 scripts/        Training and evaluation entry points
 probes/         Frozen-checkpoint diagnostics (see probes/README.md)
 ```
