@@ -217,9 +217,10 @@ def test_packed_step_stages_to_the_arrays_it_packed():
                 (b.out_regs_valid, None), (b.out_input_values, None), (b.out_inputs, L),
                 (b.valid, F)]
         got = _H2DStager('cpu')(packed, specs)
-        assert len(got) == len(want) + 3     # + witness outputs, known bits
-        assert torch.equal(got[-3], torch.from_numpy(b.out_witness[:, 0]).long())
-        assert torch.equal(got[-2], torch.from_numpy(b.out_known_zero[:, 0]))
+        assert len(got) == len(want) + 4     # + witness, known bits, output counts
+        assert torch.equal(got[-4], torch.from_numpy(b.out_witness).long())
+        assert torch.equal(got[-3], torch.from_numpy(b.out_known_zero))
+        assert torch.equal(got[-1], torch.from_numpy(b.n_witness).long())
         for g, (a, dt) in zip(got, want):
             w = torch.from_numpy(a) if dt is None else torch.from_numpy(a).to(dt)
             assert g.dtype == w.dtype and torch.equal(g, w)
@@ -614,7 +615,7 @@ def test_pair_distance_targets_match_the_reference_distance():
 def test_graphed_distance_targets_equal_the_eager_ones():
     """Replayed against new contents at the captured addresses, the graph
     gives the eager targets bit for bit."""
-    from compressor.train import GraphedDistanceTargets, pair_distance_targets
+    from compressor.train import GraphedDistanceTargets, chunk_distance_targets
     from datagen.knownbits import output_known_bits
     dev = torch.device('cuda')
     g = GraphedDistanceTargets()
@@ -623,10 +624,56 @@ def test_graphed_distance_targets_equal_the_eager_ones():
         instrs, outs = _t1_rows(48, seed)
         kb = [output_known_bits([i])[i.args[0]] for i in instrs]
         zero = torch.tensor([k.zero for k in kb]); one = torch.tensor([k.one for k in kb])
-        new = [t.to(dev) for t in (outs, zero, one)]
+        count = torch.ones(len(instrs), dtype=torch.long)
+        new = [t.to(dev) for t in (outs.unsqueeze(1), zero.unsqueeze(1), one.unsqueeze(1), count)]
         if bufs is None:
             bufs = [torch.empty_like(t) for t in new]
         for b, t in zip(bufs, new):
             b.copy_(t)
         got = g(*bufs).clone()
-        assert torch.equal(got, pair_distance_targets(*bufs))
+        assert torch.equal(got, chunk_distance_targets(*bufs))
+
+
+def test_chunk_distance_is_the_rms_over_outputs_and_counts_an_unmatched_one_as_1():
+    from compressor.train import chunk_distance_targets, pair_distance_targets
+    instrs, outs = _t1_rows(6, 9)
+    from datagen.knownbits import output_known_bits
+    kb = [output_known_bits([i])[i.args[0]] for i in instrs]
+    z = torch.tensor([k.zero for k in kb]); o = torch.tensor([k.one for k in kb])
+    # rows 0-2: two outputs (rows i and i+3 of the single-instruction set);
+    # row 3: one output; row 4: none; row 5: none.
+    W = torch.zeros(6, 2, outs.shape[1], dtype=torch.long)
+    Z = torch.zeros(6, 2, dtype=torch.long); O = torch.zeros(6, 2, dtype=torch.long)
+    for r in range(3):
+        W[r, 0], W[r, 1] = outs[r], outs[r + 3]
+        Z[r, 0], Z[r, 1], O[r, 0], O[r, 1] = z[r], z[r + 3], o[r], o[r + 3]
+    W[3, 0], Z[3, 0], O[3, 0] = outs[0], z[0], o[0]
+    count = torch.tensor([2, 2, 2, 1, 0, 0])
+    D = chunk_distance_targets(W, Z, O, count)
+    d0 = pair_distance_targets(outs[:3], z[:3], o[:3])
+    d1 = pair_distance_targets(outs[3:], z[3:], o[3:])
+    for i in range(3):
+        for j in range(3):
+            want = torch.sqrt((d0[i, j] ** 2 + d1[i, j] ** 2) / 2)
+            assert torch.allclose(D[i, j], want, atol=1e-6)
+    assert torch.allclose(D[0, 3], torch.sqrt(torch.tensor(1.0) / 2), atol=1e-6)  # match 0, one unmatched
+    assert float(D[4, 5]) == 0.0 and float(D[3, 4]) == 1.0 and float(D[0, 4]) == 1.0
+
+
+def test_distance_loss_targets_cosine_distance_and_balances_equivalents():
+    """d is the target cosine distance — orthogonal rows at d = 1 and
+    coincident rows at d = 0 cost nothing — and the equivalent pairs are
+    averaged apart from the rest, so one of them weighs as much as all the
+    others together."""
+    from compressor.train import distance_loss
+    e = torch.eye(4)[:3]                               # three orthogonal rows
+    mask = torch.ones(3, dtype=torch.bool)
+    t = torch.ones(3, 3)
+    assert float(distance_loss(e, t, mask)) < 1e-6
+    e2 = torch.stack([e[0], e[0], e[1]])               # rows 0 and 1 coincide
+    t2 = torch.tensor([[0., 0., 1.], [0., 0., 1.], [1., 1., 0.]])
+    assert float(distance_loss(e2, t2, mask)) < 1e-6
+    t3 = t2.clone(); t3[0, 1] = t3[1, 0] = 1.0         # now call them unrelated
+    # the one pair now misses its orthogonal target by sqrt(2); the two
+    # equivalent-free averages: other = (2 + 0 + 0) / 3, same = 0 (no pair)
+    assert abs(float(distance_loss(e2, t3, mask)) - 2.0 / 3) < 1e-4

@@ -298,6 +298,9 @@ class Batch:
     out_known_zero: np.ndarray   # (B, max_n_instrs) int64
     out_known_one:  np.ndarray   # (B, max_n_instrs) int64
     out_witness:    np.ndarray   # (B, max_n_instrs, N_WITNESS) int32
+    # How many of those positions hold an output: the chunk's outputs less its
+    # same-value writes, which the distance does not count.
+    n_witness:      np.ndarray   # (B,) int8
 
 
 RVT_FORMAT = BinaryFormat(
@@ -327,6 +330,7 @@ RVT_FORMAT = BinaryFormat(
         BodyField('out_known_one', np.dtype(np.int64), ('B', 'max_n_instrs')),
         BodyField('out_witness', np.dtype(np.int32),
                   ('B', 'max_n_instrs', N_WITNESS)),
+        BodyField('n_witness', np.dtype(np.int8), ('B',)),
     ],
     # Sanity bounds on the dimension header — reject a torn/corrupt stream
     # whose dims are garbage before sizing a read off them.
@@ -530,6 +534,8 @@ def pack_batch(chunks, *,
     out_inputs_arr[:actual_B] = aux.out_inputs
     witness = np.zeros((B, max_n_instrs, N_WITNESS), dtype=np.int32)
     witness[:actual_B] = aux.out_witness[:, :max_n_instrs]
+    n_witness = np.zeros(B, dtype=np.int8)
+    n_witness[:actual_B] = (aux.witness_slots >= 0).sum(1)
     known_zero = np.zeros((B, max_n_instrs), dtype=np.int64)
     known_one = np.zeros((B, max_n_instrs), dtype=np.int64)
     for i, c in enumerate(chunks):
@@ -558,7 +564,8 @@ def pack_batch(chunks, *,
                  out_inputs=out_inputs_arr,
                  out_known_zero=known_zero,
                  out_known_one=known_one,
-                 out_witness=witness)
+                 out_witness=witness,
+                 n_witness=n_witness)
 
 
 def padding_mask(batch):
@@ -685,13 +692,14 @@ def collect_into_batches(chunks_iter, *, batch_size, draw_anchors, aim=None,
     Each batch ends up with `n_invalid = round(batch_size * invalid_rate)`
     invalid rows + `batch_size - n_invalid` valid rows.
 
-    partner_rate>0 makes that fraction of each batch pairs of one-instruction
-    rows computing one function, two different spellings each, drawn by
-    `partner_sampler()` -> (Instruction, Instruction): the equivalent pairs
-    the collapse objective needs, which a naturally drawn batch almost never
-    holds. The rest of the valid rows come from `chunks_iter`.
+    partner_rate>0 makes that fraction of each batch pairs of rows computing
+    one function, two different spellings each, drawn by `partner_sampler()`
+    -> (list[Instruction], list[Instruction]), each at most max_chunk_len
+    long: the equivalent pairs the collapse objective needs, which a naturally
+    drawn batch almost never holds. The rest of the valid rows come from
+    `chunks_iter`.
 
-    Every rule (single → T1, multi-instr → T2) ships the out_regs oracle via
+    Every rule (single → T1, multi-instr → T2) ships the value targets via
     build_targets (the T1/T2 unification).
 
     draw_anchors(k) supplies k chunks' anchor states — a fresh draw per chunk
@@ -710,9 +718,8 @@ def collect_into_batches(chunks_iter, *, batch_size, draw_anchors, aim=None,
     if invalid_rate > 0 and invalid_provider is None:
         raise ValueError('invalid_rate > 0 requires invalid_provider')
 
-    if partner_rate > 0 and (partner_sampler is None or max_chunk_len != 1):
-        raise ValueError('partner_rate > 0 requires partner_sampler and '
-                         'one-instruction chunks')
+    if partner_rate > 0 and partner_sampler is None:
+        raise ValueError('partner_rate > 0 requires partner_sampler')
 
     n_invalid = int(round(batch_size * invalid_rate))
     n_pairs = int(round(batch_size * partner_rate / 2))
@@ -734,8 +741,8 @@ def collect_into_batches(chunks_iter, *, batch_size, draw_anchors, aim=None,
             buf = buf[n_valid:]
             invalids = [_make_invalid_chunk(invalid_provider())
                         for _ in range(n_invalid)]
-            partners = [_make_valid_chunk([ins]) for _ in range(n_pairs)
-                        for ins in partner_sampler()]
+            partners = [_make_valid_chunk(instrs) for _ in range(n_pairs)
+                        for instrs in partner_sampler()]
             mixed = valid + partners + invalids
             aux, out_values, out_input_values, out_regs_valid = build_targets(
                 mixed, draw_anchors=draw_anchors,

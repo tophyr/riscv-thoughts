@@ -243,3 +243,23 @@ def test_partner_pairs_compute_one_function():
         for st in states:
             assert (emu_run([a], st.astype(np.int32).copy())[0].regs[a.args[0]]
                     == emu_run([b], st.astype(np.int32).copy())[0].regs[b.args[0]]), (a, b)
+
+
+def test_every_rewrite_keeps_its_chunk_equivalent():
+    """Each chunk partner rewrite, embedded in random context
+    at lengths 2, 4 and 8, computes the same register function on the
+    emulator; a rewrite left out of the list is never drawn."""
+    from emulator import run as emu_run
+    import datagen.generate as G
+    from datagen.compare import draw_anchor_states
+    rng = np.random.default_rng(21)
+    states = draw_anchor_states(np.random.default_rng(3), 64)
+    for name in G._REWRITES:
+        for L in (2, 4, 8):
+            for _ in range(80):
+                x, y = G.sample_chunk_partner_pair(rng, L, range(1, 32), (name,))
+                assert len(x) <= L and len(y) <= L and x != y, (name, x, y)
+                for s in states:
+                    s = s.copy(); s[0] = 0
+                    assert np.array_equal(emu_run(x, s.copy())[0].regs,
+                                          emu_run(y, s.copy())[0].regs), (name, x, y)

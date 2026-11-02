@@ -6,7 +6,7 @@ lot, against what the behavioral distance asks for.
 Rows, 2,000 pairs each, registers drawn at random and shared within a pair:
   ADDI k vs k+1, ADDI k vs k+512, ADD vs SUB, SLLI 3 vs SLLI 4.
 Each row reports the mean chord distance between unit-normalized essences and
-its target: twice the behavioral distance `distance_loss` trains toward
+its target: the chord √(2d) `distance_loss` trains toward, d the behavioral distance
 (`pair_distance_targets`, `compressor/train.py`), computed on the same pairs.
 A graded space keeps k+1 well inside k+512.
 
@@ -51,7 +51,7 @@ def encode(t1, instrs):
 
 
 def target(a, b):
-    """Twice the behavioral distance of each pair (a[i], b[i])."""
+    """The target chord √(2d) of each pair (a[i], b[i]), d their behavioral distance."""
     rows = a + b
     anchors = draw_anchor_states(np.random.default_rng(0), 1)
     outs = torch.tensor(np.stack([precompute_chunk([i], anchors).witness[0]
@@ -60,7 +60,7 @@ def target(a, b):
     D = pair_distance_targets(outs, torch.tensor([k.zero for k in kb]),
                               torch.tensor([k.one for k in kb]))
     n = len(a)
-    return 2.0 * float(torch.stack([D[i, n + i] for i in range(n)]).mean())
+    return float(torch.sqrt(2.0 * torch.stack([D[i, n + i] for i in range(n)])).mean())
 
 
 def pairs():

@@ -139,7 +139,7 @@ not know you need.
    allocator doesn't fragment. Stochastically-varying batch shape is a real OOM
    trigger we hit (~step 500 of t1_cosine_full). The targets come from
    `max_chunk_len = rule.max_len` (`collect_into_batches`,
-   `datagen/batch.py:670`).
+   `datagen/batch.py:674`).
    This is why a `--rule` with no cap is REJECTED (see Rule grammar). Don't add a
    code path that emits a differently-shaped batch mid-run.
 
@@ -161,8 +161,11 @@ not know you need.
    each register in `out_inputs[k]`, its value (`out_input_values`) and its
    colour channels from `T` — never the output's own description. No
    input or output is numbered by textual order or by register number:
-   `out_inputs` lists the output's external inputs in the encoder's colour
-   order, every role ordered (`datagen.signature.output_inputs`), and the
+   `out_inputs` lists the output's external inputs in canonical role order —
+   ordered by what the function does with them (`datagen/roles.py`), so
+   equivalent chunks of different dataflow shapes present corresponding
+   inputs at the same positions — with a tie between interchangeable inputs
+   broken by the encoder's colour, every role ordered; and the
    encoder seeds each leaf from the same colouring computed from the wiring
    it is given (`RegisterStateMachine._prepass`, `compressor/model.py`). The
    oracle's colouring (strings) and the encoder's (fixed random features)
@@ -174,7 +177,7 @@ not know you need.
    tie by register number, so a rename moves values between evaluator
    positions: no error, only a register-dependent gradient on every chunk
    with a commutative op
-   (`test_signature.py::test_a_rename_never_moves_an_input_between_gather_positions`).
+   (`test_roles.py::test_a_rename_never_moves_an_input_between_evaluator_positions`).
    `datagen/tests/test_signature.py` is the oracle's evidence against the
    emulator.
 
@@ -193,20 +196,21 @@ not know you need.
    x0 is hardwired zero, not a register.
 
 6. **Memory-op chunks get no aux (V1 scope).** `build_targets`
-   (`datagen/batch.py:596`) skips chunks containing LOAD/STORE because their
+   (`datagen/batch.py:600`) skips chunks containing LOAD/STORE because their
    `Precomputed` is unavailable — `precompute_chunk` raises
-   NotImplementedError on memory ops (`datagen/compare.py:699-700`). The
+   NotImplementedError on memory ops (`datagen/compare.py:703-704`). The
    chunk's tokens are still shipped (so the encoder sees them for
    magnitude/validity), but its aux row is zero-mask / `AUX_CE_IGNORE` and its
    value-prediction row is masked off via `out_regs_valid=False`
-   (`_values_from_precomputeds`, `datagen/batch.py:403`).
+   (`_values_from_precomputeds`, `datagen/batch.py:406`).
 
 7. **The behavioral distance compares two rows at the SAME inputs, placed by
    canonical role.** Every chunk is executed at one shared set of witness
    states, its p-th input in canonical role order (`datagen/roles.py`: inputs
    ordered by what the function does with them) taking the state's position
-   p+1 and every other register 0, its outputs listed in canonical order
-   (`precompute_chunk`, shipped as `out_witness`), so two rows' outputs are
+   p+1 and every other register 0, its outputs sorted by
+   their witness values (`precompute_chunk`, shipped as `out_witness`;
+   RISCV_DESIGN, "Collapse"), so two rows' outputs are
    compared at equal values on corresponding inputs. Comparing each row at its
    own anchor draw, placing values by register number, or placing them by the
    dataflow graph's colour order, gives a target that is nonzero for a

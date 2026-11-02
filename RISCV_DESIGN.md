@@ -283,7 +283,9 @@ Realize the encoder as a register-indexed state machine over the dataflow:
   scatter, so the step captures cleanly into a compiled CUDA graph).
 - Chunk representation = the final state `S`. Essence = a
   permutation-invariant **attention pool** over the WRITTEN slots — the
-  chunk's multiset of output descriptions, each filed under a **pointer**: a
+  chunk's multiset of output descriptions (each unwritten slot enters the
+  pool as one constant key and value, so only how many slots were written
+  reaches the essence from them), each filed under a **pointer**: a
   one-hot naming which of the chunk's distinct outputs it is, computed without
   register names or instruction order (see "Value prediction reads the
   essence"). The essence holds nothing about where its
@@ -477,7 +479,8 @@ x0-write beside live instructions — because the leaf colours and the written
 descriptions are functions of the graph alone and the pool reads written
 slots only. The essence IS a canonical form of the live dataflow graph, with
 every operand role ordered. What is *not* structural and the targets do not
-impose: every commutative swap (the op-cell receives its operands in the
+impose: every commutative swap except one of two fresh inputs, which is a
+rename of them (the op-cell receives its operands in the
 other order and is told nothing about which operations commute), and every
 algebraic equivalence — identities, cancellations, a fold of two literals
 into one. A chunk carrying those is labelled by what it reads and
@@ -527,21 +530,31 @@ describing it.
 The leaf colouring cannot serve. It sees only the wiring, and the wiring of
 `ADD x3,x1,x2; SUB x4,x5,x6` maps onto itself by exchanging the two
 instructions with their registers, so no colouring computed from it can tell
-x3 from x4 — only the opcodes can. So each written register's **path colour**
-comes from the same refinement pass with every operation also seeded from its
-content (the lower tier's essence at T2, the token embedding at T1), and the
-chunk's distinct paths are put in **content-hash order**: sorted by a fixed
-projection of their path colours. An output's pointer is the one-hot of its
-path's position in that order (`RegisterStateMachine._pointer`,
-`compressor/model.py`). Two paths closer than a fixed tie distance are one
-path and share a position: identical paths differ only by float noise in the
-lower tier's essence, distinct ones by what distinguishes their instructions.
-The order is a function of the labelled graph alone, so a rename permutes the
-pointers with the slots, and a reordering of independent instructions or a
-dead instruction leaves them unchanged; outputs with identical paths share a
-pointer, which is correct, since the same function applied to each output's
-own inputs answers for both. A chunk of K instructions has at most K outputs,
-so a pointer carries at most log₂ K bits about the chunk's content.
+x3 from x4 — only the opcodes can. So the chunk's distinct outputs are ordered
+by a fixed projection of their **descriptions** — each written slot's value
+channels after the last step, which the op-cell computes from the opcodes
+before any pointer enters — and an output's pointer is the one-hot of its
+position in that order (`RegisterStateMachine._pointer`,
+`compressor/model.py`). Two descriptions closer than a fixed tie distance are
+one output and share a position: outputs computing one function from
+symmetric inputs are described alike. The order is a function of the
+descriptions alone, so a rename permutes the pointers with the slots, and a
+reordering of independent instructions or a dead instruction leaves them
+unchanged; outputs that share a pointer answer for each other, since the same
+function applied to each output's own inputs gives both. A chunk of K
+instructions has at most K outputs, so a pointer carries at most log₂ K bits
+about the chunk's content.
+
+Ordering by description is what lets two equivalent chunks with several
+outputs file each function in the same place: once the op-cell describes the
+two spellings of an output alike, they sort alike. A fixed hash of each
+output's dataflow path with its opcodes, the order this replaced, reads the
+spelling, so a commutative swap of an operand that is shared or composed put
+two equivalent chunks' outputs under different pointers in about 40% of cases;
+the description order does so in 15–18%, and in under 1% where the op-cell
+already describes the spellings alike (EXPERIMENT_LOG, "The register frame",
+findings 45 and 46). The order moves while the descriptions train, and settles
+as they do.
 
 The pool adds each written slot's pointer to its attention key, so it can
 file each output's description where the pointer will look; the pointer rides
@@ -549,12 +562,6 @@ in the emitted state as part of the binding. The evaluator's input colours
 come from the wiring-only colouring, so the only route an output's function
 has to the evaluator is the essence; a scorer checks this by handing each
 output's evaluator another chunk's essence (METRICS.md, "vp").
-
-The order reads syntax. In a chunk with two or more outputs, an equivalence
-that respells one output (`ADD x3,x1,x1` for `SLLI x3,x1,1`) changes that
-path's hash and can move it past another output's, so the two equivalent
-chunks file their functions under different pointers and their essences
-cannot coincide. A chunk with one output is unaffected.
 
 ### Collapse: a behavioral distance on the essence
 
@@ -564,26 +571,63 @@ differently. The space is meant to be graded, not only partitioned: `ADDI x,k`
 and `ADDI x,k+1` should sit nearer each other than `ADDI x,k` and
 `ADDI x,k+512`. So the collapse objective is a distance regression: every two
 rows of a batch have their essence distance (the chord between unit-normalized
-essences, 0–2) matched by MSE to twice their **behavioral distance**
-(`distance_loss`, `compressor/train.py`).
+essences) matched by MSE to √(2d), where d is their **behavioral distance**
+(`distance_loss`, `compressor/train.py`). That makes d the target cosine
+distance: equivalent rows coincide, rows that behave entirely differently are
+orthogonal, and no pair is asked to be anti-aligned, which would make one
+essence the arithmetic opposite of another. Asking unrelated rows to be
+antipodal instead cannot be met — no set of points on a sphere has a mean
+pairwise chord above √2 — and a loss measured on the cosine itself would lose
+its gradient at collapse; the chord keeps it linear there. Equivalent pairs
+are under 1% of a batch's pairs, so the loss averages them and the rest
+separately and adds the two; averaged together, collapse gets almost none of
+the gradient and folds stay apart (EXPERIMENT_LOG, "The register frame",
+findings 48 and 49).
 
 The behavioral distance compares the two rows' outputs at the same inputs. Both
-are executed at a fixed set of 64 structured witness states, each row's p-th
-input in **canonical role order** taking the state's position p+1, so inputs
-correspond by what the function does with them (executed in `datagen` by
-`precompute_chunk` and shipped in the batch). The order comes from the
-function, never the dataflow graph (`datagen/roles.py`): an input's
-fingerprint is the chunk's outputs over a fixed family of states in which it
-holds one value and every other input a second, so it depends only on the
-input's role; inputs are ordered by Weisfeiler–Lehman refinement over these
-and over the same fingerprints taken pairwise, and a class left with several
-inputs has one member singled out and the refinement repeated. Inputs the
-function ignores are dropped first. A chunk's outputs are then ordered by
-their values at the witness states. Two equivalent chunks therefore present
-corresponding inputs the same values whatever their spelling or graph shape.
-The graph's colour order does not: a commutative swap whose operand another
-instruction also reads changes it (EXPERIMENT_LOG, "The register frame",
-finding 43). At each state the two outputs'
+are executed at a fixed set of 64 structured witness states (by
+`precompute_chunk` in `datagen`, shipped in the batch as `out_witness`).
+Comparing two chunks needs two correspondences: which input of one receives
+the same value as which input of the other, and which output of one is
+compared with which output of the other. Register numbers cannot supply
+either, since a rename must not change the distance. Each chunk instead puts
+its inputs and its outputs in a **canonical order**, computed from that chunk
+alone, and position p of one chunk is matched with position p of the other.
+
+**Inputs: canonical role order** (`datagen/roles.py`). The order comes from
+the function, never the dataflow graph. An input's fingerprint is the chunk's
+outputs over a fixed family of states in which it holds one value and every
+other input a second, so it depends only on the input's role; inputs are
+ordered by Weisfeiler–Lehman refinement over these and over the same
+fingerprints taken pairwise, and a class left with several inputs has one
+member, chosen by the encoder's colour, singled out and the refinement
+repeated. Inputs the function ignores are dropped first. The p-th input then
+takes the witness state's position p+1, every other register 0. Two
+equivalent chunks present corresponding inputs the same values whatever their
+spelling or graph shape; the graph's colour order does not, since a
+commutative swap whose operand another instruction also reads changes it.
+Between two chunks that compute different functions the orders need not
+correspond: changing one immediate by one reorders the canonical inputs in
+1.0–5.8% of pairs at len 2–8, and those pairs are compared at
+non-corresponding inputs (EXPERIMENT_LOG, "The register frame", finding 43).
+
+**Outputs: sorted by their witness values** (`precompute_chunk`). An output
+that rewrites its register with the value it already held is dropped first: a
+same-value write is behaviorally no output, decided at 16 states of
+independent uniform register values. The rest are sorted by the raw bytes of
+their 64 witness values, which starts at the least significant byte of the
+value at the first state, so the key is effectively a hash. Two equivalent
+chunks have identical output vectors and sort identically, and two equal
+outputs of one chunk are interchangeable, so equivalent pairs are exact. For
+two chunks that compute different functions the order carries no
+correspondence: a near-miss that changes one output's values can move it past
+another output, and then each output is compared with an unrelated one. How
+often that happens is unmeasured. The order that removes it is the matching
+of outputs with the smallest total distance, at P² output distances and one
+assignment per row pair instead of P distances and none; a sort keyed first
+on the canonical inputs each output depends on is a cheaper approximation.
+
+At each state two corresponding outputs'
 wrap-around difference d (the shorter way round mod 2³², exact in integers)
 becomes log1p(log1p(d)) / log1p(log1p(max_dist)), and the distance is the mean
 over the states (`pair_distance_targets`; `datagen/knownbits.py`,
@@ -597,11 +641,24 @@ is the fraction of states where they disagree; two full-range outputs are at
 most 2³¹ apart. Equivalent rows read 0 at every state whatever their spelling,
 so nothing has to enumerate which spellings are equivalent.
 
+**Combining outputs** (`chunk_distance_targets`, `compressor/train.py`). Two
+rows' distance is the root-mean-square over positions of the per-output
+distance, over the larger of the two output counts, an output one row has and
+the other lacks counting 1; two rows with no outputs are 0 apart.
+
 Equivalent pairs are rare in a naturally drawn batch, so a fraction of each
 batch is **partner pairs**: two different spellings of one function on the
-same registers, drawn from groups of the equivalence manifest merged by the
-function computed (`datagen.generate.PARTNER_GROUPS`, each spelling checked on
-the emulator). The term sits on the essence, where the requirement is stated;
+same registers. For single instructions they come from groups of the
+equivalence manifest merged by the function computed
+(`datagen.generate.PARTNER_GROUPS`); for chunks, each pair is one rewrite —
+a commutative swap, a respelling within such a group, a fold of two literals,
+a cancelling pair, a reassociation, or a same-value write against its absence
+— embedded in random context whose registers it reads half the time, so
+every operand context is drawn (`sample_chunk_partner_pair`). Every rewrite
+is checked on the emulator. The mix carries every rewrite at once: a
+collapse lapses when its pairs leave the mix, and a rewrite never trained
+collapses only partly (EXPERIMENT_LOG, "The register frame", findings 47–50).
+The term sits on the essence, where the requirement is stated;
 its gradient reaches the op-cell through the pool, which is pushed to fold a
 computation wherever that is the only way two essences can meet.
 
@@ -628,7 +685,8 @@ below.
 
 Each output's values at the witness states ship in every batch, for chunks as
 for single instructions. The trainer builds the pair matrix from them for
-one-instruction rows only: two chunks' outputs have no correspondence yet.
+rows with one output, at either tier; how several outputs combine into one
+distance is not settled.
 
 ### What is built in for good, and what is built in for now
 
@@ -700,8 +758,8 @@ These are real work, each additive over a stable "register-indexed state; the
 **Evolved through extensive experimentation** (EXPERIMENT_LOG, from "Gate
 training on a frozen encoder" through "Rename-equivariant T1/T2"). The settled approach is one **behavioral loss set shared by
 T1 and T2** (`compressor.train.binding_losses`) — T1 is the
-single-instruction special case, plus the behavioral distance term at T1
-(below). No syntactic CE heads and no loss toward a hand-written equivalence
+single-instruction special case, plus the behavioral distance term on the
+essence at both tiers (below). No syntactic CE heads and no loss toward a hand-written equivalence
 label.
 
 **Magnitude / validity loss.** Soft `(‖v‖ − is_valid)²`: ‖v‖→1 for a
@@ -725,15 +783,14 @@ term): for each register the chunk writes, from the unit-normalized essence,
 that output's pointer and, for each external input the output depends on, the
 input's value at its own register (as 32 bits + a smooth scalar) and its
 colour, predict the register's raw value after the chunk (`vp_loss`; see
-"Value prediction reads the essence"). The inputs are listed per output in the
-encoder's colour order, every operand role ordered
-(`datagen.signature.output_inputs`, shipped as `out_inputs`); the evaluator
-gathers values and colours by register through one-hots, so nothing it sees
-is a register number or a position in the text, and a register-relabelled
-chunk presents the same essence, pointers and values at the same positions.
-An order that merged a commutative operation's two roles would tie its
-operands and fall back on register numbers (EXPERIMENT_LOG, "The register
-frame", finding 40). Anchor states are drawn afresh for every chunk (see the
+"Value prediction reads the essence"). The inputs are listed per output in
+canonical role order (`datagen/roles.py`, shipped as `out_inputs`), so two
+equivalent chunks of different dataflow shapes present corresponding inputs
+at the same positions, which the graph's colour order does not (finding 43);
+interchangeable inputs tie on role and are ordered by the encoder's colour,
+every operand role ordered, never by register number, so a
+register-relabelled chunk presents the same essence, pointers and values at
+the same positions (EXPERIMENT_LOG, "The register frame", finding 40). Anchor states are drawn afresh for every chunk (see the
 end of this section for why one fixed set fails).
 
 **vp is the primary objective.** The evaluator is fed raw value *bits*, not
@@ -766,9 +823,9 @@ not in the readout's control flow.
 GVN collapse and vp are both load-bearing — a vp gain that craters the GVN
 rows is a regression, not a win.
 
-**Behavioral distance (`distance_weight`), T1.** An MSE between every two
-rows' essence distance and twice their behavioral distance at shared witness
-states (see "Collapse: a behavioral distance on the essence"). It is the only
+**Behavioral distance (`distance_weight`).** An MSE between every two rows'
+essence distance and √(2d), d their behavioral distance at shared witness
+states, equivalent pairs and the rest averaged separately (see "Collapse: a behavioral distance on the essence"). It is the only
 pairwise term, and it is what makes equivalent spellings collapse: value
 prediction alone is satisfied by any essence the evaluator can read.
 

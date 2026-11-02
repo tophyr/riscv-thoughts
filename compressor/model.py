@@ -84,15 +84,14 @@ def instruction_wiring(instr):
 _COLOUR_DIM = 64
 
 # Width of an output's pointer into the essence: a one-hot of the output's
-# position in the content-hash order of the chunk's distinct output data paths.
-# A chunk of K instructions has at most K outputs, so only the first K
-# positions are ever used.
+# position when the chunk's distinct outputs are ordered by a fixed projection
+# of their descriptions. A chunk of K instructions has at most K outputs, so
+# only the first K positions are ever used.
 _PTR_DIM = MAX_OUTPUT_SLOTS
 
-# Two output paths whose content-aware colours lie closer than this are one
-# path. Over the frozen T1, identical paths differ by at most 3e-6 (float
-# noise in its essence) and the closest distinct paths by 9e-2.
-_PATH_TIE_EPS = 1e-4
+# Two outputs whose descriptions lie closer than this are one output and share
+# a position.
+_DESC_TIE_EPS = 1e-4
 
 
 class RegisterStateMachine(nn.Module):
@@ -106,9 +105,9 @@ class RegisterStateMachine(nn.Module):
         ramp, so live_in/in_slot are recoverable from the emitted object.
       colour (_COLOUR_DIM) — the leaf's structural colour (zero on slots that
         are not live leaves), so an evaluator can tell which input is which.
-      pointer (_PTR_DIM) — on a written slot, which of the chunk's distinct
-        output data paths it holds: where in the essence its function is
-        filed (zero elsewhere).
+      pointer (_PTR_DIM) — on a written slot, its position among the chunk's
+        distinct outputs ordered by a fixed projection of their descriptions:
+        where in the essence its function is filed (zero elsewhere).
 
     Before the steps run, a pre-pass over the wiring computes, from the wiring
     alone: which instructions are LIVE (reach a final write), and each leaf's
@@ -183,12 +182,10 @@ class RegisterStateMachine(nn.Module):
         self.register_buffer('A', rand(dc, dc))
         self.register_buffer('M_role', rand(2, dc, dc))      # what an op reads, by role
         self.register_buffer('U_role', rand(2, dc, dc))      # who reads a node, by role
-        # The content-aware colouring that names each output's data path: the
-        # same pass with every operation seeded from its content as well, and
-        # the fixed hash direction that sets the content-hash order of one
-        # chunk's distinct paths.
-        self.register_buffer('P_content', rand(d_content, dc))
-        self.register_buffer('u_order', rand(dc))
+        # The fixed direction the pointer orders descriptions along. Not saved:
+        # a function of its seed alone.
+        u = torch.randn(d_value, generator=torch.Generator().manual_seed(0xD15C))
+        self.register_buffer('u_desc', u / u.norm(), persistent=False)
         # essence pool: Pooling-by-Multihead-Attention (Set Transformer). k=
         # n_pool_heads learned seed QUERIES, each doing a permutation-invariant
         # attention pool over the WRITTEN register slots (softmax over slots, no
@@ -212,17 +209,13 @@ class RegisterStateMachine(nn.Module):
         # an output's description where the pointer will look for it.
         self.pool_ptr = nn.Linear(_PTR_DIM, d_value, bias=False)
 
-    def _prepass(self, oh0e, oh1e, oh_oute, active, content):
-        """Liveness and leaf colours from the wiring alone, and each written
-        register's content-aware path colour.
+    def _prepass(self, oh0e, oh1e, oh_oute, active):
+        """Liveness and leaf colours from the wiring alone.
 
         oh0e, oh1e: (B,K,R) one-hot reads with x0 masked; oh_oute: (B,K,R)
-        one-hot writes with x0 and padding masked; active (B,K); content
-        (B,K,d_content).
-        Returns (leaf_colours (B,R,dc), live (B,K), written (B,R),
-        path_colours (B,R,dc)). Leaf colours see only the wiring, so they say
-        nothing about any operation; a path colour also sees every operation's
-        content, so it tells apart outputs whose wiring is symmetric."""
+        one-hot writes with x0 and padding masked; active (B,K).
+        Returns (leaf_colours (B,R,dc), live (B,K), written (B,R)). Leaf colours
+        see only the wiring, so they say nothing about any operation."""
         B, K, R = oh_oute.shape
         dc, dev = self.d_colour, oh_oute.device
         # Liveness, backwards from the final writers: a write is live when its
@@ -256,11 +249,7 @@ class RegisterStateMachine(nn.Module):
         leaf_mask = ((cl[0] + cl[1]) * lv).sum(1).clamp(max=1.0)      # (B,R)
         CL = leaf_mask.unsqueeze(-1) * self.c_leaf
         leaves, _ = self._refine(CL, lv * self.c_op, cl, co, lv, leaf_mask)
-        op_seed = self.c_op + F.normalize(content, dim=-1) @ self.P_content
-        _, ops = self._refine(CL, lv * op_seed, cl, co, lv, leaf_mask)
-        # A written register's path is its final writer's operation.
-        paths = torch.einsum('brk,bkd->brd', last_writer, ops)
-        return leaves, live, written, paths * written.unsqueeze(-1)
+        return leaves, live, written
 
     def _refine(self, CL, CO, cl, co, lv, leaf_mask):
         """WL_ROUNDS of role-aware refinement over the live dataflow graph,
@@ -282,25 +271,24 @@ class RegisterStateMachine(nn.Module):
             CO = torch.tanh(CO @ self.A.t() + down + upO) * lv
         return CL, CO
 
-    def _pointer(self, paths, written):
+    def _pointer(self, desc, written):
         """Each written register's pointer (B,R,_PTR_DIM): a one-hot of its
-        path's position in the CONTENT-HASH ORDER of the chunk's distinct
-        paths — sorted by a fixed hash of what each path computes, never by
-        where its instructions are written. Identical paths share a position;
-        no register number or instruction position enters it, so a rename
-        permutes it with the slots and a reordering or a dead instruction
-        leaves it unchanged. The hash reads syntax, so two equivalent paths
-        spelled differently can sort differently."""
-        s = paths @ self.u_order                                      # (B,R) the hash
-        dist = (paths.unsqueeze(2) - paths.unsqueeze(1)).norm(dim=-1)  # (B,R,R)
+        position when the chunk's distinct outputs are ordered by a fixed
+        projection of their descriptions (the value channels after the last
+        step). Outputs whose descriptions coincide share a position; no
+        register number or instruction position enters, so a rename permutes
+        the pointers with the slots, and two spellings the op-cell describes
+        alike are ordered alike."""
+        s = desc @ self.u_desc                                        # (B,R)
+        dist = (desc.unsqueeze(2) - desc.unsqueeze(1)).norm(dim=-1)   # (B,R,R)
         pair = written.unsqueeze(2) * written.unsqueeze(1)
-        same = (dist <= _PATH_TIE_EPS).to(paths.dtype) * pair
+        same = (dist <= _DESC_TIE_EPS).to(desc.dtype) * pair
         n_same = same.sum(-1).clamp(min=1.0)                          # (B,R)
-        below = ((s.unsqueeze(1) < s.unsqueeze(2)).to(paths.dtype)
+        below = ((s.unsqueeze(1) < s.unsqueeze(2)).to(desc.dtype)
                  * (1.0 - same) * pair)                                # [r,q]: q below r
         order = (below / n_same.unsqueeze(1)).sum(-1).round().long()
         order = order.clamp(max=_PTR_DIM - 1)
-        return F.one_hot(order, _PTR_DIM).to(paths.dtype) * written.unsqueeze(-1)
+        return F.one_hot(order, _PTR_DIM).to(desc.dtype) * written.unsqueeze(-1)
 
     def forward(self, content, in0, in1, out, active):
         """content (B,K,d_content); in0/in1/out (B,K) long; active (B,K)
@@ -317,9 +305,8 @@ class RegisterStateMachine(nn.Module):
         oh0e = oh0 * not_x0_row
         oh1e = oh1 * not_x0_row
         a3 = active.unsqueeze(-1)
-        colours, live, written, paths = self._prepass(
-            oh0e * a3, oh1e * a3, oh_out * a3, active, content)
-        ptr = self._pointer(paths, written)                           # (B,R,P)
+        colours, live, written = self._prepass(
+            oh0e * a3, oh1e * a3, oh_out * a3, active)
         seed = self.seed_proj(colours)                                # (B,R,d_value)
         # Slots start at exactly zero; a slot acquires its leaf identity only
         # when first READ, so a register the chunk never touches contributes
@@ -366,6 +353,7 @@ class RegisterStateMachine(nn.Module):
         # normalized to ~(0,1].
         order = torch.stack([read_time / (2.0 * K), write_time], dim=-1)
         event = event + F.pad(order, (0, self.d_event - 2))
+        ptr = self._pointer(value * written.unsqueeze(-1), written)   # (B,R,P)
         T = torch.cat([value, event, colours, ptr], dim=-1)
 
         # Essence pool over the written slots: k seed queries; heads concatenate

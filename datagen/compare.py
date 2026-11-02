@@ -26,7 +26,7 @@ import numpy as np
 from emulator import (
     Instruction, R_TYPE, I_TYPE, B_TYPE, LOAD_TYPE, STORE_TYPE,
 )
-from .signature import output_inputs
+from .signature import leaf_colours, output_inputs
 from .roles import canonical_inputs
 
 
@@ -389,6 +389,21 @@ N_WITNESS = 64
 _WITNESS = []
 
 
+_DISTINCT = []
+
+
+def _distinct_states():
+    """(16, 32) register files of independent uniform values, x0 = 0: every
+    register holds values of its own, so an output equal to its register's
+    input at all of them rewrote it with what it held."""
+    if not _DISTINCT:
+        v = np.random.default_rng(0x5A3E).integers(
+            np.iinfo(np.int32).min, np.iinfo(np.int32).max, (16, 32), endpoint=True)
+        v[:, 0] = 0
+        _DISTINCT.append(v.astype(np.int32))
+    return _DISTINCT[0]
+
+
 def witness_states():
     """The (N_WITNESS, 32) int32 witness states, drawn once."""
     if not _WITNESS:
@@ -663,14 +678,15 @@ class Precomputed:
     anchors: np.ndarray          # (n_states, 32) the register files executed from
     out_regs: np.ndarray         # (n_states, 32) the register files after execution
     # Per output slot (aligned with out_slot_regs), the external input
-    # registers that output depends on, in the structural-colour order the
-    # evaluator gathers their values in (datagen.signature.output_inputs).
+    # registers that output depends on, in the canonical role order the
+    # evaluator gathers their values in (`datagen.roles`, ties by colour).
     out_inputs: np.ndarray       # (MAX_OUTPUT_SLOTS, MAX_INPUT_SLOTS) int8
     # The chunk's outputs at each witness state, with its p-th input in
     # canonical role order (`datagen.roles`) holding the state's position p+1
     # and every other register 0, listed in canonical output order (sorted by
-    # these values); witness_slots[p] is position p's output slot, -1 past the
-    # last. The behavioral distance compares rows here.
+    # these values); same-value writes are not outputs here. witness_slots[p]
+    # is position p's output slot, -1 past the last. The behavioral distance
+    # compares rows here.
     witness: np.ndarray          # (MAX_OUTPUT_SLOTS, N_WITNESS) int32
     witness_slots: np.ndarray    # (MAX_OUTPUT_SLOTS,) int8
     # Per output slot, at each anchor: its value after the chunk, and the
@@ -752,24 +768,41 @@ def precompute_chunk(chunk, anchor_states):
     out_values = np.zeros((n_states, K), dtype=np.int32)
     out_input_values = np.zeros((n_states, K, K + 1), dtype=np.int32)
     outs = write_ordered[:MAX_OUTPUT_SLOTS]
+    execute = lambda regs, rs: (_eval_ssa_numpy(ssa, len(chunk), regs, live)[0][:, rs]
+                                .astype(np.int64) & 0xFFFFFFFF)
+    # A same-value write leaves its register holding what it held, whatever
+    # that was: behaviourally no output, so the distance does not count it.
+    distinct = _distinct_states()
+    kept = execute(distinct, outs) != (distinct[:, outs].astype(np.int64) & 0xFFFFFFFF)
+    real = [r for r, k in zip(outs, kept.any(0)) if k]
+    run = lambda regs: execute(regs, real)
+    colour = leaf_colours(chunk)
+    rank = lambda r: (colour.get(r, ''), r)
+    roles = (canonical_inputs(sorted({x for r in real for x in deps[r]}), run, rank)
+             if real else [])
+    # Each output's inputs in canonical role order, the evaluator's positions;
+    # an input the fingerprints show no effect of follows, by colour.
+    position = {r: p for p, r in enumerate(roles)}
     for i, r in enumerate(outs):
         out_slot_regs[i] = r
         out_values[:, i] = out_regs[:, r]
-        for j, src in enumerate(deps[r][:MAX_INPUT_SLOTS]):
+        ordered = sorted(deps[r], key=lambda x: (x not in position,
+                                                 position.get(x, 0), rank(x)))
+        for j, src in enumerate(ordered[:MAX_INPUT_SLOTS]):
             out_inputs[i, j] = src
             out_input_values[:, i, j] = state[:, src]
-    run = lambda regs: (_eval_ssa_numpy(ssa, len(chunk), regs, live)[0][:, outs]
-                        .astype(np.int64) & 0xFFFFFFFF)
-    roles = canonical_inputs(sorted({x for r in outs for x in deps[r]}), run)
     placed = np.zeros_like(w)
     for p, r in enumerate(roles):
         placed[:, r] = w[:, p + 1]
-    at_witness = run(placed).astype(np.uint32).view(np.int32)      # (N_WITNESS, outs)
-    order = sorted(range(len(outs)), key=lambda k: at_witness[:, k].tobytes())
     witness_slots = np.full(MAX_OUTPUT_SLOTS, -1, dtype=np.int8)
-    for p, k in enumerate(order):
-        witness[p] = at_witness[:, k]
-        witness_slots[p] = k
+    if real:
+        at_witness = run(placed).astype(np.uint32).view(np.int32)  # (N_WITNESS, real)
+        # Equivalent chunks have identical output vectors, so a byte sort pairs
+        # them exactly; for different chunks it is arbitrary (RISCV_DESIGN, "Collapse").
+        order = sorted(range(len(real)), key=lambda k: at_witness[:, k].tobytes())
+        for p, k in enumerate(order):
+            witness[p] = at_witness[:, k]
+            witness_slots[p] = outs.index(real[k])
 
     return Precomputed(
         inputs=inputs,

@@ -44,39 +44,26 @@ Where each equivalence class stands. The essence is graded in the register
 frame (RISCV_DESIGN.md, "GVN"): every class that leaves the chunk's live
 dataflow graph unchanged collapses **by construction**, and the trained models
 read exactly zero on them (`probes/frame_scorecard.py`, 2000 pairs per class);
-every class that needs the op-cell to compute is the essence's to learn. The
-figures for those are the 1M T2 whose value prediction reads the essence
-(EXPERIMENT_LOG, "The register frame", finding 39; `separation` = distance
-between inequivalent pairs over distance between equivalent ones; larger is
-better; under ~10x is noise):
+every class that needs the op-cell to compute is taught by the behavioral
+distance term over a partner mix drawing every rewrite (RISCV_DESIGN.md,
+"Collapse"). The figures are the T2 record (EXPERIMENT_LOG, "The register
+frame", finding 50; essence chord distances, unrelated chunks at 1.25,
+equivalent pair against a near-miss):
 
 | equivalence class | status |
 |---|---|
-| register rename | 0 by construction |
-| reordering of independent instructions | 0 by construction |
-| dead code against its live part | 0 by construction |
-| an x0-write beside live instructions | 0 by construction |
-| commutative swap of two fresh operands | 0 by construction — a rename of the two leaves |
-| commutative swap whose operand is shared or a result | op-cell — the encoder is told nothing about which operations commute; 0.3760 against 0.6901 for unrelated chunks |
-| one no-op exchanged for another (`ADD r,r,x0` vs `ADDI r,r,0`) | op-cell; 0.1029, 2.7x against `ADDI r,r,1` |
-| `XORI` chains with the same composite mask | op-cell; 0.7651, 0.3x |
-| additive chains with the same total offset | op-cell; 0.7937, 0.4x |
-| an identity against a cancelling pair (`ADDI r,r,0` vs `+k;−k`) | op-cell; 0.9801, further apart than unrelated chunks |
+| register rename, reordering of independent instructions, dead code, an x0-write beside live instructions, a commutative swap of two fresh operands | 0 by construction |
+| a respelling, a cancelling pair, a reassociation | 0.0001–0.003 against 0.89–1.26 |
+| a fold of two literals | 0.016 against 0.57; `ADDI` / `XORI` chains 5.8x / 44.8x |
+| a same-value write against its absence; one no-op for another | 0.027 against 1.03; 0.0002 |
+| a commutative swap whose operand is shared, read again or another instruction's result | 0.0001–0.034; 0.080 for a composed operand in a one-output chunk |
+| an identity write against the empty chunk | 1.01 — the empty chunk occurs in no corpus |
 
 The guard on all of this is the opposite row: pairs a transformation did NOT
 leave equivalent must stay far apart — the aliasing control (`x+x` against
-`x+y`) reads 0.5051 against 0.6901 for unrelated chunks at T2 and 1.155
-against 1.360 at T1 (EXPERIMENT_LOG, "The register frame", findings 39 and
-42). A collapse objective that pulls those together is a
+`x+y`) reads 0.907 against 1.253 for unrelated chunks at T2 and 1.088 against
+1.213 at T1 (finding 50). A collapse objective that pulls those together is a
 worse failure than loose collapse (METRICS.md).
-
-**Nothing trains the op-cell rows** — that is their common cause. vp cannot
-supply the pressure: it is not a pairwise objective, so two distinct essences
-can both evaluate correctly, and for an instruction that writes no register it
-emits no supervised output at all and therefore no gradient whatsoever. The
-essence describes the instructions as written: a fold pair, which changes both
-literals, sits further apart than a pair whose composites differ by one
-literal.
 
 ## Milestones
 
@@ -84,29 +71,28 @@ literal.
    holds exactly: value prediction read from its essence is 100.0000% exact on
    2,457,600 held-out triples with a three-layer residual vp head, its emitted
    wiring exact on every instruction (`probes/frame_scorecard.py`; frozen as
-   `runs/t1_distance_noimm_aim050_roles_500k`, findings 42 and 43). A T2 over the T1 of
-   finding 39 — trained without the distance term, and with an evaluator input
-   order that finding 40 removed — is at **99.8276%**, 8,333 failing triples of 4,834,176, after 1M
-   steps, one seed, binding exact on every chunk, with outputs that depend on
-   three inputs (a composed slot over disjoint inputs) at 90.5% and everything
-   else above 99.86% (EXPERIMENT_LOG, "The register frame", finding 39). The
-   residual falls with training budget — 5,418–5,511 failing at 1M and 36 at
-   10M in the first-read frame (finding 35) — so 1M is the budget a
-   configuration is judged at.
+   `runs/t1_distance_cosbal_500k`, finding 50). The T2 over it, trained with
+   the behavioral distance term and rewrite partner pairs, is at **99.7857%**,
+   10,355 failing triples of 4,831,488, after 1M steps, one seed, binding
+   exact on every chunk, with outputs that depend on three inputs (a composed
+   slot over disjoint inputs) at 89.6% and everything else above 99.78%
+   (EXPERIMENT_LOG, "The register frame", finding 50). The residual falls
+   with training budget — 5,418–5,511 failing at 1M and 36 at 10M in the
+   first-read frame (finding 35) — so 1M is the budget a configuration is
+   judged at.
 
-2. **[CURRENT] Computed equivalents collapse at len=2.** Everything that leaves the live
-   dataflow graph unchanged collapses by construction (Mission's table); what
-   remains is every equivalence the op-cell has to compute. Task 1. **Settle it
-   before chunks get longer**: every added instruction multiplies the
-   equivalences a chunk participates in, so a len=4 model would learn the same
-   wrong geometry at four times the scale.
+2. **[VALIDATING] Computed equivalents collapse at len=2.** Every class tried
+   collapses at vp 99.79%, one seed (Mission's table; finding 50); the
+   decisions that produced it are under review (task 1). Settled
+   before chunks get longer because every added instruction multiplies the
+   equivalences a chunk participates in.
 
-3. **vp = 0 at len=4, then len=8.** Unmeasured in the register frame. A dead
+3. **vp = 0 and collapse at len=4, then len=8.** Unmeasured in the register frame. A dead
    instruction is 15% of len=4 and 46% of len=8 chunks (finding 33); its reads
    are in the binding and pruned from the essence at every length.
 
 4. **Beyond the happy path.** Everything above is writers-only (R/I-type ALU,
-   valid, non-x0). Then: no-write instructions (task 2), PC/branches, memory,
+   valid, non-x0). Then: no-write instructions (task 3), PC/branches, memory,
    longer and looser chunks.
 
 5. **T3.** Sequences of T2 blocks. Prerequisite: decide what a *composed*
@@ -116,172 +102,88 @@ literal.
 
 ## Open tasks
 
-In order. Task 1 is required for the MVP. The rest are queued, not parallel
+In order. Tasks 1 and 2 are required for the MVP. The rest are queued, not parallel
 work.
 
-### 1. Collapse the computed equivalences the op-cell owns (milestone 2 — required for MVP)
+### 1. Validate milestone 2
 
-Two chunks computing the same function must land on the same point. The
-classes the frame makes structural do (Mission's table); the classes that need
-the op-cell to compute — a commutative swap whose operand is another
-instruction's input or result, identity spellings, cancellations, folds of two
-literals — do not, and on the last models measured the failure on the folds
-was total rather than partial.
+The collapse at len=2 (finding 50) rests on decisions that each change what
+the encoder is asked to learn, measured on one seed. Each is examined for
+whether it is right, not only whether it worked, before the len=4 work builds
+on it.
 
-**It is not a T2 deficit — T1 fails the same class.** Single-instruction pairs
-sharing an identical binding, so the whole difference is in the essence, sit
-within a factor of 2 of pairs computing *different* functions (first-read
-frame, finding 23). **At both tiers, an equivalence collapses when the
-architecture cannot represent the difference and otherwise does not.** Any fix
-has to be designed for T1 and T2 together: they are one class (`compressor/`),
-so a mechanism that works at T1 applies at T2 unchanged. A collapse change to
-the core therefore remints T1; batch it with any other T1 change where that
-costs nothing.
+- **The balanced distance loss** (finding 49) is the critical one, and
+  nonstandard: squared errors of equivalent pairs (target 0) and of all other
+  pairs are averaged separately and summed. Its nearest standard relative is
+  class-balanced loss, applied here to a regression target split at exactly
+  0. Open questions:
+  - The 1:1 split is untuned.
+  - An equivalent pair's weight is set by how many equivalent pairs the batch
+    holds, about 119× an ordinary pair's at 613 of 73,536, so the corpus mix
+    sets it.
+  - The split is a step at d = 0: a near-miss at d = 0.01 gets the ordinary
+    weight, so separating near-misses is not boosted.
+  - A pair wrongly given d = 0 is pulled together 119× harder, so the d = 0
+    set needs auditing for false equivalents.
+  - Its only isolated evidence is a 100k-step resume at the linear target. The
+    1M-step cell combines it with the √(2d) target and the identity rewrite,
+    so no measurement isolates it there.
+- **The canonical input and output orders** (RISCV_DESIGN, "Collapse").
+  Both are exact for equivalent chunks; neither is designed for chunks that
+  differ, whose distance targets grade separation.
+  - Changing one immediate by one reorders the canonical inputs in 1–6% of
+    pairs (finding 43), comparing those pairs at non-corresponding inputs;
+    how much that inflates their targets is unmeasured.
+  - Outputs are sorted by the raw bytes of their witness values, effectively a
+    hash, so two different chunks' outputs can be paired arbitrarily; how
+    often near-misses are mispaired, at len 2, 4 and 8, is unmeasured. The
+    sort avoids a matching across output permutations, which matters at 8
+    outputs. Alternatives: a minimum-cost matching (an assignment per row
+    pair) or a sort keyed first on the canonical inputs an output depends on.
+- **Same-value writes dropped from the outputs,** decided at 16 uniform states
+  (finding 46).
+- **The pointer ordered by a projection of each output's description** (finding
+  46): 15–18% of commutative swaps still flip it.
+- **The rewrite mix:** half of every batch is partner pairs. Rewrites held out
+  of training generalize only partly, and a collapse lapses when its pairs leave
+  the mix (finding 47).
+- **A second seed,** to tell the 0.056-point vp gap to finding 44's cell from
+  noise.
 
-**At two instructions nothing in the project generates these equivalences.**
-Equivalences are enumerated in one place — the manifest in
-`datagen/generate.py` — and all 15 of its classes are single-instruction
-**rewrites**, one operation expressed another way: every template in a class
-is one `InstructionTemplate`, a single instruction, so a class can only relate
-one instruction to another. That suits T1 and nothing above it. A **fold** —
-where seeing the equivalence requires arithmetic on the operands — appears in
-none of them. A pairwise equivalence loss over the manifest, carried by the
-trainer until commit `7797c81`, is recoverable from git history.
+### 2. Carry len=2's collapse to len=4 (milestone 3)
 
-**Start at identity recognition.** It is the best-defined target in either task,
-it isolates "untrained" from "cannot compute", and one capability surfaces in
-three places:
-
-- collapse: exchanging one no-op for another reaches only 2.7x (finding 39);
-- T1's geometry (first-read frame, finding 23): three spellings of the
-  identity (`ADDI x,y,0` against `ORI`/`XORI`/`SLLI x,y,0`) sit 0.2794 apart,
-  and `ADD x,y,y` against `SLLI x,y,1` sits 0.5696 apart, both within 2x of
-  the 0.6948–0.9675 between instructions computing *different* functions;
-- the targets: a same-value self-write (`ADD x5,x5,x0`) is a read and a write,
-  so the binding is never told that it is the identity; recognising
-  `+x0`, `+0`, `|0`, `^0` and `<<0` as the identity is the essence's job.
-
-**The register frame is built** (RISCV_DESIGN.md, "GVN", "Leaf identity for
-input registers" and "Value prediction reads the essence"): value prediction
-reads the essence, per written output, through that output's pointer and its
-inputs' values and colours gathered by register in the encoder's colour order
-(`vp_loss`); the targets are raw register values; the essence is the pool over
-the written slots only, each filed under its pointer; and a leaf's identity is
-its structural colour — a role-aware Weisfeiler–Lehman colouring of the live
-dataflow graph with every operand role ordered, computed in the oracle
-(`datagen/signature.py`) and, from T1's emitted wiring, in the encoder
-(`RegisterStateMachine._prepass`). The encoder is told nothing about which
-operations commute: the list of commutative opcodes reaches only the oracle's
-signature. The oracle's colouring agrees with the emulator on 300 random chunks
-per class at len 2 and 3: rename, reordering, every commutative swap and
-dead-code insertion leave the signature unchanged, and every signature-equal
-pair found under aliasing, sharing, opcode and immediate controls is equal on
-the emulator or a register rename of the other
-(`datagen/tests/test_signature.py`). On the trained models, reorder, dead code
-and an x0-write beside a live instruction give essences equal to float noise.
-
-**Built in now, to be learned later — scaffolding, recorded as such.** The
-liveness pass and the colouring are exact structural rules in the encoder;
-neither knows anything about any operation. Their learned form is a short
-message pass over the same dataflow graph, from the final writers back to the
-leaves, each message built from the reader's content and role: liveness is
-then the direction of the pass (a dead instruction is never reached) and the
-colour is the leaf's learned embedding. The exact rules go first so that a
-failure of the frame cannot be confused with a pass that has not yet learned
-liveness; once the collapse scorecard holds with them, the
-learned pass replaces them, is checked against them, and they are deleted.
-This is the same tactic as establishing vp before collapse: a known
-simplification taken on purpose, with its removal owed. What stays built in for
-good is the graph itself — the wiring T1 emits — and the register symmetry,
-which cannot be learned into a flat vector (RISCV_DESIGN.md, "What is built
-in for good, and what is built in for now").
-
-**The signature is the scorecard's label, never a target.** Two chunks with
-equal signatures must sit at ~0; the classes the signature does not merge —
-identity spellings, cancellations, immediate folds — are exactly the fold work
-the op-cell owes, and the objective below is about them. Training the essence
-toward the signature would separate those classes: the syntactic-hash failure
-RISCV_DESIGN.md's "GVN" section names.
-
-**The objective: a behavioral distance term on the essence.** Every two
-rows' essence distance is matched, by MSE, to twice their behavioral distance:
-both rows executed at shared witness states with their inputs in colour
-order, log1p(log1p(d)) / log1p(log1p(max_dist)) averaged over the states, d
-the wrap-around difference of their outputs and max_dist the largest
-difference those outputs could ever have, from a known-bits analysis
-(`distance_loss` and `pair_distance_targets`, `compressor/train.py`;
-`datagen/knownbits.py`). Equivalent rows get target 0 whatever their spelling,
-and every other pair is held as far apart as it behaves differently, so the
-space is graded, not only partitioned. Value prediction stays on. The term
-sits on the essence, not on the written slots' descriptions, because the
-requirement is stated on the essence; the essence is computed from the
-descriptions through the pool, so the gradient still reaches the op-cell (the
-network applied at every instruction, whose output for a register's last
-write is that register's description), and pushes it to fold `i1+i2` wherever
-that is the only way two essences can meet. Generated partner pairs — two
-spellings of one function in one batch — supply the equivalent pairs a
-naturally drawn batch almost never holds. InfoNCE alone, with or without a
-uniformity term, collapses equivalents but carries no notion of how far apart
-two different functions are, and flattens that grading (EXPERIMENT_LOG, "The
-register frame", finding 41).
-
-**The order of work.**
-
-1. **T1 holds** (findings 41–43): with the immediate head removed and half
-   of every row's anchor states aimed at its own boundaries, the distance term
-   collapses every partner group (copy 0.002, sign 0.0004–0.0009, double
-   0.0008, zero 0.11, constant 0.08–0.09 against contrasts of 0.3–1.5), keeps
-   unrelated instructions at their spread (1.36), grades near-misses (`ADDI`
-   k vs k+1 at 0.34–0.36, target 0.34), and value prediction is exact on all
-   2,457,600 held-out triples on two corpus seeds and again with its
-   targets placed by canonical role (`runs/t1_distance_noimm_aim050_roles_500k`). It runs at 7–8 ms/step
-   against 4 ms without the term.
-2. **The distance term for chunks.** Every chunk's outputs at the witness
-   states ship in the batch, inputs placed by canonical role and outputs in
-   canonical order, so two chunks' outputs and inputs already correspond
-   (RISCV_DESIGN.md, "Collapse"). What remains is the trainer's pair matrix
-   for rows with several outputs (Combining outputs, below).
-3. **A multi-instruction partner generator for T2** — folds of two literals,
-   identity against a cancelling pair, commutative swaps whose operand is
-   shared or a result — emulator-verified, starting with chunks of one output.
+The distance term, the partner mix and the pointer order are settled at
+len=2 (findings 47–50); what changes at len=4 is the anchor and witness
+budget per row, the canonical roles' cost and near-miss flips (findings 42
+and 43: comparisons through operations the aiming cannot solve, carries at
+16 states), and the output counts a chunk can have. Before training at
+len=4: aim the anchors with 16 states if 8 leave carries uncovered, and
+measure the rewrite generator's operand contexts at that length.
 
 Decisions that remain:
 
-- **Combining outputs.** How the distance between two multi-output chunks is
-  built from their per-output distances (the mean over matched outputs, or
-  something that weighs an unmatched output), and how two chunks with
-  different numbers of outputs compare. Settle together with the pointer order
-  (Open ideas), since both concern chunks with more than one output.
-- **Canonical roles in the encoder.** The pointer orders outputs by a hash
-  of their spelling and the evaluator takes inputs in the graph's colour
-  order, both of which a respelling or a commutative swap can change. Both
-  could read canonical roles instead, if the binding heads are retrained to
-  predict them (they predict first-read and write order today); whether the
-  heads can learn that order exactly is untested. Settle before applying the
-  distance term to chunks.
-- **Canonical order flips between near-misses.** Changing one immediate by
-  one reorders a chunk's canonical inputs in 1–6% of pairs (finding 43),
-  inflating those pairs' distance targets; the size of the inflation is
-  unmeasured.
+- **Mining equivalents from the natural stream.** Two generated chunks whose
+  canonical witness outputs are identical compute one function, so datagen
+  could pair them without enumerating any rewrite. Most such matches are
+  renames, which collapse by construction; how many are algebraic
+  equivalents is unmeasured and can be counted from the oracle alone.
 - **The partner fraction.** How much of a batch is partner pairs against
-  naturally drawn chunks; start fixed and treat it as a tuning knob.
-- **The baseline to beat** is finding 39's 1M cell for T2: the essence spans
-  the first-read frame's range (unrelated chunks 0.6901). The aliasing control
-  (0.5051) and the fusion `different` rows (0.3221 additive, 0.1927 `XORI`)
-  are the guard — they must not fall with the rest. At T1 the frozen
-  `runs/t1_distance_noimm_aim050_roles_500k` holds unrelated instructions at 1.360 and the aliasing
-  control at 1.152 (finding 43).
+  naturally drawn chunks: half at T2, a quarter at T1.
+- **The baseline to beat** is finding 50's cell, one seed. Its aliasing control
+  (0.907 against 1.253 unrelated) and its near-miss distances are the guard —
+  they must not fall with the rest.
 - **The binding on the wire.** Per output register, its external input
-  registers in the colour order the evaluator gathers them in (`out_inputs`
-  already ships it); the ordered input and output lists (`in_slot`/`out_slot`
-  ListMLE) go away. What the heads predict instead, and how T3 consumes it, is
-  open; until then the binding heads and their ordered targets are unchanged.
-- **What does it cost?** Every collapse gain so far has traded against
-  discriminativeness, and a term that pulls equivalents together can pull
-  inequivalents together too. The guard is `behav-diff` (METRICS.md), which must
-  stay large.
+  registers in canonical role order (`out_inputs` already ships it); the
+  ordered input and output lists (`in_slot`/`out_slot` ListMLE) go away. What
+  the heads predict instead, and how T3 consumes it, is open; until then the
+  binding heads and their ordered targets are unchanged.
+- **Removing the scaffolding.** The liveness pass and the colouring are exact
+  structural rules in the encoder, to be replaced by a learned message pass
+  over the same graph once the collapse scorecard holds with them, checked
+  against them, and deleted (RISCV_DESIGN.md, "What is built in for good, and
+  what is built in for now").
 
-### 2. No-write instructions are invisible to the essence
+### 3. No-write instructions are invisible to the essence
 
 Blocks milestone 4 (~⅓ of the ISA). Content reaches the essence only through a
 register write (`value[out] = res` is gated on `out != 0`), so for branches,
@@ -305,13 +207,13 @@ slot that carried its content would separate equivalents.
 visible register inputs and outputs are equivalent whatever their instruction
 count or final PC. So an x0-write, a same-value write or a dead instruction
 beside a live chunk leaves the chunk equivalent to the live chunk alone, and
-the distance between them is a collapse failure under task 1, not a missing
+the distance between them is a collapse failure (milestones 2 and 3), not a missing
 target here; no PC-effect vp target is shipped (`out_pcs` stays unshipped). The
 one case the decision does not settle by itself is a taken branch, whose only
 effect is on the PC; confirm what it contributes when branches enter scope,
 before building any target for them.
 
-### 3. Give T1 a validity task
+### 4. Give T1 a validity task
 
 T1's output norm is meant to say whether its token window is a complete, valid
 instruction — near 1 if so, near 0 for a partial instruction, a window spanning
@@ -330,40 +232,17 @@ by `datagen/invalidity.py` from a config's `invalidity` block.
 
 Not scheduled and not yet a task; each needs a decision before it becomes one.
 
-### Order the essence pointers by learned description, not by a fixed hash
-
-Value prediction reads the essence through a pointer per written output: a
-one-hot marking the output's position when the chunk's distinct output data
-paths are sorted by a fixed hash of their content, an order called
-content-hash order (RISCV_DESIGN.md, "Value prediction reads the essence"). The hash reads syntax. In a chunk with
-two or more outputs, an equivalence that respells one output — `ADD x3,x1,x1;
-SUB x4,x5,x6` against `SLLI x3,x1,1; SUB x4,x5,x6` — changes that path's hash,
-and when the change moves it past another output's hash the order flips: the
-`SUB` output's pointer differs between the two chunks, so they file their
-functions differently and their essences cannot coincide however well the
-op-cell learns the identity. A chunk with one output is unaffected.
-
-**Candidate fix.** Sort by a fixed projection of each path's learned
-description (the written slot's value channels) instead of its content-aware
-colour, so a respelling the op-cell has collapsed sorts with the spelling it is
-equivalent to. To settle first: the order becomes a moving target while the
-descriptions train, and two distinct descriptions that drift closer than the
-distance under which two paths count as one (`_PATH_TIE_EPS`) share a
-pointer. It has to be in place before a collapse objective is applied to
-chunks with more than one output.
-
 ### An evaluator that does not depend on its inputs' order
 
-The evaluator concatenates an output's inputs in the encoder's colour order
-(`datagen.signature.output_inputs`). Two inputs of one output never share a
-colour at two instructions; from three instructions two leaves feeding
-different operations can, since the colouring sees no opcode, and the
+The evaluator concatenates an output's inputs in canonical role order,
+interchangeable inputs ordered by the encoder's colour. From three
+instructions two interchangeable inputs can also share a colour, and the
 register number then decides their positions, so a rename would move values
 between positions again (EXPERIMENT_LOG, "The register frame", finding 40).
 Embedding each (colour, value) pair with one shared layer and summing the
 results removes the order entirely, and removes most of the evaluator's input
 layer as well (next idea). It changes the evaluator's architecture, so it
-needs a remint and a comparison against finding 39. Settle before len=3.
+needs a remint and a comparison against finding 44. Settle before len=3.
 
 ### Evaluator throughput
 

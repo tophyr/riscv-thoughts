@@ -22,21 +22,23 @@ source .venv/bin/activate
 D=/home/tophy/Projects/riscv-thoughts/logs
 # The frozen lower tier. A T2 checkpoint is only interchangeable with others
 # trained on the SAME T1, so a cell that changes this must be named for it.
-T1=${T1:-runs/t1_distance_noimm_aim050_roles_500k/encoder.pt}
+T1=${T1:-runs/t1_distance_cosbal_500k/encoder.pt}
 # VP = vp-head hidden layers (residual blocks with LayerNorm). The head must
 # EVALUATE the chunk's function at the anchor points, so its capacity is a
 # confound in every vp number (METRICS.md). STEPS=1000000 is the cell a
 # configuration is judged at (EXPERIMENT_LOG, finding 39).
 LEN=${LEN:-2} DOUT=${DOUT:-512} STEPS=${STEPS:-1000000} OC=${OC:-4} VP=${VP:-12}
 NPOOL=${NPOOL:-16}
-# Local generator workers. Per-row anchors make a batch ~2.7x larger on the
-# wire, so generation runs on this machine rather than over the link to odin.
+# Weight of the behavioral distance term on the essence (0 = off); it pairs
+# rows with one output, so its corpus should carry partner chunk pairs.
+DIST=${DIST:-1.0}
+# Local generator workers.
 GEN=${GEN:-26}
 # The corpus is ONE file: opcode mix, exclude_x0_dest, and the equivalence /
 # invalidity / chain rates all live in it, and no flag can override any of
 # them. A sweep over corpus composition is therefore a config per arm, and the
 # run directory is named after the config so two arms cannot collide.
-CONFIG=${CONFIG:-configs/instr_alu_writers_chain010.json}
+CONFIG=${CONFIG:-configs/instr_alu_writers_chain010_rewrites050_aim050.json}
 # The instruction-stream seed. Re-running a cell without changing it redraws
 # the SAME corpus and measures initialization variance only, so a replicate
 # needs GEN_SEED (METRICS.md, null interventions).
@@ -47,7 +49,8 @@ TAG=${TAG:-}
 CORPUS_SLUG=$(basename "$CONFIG" .json); CORPUS_SLUG=${CORPUS_SLUG#instr_}
 
 cell() {
-  local OUT=t2_len${LEN}_d${DOUT}_s${STEPS}_dep${OC}_vp${VP}_pool${NPOOL}${TAG:+_$TAG}_${CORPUS_SLUG}
+  local DIST_SLUG=; [ "$DIST" != 0 ] && DIST_SLUG=_dist${DIST}
+  local OUT=t2_len${LEN}_d${DOUT}_s${STEPS}_dep${OC}_vp${VP}_pool${NPOOL}${DIST_SLUG}${TAG:+_$TAG}_${CORPUS_SLUG}
   # A re-run with the same knobs after a code change would overwrite the
   # recorded cell; name it with TAG instead.
   [ -f "runs/$OUT/t2.pt" ] && { echo "runs/$OUT already holds a t2.pt; pass TAG=<name>"; return 1; }
@@ -64,7 +67,7 @@ cell() {
       --count "$STEPS" 2> "$D/gen_${OUT}.log" \
     | python scripts/train_t2_encoder.py --t1-model "$T1" \
       --d-out "$DOUT" --d-event 16 --op-cell-depth "$OC" --vp-head-depth "$VP" \
-      --n-pool-heads "$NPOOL" --route binding \
+      --n-pool-heads "$NPOOL" --route binding --distance-weight "$DIST" \
       --n-steps "$STEPS" --out-dir "$OUT" \
       > "$D/t2_${OUT}.log" 2>&1
   local RC=$?

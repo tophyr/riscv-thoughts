@@ -73,6 +73,11 @@ def main():
                         "output's value from the essence, the output's "
                         "pointer and its inputs' values. The anchor states "
                         'ride in each batch.')
+    p.add_argument('--distance-weight', type=float, default=0.0,
+                   help='MSE between every two rows\' essence distance and '
+                        'their behavioral distance at shared witness states, '
+                        'inputs placed by canonical role, outputs combined by '
+                        'root-mean-square.')
     p.add_argument('--vp-smooth-weight', type=float, default=0.2,
                    help='weight on the vp smooth-magnitude (ordering) term; the '
                         'per-bit target carries resolution.')
@@ -115,6 +120,7 @@ def main():
         out_slot_weight=args.out_slot_weight,
         value_predict_weight=args.value_predict_weight,
         vp_smooth_weight=args.vp_smooth_weight,
+        distance_weight=args.distance_weight,
         t2_checkpoint=args.resume,
         t2_route=args.route,
         device=device,

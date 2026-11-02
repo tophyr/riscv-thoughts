@@ -156,7 +156,7 @@ _CATEGORY_OPS = {
 _CONFIG_EXTRA_KEYS = {'equivalences', 'invalidity', 'exclude_x0_dest', 'chain',
                       'partners', 'aim'}
 _AIM_KEYS = {'fraction'}
-_PARTNERS_KEYS = {'rate'}
+_PARTNERS_KEYS = {'rate', 'rewrites'}
 _EQUIVALENCES_KEYS = {'rate', 'max_per_class', 'min_per_class', 'boost'}
 _CHAIN_KEYS = {'rate'}
 _INVALIDITY_KEYS = {'rate', 'types'}
@@ -169,8 +169,9 @@ def validate_distribution(dist):
     Optional: 'equivalences' sub-dict for manifest-injection settings.
     Optional: 'invalidity' sub-dict {'rate': float, 'types': {name: w}}
               for invalid-window injection.
-    Optional: 'partners' sub-dict {'rate': float}: the fraction of each
-              batch made of equivalent one-instruction pairs.
+    Optional: 'partners' sub-dict {'rate': float, 'rewrites': [str]}: the
+              fraction of each batch made of equivalent pairs, and for chunks
+              the rewrites drawn from (`_REWRITES`; all of them when absent).
     Optional: 'aim' sub-dict {'fraction': float}: the fraction of each
               row's anchor states aimed at its boundaries (`datagen.aim`).
     """
@@ -218,6 +219,9 @@ def validate_distribution(dist):
         if 'rate' in pa and not (0 <= pa['rate'] <= 1):
             raise ValueError(
                 f"partners.rate must be in [0,1], got {pa['rate']}")
+        bad = set(pa.get('rewrites', [])) - set(_REWRITES)
+        if bad:
+            raise ValueError(f'Unknown partner rewrites: {bad}')
     if 'aim' in dist:
         am = dist['aim']
         if not isinstance(am, dict):
@@ -731,6 +735,125 @@ def sample_partner_pair(rng, dest_regs=None):
         binding['rd'] = int(rng.choice(list(dest_regs)))
     return (materialize(group.canonical[int(i)], binding),
             materialize(group.canonical[int(j)], binding))
+
+
+def _imm12(v):
+    return -2048 <= v <= 2047
+
+
+def _split(total, rng):
+    """Two 12-bit literals summing to `total` (a 12-bit literal)."""
+    while True:
+        a = int(rng.integers(-2048, 2048))
+        if _imm12(total - a):
+            return a, total - a
+
+
+_SUFFIX_OPS = _ALU_R_OPS + _ALU_I_OPS
+
+_REWRITES = ('swap', 'respell', 'fold', 'cancel', 'reassociate', 'identity')
+
+# Same-value writes of register t: each leaves t holding what it held.
+_IDENTITIES = (('ADDI', 'T', 'T', 0), ('ORI', 'T', 'T', 0), ('XORI', 'T', 'T', 0),
+               ('ANDI', 'T', 'T', -1), ('SLLI', 'T', 'T', 0), ('SRLI', 'T', 'T', 0),
+               ('SRAI', 'T', 'T', 0), ('ADD', 'T', 'T', 0), ('OR', 'T', 'T', 0),
+               ('XOR', 'T', 'T', 0), ('SUB', 'T', 'T', 0), ('AND', 'T', 'T', 'T'),
+               ('OR', 'T', 'T', 'T'))
+
+
+def _identity(rng, t):
+    op, *args = _IDENTITIES[int(rng.integers(len(_IDENTITIES)))]
+    return Instruction(op, *(t if a == 'T' else a for a in args))
+
+
+def _rewrite_pair(rng, max_len, pool, rewrites):
+    """A chunk of random ALU context holding one equivalence-preserving
+    rewrite, against the same chunk rewritten. The rewrite's operands are
+    registers already in the chunk half the time — another instruction's
+    input or result — so every operand context is drawn; context before and
+    after it pads the chunk to a random length up to max_len."""
+    name = str(rewrites[int(rng.integers(len(rewrites)))])
+    if name == 'identity' and (max_len == 1 or rng.random() < 0.3):
+        t = int(rng.choice(pool))
+        while True:
+            x, y = _identity(rng, t), _identity(rng, t)
+            if x.opcode != y.opcode or x.args != y.args:
+                return [x], [y]
+    seen = []
+    pick = lambda: (int(rng.choice(seen)) if seen and rng.random() < 0.5
+                    else int(rng.integers(1, 32)))
+
+    def context():
+        op = str(rng.choice(_SUFFIX_OPS))
+        ins = _make_instruction(rng, op, rd=int(rng.choice(pool)), rs1=pick(),
+                                rs2=pick() if op in _ALU_R_OPS else None)
+        seen.extend(r for r in (ins.args[:3] if op in _ALU_R_OPS else ins.args[:2]) if r)
+        return ins
+
+    size = {'swap': 1, 'respell': 1, 'identity': 1}.get(name, 2)
+    L = int(rng.integers(size + (name == 'identity'), max_len + 1))
+    before = int(rng.integers(0, L - size + 1))
+    prefix = [context() for _ in range(before)]
+    t = int(rng.choice(pool))
+    while True:
+        a, b, c = pick(), pick(), pick()
+        if len({a, b, c, t}) == 4:
+            break
+        seen.append(int(rng.integers(1, 32)))
+    if name == 'swap':
+        op = str(rng.choice(['ADD', 'XOR', 'AND', 'OR']))
+        x, y = [Instruction(op, t, a, b)], [Instruction(op, t, b, a)]
+    elif name == 'identity':
+        x, y = [_identity(rng, pick())], []
+    elif name == 'respell':
+        group = PARTNER_GROUPS[int(rng.integers(0, len(PARTNER_GROUPS)))]
+        i, j = rng.choice(len(group.canonical), size=2, replace=False)
+        binding = sample_binding(group, rng)
+        binding['rd'] = t
+        if 'rs' in binding:
+            binding['rs'] = a
+        x = [materialize(group.canonical[int(i)], binding)]
+        y = [materialize(group.canonical[int(j)], binding)]
+    elif name == 'fold':
+        if rng.random() < 0.5:
+            k1, k2 = _split(int(rng.integers(-2048, 2048)), rng)
+            k3, k4 = _split(k1 + k2, rng)
+            op = 'ADDI'
+        else:
+            k1, k2, k3 = (int(v) for v in rng.integers(-2048, 2048, 3))
+            k4 = ((k1 ^ k2 ^ k3) & 0xFFF) - (((k1 ^ k2 ^ k3) & 0x800) << 1)
+            op = 'XORI'
+        x = [Instruction(op, t, a, k1), Instruction(op, t, t, k2)]
+        y = [Instruction(op, t, a, k3), Instruction(op, t, t, k4)]
+    elif name == 'cancel':
+        k = int(rng.integers(-2047, 2048))
+        op = 'ADDI' if rng.random() < 0.5 else 'XORI'
+        x = [Instruction(op, t, a, k), Instruction(op, t, t, -k if op == 'ADDI' else k)]
+        y = [Instruction('ADDI', t, a, 0)]
+    else:
+        op = str(rng.choice(['ADD', 'XOR', 'AND', 'OR', 'SUB']))
+        if op == 'SUB':
+            x = [Instruction('SUB', t, a, b), Instruction('SUB', t, t, c)]
+            y = [Instruction('ADD', t, b, c), Instruction('SUB', t, a, t)]
+        else:
+            x = [Instruction(op, t, a, b), Instruction(op, t, t, c)]
+            y = [Instruction(op, t, b, c), Instruction(op, t, t, a)]
+    seen.extend([t, a, b, c])
+    suffix = [context() for _ in range(L - before - size)]
+    return prefix + x + suffix, prefix + y + suffix
+
+
+def sample_chunk_partner_pair(rng, max_len, dest_regs=None, rewrites=None):
+    """Two different spellings of one register function, each a chunk of at
+    most `max_len` instructions: (list[Instruction], list[Instruction]). At
+    max_len 1 it is `sample_partner_pair`; otherwise one rewrite of
+    `rewrites` (default every one of `_REWRITES`) embedded in random context
+    (`_rewrite_pair`)."""
+    if max_len == 1:
+        x, y = sample_partner_pair(rng, dest_regs)
+        return [x], [y]
+    pool = list(dest_regs) if dest_regs is not None else list(range(1, 32))
+    return _rewrite_pair(rng, max_len, pool, rewrites or _REWRITES)
 
 
 # ===========================================================================

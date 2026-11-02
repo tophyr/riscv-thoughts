@@ -75,7 +75,7 @@ def main():
                    help='MSE between every two rows\' essence distance and '
                         'their behavioral distance at shared witness states '
                         '(log-log of the output difference over the largest '
-                        'difference their known bits allow); T1 only.')
+                        'difference their known bits allow).')
     p.add_argument('--vp-smooth-weight', type=float, default=0.2,
                    help='weight on the vp smooth-magnitude (ordering) term. The '
                         'per-bit target carries resolution; this keeps '

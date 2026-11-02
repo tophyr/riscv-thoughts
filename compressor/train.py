@@ -182,8 +182,8 @@ def _pack_step_arrays(batch, split, *, vp, valid, distance):
     if valid:
         arrays += [(batch.valid, f32)]
     if distance:
-        arrays += [(batch.out_witness[:, 0], i64), (batch.out_known_zero[:, 0], i64),
-                   (batch.out_known_one[:, 0], i64)]
+        arrays += [(batch.out_witness, i64), (batch.out_known_zero, i64),
+                   (batch.out_known_one, i64), (batch.n_witness, i64)]
     arrays = [np.ascontiguousarray(a if dt is None else a.astype(dt))
               for a, dt in arrays]
     specs, n = [], 0
@@ -230,7 +230,7 @@ def _value_feat(x_i):
 def _vp_inputs(comp, T, in_values_t, out_inputs_t):
     """Per (row, anchor, output slot) the evaluator's input features, (B, A,
     O, MAX_IN·(33+dc)): for each external input the output depends on
-    (`out_inputs`, in the encoder's colour order, every role ordered), its
+    (`out_inputs`, in canonical role order, `datagen/roles.py`), its
     value in the row's anchor state (`in_values_t`, shipped in that order;
     32 bits + 1 smooth scalar) and its structural colour from `T`. Unfilled
     inputs feed value 0 and colour 0 = "no input"."""
@@ -310,7 +310,7 @@ def vp_loss(comp, T, essence, in_values_t, out_slot_regs_t, out_inputs_t,
       out_slot_regs_t:  (B, MAX_OUT) int64 — output registers (AUX_CE_IGNORE
                         for unused slots)
       out_inputs_t:     (B, MAX_OUT, MAX_IN) int64 — each output's external
-                        input registers in colour order (AUX_CE_IGNORE padded)
+                        input registers in canonical role order (AUX_CE_IGNORE padded)
       out_values_t:     (B, A, O') int32 — each output's value after the chunk
       mask_t:           (B,) bool — rows to include
       n_out:            bound on filled output slots; slots past it are
@@ -381,8 +381,25 @@ def pair_distance_targets(outputs, zero, one):
     return per.mean(-1).float()
 
 
+def chunk_distance_targets(outputs, zero, one, count):
+    """(B, B) behavioral distance between every two chunks: the root-mean-square
+    over their outputs in canonical order of `pair_distance_targets`, an output
+    one chunk has and the other lacks scoring 1; 0 between two chunks with no
+    output. outputs (B, P, K), zero / one (B, P), count (B,) outputs per chunk."""
+    P = outputs.shape[1]
+    sq = outputs.new_zeros((outputs.shape[0],) * 2, dtype=torch.float32)
+    for p in range(P):
+        has = count > p
+        both = has.unsqueeze(1) & has.unsqueeze(0)
+        one_side = has.unsqueeze(1) ^ has.unsqueeze(0)
+        d = pair_distance_targets(outputs[:, p], zero[:, p], one[:, p])
+        sq = sq + torch.where(both, d * d, torch.where(one_side, torch.ones_like(d), torch.zeros_like(d)))
+    m = torch.maximum(count.unsqueeze(1), count.unsqueeze(0)).float()
+    return torch.where(m > 0, torch.sqrt(sq / m.clamp(min=1)), torch.zeros_like(sq))
+
+
 class GraphedDistanceTargets:
-    """`pair_distance_targets` replayed as one CUDA graph: launched eagerly,
+    """`chunk_distance_targets` replayed as one CUDA graph: launched eagerly,
     its small kernels leave the GPU waiting on the host. The graph replays the
     same kernels, so the targets are bit-identical; its inputs must keep
     their addresses across calls, as the stager's device buffer does."""
@@ -390,27 +407,30 @@ class GraphedDistanceTargets:
     def __init__(self):
         self.graph, self.out, self.sig = None, None, None
 
-    def __call__(self, outputs, zero, one):
-        args = (outputs, zero, one)
+    def __call__(self, outputs, zero, one, count):
+        args = (outputs, zero, one, count)
         if not outputs.is_cuda:
-            return pair_distance_targets(*args)
+            return chunk_distance_targets(*args)
         if self.graph is None:
-            self.out = pair_distance_targets(*args)
+            self.out = chunk_distance_targets(*args)
             torch.cuda.synchronize()
             self.graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(self.graph):
-                self.out.copy_(pair_distance_targets(*args))
+                self.out.copy_(chunk_distance_targets(*args))
             self.sig = _graph_signature(args)
         assert _graph_signature(args) == self.sig
         self.graph.replay()
         return self.out
 
 
-def distance_loss(essence, target, row_mask, scale=2.0):
-    """MSE between every two valid rows' essence distance (chord on the unit
-    sphere, 0..2) and `scale` × their behavioral distance (0..1): equivalent
-    rows are pulled together, and every other pair held as far apart as it
-    behaves differently."""
+def distance_loss(essence, target, row_mask):
+    """Every two valid rows' essence distance (chord on the unit sphere)
+    matched by MSE to the chord √(2d) of their behavioral distance d (0..1):
+    d is the target cosine distance, so equivalent rows are pulled together,
+    rows that behave entirely differently are held orthogonal, and nothing
+    is asked to be anti-aligned. The equivalent pairs (d = 0) and the rest
+    are averaged separately and summed, so collapse keeps its share of the
+    gradient however few equivalent pairs a batch holds."""
     e = F.normalize(essence, dim=-1)
     sq = (2.0 - 2.0 * (e @ e.t())).clamp(min=0.0)
     dist = torch.sqrt(sq + 1e-8)          # finite gradient at coincident rows
@@ -418,8 +438,11 @@ def distance_loss(essence, target, row_mask, scale=2.0):
     valid = row_mask.bool()
     pair = valid.unsqueeze(0) & valid.unsqueeze(1) & torch.triu(
         torch.ones(B, B, dtype=torch.bool, device=dist.device), diagonal=1)
-    err = (dist - scale * target) ** 2
-    return (err * pair).sum() / pair.sum().clamp(min=1)
+    err = (dist - torch.sqrt(2.0 * target)) ** 2
+    same = pair & (target <= 0)
+    other = pair & (target > 0)
+    return ((err * same).sum() / same.sum().clamp(min=1)
+            + (err * other).sum() / other.sum().clamp(min=1))
 
 
 class _LRClock:
@@ -865,9 +888,8 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
     # One-instruction rows only, until two chunks' outputs have a
     # correspondence.
     distance_active = distance_weight > 0
-    if distance_active and not (vp_active and ingest == 'tokens'):
-        raise ValueError('distance_weight > 0 needs value prediction on and '
-                         'one-instruction rows (T1)')
+    if distance_active and not vp_active:
+        raise ValueError('distance_weight > 0 needs value prediction on')
     # Prefetcher overlaps CPU-side prep with GPU work — shared by both tiers.
     batch_source = TrainBatchPrefetcher(
         batch_iter, pack=dict(vp=vp_active, valid=valid_active,
@@ -956,13 +978,14 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
             else (_dummy, _dummy, _dummy, _dummy))
         valid_f = next(staged) if valid_active else _dummy
         if distance_active:
-            witness_t, known_zero_t, known_one_t = (next(staged), next(staged),
-                                                    next(staged))
+            witness_t, known_zero_t, known_one_t, n_witness_t = (
+                next(staged), next(staged), next(staged), next(staged))
             # Outside the compiled step (the targets are data), into one
             # persistent buffer, since the step's graph replay reads its
             # inputs at the addresses it was captured with.
             with torch.no_grad():
-                distance_t = distance_targets(witness_t, known_zero_t, known_one_t)
+                distance_t = distance_targets(witness_t, known_zero_t, known_one_t,
+                                              n_witness_t)
         else:
             distance_t = _dummy
         return (*fixed, out_values_t, vp_mask_t, in_values_t, out_inputs_t, valid_f,
@@ -1589,6 +1612,7 @@ def train_t2_encoder(batch_iter, t1_encoder, *,
                      pc_writes_weight=0.1,
                      in_slot_weight=0.1, out_slot_weight=0.1,
                      value_predict_weight=0.0, vp_smooth_weight=0.2,
+                     distance_weight=0.0,
                      t2_checkpoint=None, t2_route='binding',
                      device='auto',
                      on_log=None, save_every=10000, compile_step=True):
@@ -1606,7 +1630,7 @@ def train_t2_encoder(batch_iter, t1_encoder, *,
         live_out_weight=live_out_weight, pc_writes_weight=pc_writes_weight,
         in_slot_weight=in_slot_weight, out_slot_weight=out_slot_weight,
         value_predict_weight=value_predict_weight,
-        vp_smooth_weight=vp_smooth_weight, resume=t2_checkpoint,
-        device=device, on_log=on_log, save_every=save_every,
-        compile_step=compile_step)
+        vp_smooth_weight=vp_smooth_weight, distance_weight=distance_weight,
+        resume=t2_checkpoint, device=device, on_log=on_log,
+        save_every=save_every, compile_step=compile_step)
 

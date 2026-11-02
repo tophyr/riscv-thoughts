@@ -51,12 +51,13 @@ which operations commute; and the essence is the pool over the written slots
 only (`compressor/model.py`, `compressor/train.py`, `datagen/signature.py`). Reordering independent
 instructions, inserting dead code and adding an x0-write therefore leave the
 essence bit-identical by construction. What the code does not yet do: the
-binding is still emitted as two ordered lists rather than the graph; the
+binding is still emitted as two ordered lists rather than the graph; and the
 colouring is an exact structural rule, built in as scaffolding and to be
 replaced by a learned pass (RISCV_DESIGN.md, "What is built in for good, and
-what is built in for now"); and the equivalences that need the op-cell to
-compute — every commutative swap, identity spellings, cancellations, folds of
-two literals — are not collapsed.
+what is built in for now"). The equivalences that need the op-cell to
+compute — commutative swaps on shared or composed operands, identity
+spellings, cancellations, folds of two literals — are not collapsed by
+construction; a training objective collapses them (*Equivalence*, below).
 
 A frame numbered by textual first-read and final-write order preceded this
 one, taken knowingly so that the first question — can the architecture
@@ -153,10 +154,10 @@ no model trains on: a readout trained on one fixed set stores answers at it
 instead of evaluating. **At one instruction it holds exactly**: T1's emitted
 wiring matches the oracle on every instruction and its essence is evaluated
 exactly at 2.46 million unseen input values. **At two instructions
-it holds to 99.8276%** — 8,333 failures in 4.83 million scored values, every
+it holds to 99.7857%** — 10,355 failures in 4.83 million scored values, every
 output register of 38,400 held-out chunks at 64 input states — after 1M
 training steps, one seed, a twelve-layer residual readout; outputs that depend
-on three inputs carry the residual at 90.5%. Beyond two instructions it is
+on three inputs carry the residual at 89.6%. Beyond two instructions it is
 untested.
 
 *Equivalence.* Two instruction sequences that compute the same function must
@@ -173,9 +174,13 @@ collapses every spelling group tried — copies, zero, doubling, the sign test,
 constants — to within 0.11 of a point while unrelated instructions keep their
 spread, and with its training input states aimed where each instruction's
 output changes, it still evaluates every held-out value exactly. At two
-instructions it is not built yet: the T2 models measured describe their
-chunks as written, two chunks that fold two immediates into the same total
-landing further apart than two that compute different totals.
+instructions, with inputs matched by the role each plays in the function
+rather than by how the chunk is written, training pairs drawn from
+every rewrite in every operand context, and equivalent pairs given their own
+share of the loss, the same term collapses every class tried — folds of two
+literals, cancelling pairs, reassociations, respellings, identity writes and
+commutative swaps on shared or composed operands — while value prediction
+holds at 99.79%.
 
 Beyond both lies T3, the first tier that must *compose* bindings rather than
 merely emit them.

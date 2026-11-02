@@ -50,7 +50,7 @@ from . import (
     RVT_FORMAT, generate_chunks, collect_into_batches,
     draw_anchor_states, heldout_anchor_states,
     DEFAULT_DISTRIBUTION, build_opcode_table, validate_distribution,
-    load_distribution, sample_partner_pair,
+    load_distribution, sample_chunk_partner_pair,
     single, until_branch, until_transformation, length_cap, either,
     DEFAULT_TYPE_WEIGHTS, build_type_table, generate_invalid,
 )
@@ -199,7 +199,8 @@ def _build_batches_iter(cfg, seed):
         draw_anchors=draw_anchors,
         aim=aim,
         partner_rate=partner_rate,
-        partner_sampler=lambda: sample_partner_pair(rng, dest_regs),
+        partner_sampler=lambda: sample_chunk_partner_pair(
+            rng, rule.max_len, dest_regs, dist.get('partners', {}).get('rewrites')),
         invalid_rate=inv_rate, invalid_provider=invalid_provider,
         max_invalid_window=cfg.max_invalid_window,
         max_chunk_len=rule.max_len,

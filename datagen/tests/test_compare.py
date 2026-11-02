@@ -360,7 +360,7 @@ def test_every_augmentation_rate_comes_from_the_config_alone():
     which is what makes the config a run copies into its directory
     (scripts/record_corpus.py) a complete description of what it trained on."""
     from datagen.generate import load_distribution, validate_distribution
-    d = load_distribution('configs/instr_alu_writers_chain010.json')
+    d = load_distribution('configs/instr_alu_writers_chain010_rewrites050_aim050.json')
     assert d['chain']['rate'] == 0.10
     validate_distribution(dict(d))
     # a corpus with no chain block chains nothing
@@ -392,7 +392,7 @@ def test_witness_outputs_match_the_cpu_emulator():
     from datagen.compare import witness_states, to_ssa, live_nodes, _eval_ssa_numpy
     from datagen.generate import build_opcode_table, length_cap
     from datagen.roles import canonical_inputs
-    from datagen.signature import output_inputs
+    from datagen.signature import leaf_colours, output_inputs
     rng = np.random.default_rng(11)
     alu = build_opcode_table({'R_ALU': 0.55, 'I_ALU': 0.45})
     w = witness_states()
@@ -403,10 +403,12 @@ def test_witness_outputs_match_the_cpu_emulator():
             pre = precompute_chunk(chunk, draw_anchor_states(rng, 4))
             outs = [r for r in pre.out_slot_regs.tolist() if r != AUX_CE_IGNORE]
             ssa = to_ssa(chunk); live = live_nodes(ssa); deps = output_inputs(chunk)
+            col = leaf_colours(chunk)
             roles = canonical_inputs(
                 sorted({x for r in outs for x in deps[r]}),
                 lambda regs: _eval_ssa_numpy(ssa, len(chunk), regs, live)[0][:, outs]
-                .astype(np.int64) & 0xFFFFFFFF)
+                .astype(np.int64) & 0xFFFFFFFF,
+                lambda r: (col.get(r, ''), r))
             for p, k in enumerate(pre.witness_slots.tolist()):
                 if k < 0:
                     continue

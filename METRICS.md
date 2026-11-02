@@ -37,9 +37,10 @@ one preserved.
 
 **A second score checks that only the essence carries the function.** An
 output's function could also reach the evaluator by another route, a *leak*.
-Two routes exist in principle: the pointer is computed from each output's
-content through a fixed hash, so its position carries a little of that
-content, and the input colours carry the wiring. To test for a leak,
+Two routes exist in principle: the pointer is an output's position when the
+chunk's outputs are ordered by a fixed projection of their descriptions, so
+its position carries a little of what the output computes, and the input
+colours carry the wiring. To test for a leak,
 `probes/frame_scorecard.py` scores every output a second time, handing the
 evaluator another chunk's essence while keeping the output's own pointer and
 inputs, and reports that exact-match rate as the *leak check*. With no leak,

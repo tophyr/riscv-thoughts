@@ -48,11 +48,12 @@ def _relabel(keys):
     return {i: order.index(k) for i, k in keys.items()}
 
 
-def canonical_inputs(inputs, run):
+def canonical_inputs(inputs, run, rank):
     """The inputs the function depends on, in canonical order.
 
     inputs: candidate input registers; run(regs (n, 32) int32) -> (n, outs)
-    int64 executes the chunk."""
+    int64 executes the chunk; rank(r) is a rename-invariant key (the leaf's
+    colour) that chooses which member of a tied class is singled out."""
     F = _family()
     T = F.shape[0]
 
@@ -92,8 +93,9 @@ def canonical_inputs(inputs, run):
     while len(set(cls.values())) < len(keep):
         sizes = collections.Counter(cls.values())
         c = min(k for k, v in sizes.items() if v > 1)
-        # Any member of a class that is a symmetry gives the same result; a
-        # class that is not one would make this choice register-dependent.
-        chosen = min(i for i in keep if cls[i] == c)
-        cls = refine(_relabel({i: (v, i == chosen) for i, v in cls.items()}))
+        # Any member of a class that is a symmetry gives the same outputs; the
+        # colour picks one that a rename picks too, so positions never follow
+        # register numbers.
+        chosen = min((i for i in keep if cls[i] == c), key=rank)
+        cls = refine(_relabel({i: (v, i != chosen) for i, v in cls.items()}))
     return sorted(keep, key=lambda i: cls[i])

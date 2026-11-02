@@ -72,3 +72,54 @@ def test_equivalent_chunks_ship_identical_witness_outputs(kind):
     for a, b, perm in _pairs(kind, rng, 60):
         assert _equivalent(a, b, perm, rng), (a, b)
         assert np.array_equal(_witness(a), _witness(b)), (a, b)
+
+
+def test_a_rename_never_moves_an_input_between_evaluator_positions():
+    """The evaluator's input order (out_inputs) of a renamed chunk is the
+    original's under the rename, for every output and position — the two
+    operands of a commutative operation included, which tie on role."""
+    rng = np.random.default_rng(41)
+    alu = build_opcode_table({'R_ALU': 0.55, 'I_ALU': 0.45})
+    anchors = draw_anchor_states(np.random.default_rng(0), 2)
+    for L in (1, 2, 3):
+        src = generate_chunks(length_cap(L), rng, opcode_table=alu, chain_rate=0.5)
+        for _ in range(150):
+            ch = next(src).instructions
+            p = random_perm(rng)
+            a, b = precompute_chunk(ch, anchors), precompute_chunk(relabel(ch, p), anchors)
+            want = np.where(a.out_inputs >= 0, p[np.clip(a.out_inputs, 0, None)], a.out_inputs)
+            assert np.array_equal(b.out_inputs, want), ch
+
+
+def test_equivalent_one_output_chunks_hand_the_evaluator_the_same_values():
+    """For two equivalent chunks with one output each, position j of the
+    evaluator's inputs holds the corresponding input's value: placing the
+    same values by position in both gives the same output."""
+    rng = np.random.default_rng(8)
+    from datagen.compare import witness_states
+    w = witness_states()
+    for kind in ('shape', 'difference', 'swap'):
+        for a, b, _ in _pairs(kind, rng, 60):
+            pa = precompute_chunk(a, draw_anchor_states(rng, 2))
+            pb = precompute_chunk(b, draw_anchor_states(rng, 2))
+            if (pa.out_slot_regs >= 0).sum() != 1:
+                continue
+            outs = []
+            for ch, pre in ((a, pa), (b, pb)):
+                regs = np.zeros((w.shape[0], 32), np.int32)
+                for j, r in enumerate(pre.out_inputs[0].tolist()):
+                    if r >= 0:
+                        regs[:, r] = w[:, j + 1]
+                outs.append(np.array([emu_run(ch, s.copy())[0].regs[int(pre.out_slot_regs[0])]
+                                      for s in regs]))
+            assert np.array_equal(outs[0], outs[1]), (a, b)
+
+
+def test_a_same_value_write_is_not_an_output_of_the_distance():
+    """An identity write ships no witness output, so it meets the empty chunk;
+    a write of zero over a register is still an output."""
+    anchors = draw_anchor_states(np.random.default_rng(0), 2)
+    for chunk in ([I('ADDI', 5, 5, 0)], [I('ADD', 5, 5, 0)], [I('ADDI', 5, 5, 3), I('ADDI', 5, 5, -3)]):
+        assert int((precompute_chunk(chunk, anchors).witness_slots >= 0).sum()) == 0, chunk
+    for chunk in ([I('SUB', 5, 5, 5)], [I('ADDI', 5, 0, 0)], [I('ADDI', 6, 5, 0)]):
+        assert int((precompute_chunk(chunk, anchors).witness_slots >= 0).sum()) == 1, chunk

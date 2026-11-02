@@ -192,6 +192,14 @@ def signature(chunk, symmetric_ops=COMMUTATIVE):
                         for n in outputs.values()))
 
 
+def leaf_colours(chunk):
+    """Each live leaf register's colour, every operand role ordered — the
+    encoder's colouring. A rename never changes it."""
+    edges, outputs = dataflow(chunk)
+    col = colours(chunk, edges, live_nodes(edges, outputs), symmetric_ops=frozenset())
+    return {n[1]: c for n, c in col.items() if n[0] == 'leaf'}
+
+
 def output_inputs(chunk):
     """Per output register, the external input registers its value depends
     on, in canonical order: by leaf colour with every role ordered — the

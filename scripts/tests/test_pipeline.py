@@ -478,7 +478,7 @@ class TestCorpusRecord:
             run_dir = Path(tmp) / 'a_run'
             out, err, rc = run([
                 PYTHON, 'scripts/record_corpus.py', str(run_dir),
-                '--config', 'configs/instr_alu_writers_chain010.json',
+                '--config', 'configs/instr_alu_writers_chain010_rewrites050_aim050.json',
                 '--rule', 'cap=2', '--batch-size', '384',
                 '--n-states', '8', '--gen-seed', '7',
                 '--count', '1000'])
@@ -487,7 +487,7 @@ class TestCorpusRecord:
         # the contents travel with the run, so editing the config file later
         # cannot change what the run claims to have trained on
         assert rec['config']['chain']['rate'] == 0.10
-        assert rec['config_path'].endswith('instr_alu_writers_chain010.json')
+        assert rec['config_path'].endswith('instr_alu_writers_chain010_rewrites050_aim050.json')
         # and the knobs that live OUTSIDE the config file are recorded too
         assert (rec['rule'], rec['gen_seed'], rec['count']) == ('cap=2', 7, 1000)
         assert rec['n_states'] == 8

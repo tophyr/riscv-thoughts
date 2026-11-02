@@ -80,20 +80,22 @@ reads the essence").
 
 ```bash
 python -m datagen --rule "cap=$LEN" --batch-size 384 --n-states 8 \
-    --config configs/instr_alu_writers_chain010.json --gen-count 26 \
-    --count "$STEPS" \
-  | python scripts/train_t2_encoder.py --t1-model runs/t1_distance_noimm_aim050_roles_500k/encoder.pt \
+    --config configs/instr_alu_writers_chain010_rewrites050_aim050.json \
+    --gen-count 26 --count "$STEPS" \
+  | python scripts/train_t2_encoder.py --t1-model runs/t1_distance_cosbal_500k/encoder.pt \
     --d-out 512 --d-event 16 --op-cell-depth 4 --vp-head-depth 12 \
-    --n-pool-heads 16 --route binding \
+    --n-pool-heads 16 --route binding --distance-weight 1.0 \
     --n-steps "$STEPS" --out-dir "$OUT"
 ```
 
-T2 trains at `LEN=2`, `STEPS=1000000` on the chain-rate-0.10 corpus, with a
+T2 trains at `LEN=2`, `STEPS=1000000` on the chain-rate-0.10 corpus with half
+of every batch rewrite partner pairs and aimed anchors, with the behavioral
+distance term (EXPERIMENT_LOG, "The register frame", finding 50), and a
 twelve-layer vp head (every vp head is a residual stack with LayerNorm; a
 plain Linear+ReLU stack cannot evaluate a composed chunk exactly even from a
 perfect description, EXPERIMENT_LOG, "T2 faithfulness", finding 34). The
-rate is necessary for the composed slots (finding 30). A 1M cell takes ~4 h
-at ~14 ms/step (EXPERIMENT_LOG, "The register frame", finding 39); 10M steps
+rate is necessary for the composed slots (finding 30). A 1M cell takes ~5.5 h
+at ~20 ms/step with the distance term (finding 44); 10M steps
 cut the failing triples a further two orders of magnitude in the first-read
 frame (finding 35) and is not needed to judge a configuration. It is graded on
 the unmodified `instr_alu_writers.json`, the population the model will
@@ -139,11 +141,10 @@ exists reads a partial model.
 
 **T1 config.** T1 and T2 run the same core at the same settings, so the
 command below differs from the T2 cell only in its ingestion front-end, its
-hparams and the behavioral distance term, which only one-instruction rows
-take. Its corpus is the writers corpus with partner pairs and half of every
+hparams. Its corpus is the writers corpus with partner pairs and half of every
 row's anchor states aimed where its output changes (EXPERIMENT_LOG, "The
-register frame", findings 41–43). The frozen T1 is
-`runs/t1_distance_noimm_aim050_roles_500k`. Its vp head has three hidden layers (the
+register frame", findings 41–43 and 50). The frozen T1 is
+`runs/t1_distance_cosbal_500k`. Its vp head has three hidden layers (the
 trainer's default) of the residual-with-LayerNorm form every vp head takes, the
 smallest depth with which T1 reaches exact vp at held-out anchors, and that
 takes the 500k-step schedule (EXPERIMENT_LOG, "T2 faithfulness", finding 33).
@@ -159,8 +160,8 @@ python -m datagen --rule single --batch-size 384 --n-states 8 \
 It runs at 7–8 ms/step against 4 ms, GPU at 98–99%: datagen ships each
 output's values at 64 shared witness states (`out_witness`), and the trainer
 builds the 384×384 target from them before each step, replayed as one CUDA
-graph of its own (`GraphedDistanceTargets`, `compressor/train.py`).
-`--distance-weight` refuses anything but one-instruction rows.
+graph of its own (`GraphedDistanceTargets`, `compressor/train.py`). Both
+trainers take `--distance-weight`; it pairs rows with exactly one output.
 
 Both trainers expose the same model hparams — `--d-event`, `--op-cell-depth`,
 `--vp-head-depth`, `--n-pool-heads` — since T1 and T2 run the same core
@@ -175,8 +176,9 @@ without the write-step channel, or a `read_pulse` fed `[content, operand]`
 instead of the op-cell's hidden layer (with a separate `read_role`) fails at
 `load_state_dict`, and so does a checkpoint whose vp head is a plain ReLU
 stack, since `VPHead` (the residual form) is the only head the code builds.
-A checkpoint without the pointer (`pool_ptr`, `P_content`, `u_order`) or
-whose vp head reads a slot's description instead of the essence predates the
+A checkpoint without the pointer (`pool_ptr`), one carrying the buffers of
+the content-hash pointer the description order replaced (`P_content`,
+`u_order`), or one whose vp head reads a slot's description instead of the essence predates the
 essence-addressed evaluator and does not load. A T1 checkpoint with an
 immediate head loads without its tensors and reproduces its outputs.
 (A checkpoint trained when all pool heads shared one value projection is still
@@ -281,8 +283,8 @@ cmdline).
   inputs one output of such a chunk can read). The trainer feeds those to the
   vp head (INVARIANT 1); the 32-register files a row executes from never leave
   the generator. `out_witness` (`B, max_n_instrs, 64`) is each output at the
-  shared witness states, inputs placed by canonical role and outputs in
-  canonical order — not aligned with `out_slot_regs` — and `out_known_zero` /
+  shared witness states, inputs placed by canonical role and outputs sorted
+  by the raw bytes of their witness values — not aligned with `out_slot_regs` — and `out_known_zero` /
   `out_known_one` (`B, max_n_instrs`) its known bits, in the same order, the bits forced to 0 or 1 whatever the
   inputs (`datagen/knownbits.py`); the behavioral distance is built from both
   (INVARIANT 7). Body field list + dtypes are the `BodyField(...)` block at
@@ -319,34 +321,36 @@ attribute a result to.
   no invalidity → a clean, all-valid, always-register-writing corpus. Every
   chunk is pure ALU, so `cap=N` and `branch+cap=N` behave identically here and
   the scripts use plain `cap=N`.
-- `instr_alu_writers_chain010.json` — **T2's training corpus.** The same, plus
-  `chain: {rate: 0.10}`.
-  A uniform register draw leaves only ~4.7% of two-instruction chunks with the
-  second reading the first's result, and that scarcity — not any architectural
-  limit — is what held the composed-slot value prediction down (EXPERIMENT_LOG,
-  "T2 faithfulness", finding 30). `chain.rate` rewrites that fraction of chunks
-  so each instruction reads its predecessor's result, leaving every opcode
-  untouched, which lifts composed chunks to roughly `rate + (1-rate)*0.047` of
-  rows (counted over 20 batches of `cap=2`: 4.8% of rows composed at rate 0,
-  15.4% at rate 0.10). On single-instruction rules it rewrites nothing; it does
-draw one extra random number per chunk, so the stream differs byte-wise from
-`instr_alu_writers.json` while keeping the same distribution. The rate is in the
-  filename because another rate is another file.
 - `instr_alu_writers_partners025.json` — the writers corpus plus `partners:
-  {rate: 0.25}`: a quarter of each batch is pairs of one-instruction rows, two
-  different spellings of one function on the same registers
-  (`datagen.generate.PARTNER_GROUPS`), the equivalent pairs the behavioral
-  distance term needs and a naturally drawn batch almost never holds. Valid
-  for `--rule single` only; a longer rule is rejected. It is the unaimed arm
-  of finding 42.
+  {rate: 0.25}`: a quarter of each batch is pairs of rows, two different
+  spellings of one function on the same registers, the equivalent pairs the
+  behavioral distance term needs and a naturally drawn batch almost never
+  holds — single instructions from `datagen.generate.PARTNER_GROUPS` under
+  `--rule single`, rewrite pairs from `sample_chunk_partner_pair` under a
+  longer rule. It is the unaimed arm of finding 42.
 - `instr_alu_writers_partners025_aim050.json` — **T1's corpus for the
   collapse term.** The partners corpus plus `aim: {fraction: 0.5}`: half of
   every row's anchor states are rewritten in pairs to straddle the inputs
   where the row's output changes (`datagen/aim.py`).
   Without it the distance term's T1 fails comparisons near their immediate
   (finding 42). A scoring corpus (`--heldout-anchors`) is never aimed.
+- `instr_alu_writers_chain010_rewrites050_aim050.json` — **T2's training
+  corpus.** The writers corpus plus three blocks. `chain: {rate: 0.10}`: a
+  uniform register draw leaves only ~4.7% of two-instruction chunks with the
+  second reading the first's result, and that scarcity — not any architectural
+  limit — is what held the composed-slot value prediction down (EXPERIMENT_LOG,
+  "T2 faithfulness", finding 30). `chain.rate` rewrites that fraction of chunks
+  so each instruction reads its predecessor's result, leaving every opcode
+  untouched, which lifts composed chunks to roughly `rate + (1-rate)*0.047` of
+  rows (counted over 20 batches of `cap=2`: 4.8% of rows composed at rate 0,
+  15.4% at rate 0.10). `partners: {rate: 0.5}`: half of every batch is partner
+  pairs from `sample_chunk_partner_pair`, every rewrite (commutative swap,
+  respelling, fold, cancellation, reassociation, a same-value write against
+  its absence) embedded in random context; a partner mix that leaves a rewrite
+  out lets its collapse lapse (finding 47). `aim: {fraction: 0.5}`: half of
+  every row's anchor states aimed, as for T1.
 - `instr_alu_writers_chain100.json` — **a scoring corpus for composed slots,
-  never trained on.** The same at `chain.rate` 1.0, so every two-instruction
+  never trained on.** The writers corpus at `chain.rate` 1.0, so every two-instruction
   chunk's second instruction reads the first's result. A natural held-out corpus
   holds ~2k composed chunks per 300 batches, too few to resolve a near-exact
   readout's residual; this one holds 128 per batch. Generate it when needed

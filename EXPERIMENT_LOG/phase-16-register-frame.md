@@ -16,10 +16,25 @@ essence spanning the range the first-read frame's models had (finding 39).
 At T1 a behavioral distance term collapses equivalent spellings and grades
 inequivalent ones by how differently they behave (finding 41), and with half
 of each row's anchor states aimed at its boundaries it is exact at held-out
-anchors (finding 42). Open: the composed slots' residual, every equivalence the op-cell has to
-compute — commutativity first — the binding's wire format, the pointers'
-order under an equivalence that respells one of several outputs, and the
-learned replacement for the colouring.
+anchors (finding 42). The distance term's witness states and the evaluator's
+inputs are placed by canonical role, an order computed from the function
+(finding 43). At T2, the term on one-output rows with partner chunk pairs
+collapses every kind of pair it trains on while vp stays at 99.84%, and leaves
+untouched the equivalences outside that coverage (finding 44). Ordering the
+evaluator's pointers by a projection of each output's description keeps two
+equivalent chunks' pointers in agreement more often than a content hash
+(findings 45 and 46). With a distance target over every output, partner
+chunk pairs drawing every rewrite in every operand context, the target chord
+√(2d) and equivalent pairs averaged apart from the rest, a T2 at len=2
+collapses every equivalence class tried at vp 99.79%, one seed (findings
+47–50). Open: whether the decisions behind that collapse hold up — the
+balanced loss, the order outputs are paired in, the pointer order — a second
+seed, rewrites never trained, the composed slots' residual, the binding's
+wire format, and the learned replacement for the colouring.
+
+The run directories and corpus configs of the T2s in findings 39, 44 and
+46–49 and of the T1s in finding 43 are deleted; each finding records its
+configuration.
 
 Findings 1–36 (phases 14 and 15) were measured in the first-read canonical
 frame; their numbers are not comparable to these (METRICS.md).
@@ -438,7 +453,8 @@ states where it holds one value and every other input a second, each ordered
 pair likewise with a third value; inputs are ordered by Weisfeiler–Lehman
 refinement over these fingerprints, singling out one member of any class
 left with several and refining again; inputs the function ignores are
-dropped first; outputs are ordered by their values at the witness states.
+dropped first; outputs are sorted by the raw bytes of their values at the
+witness states.
 
 Oracle only, no model. Pairs equivalent on the emulator, 300 per class: the
 fraction whose outputs at the witness states agree exactly.
@@ -482,6 +498,291 @@ Computing the roles for every generated row makes one generator core take
 one stacked call; odin's 96 workers deliver at least 450 and 290 batches/s
 at len 1 and 2.
 
+The evaluator takes each output's inputs in the same canonical role order,
+so two equivalent chunks of different dataflow shapes present corresponding
+inputs at the same positions; a class of interchangeable inputs is ordered by
+the encoder's colour, the singled-out member first, which leaves a
+commutative operation's two operands in the colour order the evaluator had.
+On a held-out corpus in that order, the T1 of the previous paragraph scores
+87.87%, every failure on `SUB` (8.7%), `SLT` (31.5%) or `SLTU` (41.2%), whose
+two operands the roles re-pair; retrained with it
+(`runs/t1_distance_noimm_aim050_canon_500k`, otherwise as above), T1 is exact
+on all 2,457,600 held-out triples, with partner groups equivalent at
+0.0003–0.102 against contrasts of 0.30–1.46, aliasing control 1.152,
+unrelated instructions 1.361 and `ADDI` k vs k+1 at 0.377.
+
+**44. A T2 trained with the behavioral distance term on one-output rows and
+partner chunk pairs is as faithful as the T2 record and collapses every kind
+of partner pair it trained on, by 5× to 3,500× against a near-miss; it does
+not collapse a commutative swap whose operand is the previous instruction's
+result, a shape no partner kind produces, and it pushes the identity away
+from the empty chunk.** The cell is finding 39's (`scripts/run_t2.sh`: len=2,
+`d_out` 512, op-cell depth 4, twelve-layer residual vp head, 16 pool heads, 1M
+steps, one seed) over `runs/t1_distance_noimm_aim050_canon_500k`, on
+`configs/instr_alu_writers_chain010_partners025_aim050.json` — the chain-0.10
+writers corpus with a quarter of each batch partner chunk pairs and half the
+anchor states aimed — with the distance term at weight 1.0 on every two rows
+that write one register (`runs/t2_len2_d512_s1000000_dep4_vp12_pool16_dist1.0_alu_writers_chain010_partners025_aim050`;
+20 ms/step, GPU at 98–99%, 5.5 h). Scored with `probes/frame_scorecard.py` on
+the regenerated `runs/eval/t2_heldout64_len2.rvt`, and with
+`probes/partner_chunks.py`, `probes/additive_fusion.py` and
+`probes/write_position.py`, 1,000–2,000 pairs per row, beside finding 39's T2
+(which reads 99.55% on this corpus, trained with an evaluator input order
+finding 40 removed).
+
+| | distance term | finding 39's T2 |
+|---|---|---|
+| vp exact at held-out anchors | **99.8416%** (7,652 of 4,831,744 failing) | 99.8276% on its own corpus |
+| — outputs depending on 3 inputs | 91.3% | 90.5% |
+| binding exact per chunk | 100% | 100% |
+| rename / reorder / dead code / fresh swap | 0 (≤ 1.5e-6) | 0 |
+| aliasing control / unrelated chunks | 1.024 / 1.332 | 0.505 / 0.690 |
+
+Partner kinds (`sample_chunk_partner_pair`), equivalent pair against the
+second spelling with one immediate +1 or its first operation changed:
+
+| kind | distance term | finding 39's T2 |
+|---|---|---|
+| respelled first step | 0.022 / 0.810 | 0.203 / 0.441 |
+| fold of two literals | 0.075 / 0.405 | 0.779 / 0.786 |
+| a copy through `+k;−k` against the plain copy | 0.002 / 0.333 | 1.009 / 1.016 |
+| reassociation | 0.0003 / 1.058 | 0.185 / 1.105 |
+| commutative first step whose operand is read again | 0.0006 / 0.984 | 0.169 / 0.813 |
+
+Beyond the partner kinds: `ADDI` chains of one register reading itself, same
+total against a total differing by one, 0.163 against 0.418 (2.6×; finding 39:
+0.4×); `XORI` chains 0.060 against 0.354 (5.9×; 0.3×); the identity against
+`+k;−k` in place, 0.002 (0.980). Commutative swaps in naturally drawn len-2
+chunks, against unrelated chunks at 1.344 (1.063):
+
+| how the swapped instruction meets the other | one output | two outputs |
+|---|---|---|
+| shares an input | 0.000 (the swapped instruction is overwritten) | 0.738 (0.337) |
+| its result is read by the other | 0.003 (0.009) | 0.012 (0.019) |
+| its operand is the other's result | **0.289 (0.271)** | 0.598 (0.445) |
+
+The swap in the partner kinds is always the first instruction, on two inputs
+from outside; a swap on a composed operand is the same algebra in an operand
+context no partner pair reaches, and it moves not at all. Two-output chunks,
+which the term never pairs, keep or lose ground as the essence spreads. The
+identity `ADDI r,r,0` sits 1.551 from the empty chunk (0.261 in finding 39),
+against 0.333 from `ADDI r,r,1`: the empty chunk has no output, so the term
+never places it.
+
+**45. Two equivalent two-output chunks file their functions under different
+pointers in about 40% of commutative swaps whose operand is shared or
+composed, and almost never otherwise.** The pointer orders a chunk's outputs
+by a fixed hash of each output's content-aware path colour (RISCV_DESIGN,
+"Value prediction reads the essence"), so whether it flips depends on the
+frozen T1 and the fixed hash, not on T2's training. Equivalent pairs of
+two-output len-2 chunks, checked on the emulator, over
+`runs/t1_distance_noimm_aim050_canon_500k` (read through finding 44's T2);
+1,000 pairs per row; a flip is any output register whose pointer differs:
+
+| pair | pointer flips |
+|---|---|
+| one instruction respelled within a T1 partner group, step 1 / step 2 | 0.7% / 0.7% |
+| commutative swap, no register shared with the other instruction | 0.1% |
+| commutative swap, its result read by the other | 1.4% |
+| commutative swap, sharing an input with the other | 43.6% |
+| commutative swap, its operand the other's result | 40.8% |
+
+A respelling barely moves the hash because the T1 already places equivalent
+spellings at one essence (finding 43). A swap reorders operand roles, which
+the colouring keeps ordered because the encoder is told nothing about
+commutativity, and the swapped output's hash lands on either side of the
+other's at nearly even odds. These are the two-output classes finding 44
+left apart (0.738 and 0.598).
+
+Ordering the outputs instead by a fixed projection of each written slot's
+description (its value channels, which the op-cell computes before any
+pointer enters) agrees between the two spellings far more often. On the same
+pairs through finding 44's T2, over 8 fixed random unit directions: 99.1% and
+98.9% for the respellings, 100% and 99.8% for the swaps without a shared or
+composed operand, 86.2% for a swap whose operand is the other's result and
+77.3% for one sharing an input (hash: 58.1% and 56.3%). The median ratio of
+the two spellings' difference along the direction to the gap between a
+chunk's two outputs is 0.003 where the essences already coincide, and 0.443
+and 0.709 on the two swap classes; 0.4–2.6% of chunks have their two outputs
+within 1% of the median gap. This T2 was never trained on two-output pairs.
+
+**46. Ordering pointers by a projection of each output's description keeps
+two-output equivalents' pointers in agreement more often than the hash and
+settles as training runs, but the swaps it was meant to unblock still do not
+collapse, because the op-cell does not describe a commutative operation
+alike when one operand is another instruction's result — with one output and
+no pointer to disagree on, that swap stays where it was.** Finding 44's T2,
+its pointer replaced by the description order (`RegisterStateMachine._pointer`:
+a fixed unit direction, ties within 1e-4 sharing a position) and its distance
+target by the root-mean-square over canonically ordered outputs with
+same-value writes dropped (`chunk_distance_targets`, `compressor/train.py`),
+trained 100k steps more (learning rate 5e-5, 2k warmup, cosine) on its corpus
+with a partner kind added that swaps one commutative instruction of a chunk
+of any shape (`runs/t2_ptrdesc_rms_resume100k`, 21 ms/step, GPU at 98–100%).
+Tracked every 10k steps on fixed sets of finding 45's pairs (1,000 per class)
+and 2,000 natural chunks; vp on 20 held-out batches:
+
+| step | vp | swap, operand a result: flips / distance | swap, sharing an input: flips / distance | churn |
+|---|---|---|---|---|
+| 0 | 99.70% | 15.5% / 0.446 | 21.3% / 0.503 | |
+| 20k | 99.71% | 18.2% / 0.401 | 16.1% / 0.418 | 7.1% |
+| 50k | 99.76% | 21.2% / 0.377 | 17.3% / 0.359 | 5.8% |
+| 100k | 99.81% | 17.8% / 0.341 | 15.4% / 0.337 | 0.7% |
+
+(churn: the natural chunks whose pointer assignment changed since the last
+snapshot; respellings flip 0.4–2.5% throughout; unrelated chunks 1.34–1.36.)
+At step 0 the description order flips 15.5% and 21.3% where the hash flips
+41–44%, and churn decays as the learning rate does. The flips do not fall
+further. `probes/partner_chunks.py` on the same two models:
+
+| | step 0 | step 100k |
+|---|---|---|
+| swap, operand the other's result, **one output** | 0.289 | 0.310 |
+| swap, operand the other's result, two outputs | 0.457 | 0.348 |
+| swap, sharing an input, two outputs | 0.515 | 0.342 |
+| swap partner kind, equivalent / near-miss | 0.322 / 0.838 | 0.207 / 0.808 |
+
+A one-output chunk has one pointer, so its swap cannot be held apart by the
+order; it stays apart all the same, and the two-output swaps end at its
+level. The swap partner kind draws its operands from registers already in the
+chunk half the time, so composed operands are in its training pairs; how many
+per batch is not counted.
+
+**47. The op-cell learns a commutative operation on a composed operand once
+pairs of that kind are in the training mix, and loses a collapse it had when
+its pairs leave the mix.** A swap of a commutative instruction whose operand
+is another instruction's result changes the leaf colours of the chunk in a
+way that is not a permutation — the colouring passes the swapped role down to
+the producer's inputs — on 500 of 500 generated pairs (37% of swaps of any
+shape), so the two chunks hand the op-cell different seeds and it has to
+describe them alike regardless. Finding 46's final T2 trained a further 100k
+steps (learning rate 5e-5, cosine) on a corpus whose partner pairs, half of
+every batch, are all such swaps (`composed_swap`, `datagen.generate`;
+`configs/instr_alu_writers_chain010_composedswap050_aim050.json`;
+`runs/t2_composedswap_resume100k`). `probes/partner_chunks.py`, before and
+after:
+
+| pair | before | after |
+|---|---|---|
+| swap, operand the other's result, one output | 0.310 | **0.089** |
+| swap, operand the other's result, two outputs | 0.348 | **0.081** |
+| composed-swap partner kind, equivalent / near-miss | — | 0.085 / 0.875 |
+| a copy through `+k;−k` against the plain copy / near-miss | 0.002 / 0.333 | **0.809** / 0.822 |
+| fold of two literals / near-miss | 0.075 / 0.405 | 0.307 / 0.418 |
+| reassociation / near-miss | 0.0003 / 1.058 | 0.090 / 0.968 |
+| commutative first step read again / near-miss | 0.0006 / 0.984 | 0.047 / 0.838 |
+
+vp on 20 held-out batches 99.80%; unrelated chunks 1.37. The swap the op-cell
+did not describe alike collapses tenfold once trained, so its failure was
+the absence of training pairs, not the op-cell's capacity. Every partner kind
+absent from this corpus moved apart, the cancelling pair all the way to its
+near-miss: a collapse is held by the distance term acting on it, not retained
+once learned, so the partner mix has to keep every equivalence in it.
+
+**48. A T2 trained from scratch with rewrite partner pairs collapses
+commutative swaps in every operand context but folds worse than finding 44's
+cell, does not generalize to a rewrite held out of training, and is trained
+against distance targets no essence geometry can meet.** The cell is finding
+44's with the description-ordered pointer, the root-mean-square target over
+all rows (finding 46), and half of every batch partner pairs from the
+`rewrite` kind (`datagen.generate._rewrite_pair`: one rewrite — commutative
+swap, respelling within a T1 partner group, fold of two literals, or
+reassociation — embedded in random context whose registers it reads half the
+time; cancellation held out), 1M steps
+(`runs/t2_len2_d512_s1000000_dep4_vp12_pool16_dist1.0_alu_writers_chain010_rewrites050_nocancel_aim050`,
+`configs/instr_alu_writers_chain010_rewrites050_nocancel_aim050.json`, 22
+ms/step, GPU at 99%). vp 99.8229% at held-out anchors (outputs with three
+inputs 91.0%), binding exact; the scorecard's shared-operand swap 0.170
+against unrelated chunks 1.318 (finding 44: 0.659 / 1.332); natural swaps on
+a composed operand 0.207 with one output, 0.182 with two (0.289 / 0.598).
+Partner kinds, equivalent / near-miss: respelling 0.028 / 0.802, reassociation
+0.0002 / 1.086, swap 0.047 / 0.926, fold 0.260 / 0.368 (finding 44: 0.075 /
+0.405), held-out cancellation 0.616 / 0.817; the `ADDI` and `XORI` fusion
+probes 0.9× each (2.6× and 5.9×); the identity against the empty chunk 0.975.
+
+The targets explain part of it. The term matches the chord to 2 × the
+behavioral distance, so two maximally different rows are asked to be
+antipodal, and rows typically sit near 0.8 apart behaviourally. On real
+batches the mean target chord is 1.46 for the T1's corpus, 1.61 for finding
+44's and 1.69 for this one; no set of points on a sphere has a mean pairwise
+chord above √2, since the mean squared chord is 2 − 2‖mean point‖². Pairs
+whose output counts differ, which score an unmatched output as 1, are 47%
+of this corpus's pairs, with a mean target chord of 1.83 and 54% of the loss.
+
+Resuming this T2 for 100k steps (learning rate 5e-5) at scale 2 and at
+scale √2 — distance 1 mapped to orthogonal — makes the targets satisfiable
+(final distance loss 0.104 against 0.002) and shrinks the whole space by the
+same factor (unrelated chunks 1.32 against 1.10) without changing collapse
+relative to the near-misses: fold 0.269 / 0.371 against 0.232 / 0.333,
+held-out cancellation 0.607 / 0.797 against 0.502 / 0.663, vp 99.79% in both
+(`runs/t2_rewrites_resume100k_scale2`, `_scale141`). Equivalent pairs (target
+0) are 0.83% of a batch's pairs (613 of 73,536), so they carry a matching
+share of the loss.
+
+**49. Averaging the distance loss separately over equivalent pairs and the
+rest collapses every rewrite the mix trains — folds included — and half of
+the rewrite held out, at unchanged vp and aliasing control.** Equivalent pairs
+(target 0) are under 1% of a batch's pairs (finding 48), so in a loss
+averaged over all pairs they carry under 1% of the gradient. Finding 48's √2
+arm, resumed identically except that the squared errors of target-0 pairs
+and of all other pairs are each averaged and the two means summed
+(`distance_loss(balance=True)`, `compressor/train.py`;
+`runs/t2_rewrites_resume100k_scale141_bal`), against that arm:
+
+| | balanced | averaged over all pairs |
+|---|---|---|
+| fold of two literals / near-miss | **0.033** / 0.296 | 0.232 / 0.333 |
+| `ADDI` / `XORI` fusion separation | **4.1× / 7.4×** | 0.9× / 0.9× |
+| rewrite: commutative swap / respelling | **0.005 / 0.009** | 0.044 / 0.027 |
+| composed-swap partner / near-miss | **0.036** / 0.684 | 0.204 / 0.734 |
+| natural swap on a composed operand, 1 / 2 outputs | **0.053 / 0.035** | 0.203 / 0.171 |
+| scorecard's shared-operand swap / unrelated chunks | **0.017** / 1.110 | 0.148 / 1.110 |
+| cancellation, held out of training / near-miss | **0.194** / 0.726 | 0.502 / 0.663 |
+| aliasing control | 0.808 | 0.819 |
+| vp, 20 held-out batches | 99.79% | 99.79% |
+
+The identity `ADDI r,r,0` against the empty chunk stays at 0.856: no partner
+pair relates a same-value write to its absence.
+
+**50. With the settled distance term and every rewrite in the partner mix,
+a T2 at len=2 collapses every equivalence class tried — folds, cancellations,
+reassociations, respellings, identities and commutative swaps in every
+operand context — at vp 99.79%.** The T1 is finding 42's configuration
+retrained under the settled term (target chord √(2d), equivalent pairs
+averaged apart; `runs/t1_distance_cosbal_500k`): vp exact on all 2,457,600
+held-out triples, wiring exact, partner groups equivalent at 0.0001–0.0068
+against contrasts of 0.48–1.30, aliasing control 1.088, unrelated
+instructions 1.213. The T2 over it is finding 44's cell with the
+description-ordered pointer, the root-mean-square target over every row, the
+settled term, and half of every batch rewrite partner pairs drawing every
+rewrite — commutative swap, respelling, fold, cancellation, reassociation, a
+same-value write against its absence
+(`configs/instr_alu_writers_chain010_rewrites050_aim050.json`;
+`runs/t2_len2_d512_s1000000_dep4_vp12_pool16_dist1.0_cosbal_alu_writers_chain010_rewrites050_aim050`,
+1M steps, 24 ms/step, GPU at 99–100%). Scored by `scripts/run_t2.sh` on the
+regenerated held-out corpus and by the probes, against finding 44's cell:
+
+| | this T2 | finding 44 |
+|---|---|---|
+| vp exact at held-out anchors | 99.7857% (10,355 of 4,831,488 failing) | 99.8416% |
+| — outputs depending on 3 / 2 / 1 inputs | 89.6 / 99.78 / 99.95% | 91.3 / 99.85 / 99.97% |
+| binding exact per chunk; rename, reorder, dead code, fresh swap | 100%; 0 | 100%; 0 |
+| respelling / fold / cancellation / reassociation, equivalent | 0.003 / 0.016 / 0.003 / 0.0001 | 0.022 / 0.075 / 0.002 / 0.0003 |
+| — their near-misses | 0.89 / 0.57 / 1.07 / 1.26 | 0.81 / 0.40 / 0.33 / 1.06 |
+| identity write against its absence (rewrite) / near-miss | 0.027 / 1.03 | — |
+| `ADDI` / `XORI` fusion separation | 5.8× / 44.8× | 2.6× / 5.9× |
+| `ADDI r,r,0` against `ADD r,r,x0`; against `+k;−k` | 0.0002; 0.003 | —; 0.002 |
+| scorecard's shared-operand swap | 0.014 | 0.659 |
+| natural swap: shared input / result read / operand a result, 2 outputs | 0.005 / 0.0001 / 0.034 | 0.738 / 0.012 / 0.598 |
+| natural swap on a composed operand, 1 output | 0.080 | 0.289 |
+| aliasing control / unrelated chunks | 0.907 / 1.253 | 1.024 / 1.332 |
+
+The identity against the empty chunk sits at 1.013: no chunk in the corpus
+is empty, so the empty chunk — the pool with nothing written — is never
+trained against, while chunks consisting of identities collapse with one
+another and an identity inside a chunk collapses with its absence. The vp
+difference is 0.056 points, over a different T1 and on one seed each.
+
 ## Decisions taken
 
 - **The essence is graded in the register frame** — colour-identified leaves,
@@ -524,9 +825,22 @@ at len 1 and 2.
   distance term places close together differ.
 - **Distance targets place inputs by canonical role** (finding 43), never by
   the graph's colour order.
-- **The frozen T1 is `runs/t1_distance_noimm_aim050_roles_500k`** (findings 42 and 43): the distance term
-  on canonical-role targets, no immediate head, aimed anchors. No T2 has been
-  trained over it.
+- **The evaluator takes inputs in canonical role order** (finding 43), ties
+  between interchangeable inputs by colour.
+- **The frozen T1 is `runs/t1_distance_cosbal_500k`** (finding 50): the
+  settled distance term on canonical-role targets, the evaluator in
+  canonical role order, no immediate head, aimed anchors.
+- **The distance term matches the chord to √(2d) and averages equivalent
+  pairs apart from the rest** (findings 48 and 49).
+- **The T2 record is finding 50's cell**, trained on rewrite partner pairs
+  drawing every rewrite.
+- **T2 trains with the distance term on every row and partner chunk pairs**
+  (findings 44 and 46): outputs in canonical order, combined by
+  root-mean-square, same-value writes not counted.
+- **Pointers are ordered by a fixed projection of each output's description**
+  (finding 46), not by a hash of its spelling.
+- **The partner mix covers every equivalence at once** (finding 47): a
+  collapse lapses when its pairs leave the mix.
 
 ## Dead ends (do not re-run)
 

@@ -477,28 +477,33 @@ def test_fixed_shape_single_rule_out_regs():
     assert any(b.out_regs_valid.any() for b in batches)
 
 
-def test_partner_rate_places_pairs_and_needs_one_instruction():
+def test_partner_rate_places_pairs_of_equivalent_chunks():
     """The last rows of a batch at partner_rate 0.5 are pairs, each two
-    spellings of one function; a multi-instruction rule refuses a rate."""
-    from datagen.generate import sample_partner_pair
+    spellings of one function, as single instructions and as chunks."""
+    from datagen.generate import sample_chunk_partner_pair
     from emulator import run as emu_run
     rng = np.random.default_rng(5)
-    gen = collect_into_batches(
-        generate_chunks(single(), rng), batch_size=16,
-        draw_anchors=lambda k: draw_anchor_states(rng, k * 4).reshape(k, 4, -1),
-        partner_rate=0.5, partner_sampler=lambda: sample_partner_pair(rng),
-        max_chunk_len=1)
-    b = next(gen)
-    state = draw_anchor_states(np.random.default_rng(1), 1)[0].astype(np.int32)
-    state[0] = 0
-    for i in range(8, 16, 2):
-        x, _ = decode_instruction(b.tokens[i, :b.token_lens[i]].tolist(), 0)
-        y, _ = decode_instruction(b.tokens[i + 1, :b.token_lens[i + 1]].tolist(), 0)
-        assert (emu_run([x], state.copy())[0].regs[x.args[0]]
-                == emu_run([y], state.copy())[0].regs[y.args[0]]), (x, y)
-    with pytest.raises(ValueError):
-        next(collect_into_batches(
-            generate_chunks(length_cap(2), rng), batch_size=16,
+    states = draw_anchor_states(np.random.default_rng(1), 16)
+    for rule, L in ((single(), 1), (length_cap(3), 3)):
+        gen = collect_into_batches(
+            generate_chunks(rule, rng), batch_size=16,
             draw_anchors=lambda k: draw_anchor_states(rng, k * 4).reshape(k, 4, -1),
-            partner_rate=0.5, partner_sampler=lambda: sample_partner_pair(rng),
-            max_chunk_len=2))
+            partner_rate=0.5, partner_sampler=lambda: sample_chunk_partner_pair(rng, L),
+            max_chunk_len=L)
+        b = next(gen)
+        decode = lambda i: _decode_all(b.tokens[i, :b.token_lens[i]].tolist())
+        for i in range(8, 16, 2):
+            x, y = decode(i), decode(i + 1)
+            assert len(x) <= L and len(y) <= L
+            for s in states:
+                s = s.copy(); s[0] = 0
+                assert np.array_equal(emu_run(x, s.copy())[0].regs,
+                                      emu_run(y, s.copy())[0].regs), (x, y)
+
+
+def _decode_all(toks):
+    pos, out = 0, []
+    while pos < len(toks):
+        ins, pos = decode_instruction(toks, pos)
+        out.append(ins)
+    return out
