@@ -22,7 +22,7 @@ source .venv/bin/activate
 D=/home/tophy/Projects/riscv-thoughts/logs
 # The frozen lower tier. A T2 checkpoint is only interchangeable with others
 # trained on the SAME T1, so a cell that changes this must be named for it.
-T1=${T1:-runs/t1_distance_cosbal_500k/encoder.pt}
+T1=${T1:-runs/t1_setvp_500k/encoder.pt}
 # VP = vp-head hidden layers (residual blocks with LayerNorm). The head must
 # EVALUATE the chunk's function at the anchor points, so its capacity is a
 # confound in every vp number (METRICS.md). STEPS=1000000 is the cell a
@@ -32,13 +32,15 @@ NPOOL=${NPOOL:-16}
 # Weight of the behavioral distance term on the essence (0 = off); its
 # equivalent pairs come from the corpus's partner chunk pairs.
 DIST=${DIST:-1.0}
-# Local generator workers.
+# Local generator workers; with REMOTE_GEN set, generation runs on odin's pool
+# instead (LOCAL_GEN local workers beside it, PORT its link).
 GEN=${GEN:-26}
+REMOTE_GEN=${REMOTE_GEN:-} LOCAL_GEN=${LOCAL_GEN:-0} PORT=${PORT:-6464}
 # The corpus is ONE file: opcode mix, exclude_x0_dest, and the invalidity /
 # chain / partners / aim blocks all live in it, and no flag can override any of
 # them. A sweep over corpus composition is therefore a config per arm, and the
 # run directory is named after the config so two arms cannot collide.
-CONFIG=${CONFIG:-configs/instr_alu_writers_chain010_rewrites050_aim050.json}
+CONFIG=${CONFIG:-configs/instr_alu_writers_chain010_rewrites025_minedlive025_aim050.json}
 # The instruction-stream seed. Re-running a cell without changing it redraws
 # the SAME corpus and measures initialization variance only, so a replicate
 # needs GEN_SEED (METRICS.md, null interventions).
@@ -47,6 +49,20 @@ GEN_SEED=${GEN_SEED:-0}
 # pure function of the knobs, so it would silently overwrite it).
 TAG=${TAG:-}
 CORPUS_SLUG=$(basename "$CONFIG" .json); CORPUS_SLUG=${CORPUS_SLUG#instr_}
+
+# Generation: local workers, or with REMOTE_GEN set, odin's pool through
+# multinode_gen.sh (LOCAL_GEN local workers beside it).
+generate() {
+  if [ -n "$REMOTE_GEN" ]; then
+    RULE="cap=$LEN" CONFIG="$CONFIG" GEN_SEED="$GEN_SEED" PORT="$PORT" \
+      REMOTE_GEN="$REMOTE_GEN" LOCAL_GEN="$LOCAL_GEN" \
+      ./multinode_gen.sh "$STEPS" 2> "$D/gen_${OUT}.log"
+  else
+    python -m datagen --rule "cap=$LEN" --batch-size 384 --n-states 8 \
+      --config "$CONFIG" --seed "$GEN_SEED" --gen-count "$GEN" \
+      --count "$STEPS" 2> "$D/gen_${OUT}.log"
+  fi
+}
 
 cell() {
   local DIST_SLUG=; [ "$DIST" != 0 ] && DIST_SLUG=_dist${DIST}
@@ -58,14 +74,17 @@ cell() {
   # What the run trained on, recorded before it starts: hparams.json is the
   # trainer's own arguments and says nothing about the data. The config's
   # contents are copied in, so editing the file later cannot rewrite history.
+  local GENERATOR="datagen --gen-count $GEN"
+  [ -n "$REMOTE_GEN" ] && GENERATOR="multinode_gen.sh REMOTE_GEN=$REMOTE_GEN LOCAL_GEN=$LOCAL_GEN"
   python scripts/record_corpus.py "runs/$OUT" --config "$CONFIG" \
     --rule "cap=$LEN" --batch-size 384 --n-states 8 \
     --gen-seed "$GEN_SEED" --count "$STEPS" \
-    --generator "datagen --gen-count $GEN" || return 1
-  python -m datagen --rule "cap=$LEN" --batch-size 384 --n-states 8 \
-      --config "$CONFIG" --seed "$GEN_SEED" --gen-count "$GEN" \
-      --count "$STEPS" 2> "$D/gen_${OUT}.log" \
-    | python scripts/train_t2_encoder.py --t1-model "$T1" \
+    --generator "$GENERATOR" || return 1
+  # The exact code the run trains with, so it can be scored or resumed after
+  # the tree moves on: the diff against HEAD and every untracked source file.
+  { git rev-parse HEAD; git diff HEAD; } > "runs/$OUT/code.patch"
+  git ls-files --others --exclude-standard -z | tar czf "runs/$OUT/code_untracked.tgz" --null -T -
+  generate | python scripts/train_t2_encoder.py --t1-model "$T1" \
       --d-out "$DOUT" --d-event 16 --op-cell-depth "$OC" --vp-head-depth "$VP" \
       --n-pool-heads "$NPOOL" --route binding --distance-weight "$DIST" \
       --n-steps "$STEPS" --out-dir "$OUT" \

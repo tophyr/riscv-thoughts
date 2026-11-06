@@ -13,37 +13,32 @@ file is the instrument, not the readings.
 ## vp — value prediction
 
 **What it measures.** Given the chunk's input values, can its output register
-values be recovered from the essence? For each register the chunk writes, a
-readout network — the **evaluator**, `vp_head` — is handed three things and
-predicts that register's value after the chunk (`vp_loss`,
-`compressor/train.py`):
+values be recovered from the essence? A readout network — the
+**evaluator**, `vp_head` — is handed two things and predicts every register
+the chunk writes, its value after the chunk, as a set matched to the outputs
+by the assignment of least loss (`vp_loss`, `compressor/train.py`;
+RISCV_DESIGN, "Value prediction reads the essence"):
 
 - the unit-normalized essence;
-- a **pointer**: a one-hot saying which of the chunk's outputs is being
-  asked about. It marks the output's position in a fixed ordering of the
-  chunk's distinct outputs and carries nothing about what the output computes
-  (RISCV_DESIGN, "Value prediction reads the essence");
-- for each register the output depends on, its value and its structural
-  colour. The value comes from an **anchor state**: a register file the chunk
-  is executed from to produce the target. The colour is a label computed from
-  the wiring alone (RISCV_DESIGN, "Leaf identity for input registers").
+- for each of the chunk's inputs in canonical role order, its value and its
+  structural colour. The value comes from an **anchor state**: a register file
+  the chunk is executed from to produce the target. The colour is a label
+  computed from the wiring alone (RISCV_DESIGN, "Leaf identity for input
+  registers").
 
 Each output has a **function**: the computation that turns its input values
 into its value, such as `x+1046` or `x & ~y`. The encoder never sees a value,
-so a function is all a tier can hand on, and of the evaluator's three inputs
-only the essence should carry it. vp is the metric that matters because the
+so a function is all a tier can hand on, and of the evaluator's inputs only
+the essence should carry it. vp is the metric that matters because the
 essence is what a future T3 consumes: a next tier can only recover what this
 one preserved.
 
 **A second score checks that only the essence carries the function.** An
 output's function could also reach the evaluator by another route, a *leak*.
-Two routes exist in principle: the pointer is an output's position when the
-chunk's outputs are ordered by a fixed projection of their descriptions, so
-its position carries a little of what the output computes, and the input
-colours carry the wiring. To test for a leak,
-`probes/frame_scorecard.py` scores every output a second time, handing the
-evaluator another chunk's essence while keeping the output's own pointer and
-inputs, and reports that exact-match rate as the *leak check*. With no leak,
+The route that exists in principle is the input colours, which carry the
+wiring. To test for a leak, `probes/frame_scorecard.py` scores every output a
+second time, handing the evaluator another chunk's essence while keeping the
+chunk's own inputs, and reports that exact-match rate as the *leak check*. With no leak,
 the evaluator is now evaluating some other chunk's function and the rate
 collapses. It does not reach zero, because two different functions agree on
 some input values (two comparisons that both return 0); that chance floor is
@@ -314,10 +309,12 @@ same kind of quantity:
 - **behavioral** — a chunk against a variant with a commutative instruction's
   operands swapped, which never changes the chunk's function. The row is two
   populations (`probes/swap_classes.py`, `probes/frame_scorecard.py`):
-  swaps of fresh operands with a third-register destination, or with an
-  aliased destination, which are invariant by construction and read float
-  noise; and swaps whose operand is already another instruction's input or
-  result, which only the op-cell's training can collapse. The row's mean is
+  swaps of fresh operands with a third-register destination, which are
+  invariant by construction and read float noise; and swaps whose
+  destination is a swapped operand, or whose operand is already another
+  instruction's input or result, which only the op-cell's training can
+  collapse — with an aliased destination the pool reads the overwritten
+  leaf's colour, which names the operand role the swap moves. The row's mean is
   mostly the first population's zeros, so a small value does not say the
   second collapses — the probes report it separately.
 - **distinct** — unrelated chunks. The separation denominator.

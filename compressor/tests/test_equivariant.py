@@ -174,7 +174,7 @@ def test_head_on_touched_slots_matches_the_dense_head():
     from compressor.model import apply_head_touched
     torch.manual_seed(0)
     core = RegisterStateMachine(d_value=16, d_event=4, d_content=6, n_regs=32)
-    head = torch.nn.Sequential(torch.nn.Linear(16 + 4 + core.d_colour + core.d_ptr, 8), torch.nn.ReLU(),
+    head = torch.nn.Sequential(torch.nn.Linear(16 + 4 + core.d_colour, 8), torch.nn.ReLU(),
                                torch.nn.Linear(8, 1))
     B, K = 5, 3
     content = torch.randn(B, K, 6)
@@ -222,3 +222,14 @@ def test_head_shapes():
 def test_chunk_shape(chunk, shape):
     from compressor.eval import _chunk_shape
     assert _chunk_shape([Instruction(*i) for i in chunk]) == shape
+
+
+def test_an_output_overwriting_its_input_differs_from_a_copy():
+    """`ADDI x7,x7,1` and `ADDI x8,x7,1` write one description; the essence
+    must still tell in place from copy, a rename-invariant fact."""
+    m = _model()
+    tok, pad, in0, in1, out = _tokenize([Instruction('ADDI', 7, 7, 1),
+                                         Instruction('ADDI', 8, 7, 1)])
+    with torch.no_grad():
+        _, ess = m.encode_state(tok, pad, in0, in1, out)
+    assert (ess[0] - ess[1]).abs().max().item() > 1e-3

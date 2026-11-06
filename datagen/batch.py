@@ -9,8 +9,9 @@ targets. Losses see different views of the same batch:
   - Validity magnitude:
         for c in chunks:
             loss += (||encode(c.tokens)|| - (1.0 if c.valid else 0.0)) ** 2
-  - Value prediction: predict each output's value per anchor from the
-    essence and the output's input values (out_values / out_input_values).
+  - Value prediction: predict every output's value per anchor from the
+    essence and the chunk's input values in canonical role order (out_values /
+    in_roles / in_role_values).
   - Register-identity aux reads the per-row aux targets (live_in/out masks,
     slot regs).
 
@@ -21,6 +22,7 @@ generation time when the source list[Instruction] is still in hand.
 """
 
 import struct
+import zlib
 from dataclasses import dataclass
 
 import numpy as np
@@ -30,9 +32,8 @@ from tokenizer.tokenizer import MAX_INSTR_TOKENS
 
 from .compare import (
     AUX_CE_IGNORE, MAX_INPUT_SLOTS, MAX_OUTPUT_SLOTS, N_REGS, N_WITNESS,
-    precompute_chunk,
+    n_positions, placements, precompute_chunk,
 )
-from .knownbits import output_known_bits
 from .generate import (
     chain_group, collect_groups, random_instruction,
 )
@@ -61,8 +62,14 @@ class BinaryFormat:
     Per batch:
       prefix: 4-byte magic + N dtype chars
       header: one uint32 per symbolic dimension
-      body:   the body fields as contiguous raw arrays
+      length: uint64, the compressed body's size
+      body:   the body fields as contiguous raw arrays, zlib-compressed
+              (level 1). The distance fields repeat shared witness columns
+              across positions and placements, so a len-2 batch shrinks about
+              18x, and a trainer's main thread moves only the compressed bytes.
     """
+
+    _LEN = struct.Struct('<Q')
 
     def __init__(self, magic, header_fields, body_fields, header_bounds=None):
         if len(magic) != 4:
@@ -182,8 +189,27 @@ class BinaryFormat:
         f.write(self._prefix_struct.pack(self.magic, self._dtype_chars))
         f.write(self._header_struct.pack(
             *[header[n] for n in self.header_fields]))
-        for fld in self.body_fields:
-            f.write(getattr(batch, fld.name).tobytes())
+        body = zlib.compress(b''.join(
+            np.ascontiguousarray(getattr(batch, fld.name)).tobytes()
+            for fld in self.body_fields), 1)
+        f.write(self._LEN.pack(len(body)))
+        f.write(body)
+
+    def _read_body(self, f, header_vals):
+        """The compressed body after a header, validated against the size the
+        header implies."""
+        lb = f.read(self._LEN.size)
+        if len(lb) < self._LEN.size:
+            raise EOFError(f'Truncated body length ({len(lb)} bytes)')
+        (n,) = self._LEN.unpack(lb)
+        size = self.body_size(*header_vals)
+        if n > size + 1024 + size // 100:
+            raise ValueError(f'Invalid {self.name} body length {n} for a '
+                             f'{size}-byte body')
+        body = f.read(n) if n else b''
+        if len(body) < n:
+            raise EOFError(f'Truncated body (got {len(body)}, expected {n})')
+        return lb + body
 
     def read_batch(self, f, batch_class):
         if self._read_prefix(f) is None:
@@ -195,17 +221,18 @@ class BinaryFormat:
         header_vals = self._header_struct.unpack(header_buf)
         self._check_header_bounds(header_vals)
         header = dict(zip(self.header_fields, header_vals))
-        kwargs = {}
+        raw = zlib.decompress(self._read_body(f, header_vals)[self._LEN.size:])
+        if len(raw) != self.body_size(*header_vals):
+            raise ValueError(f'Invalid {self.name} body: {len(raw)} bytes, '
+                             f'header implies {self.body_size(*header_vals)}')
+        kwargs, off = {}, 0
         for fld in self.body_fields:
             shape = self._shape(fld, header)
             n_bytes = int(np.prod(shape)) * fld.dtype.itemsize
-            buf = f.read(n_bytes) if n_bytes > 0 else b''
-            if n_bytes > 0 and len(buf) < n_bytes:
-                raise EOFError(
-                    f'Truncated body for {fld.name} '
-                    f'(got {len(buf)}, expected {n_bytes})')
             kwargs[fld.name] = np.frombuffer(
-                buf, dtype=fld.dtype).reshape(shape).copy()
+                raw, dtype=fld.dtype, count=int(np.prod(shape)),
+                offset=off).reshape(shape).copy()
+            off += n_bytes
         return batch_class(**kwargs)
 
     def read_batch_bytes(self, f):
@@ -218,12 +245,7 @@ class BinaryFormat:
                 f'Truncated batch header ({len(header_buf)} bytes)')
         header_vals = self._header_struct.unpack(header_buf)
         self._check_header_bounds(header_vals)
-        body_size = self.body_size(*header_vals)
-        body = f.read(body_size) if body_size > 0 else b''
-        if body_size > 0 and len(body) < body_size:
-            raise EOFError(
-                f'Truncated body (got {len(body)}, expected {body_size})')
-        return prefix + header_buf + body
+        return prefix + header_buf + self._read_body(f, header_vals)
 
     def reader(self, f, batch_class):
         while True:
@@ -277,44 +299,48 @@ class Batch:
     # Per output slot, the external input registers it depends on, in the
     # order the evaluator gathers their values (AUX_CE_IGNORE padded).
     out_inputs:     np.ndarray   # (B, MAX_OUTPUT_SLOTS, MAX_INPUT_SLOTS) int8
-    # Per output slot (aligned with out_slot_regs) at each anchor state: the
-    # output's value after the chunk — the value-prediction target — and the
-    # values of its inputs in out_inputs order, 0 past the last. Each row is
-    # executed from one structured draw placed on its own input registers;
-    # these are everything value prediction reads of that execution. Computed
-    # in the gen workers. OB = B; out_regs_valid marks decodable non-mem rows.
+    # The chunk's inputs in canonical role order (`datagen.roles`;
+    # AUX_CE_IGNORE padded), and at each anchor state each output's value after
+    # the chunk (aligned with out_slot_regs) — the value-prediction target —
+    # and the values of those inputs, 0 past the last. Each row is executed
+    # from one structured draw placed on its own input registers; these are
+    # everything value prediction reads of that execution. Computed in the
+    # gen workers. OB = B; out_regs_valid marks decodable non-mem rows.
+    in_roles:         np.ndarray   # (B, n_positions) int8
     out_values:       np.ndarray   # (OB, n_anchors, max_n_instrs) int32
-    out_input_values: np.ndarray   # (OB, n_anchors, max_n_instrs, max_out_inputs) int32
+    in_role_values:   np.ndarray   # (OB, n_anchors, n_positions) int32
     out_regs_valid:   np.ndarray   # (OB,) bool
-    # The behavioral distance's fields, per output in CANONICAL output order
-    # (not aligned with out_slot_regs): each output's value at every shared
-    # witness state (`datagen.compare.witness_states`), the chunk's inputs
-    # placed by canonical role (`datagen.roles`), and the bits of the output
-    # forced to 0 / to 1 whatever the inputs hold
-    # (`datagen.knownbits.output_known_bits`), as 32-bit masks. All 0 past the
-    # last output or out of the analysis' scope. A chunk writes at most one
-    # register per instruction, hence max_n_instrs positions.
-    out_known_zero: np.ndarray   # (B, max_n_instrs) int64
-    out_known_one:  np.ndarray   # (B, max_n_instrs) int64
-    out_witness:    np.ndarray   # (B, max_n_instrs, N_WITNESS) int32
-    # How many of those positions hold an output: the chunk's outputs less its
-    # same-value writes, which the distance does not count.
-    n_witness:      np.ndarray   # (B,) int8
+    # The behavioral distance's fields (`datagen.compare.Precomputed.rf_*`):
+    # each row's register file after the chunk at the shared witness states,
+    # under every placement of its canonical inputs on the n_positions
+    # register positions — the final value on each position, and of each
+    # register written but not read — with the bits each column never changes
+    # and each written-only register's squared distance from its old value.
+    # n_wo counts the written-only registers. All 0 on rows without targets.
+    rf_pos:      np.ndarray   # (B, n_places, n_positions, N_WITNESS) int32
+    rf_pos_zero: np.ndarray   # (B, n_places, n_positions) int64
+    rf_pos_one:  np.ndarray   # (B, n_places, n_positions) int64
+    rf_wo:       np.ndarray   # (B, n_places, max_n_instrs, N_WITNESS) int32
+    rf_wo_zero:  np.ndarray   # (B, max_n_instrs) int64
+    rf_wo_one:   np.ndarray   # (B, max_n_instrs) int64
+    rf_wo_free:  np.ndarray   # (B, max_n_instrs) float32
+    n_wo:        np.ndarray   # (B,) int8
 
 
 RVT_FORMAT = BinaryFormat(
     magic=b'RVT\x00',
     header_fields=['B', 'max_tokens', 'max_n_instrs', 'n_anchors', 'OB',
-                   'max_out_inputs'],
+                   'n_places', 'n_positions'],
     body_fields=[
         BodyField('tokens', np.dtype(np.int8), ('B', 'max_tokens')),
         BodyField('token_lens', np.dtype(np.int32), ('B',)),
         BodyField('valid', np.dtype(np.bool_), ('B',)),
         BodyField('instr_lens', np.dtype(np.int32), ('B', 'max_n_instrs')),
+        BodyField('in_roles', np.dtype(np.int8), ('B', 'n_positions')),
         BodyField('out_values', np.dtype(np.int32),
                   ('OB', 'n_anchors', 'max_n_instrs')),
-        BodyField('out_input_values', np.dtype(np.int32),
-                  ('OB', 'n_anchors', 'max_n_instrs', 'max_out_inputs')),
+        BodyField('in_role_values', np.dtype(np.int32),
+                  ('OB', 'n_anchors', 'n_positions')),
         BodyField('out_regs_valid', np.dtype(np.bool_), ('OB',)),
         BodyField('live_in_mask', np.dtype(np.bool_), ('B', N_REGS)),
         BodyField('live_out_mask', np.dtype(np.bool_), ('B', N_REGS)),
@@ -325,11 +351,16 @@ RVT_FORMAT = BinaryFormat(
                   ('B', MAX_OUTPUT_SLOTS)),
         BodyField('out_inputs', np.dtype(np.int8),
                   ('B', MAX_OUTPUT_SLOTS, MAX_INPUT_SLOTS)),
-        BodyField('out_known_zero', np.dtype(np.int64), ('B', 'max_n_instrs')),
-        BodyField('out_known_one', np.dtype(np.int64), ('B', 'max_n_instrs')),
-        BodyField('out_witness', np.dtype(np.int32),
-                  ('B', 'max_n_instrs', N_WITNESS)),
-        BodyField('n_witness', np.dtype(np.int8), ('B',)),
+        BodyField('rf_pos', np.dtype(np.int32),
+                  ('B', 'n_places', 'n_positions', N_WITNESS)),
+        BodyField('rf_pos_zero', np.dtype(np.int64), ('B', 'n_places', 'n_positions')),
+        BodyField('rf_pos_one', np.dtype(np.int64), ('B', 'n_places', 'n_positions')),
+        BodyField('rf_wo', np.dtype(np.int32),
+                  ('B', 'n_places', 'max_n_instrs', N_WITNESS)),
+        BodyField('rf_wo_zero', np.dtype(np.int64), ('B', 'max_n_instrs')),
+        BodyField('rf_wo_one', np.dtype(np.int64), ('B', 'max_n_instrs')),
+        BodyField('rf_wo_free', np.dtype(np.float32), ('B', 'max_n_instrs')),
+        BodyField('n_wo', np.dtype(np.int8), ('B',)),
     ],
     # Sanity bounds on the dimension header — reject a torn/corrupt stream
     # whose dims are garbage before sizing a read off them.
@@ -339,7 +370,8 @@ RVT_FORMAT = BinaryFormat(
         'max_n_instrs': (1, 100_000),
         'n_anchors': (0, 256),
         'OB': (0, 1_000_000),
-        'max_out_inputs': (1, MAX_INPUT_SLOTS),
+        'n_places': (1, 40320),
+        'n_positions': (1, MAX_INPUT_SLOTS),
     },
 )
 
@@ -359,8 +391,7 @@ class AuxPayload:
     in_slot_regs: np.ndarray    # (actual_B, MAX_INPUT_SLOTS) int8
     out_slot_regs: np.ndarray   # (actual_B, MAX_OUTPUT_SLOTS) int8
     out_inputs: np.ndarray      # (actual_B, MAX_OUTPUT_SLOTS, MAX_INPUT_SLOTS) int8
-    out_witness: np.ndarray     # (actual_B, MAX_OUTPUT_SLOTS, N_WITNESS) int32
-    witness_slots: np.ndarray   # (actual_B, MAX_OUTPUT_SLOTS) int8
+    precomputed: list           # per row, its Precomputed (in_roles, rf_*) or None
 
 
 def _empty_aux(n):
@@ -377,8 +408,7 @@ def _empty_aux(n):
                               dtype=np.int8),
         out_inputs=np.full((n, MAX_OUTPUT_SLOTS, MAX_INPUT_SLOTS),
                            AUX_CE_IGNORE, dtype=np.int8),
-        out_witness=np.zeros((n, MAX_OUTPUT_SLOTS, N_WITNESS), dtype=np.int32),
-        witness_slots=np.full((n, MAX_OUTPUT_SLOTS), -1, dtype=np.int8),
+        precomputed=[None] * n,
     )
 
 
@@ -396,30 +426,23 @@ def _aux_from_precomputeds(precomputeds):
         aux.in_slot_regs[i] = pre.in_slot_regs
         aux.out_slot_regs[i] = pre.out_slot_regs
         aux.out_inputs[i] = pre.out_inputs
-        aux.out_witness[i] = pre.witness
-        aux.witness_slots[i] = pre.witness_slots
+        aux.precomputed[i] = pre
     return aux
 
 
-def max_out_inputs(max_n_instrs):
-    """Inputs one output of a max_n_instrs-instruction chunk can depend on."""
-    return min(max_n_instrs + 1, MAX_INPUT_SLOTS)
-
-
 def _values_from_precomputeds(precomputeds, n_anchors, max_n_instrs):
-    """Each row's per-output values and input values at its anchors, padded to
-    (n, n_anchors, max_n_instrs[, max_out_inputs]). None rows (invalid /
-    mem-op) are zeros with valid=False."""
-    n, I = len(precomputeds), max_out_inputs(max_n_instrs)
+    """Each row's per-output values and role-ordered input values at its
+    anchors, padded to (n, n_anchors, max_n_instrs) and (n, n_anchors,
+    n_positions). None rows (invalid / mem-op) are zeros with valid=False."""
+    n, P = len(precomputeds), n_positions(max_n_instrs)
     values = np.zeros((n, n_anchors, max_n_instrs), dtype=np.int32)
-    inputs = np.zeros((n, n_anchors, max_n_instrs, I), dtype=np.int32)
+    inputs = np.zeros((n, n_anchors, P), dtype=np.int32)
     valid = np.zeros(n, dtype=bool)
     for i, pre in enumerate(precomputeds):
         if pre is None:
             continue
-        k, j = pre.out_input_values.shape[1:]
-        values[i, :, :k] = pre.out_values
-        inputs[i, :, :k, :min(j, I)] = pre.out_input_values[..., :I]
+        values[i, :, :pre.out_values.shape[1]] = pre.out_values
+        inputs[i, :, :len(pre.in_roles)] = pre.in_role_values
         valid[i] = True
     return values, inputs, valid
 
@@ -427,7 +450,7 @@ def _values_from_precomputeds(precomputeds, n_anchors, max_n_instrs):
 def pack_batch(chunks, *,
                target_B, target_max_tokens,
                target_max_n_instrs,
-               out_values=None, out_input_values=None, out_regs_valid=None,
+               out_values=None, in_role_values=None, out_regs_valid=None,
                aux_payload=None):
     """Build a Batch from chunks and their per-output value targets.
 
@@ -493,23 +516,23 @@ def pack_batch(chunks, *,
             for j, instr in enumerate(c.instructions):
                 instr_lens[i, j] = len(encode_instruction(instr))
 
-    I = max_out_inputs(max_n_instrs)
+    P = n_positions(max_n_instrs)
     if out_values is None:
         values_arr = np.zeros((0, 0, max_n_instrs), dtype=np.int32)
-        inputs_arr = np.zeros((0, 0, max_n_instrs, I), dtype=np.int32)
+        inputs_arr = np.zeros((0, 0, P), dtype=np.int32)
         out_regs_valid_arr = np.zeros((0,), dtype=bool)
     else:
         n_anchors = out_values.shape[1]
         if (out_values.shape != (actual_B, n_anchors, max_n_instrs)
-                or out_input_values.shape != (actual_B, n_anchors, max_n_instrs, I)):
+                or in_role_values.shape != (actual_B, n_anchors, P)):
             raise ValueError(
-                f'out_values {out_values.shape} / out_input_values '
-                f'{out_input_values.shape} must be (actual_B={actual_B}, '
-                f'n_anchors, {max_n_instrs}[, {I}])')
+                f'out_values {out_values.shape} / in_role_values '
+                f'{in_role_values.shape} must be (actual_B={actual_B}, '
+                f'n_anchors, {max_n_instrs} / {P})')
         values_arr = np.zeros((B, n_anchors, max_n_instrs), dtype=np.int32)
         values_arr[:actual_B] = out_values
-        inputs_arr = np.zeros((B, n_anchors, max_n_instrs, I), dtype=np.int32)
-        inputs_arr[:actual_B] = out_input_values
+        inputs_arr = np.zeros((B, n_anchors, P), dtype=np.int32)
+        inputs_arr[:actual_B] = in_role_values
         out_regs_valid_arr = np.zeros((B,), dtype=bool)
         out_regs_valid_arr[:actual_B] = out_regs_valid
 
@@ -531,29 +554,30 @@ def pack_batch(chunks, *,
     out_inputs_arr = np.full((B, MAX_OUTPUT_SLOTS, MAX_INPUT_SLOTS),
                              AUX_CE_IGNORE, dtype=np.int8)
     out_inputs_arr[:actual_B] = aux.out_inputs
-    witness = np.zeros((B, max_n_instrs, N_WITNESS), dtype=np.int32)
-    witness[:actual_B] = aux.out_witness[:, :max_n_instrs]
-    n_witness = np.zeros(B, dtype=np.int8)
-    n_witness[:actual_B] = (aux.witness_slots >= 0).sum(1)
-    known_zero = np.zeros((B, max_n_instrs), dtype=np.int64)
-    known_one = np.zeros((B, max_n_instrs), dtype=np.int64)
-    for i, c in enumerate(chunks):
-        if not (c.valid and c.instructions):
+    S = len(placements(P))
+    in_roles = np.full((B, P), AUX_CE_IGNORE, dtype=np.int8)
+    for i, pre in enumerate(aux.precomputed):
+        if pre is not None:
+            in_roles[i, :len(pre.in_roles)] = pre.in_roles
+    rf = dict(rf_pos=np.zeros((B, S, P, N_WITNESS), dtype=np.int32),
+              rf_pos_zero=np.zeros((B, S, P), dtype=np.int64),
+              rf_pos_one=np.zeros((B, S, P), dtype=np.int64),
+              rf_wo=np.zeros((B, S, max_n_instrs, N_WITNESS), dtype=np.int32),
+              rf_wo_zero=np.zeros((B, max_n_instrs), dtype=np.int64),
+              rf_wo_one=np.zeros((B, max_n_instrs), dtype=np.int64),
+              rf_wo_free=np.zeros((B, max_n_instrs), dtype=np.float32),
+              n_wo=np.zeros(B, dtype=np.int8))
+    for i, pre in enumerate(aux.precomputed):
+        if pre is None:
             continue
-        try:
-            kb = output_known_bits(c.instructions)
-        except NotImplementedError:
-            continue
-        for p in range(max_n_instrs):
-            k = int(aux.witness_slots[i, p])
-            r = int(out_slot_arr[i, k]) if k >= 0 else AUX_CE_IGNORE
-            if r != AUX_CE_IGNORE and r in kb:
-                known_zero[i, p], known_one[i, p] = kb[r].zero, kb[r].one
+        for k in rf:
+            rf[k][i] = getattr(pre, k)
 
     return Batch(tokens=tokens, token_lens=token_lens, valid=valid,
                  instr_lens=instr_lens,
                  out_values=values_arr,
-                 out_input_values=inputs_arr,
+                 in_roles=in_roles,
+                 in_role_values=inputs_arr,
                  out_regs_valid=out_regs_valid_arr,
                  live_in_mask=live_in_arr,
                  live_out_mask=live_out_arr,
@@ -561,10 +585,7 @@ def pack_batch(chunks, *,
                  in_slot_regs=in_slot_arr,
                  out_slot_regs=out_slot_arr,
                  out_inputs=out_inputs_arr,
-                 out_known_zero=known_zero,
-                 out_known_one=known_one,
-                 out_witness=witness,
-                 n_witness=n_witness)
+                 **rf)
 
 
 def padding_mask(batch):
@@ -615,7 +636,7 @@ def build_targets(chunks, draw_anchors, max_n_instrs, aim=None):
     row's draw to straddle that chunk's boundaries (`datagen.aim`) before it
     is executed.
 
-    Returns (aux, out_values, out_input_values, out_regs_valid): aux is the
+    Returns (aux, out_values, in_role_values, out_regs_valid): aux is the
     parallel AuxPayload; the rest is `_values_from_precomputeds`, padded to
     max_n_instrs output slots.
     """
@@ -627,7 +648,7 @@ def build_targets(chunks, draw_anchors, max_n_instrs, aim=None):
             states = drawn[n_drawn]
             if aim is not None:
                 states = aim(ch.instructions, states)
-            aux_pre.append(precompute_chunk(ch.instructions, states))
+            aux_pre.append(precompute_chunk(ch.instructions, states, max_n_instrs))
             n_drawn += 1
         else:
             aux_pre.append(None)
@@ -731,7 +752,7 @@ def collect_into_batches(chunks_iter, *, batch_size, draw_anchors, aim=None,
             partners = [_make_valid_chunk(instrs) for _ in range(n_pairs)
                         for instrs in partner_sampler()]
             mixed = valid + partners + invalids
-            aux, out_values, out_input_values, out_regs_valid = build_targets(
+            aux, out_values, in_role_values, out_regs_valid = build_targets(
                 mixed, draw_anchors=draw_anchors,
                 max_n_instrs=target_max_n_instrs, aim=aim)
             yield pack_batch(
@@ -740,6 +761,6 @@ def collect_into_batches(chunks_iter, *, batch_size, draw_anchors, aim=None,
                 target_max_tokens=target_max_tokens,
                 target_max_n_instrs=target_max_n_instrs,
                 out_values=out_values,
-                out_input_values=out_input_values,
+                in_role_values=in_role_values,
                 out_regs_valid=out_regs_valid,
                 aux_payload=aux)

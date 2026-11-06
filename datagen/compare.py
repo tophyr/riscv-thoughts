@@ -19,6 +19,7 @@ V1 scope: ALU R/I-type, LUI, AUIPC, B-type, JAL, JALR. Memory ops
 """
 
 import functools
+import itertools
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -28,6 +29,7 @@ from emulator import (
 )
 from .signature import leaf_colours, output_inputs
 from .roles import canonical_inputs
+from .knownbits import column_distance, observed_bits
 
 
 # ---------------------------------------------------------------------------
@@ -382,34 +384,67 @@ def heldout_anchor_states(n_states=HELDOUT_N_ANCHORS):
 
 
 # Shared witness states for the behavioral distance between rows: a fixed
-# structured draw no training anchor or held-out set uses. Every output is
-# executed at all of them, so two rows' outputs are compared at equal inputs.
+# structured draw no training anchor or held-out set uses, each state's
+# registers shuffled so no register position is special — the distance takes
+# a minimum over placements, which is unbiased only if every placement sees
+# the same distribution. Every row is executed at all of them, so two rows are
+# compared at equal inputs.
 WITNESS_SEED = 0x51D0
 N_WITNESS = 64
 _WITNESS = []
 
+# The bound family: a larger draw of the same kind, at which the bits an
+# output never changes are read, so the range a per-state difference is
+# measured against is a function of the chunk's behaviour, not its spelling.
+BOUND_SEED = 0xB0D5
+N_BOUND = 1024
+_BOUND = []
 
-_DISTINCT = []
+# A register no placement uses: its column is the value a register held before
+# a chunk that writes it without reading it.
+FRESH_COL = N_REGS - 1
+
+# Placements are enumerated over at most this many positions (two-instruction
+# chunks); beyond it only the canonical placement is shipped.
+MAX_PLACED_POSITIONS = 4
 
 
-def _distinct_states():
-    """(16, 32) register files of independent uniform values, x0 = 0: every
-    register holds values of its own, so an output equal to its register's
-    input at all of them rewrote it with what it held."""
-    if not _DISTINCT:
-        v = np.random.default_rng(0x5A3E).integers(
-            np.iinfo(np.int32).min, np.iinfo(np.int32).max, (16, 32), endpoint=True)
-        v[:, 0] = 0
-        _DISTINCT.append(v.astype(np.int32))
-    return _DISTINCT[0]
+def _exchangeable_draw(seed, n):
+    rng = np.random.default_rng(seed)
+    s = draw_anchor_states(rng, n)
+    for i in range(n):
+        s[i, 1:] = s[i, 1 + rng.permutation(N_REGS - 1)]
+    return s
 
 
 def witness_states():
     """The (N_WITNESS, 32) int32 witness states, drawn once."""
     if not _WITNESS:
-        _WITNESS.append(draw_anchor_states(np.random.default_rng(WITNESS_SEED),
-                                           N_WITNESS))
+        _WITNESS.append(_exchangeable_draw(WITNESS_SEED, N_WITNESS))
     return _WITNESS[0]
+
+
+def bound_states():
+    """The (N_BOUND, 32) int32 states output bounds are read at, drawn once."""
+    if not _BOUND:
+        _BOUND.append(_exchangeable_draw(BOUND_SEED, N_BOUND))
+    return _BOUND[0]
+
+
+def n_positions(max_len):
+    """Register positions a row of a max_len-instruction corpus is placed on:
+    one per input a chunk can read."""
+    return 2 * max_len
+
+
+def placements(n_pos):
+    """Every assignment of a chunk's canonical inputs to the n_pos positions
+    (permutations of range(n_pos); input i takes position perm[i]), the
+    canonical placement first. Only the canonical one past
+    MAX_PLACED_POSITIONS."""
+    if n_pos > MAX_PLACED_POSITIONS:
+        return [tuple(range(n_pos))]
+    return list(itertools.permutations(range(n_pos)))
 
 
 def _canonical_state(anchor_states, inputs, canon_positions):
@@ -681,20 +716,30 @@ class Precomputed:
     # registers that output depends on, in the canonical role order the
     # evaluator gathers their values in (`datagen.roles`, ties by colour).
     out_inputs: np.ndarray       # (MAX_OUTPUT_SLOTS, MAX_INPUT_SLOTS) int8
-    # The chunk's outputs at each witness state, with its p-th input in
-    # canonical role order (`datagen.roles`) holding the state's position p+1
-    # and every other register 0, listed in canonical output order (sorted by
-    # these values); same-value writes are not outputs here. witness_slots[p]
-    # is position p's output slot, -1 past the last. The behavioral distance
-    # compares rows here.
-    witness: np.ndarray          # (MAX_OUTPUT_SLOTS, N_WITNESS) int32
-    witness_slots: np.ndarray    # (MAX_OUTPUT_SLOTS,) int8
-    # Per output slot, at each anchor: its value after the chunk, and the
-    # values of its inputs in out_inputs order (0 past the last) — all value
-    # prediction reads of the register files above. A chunk of K instructions
-    # writes at most K registers, each depending on at most K+1 inputs.
+    # The chunk's register file after it, at each witness state, for the
+    # behavioral distance (RISCV_DESIGN, "Collapse"). Under placement s
+    # (`placements`) canonical input i takes position perm_s[i], the state's
+    # column perm_s[i]+1. rf_pos[s, p] is the final value of the register on
+    # position p — its new value if the chunk wrote it, else the value placed
+    # there — and rf_wo[s, j] the j-th register written but not an input.
+    # Bits constant across the bound family, at the canonical placement, bound
+    # each column; rf_wo_free is the squared distance of each written-only
+    # register from the value it held before the chunk.
+    rf_pos: np.ndarray           # (S, P, N_WITNESS) int32
+    rf_pos_zero: np.ndarray      # (S, P) int64
+    rf_pos_one: np.ndarray       # (S, P) int64
+    rf_wo: np.ndarray            # (S, max_len, N_WITNESS) int32
+    rf_wo_zero: np.ndarray       # (max_len,) int64
+    rf_wo_one: np.ndarray        # (max_len,) int64
+    rf_wo_free: np.ndarray       # (max_len,) float32
+    n_wo: int
+    # At each anchor: each output's value after the chunk (aligned with
+    # out_slot_regs), and the values of the chunk's inputs in canonical role
+    # order (`in_roles`) — all value prediction reads of the register files
+    # above. A chunk of K instructions writes at most K registers.
     out_values: np.ndarray       # (n_states, K) int32
-    out_input_values: np.ndarray  # (n_states, K, K+1) int32
+    in_roles: list               # the chunk's inputs in canonical role order
+    in_role_values: np.ndarray   # (n_states, len(in_roles)) int32
     pc_explicit: bool            # does any live SSA op write PC
     # Per-row aux targets (T2 register-identity supervision).
     live_in_mask: np.ndarray     # (N_REGS,) bool — behavioral inputs as mask
@@ -703,9 +748,11 @@ class Precomputed:
     out_slot_regs: np.ndarray    # (MAX_OUTPUT_SLOTS,) int8 — reg or AUX_CE_IGNORE
 
 
-def precompute_chunk(chunk, anchor_states):
+def precompute_chunk(chunk, anchor_states, max_len=None):
     """Structural labels from the fixed witness states, and execution at
-    `anchor_states` for the value-prediction target.
+    `anchor_states` for the value-prediction target. `max_len` is the
+    corpus's chunk-length cap, which fixes the distance fields' positions
+    (default: this chunk's length).
 
     `anchor_states` is a structured draw whose copies, near-immediate and
     boundary values sit at positions 1, 2, …; it is placed onto the chunk's
@@ -762,24 +809,16 @@ def precompute_chunk(chunk, anchor_states):
                            key=lambda r: ssa.output_versions[r])
     out_slot_regs = np.full(MAX_OUTPUT_SLOTS, AUX_CE_IGNORE, dtype=np.int8)
     deps = output_inputs(chunk)
-    w = witness_states()
-    witness = np.zeros((MAX_OUTPUT_SLOTS, N_WITNESS), dtype=np.int32)
     n_states, K = state.shape[0], len(chunk)
     out_values = np.zeros((n_states, K), dtype=np.int32)
-    out_input_values = np.zeros((n_states, K, K + 1), dtype=np.int32)
     outs = write_ordered[:MAX_OUTPUT_SLOTS]
-    execute = lambda regs, rs: (_eval_ssa_numpy(ssa, len(chunk), regs, live)[0][:, rs]
-                                .astype(np.int64) & 0xFFFFFFFF)
-    # A same-value write leaves its register holding what it held, whatever
-    # that was: behaviourally no output, so the distance does not count it.
-    distinct = _distinct_states()
-    kept = execute(distinct, outs) != (distinct[:, outs].astype(np.int64) & 0xFFFFFFFF)
-    real = [r for r, k in zip(outs, kept.any(0)) if k]
-    run = lambda regs: execute(regs, real)
+    execute = lambda regs: _eval_ssa_numpy(ssa, len(chunk), regs, live)[0]
     colour = leaf_colours(chunk)
     rank = lambda r: (colour.get(r, ''), r)
-    roles = (canonical_inputs(sorted({x for r in real for x in deps[r]}), run, rank)
-             if real else [])
+    run = lambda regs: execute(regs)[:, outs].astype(np.int64) & 0xFFFFFFFF
+    roles = (canonical_inputs(sorted({x for r in outs for x in deps[r]}), run, rank,
+                              execute)
+             if outs else [])
     # Each output's inputs in canonical role order, the evaluator's positions;
     # an input the fingerprints show no effect of follows, by colour.
     position = {r: p for p, r in enumerate(roles)}
@@ -790,20 +829,7 @@ def precompute_chunk(chunk, anchor_states):
                                                  position.get(x, 0), rank(x)))
         for j, src in enumerate(ordered[:MAX_INPUT_SLOTS]):
             out_inputs[i, j] = src
-            out_input_values[:, i, j] = state[:, src]
-    placed = np.zeros_like(w)
-    for p, r in enumerate(roles):
-        placed[:, r] = w[:, p + 1]
-    witness_slots = np.full(MAX_OUTPUT_SLOTS, -1, dtype=np.int8)
-    if real:
-        at_witness = run(placed).astype(np.uint32).view(np.int32)  # (N_WITNESS, real)
-        # Equivalent chunks have identical output vectors, so a byte sort pairs
-        # them exactly; for different chunks it is arbitrary (RISCV_DESIGN, "Collapse").
-        order = sorted(range(len(real)), key=lambda k: at_witness[:, k].tobytes())
-        for p, k in enumerate(order):
-            witness[p] = at_witness[:, k]
-            witness_slots[p] = outs.index(real[k])
-
+    rf = _register_file_fields(execute, roles, outs, max_len or len(chunk))
     return Precomputed(
         inputs=inputs,
         behavioral_inputs=behavioral_inputs,
@@ -811,13 +837,68 @@ def precompute_chunk(chunk, anchor_states):
         anchors=state,
         out_regs=out_regs,
         out_inputs=out_inputs,
-        witness=witness,
-        witness_slots=witness_slots,
+        **rf,
         out_values=out_values,
-        out_input_values=out_input_values,
+        in_roles=list(roles),
+        in_role_values=state[:, list(roles)].astype(np.int32).reshape(n_states, len(roles)),
         pc_explicit=pc_explicit,
         live_in_mask=live_in_mask,
         live_out_mask=live_out_mask,
         in_slot_regs=in_slot_regs,
         out_slot_regs=out_slot_regs,
     )
+
+
+def _register_file_fields(execute, roles, outs, max_len):
+    """The behavioral distance's fields of one chunk (Precomputed.rf_*):
+    `execute(states)` runs it, `roles` are its canonical inputs, `outs` the
+    registers it writes."""
+    P = n_positions(max_len)
+    perms = placements(P)
+    assert len(roles) <= P, (roles, P)
+    wonly = [r for r in outs if r not in roles]
+    assert len(wonly) <= max_len, (wonly, max_len)
+
+    S, n = len(perms), len(roles)
+    cols = np.array([[pm[i] + 1 for i in range(n)] for pm in perms], dtype=np.int64).reshape(S, n)
+
+    def place(states, s):
+        st = np.zeros_like(states)
+        st[:, roles] = states[:, cols[s]]
+        return st
+
+    w = witness_states()
+    placed = np.zeros((S, N_WITNESS, N_REGS), dtype=w.dtype)
+    placed[:, :, roles] = w[:, cols].transpose(1, 0, 2)
+    fin = execute(placed.reshape(-1, N_REGS)).reshape(S, N_WITNESS, N_REGS)
+    # Every position holds its placed value unless an input sits on it.
+    rf_pos = np.broadcast_to(w[:, 1:P + 1].T, (S, P, N_WITNESS)).copy()
+    if n:
+        sidx = np.arange(S)[:, None]
+        rf_pos[sidx, cols - 1] = fin[:, :, roles].transpose(0, 2, 1)
+    rf_wo = np.zeros((S, max_len, N_WITNESS), dtype=np.int32)
+    if wonly:
+        rf_wo[:, :len(wonly)] = fin[:, :, wonly].transpose(0, 2, 1)
+
+    b = bound_states()
+    fb = execute(place(b, 0))
+    role_bits = [observed_bits(fb[:, r]) for r in roles]
+    prior_bits = [observed_bits(b[:, p + 1]) for p in range(P)]
+    rf_pos_zero = np.zeros((len(perms), P), dtype=np.int64)
+    rf_pos_one = np.zeros((len(perms), P), dtype=np.int64)
+    for s, pm in enumerate(perms):
+        bits = list(prior_bits)
+        for i in range(len(roles)):
+            bits[pm[i]] = role_bits[i]
+        rf_pos_zero[s], rf_pos_one[s] = zip(*bits)
+    rf_wo_zero = np.zeros(max_len, dtype=np.int64)
+    rf_wo_one = np.zeros(max_len, dtype=np.int64)
+    rf_wo_free = np.zeros(max_len, dtype=np.float32)
+    fresh = observed_bits(b[:, FRESH_COL])
+    for j, r in enumerate(wonly):
+        z, o = observed_bits(fb[:, r])
+        rf_wo_zero[j], rf_wo_one[j] = z, o
+        rf_wo_free[j] = column_distance(rf_wo[0, j], (z, o), w[:, FRESH_COL], fresh) ** 2
+    return dict(rf_pos=rf_pos, rf_pos_zero=rf_pos_zero, rf_pos_one=rf_pos_one,
+                rf_wo=rf_wo, rf_wo_zero=rf_wo_zero, rf_wo_one=rf_wo_one,
+                rf_wo_free=rf_wo_free, n_wo=len(wonly))

@@ -4,3 +4,4 @@ numexpr
 pytest
 tinyfive
 torch
+z3-solver

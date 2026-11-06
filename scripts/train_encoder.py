@@ -21,8 +21,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from compressor.train import train_encoder
-from datagen import RVT_FORMAT, Batch
+from compressor.train import raw_batches, train_encoder
+
 from scripts._common import (
     resolve_device, add_common_train_args, open_run_dir)
 
@@ -93,7 +93,7 @@ def main():
     device = resolve_device('auto')
     save_dir, save = open_run_dir(args, 'encoder')
 
-    reader = RVT_FORMAT.reader(sys.stdin.buffer, Batch)
+    reader = raw_batches(sys.stdin.buffer)
 
     encoder, losses = train_encoder(
         reader,

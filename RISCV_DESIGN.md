@@ -269,12 +269,9 @@ Realize the encoder as a register-indexed state machine over the dataflow:
   permutation-invariant **attention pool** over the WRITTEN slots — the
   chunk's multiset of output descriptions (each unwritten slot enters the
   pool as one constant key and value, so only how many slots were written
-  reaches the essence from them), each filed under a **pointer**: a
-  one-hot naming which of the chunk's distinct outputs it is, computed without
-  register names or instruction order (see "Value prediction reads the
-  essence"). The essence holds nothing about where its
+  reaches the essence from them). The essence holds nothing about where its
   inputs sit or in what order anything happened; binding = the per-slot
-  structure, read back by the binding heads, pointers included.
+  structure, read back by the binding heads.
 
 **The pool's per-head value width is a capacity ceiling, separate from the
 essence width.** The pool runs `k` attention heads over the 32 slots and
@@ -321,15 +318,17 @@ alone, and reads/writes are pure one-hot tensor ops. Anything added to the
 pool's input must likewise be register-indexed, or the invariance stops being
 exact.
 
-Each slot carries four channel groups, all placed through the register
+Each slot carries three channel groups, all placed through the register
 one-hots and so all equivariant: **value channels** (set on write, preserved
 on read — the dataflow state the op-cell threads, which makes multi-hop
 value-numbering correct), **event channels** (accumulate read/write events
 with order timestamps, so which registers are read and written, and in what
 order, are recoverable from the emitted object; a pure value-state records
-only writes), the leaf's **colour** (below) and the output's **pointer**
-(see "Value prediction reads the essence"). Only the value channels and the
-pointer reach the pool. The read pulse is content-dependent, so a behaviorally-irrelevant
+only writes), and the leaf's **colour** (below). The value channels and each
+written slot's own colour reach the pool; the colour is nonzero
+exactly when the output overwrote a register the chunk reads, which is what
+tells an in-place write from a copy (see "The behaviour the distance
+measures"). The read pulse is content-dependent, so a behaviorally-irrelevant
 read (`AND rs1,x0`) is distinguishable from a relevant one.
 
 **Operand order is consumed by the op-cell and nowhere else.** The op-cell sees
@@ -457,8 +456,8 @@ x0-write beside live instructions — because the leaf colours and the written
 descriptions are functions of the graph alone and the pool reads written
 slots only. The essence IS a canonical form of the live dataflow graph, with
 every operand role ordered. What is *not* structural and the targets do not
-impose: every commutative swap except one of two fresh inputs, which is a
-rename of them (the op-cell receives its operands in the
+impose: every commutative swap except one of two fresh inputs into a third
+register, which is a rename of them (the op-cell receives its operands in the
 other order and is told nothing about which operations commute), and every
 algebraic equivalence — identities, cancellations, a fold of two literals
 into one. A chunk carrying those is labelled by what it reads and
@@ -471,9 +470,9 @@ feeds which role and which result lands where is the chunk's interface and
 belongs in the binding (WHAT_IS_A_THOUGHT.md, "The Thought and Its
 Interface"), so no input or output is numbered by textual order anywhere in
 the essence's supervision — only the binding heads' order targets use it:
-value prediction is evaluated per written output, handing
-the evaluator the essence, that output's pointer and its inputs' values and
-colours gathered by register (see "Value prediction reads the essence" and
+value prediction is evaluated on every written output at once, handing
+the evaluator the essence and the chunk's inputs' values and colours in
+canonical role order (see "Value prediction reads the essence" and
 "Training"), and the targets are the raw register values. Numbering inputs
 and outputs by first-read and final-write order instead grades the essence on
 one linearization of the chunk and separates reordered, dead-code-bearing and
@@ -486,56 +485,41 @@ register's value after the chunk from the chunk's input values. The next tier
 consumes the essence, so the essence is what value prediction has to grade. An evaluator handed each written slot's own description
 certifies the slots and leaves the pool unshaped: every value is recovered
 while the essences of unrelated chunks barely separate (EXPERIMENT_LOG,
-finding 38). So the evaluator is handed, for each written output, the
-unit-normalized essence, that output's **pointer**, and the values and colours
-of the output's inputs — never the output's own description (`vp_loss`,
-`compressor/train.py`). Each slot's description is then shaped by what the
-essence must carry, and unrelated chunks' essences separate (finding 39).
-Exact evaluation from the essence implies the written
-slots carry their functions: a slot's row is the only route its function has
-into the essence.
+finding 38). So the evaluator is handed the unit-normalized essence and the
+values and colours of the chunk's inputs in canonical role order, and
+predicts every output at once — never an output's own description
+(`vp_loss`, `compressor/train.py`). Each slot's description is then shaped by
+what the essence must carry, and unrelated chunks' essences separate (finding
+39). Exact evaluation from the essence implies the written slots carry their
+functions: a slot's row is the only route its function has into the essence.
 
-**The pointer names an output's function inside the essence without naming
-anything else.** A chunk with two outputs pools two functions into one
-vector, and the evaluator must be told which one it is asked about. An
-output's write rank would say, but write rank is a property of the
-linearization, not of the function. The pointer must be free of register names and of instruction
-order, deterministic, and narrow enough to select a function without
-describing it.
+**The outputs are a set, so the evaluator predicts a set.** A chunk with two
+outputs pools two functions into one vector. Asking the evaluator for one
+output at a time needs a name for that output that is free of register names
+and of instruction order, and every such name is a canonical order of the
+chunk's outputs: the wiring cannot provide it (the wiring of `ADD
+x3,x1,x2; SUB x4,x5,x6` maps onto itself by exchanging the two instructions
+with their registers), and an order taken from the outputs' descriptions,
+filed into the pool, cannot be continuous — a small change that swaps two
+outputs' ranks refiles both, and near-misses that swap sit about 0.3 further
+from their distance targets than those that do not (EXPERIMENT_LOG, "The
+register frame", finding 58; findings 39–46 for the orders tried). So no
+output is named. The evaluator emits one prediction per possible output, and
+the predictions are matched to the chunk's outputs by the assignment of least
+loss (`vp_assignment`: every permutation up to four outputs, greedy past
+that). The readout keeps an order of its own prediction slots; the essence,
+which the next tier consumes, depends on none. Handed every input of the
+chunk and no name for the output, the evaluator has to work out which inputs
+each output reads, so it needs more training to reach the same accuracy: at
+equal steps it fails more often than an evaluator handed each output's own
+inputs by name, and given three times the steps it fails less, with the
+essence's discontinuity at a swap 4–5× smaller (EXPERIMENT_LOG, "The register
+frame", findings 60 and 61).
 
-The leaf colouring cannot serve. It sees only the wiring, and the wiring of
-`ADD x3,x1,x2; SUB x4,x5,x6` maps onto itself by exchanging the two
-instructions with their registers, so no colouring computed from it can tell
-x3 from x4 — only the opcodes can. So the chunk's distinct outputs are ordered
-by a fixed projection of their **descriptions** — each written slot's value
-channels after the last step, which the op-cell computes from the opcodes
-before any pointer enters — and an output's pointer is the one-hot of its
-position in that order (`RegisterStateMachine._pointer`,
-`compressor/model.py`). Two descriptions closer than a fixed tie distance are
-one output and share a position: outputs computing one function from
-symmetric inputs are described alike. The order is a function of the
-descriptions alone, so a rename permutes the pointers with the slots, and a
-reordering of independent instructions or a dead instruction leaves them
-unchanged; outputs that share a pointer answer for each other, since the same
-function applied to each output's own inputs gives both. A chunk of K
-instructions has at most K outputs, so a pointer carries at most log₂ K bits
-about the chunk's content.
-
-Ordering by description is what lets two equivalent chunks with several
-outputs file each function in the same place: once the op-cell describes the
-two spellings of an output alike, they sort alike. An order fixed by a hash of
-each output's dataflow path and opcodes cannot do this, since it reads the
-spelling: a commutative swap of an operand that is shared or composed files
-two equivalent chunks' outputs under different pointers (EXPERIMENT_LOG,
-findings 45 and 46). The description order moves while the descriptions
-train, and settles as they do.
-
-The pool adds each written slot's pointer to its attention key, so it can
-file each output's description where the pointer will look; the pointer rides
-in the emitted state as part of the binding. The evaluator's input colours
-come from the wiring-only colouring, so the only route an output's function
-has to the evaluator is the essence; a scorer checks this by handing each
-output's evaluator another chunk's essence (METRICS.md, "vp").
+The evaluator's input colours come from the wiring-only colouring, so the
+only route an output's function has to the evaluator is the essence; a scorer
+checks this by handing each chunk's evaluator another chunk's essence
+(METRICS.md, "vp").
 
 ### Collapse: a behavioral distance on the essence
 
@@ -552,73 +536,106 @@ orthogonal, and no pair is asked to be anti-aligned, which would make one
 essence the arithmetic opposite of another. Asking unrelated rows to be
 antipodal instead cannot be met — no set of points on a sphere has a mean
 pairwise chord above √2 — and a loss measured on the cosine itself would lose
-its gradient at collapse; the chord keeps it linear there. Equivalent pairs
-are under 1% of a batch's pairs, so the loss averages them and the rest
-separately and adds the two; averaged together, collapse gets almost none of
-the gradient and folds stay apart (EXPERIMENT_LOG, "The register frame",
-findings 48 and 49).
+its gradient at collapse; the chord keeps it linear there.
 
-The behavioral distance compares the two rows' outputs at the same inputs. Both
-are executed at a fixed set of 64 structured witness states (by
-`precompute_chunk` in `datagen`, shipped in the batch as `out_witness`).
-Comparing two chunks needs two correspondences: which input of one receives
-the same value as which input of the other, and which output of one is
-compared with which output of the other. Register numbers cannot supply
-either, since a rename must not change the distance. Each chunk instead puts
-its inputs and its outputs in a **canonical order**, computed from that chunk
-alone, and position p of one chunk is matched with position p of the other.
+No essence geometry meets every target exactly, so the loss decides where the
+leftover distortion falls. Meaning (distance 0) and smoothness (small
+differences stay small) are both local properties, so the distortion belongs
+on the far pairs: each pair's error is weighted by 1 / (c + ε), c its target
+chord, as in Sammon's stress, continuously in the target and independent of
+how many equivalent pairs a batch holds. ε is the chord of the smallest
+nonzero target the distance can hold — one witness state differing by 1 in a
+full-range register, 0.073 — below which two targets are not told apart
+(`distance_loss`, `DISTANCE_EPS`).
 
-**Inputs: canonical role order** (`datagen/roles.py`). The order comes from
-the function, never the dataflow graph. An input's fingerprint is the chunk's
-outputs over a fixed family of states in which it holds one value and every
-other input a second, so it depends only on the input's role; inputs are
-ordered by Weisfeiler–Lehman refinement over these and over the same
-fingerprints taken pairwise, and a class left with several inputs has one
+**The behaviour the distance measures.** A chunk's behaviour is its map on the
+register file, up to a rename: each register's value after the chunk as a
+function of the register file before it. A register the chunk leaves holding
+what it held is no output, so `ADDI x4,x3,42 ; ADDI x7,x7,0` is equivalent to
+`ADDI x4,x3,42`, while `ADDI x4,x3,42 ; ADDI x8,x7,0` is not — the copy
+destroys x8's value. Which register an output lands in is binding; whether it
+lands on a register the chunk reads is a relation between binding entries
+that every rename preserves, and it is behaviour. Smoothness then places
+`x7 += 1` one small step from `x7 += 0`, which is no output, and `x8 = x7 + 1`
+far from both. So the essence has to see, for each output, which of the
+chunk's inputs it overwrites.
+
+**The ideal distance.** d\*(A, B) is the minimum over renames π (x0 fixed) of
+the root-sum-square over registers of the per-register distance between A's
+register file after s and B's after π·s, each per-register distance the mean
+over input states s of the doubly-logarithmic difference below
+(`datagen/ideal.py` computes it exactly in the rename, slowly). Four
+properties make it the reference:
+
+- *Meaning*: d\* = 0 exactly when the two chunks are equivalent.
+- *Behaviour only*: d\*(A, C) = d\*(A′, C) whenever A ≡ A′; nothing computed
+  from a spelling enters.
+- *Continuity*: a minimum over continuous terms, so a small change to one
+  chunk's behaviour moves d\* a little, and no discrete choice inside it can
+  flip.
+- *No correspondence prior*: two chunks' registers are matched by the rename
+  that makes them closest, not by an order fixed per chunk.
+
+A root-sum-square over registers rather than a mean is what keeps d\* a
+function of behaviour: a mean divides by a count of registers, and adding a
+register that never changes would then move every distance.
+
+Partner pairs change which pairs are sampled, not d\*. They stand in for the
+function only if their structure carries nothing a model could learn instead:
+every pair is one local edit in otherwise identical context, so a collapse
+learned from them may be a collapse of the edit, and only equivalences the
+generator never produces can tell the two apart.
+
+**The trained target** (`register_distance_targets`, `compressor/train.py`) is
+tanh(d\*) computed over a fixed set of 64 witness states, its rename
+restricted to what a batch can carry. Each chunk's inputs are put in a
+**canonical role order** (`datagen/roles.py`): an input's fingerprint is the
+chunk's outputs, and its own register's value after the chunk, over a fixed
+family of states in which it holds one value and every other input a second,
+so it depends only on the input's role and on whether the chunk overwrites
+it; inputs are ordered by Weisfeiler–Lehman refinement over these and over the
+same fingerprints taken pairwise, and a class left with several inputs has one
 member, chosen by the encoder's colour, singled out and the refinement
-repeated. Inputs the function ignores are dropped first. The p-th input then
-takes the witness state's position p+1, every other register 0. Two
-equivalent chunks present corresponding inputs the same values whatever their
-spelling or graph shape; the graph's colour order does not, since a
-commutative swap whose operand another instruction also reads changes it.
-Between two chunks that compute different functions the orders need not
-correspond: changing one immediate by one reorders the canonical inputs in
-1.0–5.8% of pairs at len 2–8, and those pairs are compared at
-non-corresponding inputs (EXPERIMENT_LOG, "The register frame", finding 43).
+repeated. Inputs the function ignores are dropped first. Input i is then
+placed on position perm[i] of the 2K register positions of a K-instruction
+corpus (`n_positions`), taking that column of the witness state, every other
+register 0; the witness states have each state's registers shuffled, so no
+position is special. `precompute_chunk` ships, for every placement perm
+(`placements`), the final value on each position — the new value if the chunk
+wrote that register, the placed value otherwise, so an unchanged register
+contributes nothing — and the final value of each register written but not
+read (`rf_pos`, `rf_wo`).
 
-**Outputs: sorted by their witness values** (`precompute_chunk`). An output
-that rewrites its register with the value it already held is dropped first: a
-same-value write is behaviorally no output, decided at 16 states of
-independent uniform register values. The rest are sorted by the raw bytes of
-their 64 witness values, which starts at the least significant byte of the
-value at the first state, so the key is effectively a hash. Two equivalent
-chunks have identical output vectors and sort identically, and two equal
-outputs of one chunk are interchangeable, so equivalent pairs are exact. For
-two chunks that compute different functions the order carries no
-correspondence: a near-miss that changes one output's values can move it past
-another output, and then each output is compared with an unrelated one. How
-often that happens is unmeasured. The order that removes it is the matching
-of outputs with the smallest total distance, at P² output distances and one
-assignment per row pair instead of P distances and none; a sort keyed first
-on the canonical inputs each output depends on is a cheaper approximation.
+For two rows, the target compares the first at its canonical placement with
+the second at every placement and keeps the cheapest; positions are compared
+one to one, and the written-only registers by the cheapest permutation, a
+register one row writes and the other leaves compared with its old value —
+an unrelated register's — whose squared distance ships as `rf_wo_free`. The
+result is symmetrised. Every placement is enumerated up to 4 positions (24 at
+K = 2); beyond that only the canonical placement ships, and a pair whose
+canonical orders do not correspond is compared at non-corresponding inputs
+(changing one immediate by one reorders the canonical inputs in 1.0–5.8% of
+pairs at len 2–8, EXPERIMENT_LOG, "The register frame", finding 43).
 
-At each state two corresponding outputs'
-wrap-around difference d (the shorter way round mod 2³², exact in integers)
-becomes log1p(log1p(d)) / log1p(log1p(max_dist)), and the distance is the mean
-over the states (`pair_distance_targets`; `datagen/knownbits.py`,
-`output_distance`). The nested logarithm spreads small differences and
+At each state two corresponding values' wrap-around difference d (the shorter
+way round mod 2³², exact in integers) becomes
+log1p(log1p(d)) / log1p(log1p(max_dist)), and a register's distance is the
+mean over the states (`datagen.knownbits.column_distance`; on the GPU,
+`compressor.train._column_distance`). The nested logarithm spreads small differences and
 saturates large ones: a difference of 1 is 0.17, of 10³ 0.66, of 10⁶ 0.86.
-`max_dist` is the largest difference the two outputs could ever have, from a
-known-bits analysis of each — the bits forced to 0 or 1 whatever the inputs,
-propagated one transfer function per instruction (`output_known_bits`). Two
-comparisons, which can only be 0 or 1, are at most 1 apart, so their distance
-is the fraction of states where they disagree; two full-range outputs are at
-most 2³¹ apart. Equivalent rows read 0 at every state whatever their spelling,
-so nothing has to enumerate which spellings are equivalent.
+`max_dist` is the largest difference the two columns could ever have, from the
+bits each never changes across a fixed family of 1,024 structured states
+(`bound_states`, `observed_bits`), so it is a property of the behaviour: two
+comparisons, which only ever set bit 0, are at most 1 apart and their distance
+is the fraction of states where they disagree; two full-range values are at
+most 2³¹ apart. A bit that varies only off the family is read as constant.
 
-**Combining outputs** (`chunk_distance_targets`, `compressor/train.py`). Two
-rows' distance is the root-mean-square over positions of the per-output
-distance, over the larger of the two output counts, an output one row has and
-the other lacks counting 1; two rows with no outputs are 0 apart.
+What remains between the target and d\*: the 64 witness states, so two
+functions that differ only off them read 0 (`SLTI x,k` against
+`SLTI x,k+1`); the 1,024 bound states; the rename beyond 4 positions; and the
+written-only registers' distance from their old values, measured at the
+canonical placement only. `probes/target_vs_ideal.py` measures the target
+against d\* (EXPERIMENT_LOG, "The register frame", finding 52).
 
 Equivalent pairs are rare in a naturally drawn batch, so a fraction of each
 batch is **partner pairs**: two different spellings of one function on the
@@ -631,7 +648,14 @@ a cancelling pair, a reassociation, or a same-value write against its absence
 — embedded in random context whose registers it reads half the time, so
 every operand context is drawn (`sample_chunk_partner_pair`). The test suite
 checks every group and every rewrite on the emulator
-(`datagen/tests/test_generate.py`). The mix carries every rewrite at once: a
+(`datagen/tests/test_generate.py`). A list of rewrites can only teach the
+equivalences someone wrote down, so a share of the chunk pairs is found by
+search instead (`datagen/mine.py`): a random two-instruction chain writing one
+register, against every single ALU instruction computing that register from
+the chain's inputs, a match at 256 states proved equal on every register file
+by the z3 solver (`datagen/prove.py`). Each searched pair is drawn a bounded
+number of times and then replaced (`partners.mined.reuse`), so the pairs are
+not a fixed set. The mix carries every rewrite at once: a
 collapse lapses when its pairs leave the mix, and a rewrite never trained
 collapses only partly (EXPERIMENT_LOG, "The register frame", findings 47–50).
 The term sits on the essence, where the requirement is stated;
@@ -751,21 +775,19 @@ invariant essence):
   final-write order, as ListMLE (Plackett–Luce) over per-register scalar
   score heads (argsort to decode; duplicate-free).
 
-**Value prediction, read from the essence, per written output.** Per-anchor,
-per-output per-bit binary cross-entropy (BCE) (plus a bounded smooth-magnitude
-term): for each register the chunk writes, from the unit-normalized essence,
-that output's pointer and, for each external input the output depends on, the
-input's value at its own register (as 32 bits + a smooth scalar) and its
-colour, predict the register's raw value after the chunk (`vp_loss`; see
-"Value prediction reads the essence"). The inputs are listed per output in
-canonical role order (`datagen/roles.py`, shipped as `out_inputs`), so two
-equivalent chunks of different dataflow shapes present corresponding inputs
-at the same positions, which the graph's colour order does not (finding 43);
-interchangeable inputs tie on role and are ordered by the encoder's colour,
-every operand role ordered, never by register number, so a
-register-relabelled chunk presents the same essence, pointers and values at
-the same positions (EXPERIMENT_LOG, "The register frame", finding 40). Anchor
-states are drawn afresh for every chunk (below).
+**Value prediction, read from the essence, as a set.** Per-anchor, per-bit
+binary cross-entropy (BCE) (plus a bounded smooth-magnitude term): from the
+unit-normalized essence and, for each of the chunk's inputs, its value at its
+own register (as 32 bits + a smooth scalar) and its colour, predict every
+register the chunk writes, the predictions matched to the outputs by the
+assignment of least loss (`vp_loss`; see "Value prediction reads the
+essence"). The inputs are listed in canonical role order (`datagen/roles.py`,
+shipped as `in_roles`), so two equivalent chunks of different dataflow shapes
+present corresponding inputs at the same positions, which the graph's colour
+order does not (finding 43); interchangeable inputs tie on role and are
+ordered by the encoder's colour, every operand role ordered, never by register
+number (EXPERIMENT_LOG, "The register frame", finding 40). Anchor states are
+drawn afresh for every chunk (below).
 
 **What vp measures.** The evaluator is fed raw value *bits*, not
 log-compressed scalars. What it measures is the essence composed with the
@@ -778,10 +800,11 @@ states what it certifies and how to measure the halves apart). vp's gradient
 reaches every written slot through the pool, and the essence's magnitude is
 shaped only by the validity loss: the evaluator reads its direction.
 
-**Every output is predicted from the essence and its own pointer, and that is
-deliberate.** An output whose value depends on another output's gets no
-access to the other's prediction — a chunk computing `r4 = x+1042; r7 =
-r4+4` must produce `x+1046` for `r7` from the essence and `r7`'s pointer.
+**Every output is predicted from the essence, none from another's
+prediction, and that is deliberate.** An output whose value depends on another
+output's gets no access to the other's prediction — a chunk computing `r4 =
+x+1042; r7 = r4+4` must produce `x+1046` for `r7` from the essence and the
+chunk's inputs.
 
 Chaining them is architecturally possible — the output slots have a defined SSA
 write order and the dataflow is a DAG, so the iteration would be over the output

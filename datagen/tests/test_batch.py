@@ -128,30 +128,32 @@ def test_round_trip():
     assert np.array_equal(b.in_slot_regs, got.in_slot_regs)
     assert np.array_equal(b.out_slot_regs, got.out_slot_regs)
     assert np.array_equal(b.out_values, got.out_values)
-    assert np.array_equal(b.out_input_values, got.out_input_values)
+    assert np.array_equal(b.in_roles, got.in_roles)
+    assert np.array_equal(b.in_role_values, got.in_role_values)
 
-def _reexecuted(chunk, out_slot_regs, out_inputs, input_values):
-    """Each output's value re-executed from only the input values the row
-    ships for it, every other register 0: (n_anchors, n_outputs)."""
+def _reexecuted(chunk, out_slot_regs, in_roles, in_role_values, n_out):
+    """Each output's value re-executed from only the chunk's role-ordered
+    input values the row ships, every other register 0: (n_anchors, n_out)."""
     from datagen.compare import to_ssa, live_nodes, _eval_ssa_numpy, AUX_CE_IGNORE
     ssa = to_ssa(chunk)
-    A = input_values.shape[0]
-    got = np.zeros((A, input_values.shape[1]), dtype=np.int32)
-    for k, r in enumerate(out_slot_regs[:input_values.shape[1]].tolist()):
-        if r == AUX_CE_IGNORE:
-            continue
-        regs = np.zeros((A, 32), dtype=np.int32)
-        for j, src in enumerate(out_inputs[k].tolist()):
-            if src != AUX_CE_IGNORE:
-                regs[:, src] = input_values[:, k, j]
-        got[:, k] = _eval_ssa_numpy(ssa, len(chunk), regs, live_nodes(ssa))[0][:, r]
+    A = in_role_values.shape[0]
+    regs = np.zeros((A, 32), dtype=np.int32)
+    for j, src in enumerate(in_roles.tolist()):
+        if src != AUX_CE_IGNORE:
+            regs[:, src] = in_role_values[:, j]
+    out = _eval_ssa_numpy(ssa, len(chunk), regs, live_nodes(ssa))[0]
+    got = np.zeros((A, n_out), dtype=np.int32)
+    for k, r in enumerate(out_slot_regs[:n_out].tolist()):
+        if r != AUX_CE_IGNORE:
+            got[:, k] = out[:, r]
     return got
 
 
 def test_each_output_ships_the_inputs_its_value_was_executed_from():
     """One structured draw per chunk, placed on its own input registers: the
-    evaluator reads an output's input values from `out_input_values`, so
-    re-executing from those alone must give `out_values`."""
+    evaluator reads the chunk's input values in canonical role order from
+    `in_role_values`, so re-executing from those alone must give
+    `out_values`."""
     from datagen.generate import build_opcode_table
     rng = np.random.default_rng(3)
     alu = build_opcode_table({'R_ALU': 0.5, 'I_ALU': 0.5})   # no mem-op rows
@@ -162,15 +164,15 @@ def test_each_output_ships_the_inputs_its_value_was_executed_from():
         max_chunk_len=3)
     b = next(gen)
     assert b.out_values.shape == (32, 4, 3)
-    assert b.out_input_values.shape == (32, 4, 3, 4)
-    assert not np.array_equal(b.out_input_values[0], b.out_input_values[1])
+    assert b.in_role_values.shape == (32, 4, 6) and b.in_roles.shape == (32, 6)
+    assert not np.array_equal(b.in_role_values[0], b.in_role_values[1])
     for i in np.nonzero(b.out_regs_valid)[0]:
         toks, pos, chunk = b.tokens[i, :b.token_lens[i]].tolist(), 0, []
         while pos < len(toks):
             ins, pos = decode_instruction(toks, pos)
             chunk.append(ins)
-        got = _reexecuted(chunk, b.out_slot_regs[i], b.out_inputs[i],
-                          b.out_input_values[i])
+        got = _reexecuted(chunk, b.out_slot_regs[i], b.in_roles[i],
+                          b.in_role_values[i], 3)
         assert np.array_equal(got, b.out_values[i]), chunk
 
 
@@ -337,8 +339,7 @@ def test_pack_rejects_aux_first_dim_mismatch():
         in_slot_regs=np.full((2, 32), AUX_CE_IGNORE, dtype=np.int8),
         out_slot_regs=np.full((2, 16), AUX_CE_IGNORE, dtype=np.int8),
         out_inputs=np.full((2, 16, 32), AUX_CE_IGNORE, dtype=np.int8),
-        out_witness=np.zeros((2, 16, 64), dtype=np.int32),
-        witness_slots=np.full((2, 16), -1, dtype=np.int8),
+        precomputed=[None, None],
     )
     with pytest.raises(ValueError, match='aux_payload first dim'):
         pack_batch(chunks, target_B=1,
@@ -467,11 +468,11 @@ def test_fixed_shape_single_rule_out_regs():
 
     shape0 = batches[0].tokens.shape
     ilen0 = batches[0].instr_lens.shape
-    ov0, oiv0 = batches[0].out_values.shape, batches[0].out_input_values.shape
+    ov0, oiv0 = batches[0].out_values.shape, batches[0].in_role_values.shape
     for b in batches:
         assert b.tokens.shape == shape0
         assert b.instr_lens.shape == ilen0
-        assert b.out_values.shape == ov0 and b.out_input_values.shape == oiv0
+        assert b.out_values.shape == ov0 and b.in_role_values.shape == oiv0
         assert b.out_values.shape[0] == b.tokens.shape[0]       # OB == B
     # out_regs carries meaningful rows.
     assert any(b.out_regs_valid.any() for b in batches)

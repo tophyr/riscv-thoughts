@@ -3,15 +3,16 @@
 slot at held-out anchors, the emitted binding, and equivalence collapse over
 the classes the structural signature defines.
 
-  vp        — exact 32-bit match of the evaluator's prediction (read from
-              the essence through each output's pointer), over every (row,
-              output slot, anchor) triple of the corpus, with the failing
-              count and the rate by the writing opcode and by the output's
-              input count. The corpus must be generated with
+  vp        — exact 32-bit match of the evaluator's predictions (read from
+              the essence and the chunk's role-ordered inputs, as a set,
+              matched to the outputs by the assignment of least loss), over
+              every (row, output slot, anchor) triple of the corpus, with the
+              failing count and the rate by the writing opcode and by the
+              output's input count. The corpus must be generated with
               `datagen --heldout-anchors` so no model trained at its states.
               The leak check hands the evaluator ANOTHER chunk's essence with
-              this output's pointer and inputs; it must fail if the function
-              reaches the evaluator only through the essence.
+              this chunk's inputs; it must fail if the function reaches the
+              evaluator only through the essence.
   binding   — T1: emitted wiring exact per instruction; T2: emitted input and
               output lists exact per chunk (scripts/eval.py's definitions).
   collapse  — essence L2 (unit-normalized) on pairs of one register function:
@@ -44,7 +45,8 @@ from compressor.eval import (encode_chunks_t2, t1_binding_accuracy,
                              t2_exact_binding)
 from compressor.model import instruction_wiring
 from compressor.train import (_split_to_per_instruction, _t2_assemble,
-                              _t1_wiring, vp_predict, _value_bits)
+                              _t1_wiring, vp_predict, _value_bits,
+                             _vp_cost, vp_assignment, vp_aligned)
 from datagen import RVT_FORMAT, Batch, AUX_CE_IGNORE, padding_mask
 from datagen.signature import COMMUTATIVE
 from datagen.generate import PARTNER_GROUPS, materialize, sample_binding
@@ -107,24 +109,31 @@ for batch in batches():
     if st is None:
         continue
     T, essence = st
-    in_values = torch.from_numpy(batch.out_input_values).to(dev)
+    in_values = torch.from_numpy(batch.in_role_values).to(dev)
+    in_roles = torch.from_numpy(batch.in_roles.astype(np.int64)).to(dev)
     # A chunk of K instructions writes at most K registers, so output slots
     # past the grid's instruction count are AUX_CE_IGNORE; slicing them off is
     # the same score at a fraction of the evaluator's work.
     n_out = int(batch.instr_lens.shape[1])
     assert (batch.out_slot_regs[:, n_out:] == AUX_CE_IGNORE).all()
     out_slot = torch.from_numpy(batch.out_slot_regs[:, :n_out].astype(np.int64)).to(dev)
-    out_inputs = torch.from_numpy(batch.out_inputs[:, :n_out].astype(np.int64)).to(dev)
+    out_values = torch.from_numpy(batch.out_values[:, :, :n_out].astype(np.int64)).to(dev)
     target_bits = _value_bits(torch.from_numpy(
         batch.out_values[:, :, :n_out].astype(np.int64)).to(dev)).bool()
     valid = (out_slot != AUX_CE_IGNORE) & torch.from_numpy(batch.out_regs_valid).to(dev).unsqueeze(-1)
     va = valid.cpu().numpy()
-    # The leak check hands each row ANOTHER row's essence with its own pointer
-    # and inputs: if the function reached the head any other way, it would pass.
+    # The evaluator predicts the outputs as a set; each row's predictions are
+    # matched to its outputs by the assignment the loss uses (least loss).
+    # The leak check hands each row ANOTHER row's essence with its own
+    # inputs: if the function reached the head any other way, it would pass.
     other = essence[torch.randperm(essence.shape[0], generator=perm_rng).to(dev)]
+
+    def exact(e):
+        pred = vp_predict(comp, T, e, in_values, in_roles, n_out)
+        slot, _ = vp_assignment(_vp_cost(pred, out_values, 0.2), valid.float())
+        return ((vp_aligned(pred, slot)[..., :32] > 0) == target_bits).all(-1).cpu().numpy()
     with torch.no_grad():
-        ex, lk = (((vp_predict(comp, T, e, in_values, out_slot, out_inputs)[..., :32] > 0)
-                   == target_bits).all(-1).cpu().numpy() for e in (essence, other))   # (B,A,O)
+        ex, lk = exact(essence), exact(other)                                   # (B,A,O)
     leak_hits += int((lk & va[:, None, :]).sum())
     for b in np.nonzero(batch.out_regs_valid)[0]:
         instrs = chunk_instrs(batch, b)
@@ -270,7 +279,7 @@ if L > 1:
     # exist only from two instructions up.
     classes[1:1] = [('reorder independent instrs', reorder, 'MUST be 0'),
                     ('dead-code insertion', dead_insert, 'MUST be 0'),
-                    ('commutative swap, fresh operands', lambda c: comm_swap(c, False), 'a rename of two leaves: 0 by construction'),
+                    ('commutative swap, fresh operands', lambda c: comm_swap(c, False), '0 by construction into a third register; the op-cell\'s when the destination is a swapped operand'),
                     ('commutative swap, shared operand', lambda c: comm_swap(c, True), "the op-cell's")]
 print(f'\n  collapse over the signature classes ({N_PAIRS} pairs each, len={L}):')
 for name, fn, note in classes:

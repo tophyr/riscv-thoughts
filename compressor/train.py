@@ -27,6 +27,7 @@ import torch.nn.functional as F
 
 from tokenizer import BOS, EOS, PAD, VOCAB_SIZE, encode_instruction
 from tokenizer.tokenizer import decode_instruction
+from datagen.compare import N_WITNESS
 from datagen import (
     padding_mask,
     precompute_chunk,
@@ -158,12 +159,14 @@ def _pack_step_arrays(batch, split, *, vp, valid, distance):
               (batch.in_slot_regs, i64), (batch.out_slot_regs, i64)]
     if vp:
         arrays += [(batch.out_values, None), (batch.out_regs_valid, None),
-                   (batch.out_input_values, None), (batch.out_inputs, i64)]
+                   (batch.in_role_values, None), (batch.in_roles, i64)]
     if valid:
         arrays += [(batch.valid, f32)]
     if distance:
-        arrays += [(batch.out_witness, i64), (batch.out_known_zero, i64),
-                   (batch.out_known_one, i64), (batch.n_witness, i64)]
+        arrays += [(batch.rf_pos, None), (batch.rf_pos_zero, i64),
+                   (batch.rf_pos_one, i64), (batch.rf_wo, None),
+                   (batch.rf_wo_zero, i64), (batch.rf_wo_one, i64),
+                   (batch.rf_wo_free, f32), (batch.n_wo, i64)]
     arrays = [np.ascontiguousarray(a if dt is None else a.astype(dt))
               for a, dt in arrays]
     specs, n = [], 0
@@ -207,115 +210,132 @@ def _value_feat(x_i):
         [_value_bits(x_i), _value_smooth(x_i.float()).unsqueeze(-1)], dim=-1)
 
 
-def _vp_inputs(comp, T, in_values_t, out_inputs_t):
-    """Per (row, anchor, output slot) the evaluator's input features, (B, A,
-    O, MAX_IN·(33+dc)): for each external input the output depends on
-    (`out_inputs`, in canonical role order, `datagen/roles.py`), its
-    value in the row's anchor state (`in_values_t`, shipped in that order;
-    32 bits + 1 smooth scalar) and its structural colour from `T`. Unfilled
-    inputs feed value 0 and colour 0 = "no input"."""
-    B, A = in_values_t.shape[0], in_values_t.shape[1]
-    d, dc = comp.d_out, comp.d_colour
-    O, I = out_inputs_t.shape[1], out_inputs_t.shape[2]
-    in_valid = (out_inputs_t != AUX_CE_IGNORE)                        # (B, O, I)
-    in_idx = out_inputs_t.clamp(min=0).long()
-    c0 = d + comp.d_event
-    colours = T[..., c0:c0 + dc]                                      # (B, R, dc)
-    in_col = colours.gather(
-        1, in_idx.reshape(B, -1, 1).expand(-1, -1, dc)).reshape(B, O, I, dc)
-    in_col = in_col * in_valid.unsqueeze(-1)
+def _vp_inputs(comp, T, in_values_t, in_roles_t):
+    """Per (row, anchor) the evaluator's input features, (B, A,
+    MAX_IN·(33+dc)): each of the chunk's inputs in canonical role order
+    (`in_roles`, `datagen/roles.py`), its value in the row's anchor state
+    (`in_values_t`, shipped as `in_role_values`; 32 bits + 1 smooth scalar)
+    and its structural colour from `T`. Unfilled positions feed value 0 and
+    colour 0 = "no input"."""
+    B, A, P = in_values_t.shape
+    dc = comp.d_colour
+    valid = (in_roles_t != AUX_CE_IGNORE)                             # (B, P)
+    idx = in_roles_t.clamp(min=0).long()
+    c0 = comp.d_out + comp.d_event
+    col = T[..., c0:c0 + dc].gather(1, idx.unsqueeze(-1).expand(-1, -1, dc))
+    col = col * valid.unsqueeze(-1)                                    # (B, P, dc)
     # Kept INTEGER until the bit decomposition: float32 loses every bit above
     # 2^24.
-    vals = F.pad(in_values_t[:, :, :O].to(torch.int64),
-                 (0, I - in_values_t.shape[-1]))
-    vals = vals * in_valid.unsqueeze(1)
-    vfeat = torch.cat([_value_feat(vals),
-                       in_col.unsqueeze(1).expand(-1, A, -1, -1, -1)], -1)
-    return vfeat.reshape(B, A, O, I * (_VP_VALUE_BITS + 1 + dc))
+    vals = in_values_t.to(torch.int64) * valid.unsqueeze(1)
+    f = torch.cat([_value_feat(vals), col.unsqueeze(1).expand(-1, A, -1, -1)], -1)
+    f = f.reshape(B, A, P * (_VP_VALUE_BITS + 1 + dc))
+    return F.pad(f, (0, (comp.max_input_slots - P) * (_VP_VALUE_BITS + 1 + dc)))
 
 
-def _essence_desc(comp, T, essence, out_slot_regs_t):
-    """(B, O, d+d_ptr): what the evaluator is handed for each output in place
-    of the output's own description — the unit-normalized essence (magnitude
-    is validity) and the output's pointer, read from the written register's
-    pointer channels in `T`."""
-    p0 = comp.d_out + comp.d_event + comp.d_colour
-    out_idx = out_slot_regs_t.clamp(min=0).long()
-    ptr = T[..., p0:p0 + comp.d_ptr].gather(
-        1, out_idx.unsqueeze(-1).expand(-1, -1, comp.d_ptr))          # (B, O, P)
-    ess = F.normalize(essence, dim=-1).unsqueeze(1).expand(-1, ptr.shape[1], -1)
-    return torch.cat([ess, ptr], -1)
+def vp_predict(comp, T, essence, in_values_t, in_roles_t, n_out):
+    """The evaluator's predictions per (row, anchor, prediction slot), (B, A,
+    n_out, 33), from the unit-normalized essence and the chunk's role-ordered
+    inputs: a set, in the head's own slot order (`vp_assignment` matches it to
+    the outputs). The one definition every scorer reads."""
+    vin = _vp_inputs(comp, T, in_values_t, in_roles_t)
+    ess = F.normalize(essence, dim=-1).unsqueeze(1).expand(-1, vin.shape[1], -1)
+    out = comp.vp_head(torch.cat([ess, vin], -1))
+    return out.view(*out.shape[:2], -1, _VP_VALUE_BITS + 1)[:, :, :n_out]
 
 
-def _vp_bce(pred, out_slot_regs_t, out_values_t, mask_t, vp_smooth_weight,
-            return_count):
-    """Per-bit BCE + vp_smooth_weight · smooth-magnitude MSE, averaged over
-    (row, output slot, anchor) triples with a filled output slot."""
-    O = out_slot_regs_t.shape[1]
-    out_valid = out_slot_regs_t != AUX_CE_IGNORE                      # (B, O)
-    target_i = out_values_t[:, :, :O].to(torch.int64)                # (B, A, O)
-    nbits = _VP_VALUE_BITS
-    bit_loss = F.binary_cross_entropy_with_logits(
-        pred[..., :nbits], _value_bits(target_i), reduction='none').mean(-1)
-    sm_loss = (pred[..., nbits] - _value_smooth(target_i.float())) ** 2
-    per_slot = (bit_loss + vp_smooth_weight * sm_loss).mean(dim=1)   # (B, O)
-    # Mask-multiply (not boolean index / early return) so the op stays
-    # static-shape and host-sync-free — capturable in the full-step graph.
-    pm = (out_valid & mask_t.unsqueeze(-1)).float()
-    loss = (per_slot * pm).sum() / pm.sum().clamp(min=1)
-    return (loss, int(pm.sum())) if return_count else loss
+def _vp_cost(pred, out_values_t, vp_smooth_weight):
+    """(B, slot, output) per-bit BCE + vp_smooth_weight · smooth-magnitude MSE
+    between every prediction slot and every true output, averaged over the
+    anchors."""
+    target_i = out_values_t.to(torch.int64)                            # (B, A, K)
+    bits = _value_bits(target_i)                                       # (B, A, K, 32)
+    nb = _VP_VALUE_BITS
+    bce = F.binary_cross_entropy_with_logits(
+        pred[..., :nb].unsqueeze(3).expand(-1, -1, -1, bits.shape[2], -1),
+        bits.unsqueeze(2).expand(-1, -1, pred.shape[2], -1, -1),
+        reduction='none').mean(-1)                                     # (B, A, S, K)
+    sm = (pred[..., nb].unsqueeze(3) - _value_smooth(target_i.float()).unsqueeze(2)) ** 2
+    return (bce + vp_smooth_weight * sm).mean(1)
 
 
-def vp_loss(comp, T, essence, in_values_t, out_slot_regs_t, out_inputs_t,
+_PERMS = {}
+
+
+def vp_assignment(cost, valid):
+    """The assignment of prediction slots to a row's true outputs: (slot of
+    each output (B, K) long, its summed cost (B,)). `cost` (B, S, K) from
+    `_vp_cost`, `valid` (B, K) the outputs that exist. Exact for K ≤ 4, where
+    every permutation is enumerated; past that, greedy — the cheapest
+    remaining (slot, output) pair taken K times — which is fixed-shape but not
+    always the least-cost assignment."""
+    K = cost.shape[2]
+    if K <= 4:
+        key = (K, cost.device)
+        if key not in _PERMS:
+            _PERMS[key] = torch.tensor(list(itertools.permutations(range(K))),
+                                       device=cost.device, dtype=torch.long)
+        perms = _PERMS[key]                                           # (nP, K)
+        picked = cost[:, perms, torch.arange(K, device=cost.device)]   # (B, nP, K)
+        total = (picked * valid.unsqueeze(1)).sum(-1)                  # (B, nP)
+        best = total.argmin(-1)
+        return perms[best], total.gather(1, best.unsqueeze(1)).squeeze(1)
+    B, S = cost.shape[:2]
+    c = torch.where(valid.unsqueeze(1).bool(), cost, torch.zeros_like(cost))
+    big = c.detach().max() + 1.0
+    free = torch.ones(B, S, K, dtype=torch.bool, device=cost.device)
+    slot = torch.zeros(B, K, dtype=torch.long, device=cost.device)
+    total = cost.new_zeros(B)
+    for _ in range(K):
+        flat = torch.where(free, c, big).reshape(B, -1).argmin(-1)
+        i, j = flat // K, flat % K
+        slot = slot.scatter(1, j.unsqueeze(1), i.unsqueeze(1))
+        total = total + c[torch.arange(B, device=cost.device), i, j]
+        free = free & (torch.arange(S, device=cost.device).view(1, S, 1) != i.view(B, 1, 1)) \
+            & (torch.arange(K, device=cost.device).view(1, 1, K) != j.view(B, 1, 1))
+    return slot, total
+
+
+def vp_aligned(pred, slot_of_output):
+    """Predictions (B, A, S, 33) reordered to the outputs: (B, A, K, 33)."""
+    idx = slot_of_output.unsqueeze(1).unsqueeze(-1).expand(-1, pred.shape[1], -1, pred.shape[-1])
+    return pred.gather(2, idx)
+
+
+def vp_loss(comp, T, essence, in_values_t, out_slot_regs_t, in_roles_t,
             out_values_t, mask_t, vp_smooth_weight=0.2, return_count=False,
             n_out=None):
-    """Value prediction read from the ESSENCE, per written output.
+    """Value prediction read from the ESSENCE, as a set.
 
-    For output k of a row the head is handed the unit-normalized essence, the
-    output's pointer (which of the chunk's distinct output paths to evaluate;
-    it says nothing about that path's function) and, for each external input
-    the output depends on, the input's value and colour (`_vp_inputs`), and
-    predicts that register's value after the chunk (32 bit-logits + 1 smooth
-    scalar). The output's own description is never handed over, so its
-    function has to reach the head through the essence. Nothing in the
-    features is a register number or a position in the text: everything is
-    reached through one-hot gathers that a rename permutes.
+    The head is handed the unit-normalized essence and every input of the
+    chunk in canonical role order — its value and colour (`_vp_inputs`) —
+    and predicts every output at once; the predictions are matched to the
+    chunk's outputs by the cheapest assignment (`vp_assignment`). No output
+    is named to the head and nothing ranks the outputs, so the essence carries
+    them as a set and a small change cannot refile them.
 
     Args:
-      comp:             the Compressor (uses comp.vp_head and its widths)
-      T:                (B, n_regs, d_slot) the emitted state
-      essence:          (B, d_out) the emitted essence
-      in_values_t:      (B, A, O', I') int32 — each output's input values at
-                        each anchor, in out_inputs order (`out_input_values`)
+      in_values_t:      (B, A, P) int32 — the role-ordered inputs' values at
+                        each anchor (`in_role_values`)
       out_slot_regs_t:  (B, MAX_OUT) int64 — output registers (AUX_CE_IGNORE
                         for unused slots)
-      out_inputs_t:     (B, MAX_OUT, MAX_IN) int64 — each output's external
-                        input registers in canonical role order (AUX_CE_IGNORE padded)
-      out_values_t:     (B, A, O') int32 — each output's value after the chunk
+      in_roles_t:       (B, P) int64 — the chunk's inputs in canonical role
+                        order (AUX_CE_IGNORE padded)
+      out_values_t:     (B, A, K) int32 — each output's value after the chunk
       mask_t:           (B,) bool — rows to include
-      n_out:            bound on filled output slots; slots past it are
-                        skipped (they must be AUX_CE_IGNORE)
+      n_out:            bound on filled output slots
 
-    Returns a scalar loss (per-bit BCE + vp_smooth_weight · smooth-magnitude
-    MSE) over (row, output slot, anchor) triples with a filled output slot.
+    Returns the mean over (row, output) of the matched per-bit BCE +
+    vp_smooth_weight · smooth-magnitude MSE, averaged over anchors.
     """
-    if n_out is not None:
-        out_slot_regs_t = out_slot_regs_t[:, :n_out]
-        out_inputs_t = out_inputs_t[:, :n_out]
-    pred = vp_predict(comp, T, essence, in_values_t, out_slot_regs_t,
-                      out_inputs_t)
-    return _vp_bce(pred, out_slot_regs_t, out_values_t, mask_t,
-                   vp_smooth_weight, return_count)
-
-
-def vp_predict(comp, T, essence, in_values_t, out_slot_regs_t, out_inputs_t):
-    """The evaluator's prediction per (row, anchor, output slot), (B, A, O, 33),
-    through the same features `vp_loss` builds — the one definition every
-    probe that scores the head reads."""
-    vin = _vp_inputs(comp, T, in_values_t, out_inputs_t)
-    desc = _essence_desc(comp, T, essence, out_slot_regs_t)
-    return comp.vp_head(torch.cat(
-        [desc.unsqueeze(1).expand(-1, vin.shape[1], -1, -1), vin], -1))
+    K = n_out if n_out is not None else out_values_t.shape[2]
+    valid = (out_slot_regs_t[:, :K] != AUX_CE_IGNORE).float()
+    pred = vp_predict(comp, T, essence, in_values_t, in_roles_t, K)
+    cost = _vp_cost(pred, out_values_t[:, :, :K], vp_smooth_weight)
+    _, total = vp_assignment(cost, valid)
+    m = mask_t.float()
+    n = (valid.sum(-1) * m).sum()
+    loss = (total * m).sum() / n.clamp(min=1)
+    return (loss, int(n)) if return_count else loss
 
 
 _FULL = 1 << 32
@@ -331,72 +351,97 @@ def _max_wrap_distance_t(lo, hi):
     return torch.where(peak, torch.full_like(lo, _HALF), torch.maximum(wrap(lo), wrap(hi)))
 
 
-def max_distance_matrix(zero, one):
-    """(B, B) largest wrap-around distance between any value row i's output
-    allows and any row j's allows — vectorized `datagen.knownbits.max_distance`
-    over (B,) int64 known-zero / known-one masks."""
-    umin, umax = one, (~zero) & _MASK32
-    sign_known_zero, sign_known_one = (zero & _HALF) != 0, (one & _HALF) != 0
-    smin_u = one | torch.where(sign_known_zero, 0, _HALF)
-    smax_u = umax & torch.where(sign_known_one, _MASK32, _MASK32 ^ _HALF)
-    signed = lambda v: torch.where(v >= _HALF, v - _FULL, v)
-    smin, smax = signed(smin_u), signed(smax_u)
-    u = _max_wrap_distance_t(umin.unsqueeze(1) - umax.unsqueeze(0), umax.unsqueeze(1) - umin.unsqueeze(0))
-    s = _max_wrap_distance_t(smin.unsqueeze(1) - smax.unsqueeze(0), smax.unsqueeze(1) - smin.unsqueeze(0))
-    return torch.minimum(u, s)
+def max_distance_cross(za, oa, zb, ob):
+    """Largest wrap-around distance between any value a column of set a
+    allows and any one of set b allows, from int64 masks of the bits each
+    column never changes, broadcast against each other
+    (`datagen.knownbits.max_distance`)."""
+    def bounds(zero, one):
+        umax = (~zero) & _MASK32
+        sk0, sk1 = (zero & _HALF) != 0, (one & _HALF) != 0
+        smin_u = one | torch.where(sk0, 0, _HALF)
+        smax_u = umax & torch.where(sk1, _MASK32, _MASK32 ^ _HALF)
+        signed = lambda v: torch.where(v >= _HALF, v - _FULL, v)
+        return one, umax, signed(smin_u), signed(smax_u)
+    ua, Ua, sa, Sa = bounds(za, oa)
+    ub, Ub, sb, Sb = bounds(zb, ob)
+    return torch.minimum(_max_wrap_distance_t(ua - Ub, Ua - ub),
+                         _max_wrap_distance_t(sa - Sb, Sa - sb))
 
 
-def pair_distance_targets(outputs, zero, one):
-    """(B, B) behavioral distance between every two rows: the mean over the
-    witness states (`outputs` (B, K), shipped as `batch.out_witness`) of
-    `datagen.knownbits.output_distance` — the wrap-around
-    difference, log1p(log1p(d)) / log1p(log1p(max_dist)), with max_dist from
-    the two outputs' known bits. 0 for rows that agree at every witness state."""
-    maxd = max_distance_matrix(zero, one).double()                    # (B, B)
-    d = torch.remainder(outputs.unsqueeze(1) - outputs.unsqueeze(0), _FULL)   # (B, B, K)
-    d = torch.minimum(d, _FULL - d).double()
-    ll = torch.log1p(torch.log1p(d))
-    den = torch.log1p(torch.log1p(maxd)).unsqueeze(-1)
-    per = torch.where(d > 0, ll / den.clamp(min=1e-12), torch.zeros_like(ll))
-    return per.mean(-1).float()
+def _inv_log_bound(za, oa, zb, ob):
+    """1 / log1p(log1p(max distance)), 0 where the bound is 0 (two equal
+    constants, whose distance is 0 at every state)."""
+    m = max_distance_cross(za, oa, zb, ob).float()
+    return torch.where(m > 0, 1.0 / torch.log1p(torch.log1p(m)).clamp(min=1e-12),
+                       torch.zeros_like(m))
 
 
-def chunk_distance_targets(outputs, zero, one, count):
-    """(B, B) behavioral distance between every two chunks: the root-mean-square
-    over their outputs in canonical order of `pair_distance_targets`, an output
-    one chunk has and the other lacks scoring 1; 0 between two chunks with no
-    output. outputs (B, P, K), zero / one (B, P), count (B,) outputs per chunk."""
-    P = outputs.shape[1]
-    sq = outputs.new_zeros((outputs.shape[0],) * 2, dtype=torch.float32)
-    for p in range(P):
-        has = count > p
-        both = has.unsqueeze(1) & has.unsqueeze(0)
-        one_side = has.unsqueeze(1) ^ has.unsqueeze(0)
-        d = pair_distance_targets(outputs[:, p], zero[:, p], one[:, p])
-        sq = sq + torch.where(both, d * d, torch.where(one_side, torch.ones_like(d), torch.zeros_like(d)))
-    m = torch.maximum(count.unsqueeze(1), count.unsqueeze(0)).float()
-    return torch.where(m > 0, torch.sqrt(sq / m.clamp(min=1)), torch.zeros_like(sq))
+def _column_distance(a, b, inv):
+    """Mean over the last (witness-state) axis of log1p(log1p(|a − b|)), the
+    int32 difference wrapping mod 2³² so its magnitude is the wrap-around
+    distance, scaled by `inv`; a, b broadcast against each other."""
+    d = (a - b).float().abs()
+    return torch.log1p(torch.log1p(d)).mean(-1) * inv
+
+
+_column_distance_fused = torch.compile(_column_distance, dynamic=False)
+
+
+def register_distance_targets(pos, pos_zero, pos_one, wo, wo_zero, wo_one,
+                              wo_free, n_wo, fused=True):
+    """(B, B) behavioral distance between every two rows' register files
+    after the chunk (RISCV_DESIGN, "Collapse"): the root-sum-square over
+    registers of their per-register distances — the input positions, and the
+    written-only registers matched by the cheapest permutation, a register one
+    row writes and the other leaves compared with its old value — minimised
+    over every placement of the second row's inputs, symmetrised, and mapped
+    to [0, 1) by tanh. Fields as `datagen.batch.Batch.rf_*`, values int32."""
+    col = _column_distance_fused if fused and pos.is_cuda else _column_distance
+    K = wo.shape[2]
+    # Row a at its canonical placement against row b at every placement s.
+    inv = _inv_log_bound(pos_zero[:, None, None, 0], pos_one[:, None, None, 0],
+                         pos_zero[None], pos_one[None])                 # (B,B,S,P)
+    c = (col(pos[:, None, None, 0], pos[None], inv) ** 2).sum(-1)       # (B,B,S)
+    inv = _inv_log_bound(wo_zero[:, None, None, :, None], wo_one[:, None, None, :, None],
+                         wo_zero[None, :, None, None, :], wo_one[None, :, None, None, :])
+    D = col(wo[:, None, :1, :, None], wo[None, :, :, None, :], inv) ** 2  # (B,B,S,K,K)
+    real = torch.arange(K, device=pos.device) < n_wo.unsqueeze(1)       # (B,K)
+    ra, rb = real[:, None, None, :, None], real[None, :, None, None, :]
+    only = (wo_free * real)[:, None, None, :, None] + (wo_free * real)[None, :, None, None, :]
+    M = torch.where(ra & rb, D, only)
+    w = torch.stack([sum(M[..., i, t[i]] for i in range(K))
+                     for t in itertools.permutations(range(K))]).amin(0)
+    best = (c + w).amin(-1)
+    best = torch.minimum(best, best.t())
+    return torch.tanh(torch.sqrt(best.clamp(min=0.0)))
+
+
+# The chord of the smallest nonzero behavioral distance a target can hold: one
+# witness state differing by 1 in a full-range register. Pairs whose targets
+# differ by less are not told apart, so it is the loss's scale floor.
+_D_MIN = float(np.log1p(np.log1p(1.0)) / np.log1p(np.log1p(float(_HALF)))) / N_WITNESS
+DISTANCE_EPS = float(np.sqrt(2.0 * np.tanh(_D_MIN)))
 
 
 class GraphedDistanceTargets:
-    """`chunk_distance_targets` replayed as one CUDA graph: launched eagerly,
-    its small kernels leave the GPU waiting on the host. The graph replays the
-    same kernels, so the targets are bit-identical; its inputs must keep
-    their addresses across calls, as the stager's device buffer does."""
+    """`register_distance_targets` replayed as one CUDA graph: launched
+    eagerly, its small kernels leave the GPU waiting on the host. The graph
+    replays the same kernels, so the targets are bit-identical; its inputs must
+    keep their addresses across calls, as the stager's device buffer does."""
 
     def __init__(self):
         self.graph, self.out, self.sig = None, None, None
 
-    def __call__(self, outputs, zero, one, count):
-        args = (outputs, zero, one, count)
-        if not outputs.is_cuda:
-            return chunk_distance_targets(*args)
+    def __call__(self, *args):
+        if not args[0].is_cuda:
+            return register_distance_targets(*args)
         if self.graph is None:
-            self.out = chunk_distance_targets(*args)
+            self.out = register_distance_targets(*args)
             torch.cuda.synchronize()
             self.graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(self.graph):
-                self.out.copy_(chunk_distance_targets(*args))
+                self.out.copy_(register_distance_targets(*args))
             self.sig = _graph_signature(args)
         assert _graph_signature(args) == self.sig
         self.graph.replay()
@@ -408,21 +453,20 @@ def distance_loss(essence, target, row_mask):
     matched by MSE to the chord √(2d) of their behavioral distance d (0..1):
     d is the target cosine distance, so equivalent rows are pulled together,
     rows that behave entirely differently are held orthogonal, and nothing
-    is asked to be anti-aligned. The equivalent pairs (d = 0) and the rest
-    are averaged separately and summed, so collapse keeps its share of the
-    gradient however few equivalent pairs a batch holds."""
+    is asked to be anti-aligned. No geometry meets every target, so each
+    pair's error is weighted by 1 / (target chord + DISTANCE_EPS), as in
+    Sammon's stress: the distortion falls on far pairs, continuously in the
+    target, and meaning and small differences are kept."""
     e = F.normalize(essence, dim=-1)
     sq = (2.0 - 2.0 * (e @ e.t())).clamp(min=0.0)
     dist = torch.sqrt(sq + 1e-8)          # finite gradient at coincident rows
     B = dist.shape[0]
     valid = row_mask.bool()
-    pair = valid.unsqueeze(0) & valid.unsqueeze(1) & torch.triu(
-        torch.ones(B, B, dtype=torch.bool, device=dist.device), diagonal=1)
-    err = (dist - torch.sqrt(2.0 * target)) ** 2
-    same = pair & (target <= 0)
-    other = pair & (target > 0)
-    return ((err * same).sum() / same.sum().clamp(min=1)
-            + (err * other).sum() / other.sum().clamp(min=1))
+    pair = (valid.unsqueeze(0) & valid.unsqueeze(1) & torch.triu(
+        torch.ones(B, B, dtype=torch.bool, device=dist.device), diagonal=1)).float()
+    chord = torch.sqrt(2.0 * target)
+    w = pair / (chord + DISTANCE_EPS)
+    return ((dist - chord) ** 2 * w).sum() / w.sum().clamp(min=1e-12)
 
 
 class _LRClock:
@@ -908,7 +952,7 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
     # at a fixed-padded instruction count (B*MNI). Host-sync-free, static-shape.
     def _fwd_loss(tok, pad, w0, w1, wo, active,
                   li, lo, pc, in_slot, out_slot, out_values, vp_mask, in_values,
-                  out_inputs, valid_f,
+                  in_roles, valid_f,
                   ike, oke, distance_target):
         content_seq, c0, c1, co = _content(tok, pad, w0, w1, wo, active)
         T, essence = comp.encode_state(content_seq, c0, c1, co, active)
@@ -918,7 +962,7 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
             comp, T, essence, live_in_t=li, live_out_t=lo, pc_writes_t=pc,
             in_slot_t=in_slot, out_slot_t=out_slot, in_k_eff=ike, out_k_eff=oke)
         vp = (vp_loss(
-                  comp, T, essence, in_values, out_slot, out_inputs, out_values,
+                  comp, T, essence, in_values, out_slot, in_roles, out_values,
                   vp_mask, vp_smooth_weight=vp_smooth_weight, n_out=oke)
               if vp_active else essence.new_zeros(()))
         ds = (distance_loss(essence, distance_target, vp_mask)
@@ -948,22 +992,20 @@ def train_compressor(batch_iter, *, ingest, lower_encoder=None,
             return None
         staged = iter(stage(packed, specs))
         fixed = [next(staged) for _ in range(11)]
-        out_values_t, vp_mask_t, in_values_t, out_inputs_t = (
+        out_values_t, vp_mask_t, in_values_t, in_roles_t = (
             (next(staged), next(staged), next(staged), next(staged)) if vp_active
             else (_dummy, _dummy, _dummy, _dummy))
         valid_f = next(staged) if valid_active else _dummy
         if distance_active:
-            witness_t, known_zero_t, known_one_t, n_witness_t = (
-                next(staged), next(staged), next(staged), next(staged))
+            rf_t = [next(staged) for _ in range(8)]
             # Outside the compiled step (the targets are data), into one
             # persistent buffer, since the step's graph replay reads its
             # inputs at the addresses it was captured with.
             with torch.no_grad():
-                distance_t = distance_targets(witness_t, known_zero_t, known_one_t,
-                                              n_witness_t)
+                distance_t = distance_targets(*rf_t)
         else:
             distance_t = _dummy
-        return (*fixed, out_values_t, vp_mask_t, in_values_t, out_inputs_t, valid_f,
+        return (*fixed, out_values_t, vp_mask_t, in_values_t, in_roles_t, valid_f,
                 IN_K, OUT_K, distance_t)
 
     def _extra(item, aux):
@@ -1433,7 +1475,9 @@ def _mp_worker_main(in_q, out_q, parent_pid, pack, n_slots):
         os._exit(0)
     # Imports must happen inside the worker (spawn context = fresh
     # interpreter, doesn't inherit parent's already-loaded modules).
+    import io
     from compressor.train import _pack_step_arrays, _split_to_per_instruction
+    from datagen import RVT_FORMAT, Batch
     # Packed steps go through a ring of slots in a /dev/shm file rather than
     # through the queue: unpickling ~0.7 MB per step cost the trainer's main
     # thread more than packing saved. The queue carries only the slot index.
@@ -1443,6 +1487,8 @@ def _mp_worker_main(in_q, out_q, parent_pid, pack, n_slots):
             batch = in_q.get()
             if batch is None:
                 break
+            if isinstance(batch, bytes):       # parsed here, off the main thread
+                batch = RVT_FORMAT.read_batch(io.BytesIO(batch), Batch)
             packed, specs, n_instrs, shape = _pack_step_arrays(
                 batch, _split_to_per_instruction(batch), **pack)
             if packed is None:
@@ -1472,6 +1518,18 @@ def _remove_orphan_rings():
             pass
 
 
+def raw_batches(f):
+    """Each RVT batch on stream f as its raw bytes, unparsed: parsing a large
+    batch and pickling its arrays to a worker cost the main thread more than a
+    step, while bytes cross to the worker as one copy."""
+    from datagen import RVT_FORMAT
+    while True:
+        b = RVT_FORMAT.read_batch_bytes(f)
+        if b is None:
+            return
+        yield b
+
+
 class TrainBatchPrefetcher:
     """Multiprocessing prefetcher: CPU-side prep — the per-instruction split and
     packing a step's arrays for the device (`_pack_step_arrays`, configured by
@@ -1479,8 +1537,9 @@ class TrainBatchPrefetcher:
     with the main loop's GPU work.
 
     Architecture:
-      - Reader thread (main process, daemon): pulls Batches from batch_iter
-        (the RVT stream) and deals batch i to worker i % n_workers.
+      - Reader thread (main process, daemon): pulls batches from batch_iter
+        — Batches, or one RVT batch's raw bytes each (`raw_batches`), which
+        the worker parses — and deals batch i to worker i % n_workers.
       - Worker processes (spawn context, fresh interpreters): split and pack
         each Batch and push the packed step to their own output queue.
       - Main loop: reads the output queues in the same round-robin order, so

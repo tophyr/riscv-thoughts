@@ -12,7 +12,7 @@ Usage (scripts/run_t2.sh is the canonical launcher):
     python -m datagen --rule cap=2 --batch-size 384 --n-states 8 \\
         --config configs/instr_alu_writers_chain010_rewrites050_aim050.json \\
         --count 1000000 \\
-      | train_t2_encoder.py --t1-model runs/t1_distance_cosbal_500k/encoder.pt \\
+      | train_t2_encoder.py --t1-model runs/t1_setvp_500k/encoder.pt \\
         --d-out 512 --op-cell-depth 4 --vp-head-depth 12 --n-pool-heads 16 \\
         --distance-weight 1.0 --n-steps 1000000 --out-dir "$OUT"
 """
@@ -23,8 +23,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from compressor.train import train_t2_encoder
-from datagen import RVT_FORMAT, Batch
+from compressor.train import raw_batches, train_t2_encoder
+
 from scripts._common import (
     resolve_device, add_common_train_args, open_run_dir, load_frozen_encoder)
 
@@ -110,7 +110,7 @@ def main():
 
     t1 = load_frozen_encoder(args.t1_model, device)
 
-    reader = RVT_FORMAT.reader(sys.stdin.buffer, Batch)
+    reader = raw_batches(sys.stdin.buffer)
 
     t2, losses = train_t2_encoder(
         reader, t1,

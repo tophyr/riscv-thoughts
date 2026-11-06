@@ -193,7 +193,8 @@ def _build_batches_iter(cfg, seed):
         aim=aim,
         partner_rate=partner_rate,
         partner_sampler=lambda: sample_chunk_partner_pair(
-            rng, rule.max_len, dest_regs, dist.get('partners', {}).get('rewrites')),
+            rng, rule.max_len, dest_regs, dist.get('partners', {}).get('rewrites'),
+            dist.get('partners', {}).get('mined')),
         invalid_rate=inv_rate, invalid_provider=invalid_provider,
         max_invalid_window=cfg.max_invalid_window,
         max_chunk_len=rule.max_len,

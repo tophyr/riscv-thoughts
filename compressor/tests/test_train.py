@@ -19,6 +19,7 @@ from datagen import AUX_CE_IGNORE, MAX_INPUT_SLOTS, MAX_OUTPUT_SLOTS
 from tokenizer import BOS, EOS, PAD, VOCAB_SIZE, decode_instruction
 
 from compressor.model import T1Compressor, T2Compressor
+from emulator import Instruction
 from compressor.train import (
     _VP_VALUE_BITS,
     _listmle_loss,
@@ -69,83 +70,89 @@ class _CaptureHead(torch.nn.Module):
 
 
 def _vp_comp(head, d, de):
-    from compressor.model import _COLOUR_DIM, _PTR_DIM
+    from compressor.model import _COLOUR_DIM
     return type('C', (), {'vp_head': head, 'd_out': d, 'd_event': de,
-                          'd_colour': _COLOUR_DIM, 'd_ptr': _PTR_DIM})()
+                          'd_colour': _COLOUR_DIM, 'max_input_slots': MAX_INPUT_SLOTS})()
 
 
-def test_vp_loss_feeds_the_essence_the_pointer_and_the_inputs_by_register():
-    """For output slot k the head is fed the unit-normalized essence, the
-    WRITTEN register's pointer channels from T (never its value channels),
-    and for each of the output's inputs (out_inputs) its shipped value at the
-    anchor as [32 bits, 1 smooth] plus the input register's colour channels
-    from T. Unfilled inputs feed zeros."""
-    from compressor.model import _COLOUR_DIM as dc, _PTR_DIM as P
-    B, d, de, A = 1, 4, 2, 2
-    T = torch.zeros(B, 32, d + de + dc + P)
+def test_vp_loss_feeds_the_essence_and_the_chunk_inputs_by_role():
+    """The head is fed the unit-normalized essence and, for each of the
+    chunk's inputs in canonical role order (in_roles), its shipped value at
+    the anchor as [32 bits, 1 smooth] plus the input register's colour
+    channels from T — no output is named to it. Unfilled positions feed
+    zeros."""
+    from compressor.model import _COLOUR_DIM as dc
+    B, d, de, A, P = 1, 4, 2, 2, 4
+    T = torch.zeros(B, 32, d + de + dc)
     T[0, 9, :d] = torch.tensor([1.0, 2.0, 3.0, 4.0])        # description of x9
-    T[0, 9, d + de + dc + 1] = 1.0                           # pointer of x9: order 1
     T[0, 7, d + de:d + de + dc] = 0.5                        # colour of leaf x7
     essence = torch.tensor([[3.0, 0.0, 4.0, 0.0]])
-    in_values = torch.zeros(B, A, MAX_OUTPUT_SLOTS, 3, dtype=torch.int32)
-    in_values[0, :, 0, 0] = torch.tensor([70, 71], dtype=torch.int32)
+    in_values = torch.zeros(B, A, P, dtype=torch.int32)
+    in_values[0, :, 0] = torch.tensor([70, 71], dtype=torch.int32)
+    in_roles = torch.full((B, P), AUX_CE_IGNORE, dtype=torch.int64)
+    in_roles[0, 0] = 7
     out_slot = torch.full((B, MAX_OUTPUT_SLOTS), AUX_CE_IGNORE, dtype=torch.int64)
     out_slot[0, 0] = 9
-    out_inputs = torch.full((B, MAX_OUTPUT_SLOTS, MAX_INPUT_SLOTS), AUX_CE_IGNORE, dtype=torch.int64)
-    out_inputs[0, 0, 0] = 7
-    out_values = torch.zeros(B, A, MAX_OUTPUT_SLOTS, dtype=torch.int32)
-    head = _CaptureHead(_VP_SLOT)
-    vp_loss(_vp_comp(head, d, de), T, essence, in_values, out_slot, out_inputs,
-            out_values, torch.tensor([True]))
-    x = head.last                                     # (B, A, O, d + P + I*(33+dc))
-    assert x.shape == (B, A, MAX_OUTPUT_SLOTS, d + P + MAX_INPUT_SLOTS * (_VP_SLOT + dc))
-    assert torch.allclose(x[0, :, 0, :d], torch.tensor([[0.6, 0.0, 0.8, 0.0]] * A))
-    assert torch.equal(x[0, :, 0, d:d + P], F_one_hot(1, P).expand(A, -1))
-    feats = x[0, :, 0, d + P:].reshape(A, MAX_INPUT_SLOTS, _VP_SLOT + dc)
-    assert torch.equal(feats[:, 0, :_VP_VALUE_BITS], _value_bits(in_values[0, :, 0, 0].long()))
-    assert torch.allclose(feats[:, 0, _VP_VALUE_BITS], _value_smooth(in_values[0, :, 0, 0].float()))
+    out_values = torch.zeros(B, A, 2, dtype=torch.int32)
+    head = _CaptureHead(MAX_OUTPUT_SLOTS * _VP_SLOT)
+    vp_loss(_vp_comp(head, d, de), T, essence, in_values, out_slot, in_roles,
+            out_values, torch.tensor([True]), n_out=2)
+    x = head.last                                     # (B, A, d + I*(33+dc))
+    assert x.shape == (B, A, d + MAX_INPUT_SLOTS * (_VP_SLOT + dc))
+    assert torch.allclose(x[0, :, :d], torch.tensor([[0.6, 0.0, 0.8, 0.0]] * A))
+    feats = x[0, :, d:].reshape(A, MAX_INPUT_SLOTS, _VP_SLOT + dc)
+    assert torch.equal(feats[:, 0, :_VP_VALUE_BITS], _value_bits(in_values[0, :, 0].long()))
+    assert torch.allclose(feats[:, 0, _VP_VALUE_BITS], _value_smooth(in_values[0, :, 0].float()))
     assert torch.all(feats[:, 0, _VP_SLOT:] == 0.5)
     assert torch.count_nonzero(feats[:, 1:]) == 0
 
 
-def F_one_hot(i, n):
-    return torch.nn.functional.one_hot(torch.tensor(i), n).float()
+class _FixedHead(torch.nn.Module):
+    """Output one fixed prediction vector for every row and anchor."""
+
+    def __init__(self, out):
+        super().__init__()
+        self.out = out
+
+    def forward(self, x):
+        return self.out.expand(*x.shape[:-1], -1)
 
 
-def test_vp_loss_gather_and_mask():
-    """The target is the output's shipped value; only filled
-    (row, slot) pairs of unmasked rows contribute, and return_count gives
-    that pair count."""
-    from compressor.model import _COLOUR_DIM, _PTR_DIM
-    B, d, de, A = 2, 4, 2, 2
-    T = torch.zeros(B, 32, d + de + _COLOUR_DIM + _PTR_DIM)
+def test_vp_loss_matches_predictions_to_outputs_by_the_cheapest_assignment():
+    """The head's prediction slots are matched to the chunk's outputs by the
+    assignment of least loss, so predicting the outputs in the other order
+    costs nothing; only filled (row, output) pairs of unmasked rows count."""
+    from compressor.model import _COLOUR_DIM
+    B, d, de, A, P = 2, 4, 2, 1, 4
+    T = torch.zeros(B, 32, d + de + _COLOUR_DIM)
     essence = torch.ones(B, d)
-    in_values = torch.zeros(B, A, MAX_OUTPUT_SLOTS, 3, dtype=torch.int32)
+    in_values = torch.zeros(B, A, P, dtype=torch.int32)
+    in_roles = torch.full((B, P), AUX_CE_IGNORE, dtype=torch.int64)
     out_slot = torch.full((B, MAX_OUTPUT_SLOTS), AUX_CE_IGNORE, dtype=torch.int64)
     out_slot[0, 0], out_slot[0, 1] = 5, 9
-    out_inputs = torch.full((B, MAX_OUTPUT_SLOTS, MAX_INPUT_SLOTS), AUX_CE_IGNORE, dtype=torch.int64)
-    out_values = torch.zeros(B, A, MAX_OUTPUT_SLOTS, dtype=torch.int32)
-    out_values[0, :, 0] = torch.tensor([10, 20]); out_values[0, :, 1] = torch.tensor([30, 40])
-    comp = _vp_comp(_ConstHead(_VP_SLOT, 0.0), d, de)
-    loss, count = vp_loss(comp, T, essence, in_values, out_slot, out_inputs, out_values,
-                          torch.tensor([True, True]), return_count=True)
+    out_values = torch.zeros(B, A, 2, dtype=torch.int32)
+    out_values[0, 0, 0], out_values[0, 0, 1] = 10, 30
+
+    def slot(v):
+        bits = _value_bits(torch.tensor(v)).float() * 40 - 20     # confident logits
+        return torch.cat([bits, _value_smooth(torch.tensor(float(v))).view(1)])
+    fixed = torch.zeros(MAX_OUTPUT_SLOTS * _VP_SLOT)
+    fixed[:_VP_SLOT], fixed[_VP_SLOT:2 * _VP_SLOT] = slot(30), slot(10)   # swapped
+    comp = _vp_comp(_FixedHead(fixed), d, de)
+    loss, count = vp_loss(comp, T, essence, in_values, out_slot, in_roles, out_values,
+                          torch.tensor([True, False]), return_count=True, n_out=2)
     assert count == 2
-    # Zero logits: per-bit BCE is ln 2 for every bit; smooth term (0 - s)^2.
-    want = 0.0
-    for vals in ((10, 20), (30, 40)):
-        per = [math.log(2) + 0.2 * float(_value_smooth(torch.tensor(float(v))) ** 2) for v in vals]
-        want += sum(per) / len(per)
-    assert abs(float(loss) - want / 2) < 1e-5
-    masked = vp_loss(comp, T, essence, in_values, out_slot, out_inputs, out_values,
-                     torch.tensor([False, False]))
+    assert float(loss) < 1e-6
+    masked = vp_loss(comp, T, essence, in_values, out_slot, in_roles, out_values,
+                     torch.tensor([False, False]), n_out=2)
     assert float(masked) == 0.0
 
 
 def test_gen_shipped_values_re_execute_from_their_inputs():
-    """Every shipped output value re-executes from that output's shipped
-    input values alone, over register-dataflow chunks. (An output computed
+    """Every shipped output value re-executes from the chunk's shipped
+    role-ordered input values alone, over register-dataflow chunks. (An output computed
     from the PC after a jump also depends on the jump's operands, which
-    out_inputs does not list; PC effects are out of scope.)"""
+    in_roles does not list; PC effects are out of scope.)"""
     from datagen.batch import collect_into_batches, generate_chunks
     from datagen.compare import draw_anchor_states
     from datagen.generate import build_opcode_table, length_cap
@@ -163,8 +170,8 @@ def test_gen_shipped_values_re_execute_from_their_inputs():
     assert batch.out_values.shape[0] == batch.tokens.shape[0]   # OB == B (T2)
     for i in np.nonzero(batch.out_regs_valid)[0]:
         chunk = _decode_chunk_instructions(batch, i)
-        got = _reexecuted(chunk, batch.out_slot_regs[i], batch.out_inputs[i],
-                          batch.out_input_values[i])
+        got = _reexecuted(chunk, batch.out_slot_regs[i], batch.in_roles[i],
+                          batch.in_role_values[i], 4)
         assert np.array_equal(got, batch.out_values[i]), chunk
 
 
@@ -237,13 +244,15 @@ def test_packed_step_stages_to_the_arrays_it_packed():
         want = [(tok, L), (pad, None), (g0, L), (g1, L), (go, L), (act, F),
                 (b.live_in_mask, F), (b.live_out_mask, F), (b.pc_writes, F),
                 (b.in_slot_regs, L), (b.out_slot_regs, L), (b.out_values, None),
-                (b.out_regs_valid, None), (b.out_input_values, None), (b.out_inputs, L),
+                (b.out_regs_valid, None), (b.in_role_values, None), (b.in_roles, L),
                 (b.valid, F)]
         got = _H2DStager('cpu')(packed, specs)
-        assert len(got) == len(want) + 4     # + witness, known bits, output counts
-        assert torch.equal(got[-4], torch.from_numpy(b.out_witness).long())
-        assert torch.equal(got[-3], torch.from_numpy(b.out_known_zero))
-        assert torch.equal(got[-1], torch.from_numpy(b.n_witness).long())
+        assert len(got) == len(want) + 8     # + the register-file distance fields
+        assert torch.equal(got[-8], torch.from_numpy(b.rf_pos))
+        assert torch.equal(got[-7], torch.from_numpy(b.rf_pos_zero))
+        assert torch.equal(got[-5], torch.from_numpy(b.rf_wo))
+        assert torch.equal(got[-2], torch.from_numpy(b.rf_wo_free))
+        assert torch.equal(got[-1], torch.from_numpy(b.n_wo).long())
         for g, (a, dt) in zip(got, want):
             w = torch.from_numpy(a) if dt is None else torch.from_numpy(a).to(dt)
             assert g.dtype == w.dtype and torch.equal(g, w)
@@ -536,7 +545,7 @@ def test_build_optim_sched_plain_cosine_when_no_warmup():
 def test_t2compressor_forward_shape_and_padding_contract():
     """The equivariant T2 runs the register-state machine over a chunk of
     frozen-T1 essences threaded by per-instruction wiring. encode_state ->
-    (T (B,n_regs,d_out+d_event+d_colour+d_ptr), essence (B,d_out)); padded steps (active=0)
+    (T (B,n_regs,d_out+d_event+d_colour), essence (B,d_out)); padded steps (active=0)
     are no-ops, so a chunk shorter than N does not NaN."""
     torch.manual_seed(0)
     t2 = T2Compressor(d_t1=8, d_out=12, d_event=16)
@@ -548,7 +557,7 @@ def test_t2compressor_forward_shape_and_padding_contract():
     active = torch.ones(B, N); active[2, 1:] = 0.0
 
     T, essence = t2.encode_state(seq, in0, in1, out, active)
-    assert T.shape == (B, R, 12 + 16 + t2.d_colour + t2.d_ptr)
+    assert T.shape == (B, R, 12 + 16 + t2.d_colour)
     assert essence.shape == (B, 12)
     assert not torch.isnan(T).any() and not torch.isnan(essence).any()
     # encode() returns just the essence.
@@ -592,110 +601,141 @@ def test_every_probe_and_entry_script_compiles():
         Path(str(f) + 'c').unlink(missing_ok=True)
 
 
-def _t1_rows(n, seed):
-    """n random one-instruction ALU rows: the instructions, and each one's
-    output at the witness states as datagen ships it."""
-    import random
-    from emulator import Instruction
-    from datagen import draw_anchor_states, precompute_chunk
-    rng = random.Random(seed)
-    R = ['ADD', 'SUB', 'XOR', 'OR', 'AND', 'SLL', 'SRL', 'SRA', 'SLT', 'SLTU']
-    Iops = ['ADDI', 'XORI', 'ORI', 'ANDI', 'SLTI', 'SLTIU', 'SLLI', 'SRLI', 'SRAI']
-    instrs = []
-    for _ in range(n):
-        rd, a, b = rng.randrange(1, 32), rng.randrange(0, 6), rng.randrange(0, 6)
-        if rng.random() < 0.5:
-            instrs.append(Instruction(rng.choice(R), rd, a, b))
+_RF = ('rf_pos', 'rf_pos_zero', 'rf_pos_one', 'rf_wo', 'rf_wo_zero', 'rf_wo_one',
+       'rf_wo_free', 'n_wo')
+
+
+def _rf_batch(chunks, max_len):
+    """A packed batch of `chunks` and its distance fields as tensors."""
+    from datagen import draw_anchor_states
+    from datagen.batch import build_targets, pack_batch, _make_valid_chunk
+    rows = [_make_valid_chunk(c) for c in chunks]
+    rng = np.random.default_rng(0)
+    aux, ov, oiv, orv = build_targets(
+        rows, lambda k: np.stack([draw_anchor_states(rng, 2) for _ in range(k)]), max_len)
+    b = pack_batch(rows, target_B=len(rows), target_max_tokens=9 * max_len,
+                   target_max_n_instrs=max_len, out_values=ov, in_role_values=oiv,
+                   out_regs_valid=orv, aux_payload=aux)
+    dt = {'rf_wo_free': torch.float32, 'rf_pos': torch.int32, 'rf_wo': torch.int32}
+    return [torch.from_numpy(getattr(b, k)).to(dt.get(k, torch.int64)) for k in _RF]
+
+
+_A = [Instruction('ADDI', 4, 3, 42)]
+_CASES = [
+    (_A, _A + [Instruction('ADDI', 7, 7, 0)]),          # a write that changes nothing
+    (_A, _A + [Instruction('ADDI', 8, 7, 0)]),          # a copy
+    (_A, _A + [Instruction('ADDI', 7, 7, 1)]),          # an in-place step
+    (_A, [Instruction('ADDI', 4, 3, 43)]),              # an immediate moved by one
+    (_A, [Instruction('ADDI', 9, 12, 42)]),             # a rename
+    ([Instruction('SUB', 5, 6, 6)], [Instruction('ADDI', 5, 0, 1)]),   # zero against 1
+    ([Instruction('ADDI', 5, 0, 0)], [Instruction('ADDI', 5, 0, 1)]),
+    ([Instruction('XORI', 10, 20, -312), Instruction('ANDI', 19, 13, 1349)],
+     [Instruction('XORI', 10, 20, -312), Instruction('ANDI', 19, 13, 1348)]),
+    (_A, []),
+]
+
+
+def test_register_distance_targets_track_the_reference_distance():
+    """Against tanh(d*) (`datagen.ideal`): exact zeros where d* is 0, within
+    0.03 elsewhere (the two are averaged over different state families)."""
+    from compressor.train import register_distance_targets
+    from datagen.ideal import ideal_distance
+    rows = [c for p in _CASES for c in p]
+    D = register_distance_targets(*_rf_batch(rows, 2))
+    for k, (a, b) in enumerate(_CASES):
+        want = math.tanh(ideal_distance(a, b))
+        got = float(D[2 * k, 2 * k + 1])
+        if want == 0.0:
+            assert got == 0.0, (a, b, got)
         else:
-            op = rng.choice(Iops)
-            imm = rng.randrange(32) if op in ('SLLI', 'SRLI', 'SRAI') else rng.randrange(-2048, 2048)
-            instrs.append(Instruction(op, rd, a, imm))
-    anchors = draw_anchor_states(np.random.default_rng(seed), 1)
-    outs = torch.tensor(np.stack([precompute_chunk([i], anchors).witness[0]
-                                  for i in instrs]).astype(np.int64))
-    return instrs, outs
+            assert abs(got - want) < 0.03, (a, b, got, want)
+    assert torch.equal(D, D.t())
 
 
-def test_pair_distance_targets_match_the_reference_distance():
-    from compressor.train import max_distance_matrix, pair_distance_targets
-    from datagen.knownbits import output_known_bits, max_distance, output_distance
-    instrs, outs = _t1_rows(24, 2)
-    outs = outs[:, :5]
-    kb = [output_known_bits([i])[i.args[0]] for i in instrs]
-    zero = torch.tensor([k.zero for k in kb]); one = torch.tensor([k.one for k in kb])
-    m = max_distance_matrix(zero, one)
-    D = pair_distance_targets(outs, zero, one)
-    for i in range(24):
-        for j in range(24):
-            ref = max_distance(kb[i], kb[j])
-            assert int(m[i, j]) == ref, (instrs[i], instrs[j])
-            want = np.mean([output_distance(int(outs[i, k]), int(outs[j, k]), ref) for k in range(5)])
-            assert abs(float(D[i, j]) - want) < 1e-5
+def test_every_partner_rewrite_is_at_zero():
+    from compressor.train import register_distance_targets
+    from datagen.generate import sample_chunk_partner_pair
+    rng = np.random.default_rng(5)
+    pairs = [sample_chunk_partner_pair(rng, 2) for _ in range(60)]
+    D = register_distance_targets(*_rf_batch([c for p in pairs for c in p], 2))
+    for k, (a, b) in enumerate(pairs):
+        assert float(D[2 * k, 2 * k + 1]) == 0.0, (a, b)
+
+
+def test_column_distance_matches_the_datagen_column_distance():
+    from compressor.train import _column_distance, _inv_log_bound
+    from datagen.knownbits import column_distance, observed_bits
+    rng = np.random.default_rng(2)
+    cols = [rng.integers(-2 ** 31, 2 ** 31, 64).astype(np.int32),
+            (rng.integers(0, 2, 64)).astype(np.int32),
+            np.full(64, 7, np.int32), np.full(64, 9, np.int32)]
+    cols.append(cols[0] + 1)
+    bits = [observed_bits(c) for c in cols]
+    t = torch.from_numpy(np.stack(cols))
+    z = torch.tensor([b[0] for b in bits]); o = torch.tensor([b[1] for b in bits])
+    inv = _inv_log_bound(z[:, None], o[:, None], z[None], o[None])
+    D = _column_distance(t[:, None], t[None], inv)
+    for i in range(len(cols)):
+        for j in range(len(cols)):
+            want = column_distance(cols[i], bits[i], cols[j], bits[j])
+            assert abs(float(D[i, j]) - want) < 1e-5, (i, j)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='needs CUDA')
 def test_graphed_distance_targets_equal_the_eager_ones():
-    """Replayed against new contents at the captured addresses, the graph
-    gives the eager targets bit for bit."""
-    from compressor.train import GraphedDistanceTargets, chunk_distance_targets
-    from datagen.knownbits import output_known_bits
+    """The fused kernels, replayed as a graph against new contents at the
+    captured addresses, give the eager targets."""
+    from compressor.train import GraphedDistanceTargets, register_distance_targets
+    from datagen.generate import sample_chunk_partner_pair
     dev = torch.device('cuda')
     g = GraphedDistanceTargets()
     bufs = None
     for seed in (3, 4, 5):
-        instrs, outs = _t1_rows(48, seed)
-        kb = [output_known_bits([i])[i.args[0]] for i in instrs]
-        zero = torch.tensor([k.zero for k in kb]); one = torch.tensor([k.one for k in kb])
-        count = torch.ones(len(instrs), dtype=torch.long)
-        new = [t.to(dev) for t in (outs.unsqueeze(1), zero.unsqueeze(1), one.unsqueeze(1), count)]
+        rng = np.random.default_rng(seed)
+        rows = [c for _ in range(24) for c in sample_chunk_partner_pair(rng, 2)]
+        new = [t.to(dev) for t in _rf_batch(rows, 2)]
         if bufs is None:
             bufs = [torch.empty_like(t) for t in new]
         for b, t in zip(bufs, new):
             b.copy_(t)
         got = g(*bufs).clone()
-        assert torch.equal(got, chunk_distance_targets(*bufs))
+        want = register_distance_targets(*bufs, fused=False)
+        assert torch.allclose(got, want, atol=1e-5)
 
 
-def test_chunk_distance_is_the_rms_over_outputs_and_counts_an_unmatched_one_as_1():
-    from compressor.train import chunk_distance_targets, pair_distance_targets
-    instrs, outs = _t1_rows(6, 9)
-    from datagen.knownbits import output_known_bits
-    kb = [output_known_bits([i])[i.args[0]] for i in instrs]
-    z = torch.tensor([k.zero for k in kb]); o = torch.tensor([k.one for k in kb])
-    # rows 0-2: two outputs (rows i and i+3 of the single-instruction set);
-    # row 3: one output; row 4: none; row 5: none.
-    W = torch.zeros(6, 2, outs.shape[1], dtype=torch.long)
-    Z = torch.zeros(6, 2, dtype=torch.long); O = torch.zeros(6, 2, dtype=torch.long)
-    for r in range(3):
-        W[r, 0], W[r, 1] = outs[r], outs[r + 3]
-        Z[r, 0], Z[r, 1], O[r, 0], O[r, 1] = z[r], z[r + 3], o[r], o[r + 3]
-    W[3, 0], Z[3, 0], O[3, 0] = outs[0], z[0], o[0]
-    count = torch.tensor([2, 2, 2, 1, 0, 0])
-    D = chunk_distance_targets(W, Z, O, count)
-    d0 = pair_distance_targets(outs[:3], z[:3], o[:3])
-    d1 = pair_distance_targets(outs[3:], z[3:], o[3:])
-    for i in range(3):
-        for j in range(3):
-            want = torch.sqrt((d0[i, j] ** 2 + d1[i, j] ** 2) / 2)
-            assert torch.allclose(D[i, j], want, atol=1e-6)
-    assert torch.allclose(D[0, 3], torch.sqrt(torch.tensor(1.0) / 2), atol=1e-6)  # match 0, one unmatched
-    assert float(D[4, 5]) == 0.0 and float(D[3, 4]) == 1.0 and float(D[0, 4]) == 1.0
-
-
-def test_distance_loss_targets_cosine_distance_and_balances_equivalents():
+def test_distance_loss_targets_cosine_distance_and_weights_small_targets_up():
     """d is the target cosine distance — orthogonal rows at d = 1 and
-    coincident rows at d = 0 cost nothing — and the equivalent pairs are
-    averaged apart from the rest, so one of them weighs as much as all the
-    others together."""
-    from compressor.train import distance_loss
-    e = torch.eye(4)[:3]                               # three orthogonal rows
+    coincident rows at d = 0 cost nothing — and a pair's error weighs
+    1 / (target chord + DISTANCE_EPS)."""
+    from compressor.train import distance_loss, DISTANCE_EPS
+    e = torch.eye(4)[:3]
     mask = torch.ones(3, dtype=torch.bool)
-    t = torch.ones(3, 3)
-    assert float(distance_loss(e, t, mask)) < 1e-6
+    assert float(distance_loss(e, torch.ones(3, 3), mask)) < 1e-6
     e2 = torch.stack([e[0], e[0], e[1]])               # rows 0 and 1 coincide
     t2 = torch.tensor([[0., 0., 1.], [0., 0., 1.], [1., 1., 0.]])
     assert float(distance_loss(e2, t2, mask)) < 1e-6
-    t3 = t2.clone(); t3[0, 1] = t3[1, 0] = 1.0         # now call them unrelated
-    # the one pair now misses its orthogonal target by sqrt(2); the two
-    # equivalent-free averages: other = (2 + 0 + 0) / 3, same = 0 (no pair)
-    assert abs(float(distance_loss(e2, t3, mask)) - 2.0 / 3) < 1e-4
+    t3 = t2.clone(); t3[0, 1] = t3[1, 0] = 1.0         # call the coincident pair unrelated
+    c = math.sqrt(2.0)
+    w = 1.0 / (c + DISTANCE_EPS)
+    want = (2.0 * w) / (3 * w)                          # its chord misses by sqrt(2)
+    assert abs(float(distance_loss(e2, t3, mask)) - want) < 1e-4
+    t4 = t2.clone(); t4[0, 1] = t4[1, 0] = 0.5          # a nearer target weighs more
+    c4 = 1.0
+    w4 = 1.0 / (c4 + DISTANCE_EPS)
+    want4 = (1.0 * w4) / (w4 + 2 * w)
+    assert abs(float(distance_loss(e2, t4, mask)) - want4) < 1e-4
+
+
+def test_vp_assignment_is_exact_by_enumeration_and_greedy_past_four():
+    """Up to four outputs the least-cost assignment of every permutation; past
+    four a greedy one, which recovers a planted assignment whose costs leave
+    no tie."""
+    from compressor.train import vp_assignment
+    g = torch.Generator().manual_seed(0)
+    for K in (2, 3, 4, 6):
+        perm = torch.randperm(K, generator=g)
+        cost = torch.rand(5, K, K, generator=g) + 1.0
+        cost[:, perm, torch.arange(K)] = 0.01                 # slot perm[j] serves output j
+        slot, total = vp_assignment(cost, torch.ones(5, K))
+        assert torch.equal(slot, perm.expand(5, -1)), K
+        assert torch.allclose(total, torch.full((5,), 0.01 * K))

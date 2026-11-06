@@ -1,0 +1,18 @@
+{
+  "R_ALU": 0.55,
+  "I_ALU": 0.45,
+  "exclude_x0_dest": true,
+  "chain": {
+    "rate": 0.1
+  },
+  "partners": {
+    "rate": 0.5,
+    "mined": {
+      "fraction": 0.5,
+      "reuse": 2
+    }
+  },
+  "aim": {
+    "fraction": 0.5
+  }
+}

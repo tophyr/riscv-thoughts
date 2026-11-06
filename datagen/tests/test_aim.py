@@ -131,6 +131,6 @@ def test_an_aimed_batch_ships_the_inputs_its_values_were_executed_from():
         while pos < len(toks):
             ins, pos = decode_instruction(toks, pos)
             chunk.append(ins)
-        got = _reexecuted(chunk, b.out_slot_regs[i], b.out_inputs[i],
-                          b.out_input_values[i])
+        got = _reexecuted(chunk, b.out_slot_regs[i], b.in_roles[i],
+                          b.in_role_values[i], 3)
         assert np.array_equal(got, b.out_values[i])

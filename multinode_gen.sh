@@ -124,12 +124,14 @@ kill -0 $SSH_PID 2>/dev/null || { echo "ERROR: remote process died" >&2; exit 1;
 # --count TOTAL bounds the joined stream and, on reaching it, reaps the
 # local pool and (via BrokenPipe over nc) the remote pool.
 # </dev/null: mux only the explicit <(nc …) input, never an inherited stdin.
+# Local worker seeds start past the remote pool's (remote worker i draws
+# GEN_SEED+i), so no local worker repeats a remote worker's stream.
 ${PYTHON} -m datagen \
     --gen-count ${LOCAL_GEN} \
     <(nc odin ${PORT} -d | lz4 -dc) \
     --rule ${RULE} \
     --batch-size ${BATCH_SIZE} \
     --n-states ${N_STATES} \
-    --seed ${GEN_SEED} \
+    --seed $((GEN_SEED + REMOTE_GEN)) \
     --config ${CONFIG} \
     --count ${TOTAL} </dev/null

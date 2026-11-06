@@ -382,14 +382,15 @@ def test_chain_config_block_is_validated():
     validate_distribution({'R_ALU': 1.0, 'chain': {'rate': 0.25}})
 
 
-def test_witness_outputs_match_the_cpu_emulator():
-    """Each output at every witness state, the chunk's p-th input in canonical
-    role order holding the state's position p+1 and every other register 0,
-    listed in canonical output order, equals the CPU emulator on that
-    register file."""
+def test_register_file_fields_match_the_cpu_emulator():
+    """Under every placement, each position holds the CPU emulator's final
+    value of the register placed there — the chunk's canonical input i on
+    position perm[i] — or, with no register placed there, the value placed;
+    each written-only register holds its final value."""
     from emulator import run as emu_run
     from datagen.batch import generate_chunks
-    from datagen.compare import witness_states, to_ssa, live_nodes, _eval_ssa_numpy
+    from datagen.compare import (witness_states, to_ssa, live_nodes, _eval_ssa_numpy,
+                                 n_positions, placements)
     from datagen.generate import build_opcode_table, length_cap
     from datagen.roles import canonical_inputs
     from datagen.signature import leaf_colours, output_inputs
@@ -398,9 +399,10 @@ def test_witness_outputs_match_the_cpu_emulator():
     w = witness_states()
     for L in (1, 2, 3):
         chunks = generate_chunks(length_cap(L), rng, opcode_table=alu, chain_rate=0.5)
-        for _ in range(40):
+        perms = placements(n_positions(L))
+        for _ in range(25):
             chunk = next(chunks).instructions
-            pre = precompute_chunk(chunk, draw_anchor_states(rng, 4))
+            pre = precompute_chunk(chunk, draw_anchor_states(rng, 4), L)
             outs = [r for r in pre.out_slot_regs.tolist() if r != AUX_CE_IGNORE]
             ssa = to_ssa(chunk); live = live_nodes(ssa); deps = output_inputs(chunk)
             col = leaf_colours(chunk)
@@ -408,13 +410,20 @@ def test_witness_outputs_match_the_cpu_emulator():
                 sorted({x for r in outs for x in deps[r]}),
                 lambda regs: _eval_ssa_numpy(ssa, len(chunk), regs, live)[0][:, outs]
                 .astype(np.int64) & 0xFFFFFFFF,
-                lambda r: (col.get(r, ''), r))
-            for p, k in enumerate(pre.witness_slots.tolist()):
-                if k < 0:
-                    continue
-                for s in range(0, w.shape[0], 7):
+                lambda r: (col.get(r, ''), r),
+                lambda regs: _eval_ssa_numpy(ssa, len(chunk), regs, live)[0])
+            wonly = [r for r in outs if r not in roles]
+            assert pre.n_wo == len(wonly)
+            for si in rng.choice(len(perms), min(3, len(perms)), replace=False):
+                pm = perms[si]
+                for st in range(0, w.shape[0], 9):
                     regs = np.zeros(32, dtype=np.int32)
-                    for q, src in enumerate(roles):
-                        regs[src] = w[s, q + 1]
-                    want = emu_run(chunk, regs)[0].regs[outs[k]]
-                    assert pre.witness[p, s] == want, (chunk, p, s)
+                    for i, r in enumerate(roles):
+                        regs[r] = w[st, pm[i] + 1]
+                    final = emu_run(chunk, regs)[0].regs
+                    on = {pm[i]: r for i, r in enumerate(roles)}
+                    for p in range(n_positions(L)):
+                        want = final[on[p]] if p in on else w[st, p + 1]
+                        assert pre.rf_pos[si, p, st] == want, (chunk, si, p, st)
+                    for j, r in enumerate(wonly):
+                        assert pre.rf_wo[si, j, st] == final[r], (chunk, si, j, st)

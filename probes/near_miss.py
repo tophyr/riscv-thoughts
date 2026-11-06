@@ -7,7 +7,7 @@ Rows, 2,000 pairs each, registers drawn at random and shared within a pair:
   ADDI k vs k+1, ADDI k vs k+512, ADD vs SUB, SLLI 3 vs SLLI 4.
 Each row reports the mean chord distance between unit-normalized essences and
 its target: the chord √(2d) `distance_loss` trains toward, d the behavioral distance
-(`pair_distance_targets`, `compressor/train.py`), computed on the same pairs.
+(`register_distance_targets`, `compressor/train.py`), computed on the same pairs.
 A graded space keeps k+1 well inside k+512.
 
 Usage: near_miss.py <t1_run_dir> [<t1_run_dir> ...]
@@ -21,9 +21,9 @@ import torch.nn.functional as F
 sys.path.insert(0, '/home/tophy/Projects/riscv-thoughts')
 
 from compressor.model import instruction_wiring
-from compressor.train import pair_distance_targets
-from datagen import draw_anchor_states, precompute_chunk
-from datagen.knownbits import output_known_bits
+from compressor.train import register_distance_targets
+from datagen import draw_anchor_states
+from datagen.batch import build_targets, pack_batch, _make_valid_chunk
 from emulator import Instruction as I
 from scripts._common import load_frozen_encoder
 from tokenizer import encode_instruction, PAD
@@ -50,17 +50,25 @@ def encode(t1, instrs):
     return F.normalize(e.float(), dim=-1)
 
 
-def target(a, b):
-    """The target chord √(2d) of each pair (a[i], b[i]), d their behavioral distance."""
-    rows = a + b
-    anchors = draw_anchor_states(np.random.default_rng(0), 1)
-    outs = torch.tensor(np.stack([precompute_chunk([i], anchors).witness[0]
-                                  for i in rows]).astype(np.int64))
-    kb = [output_known_bits([i])[i.args[0]] for i in rows]
-    D = pair_distance_targets(outs, torch.tensor([k.zero for k in kb]),
-                              torch.tensor([k.one for k in kb]))
-    n = len(a)
-    return float(torch.sqrt(2.0 * torch.stack([D[i, n + i] for i in range(n)])).mean())
+def target(a, b, per=200):
+    """The target chord √(2d) of each pair (a[i], b[i]), d their behavioral
+    distance, built from packed batches as the trainer builds it."""
+    rng = np.random.default_rng(0)
+    chords = []
+    for s in range(0, len(a), per):
+        rows = [_make_valid_chunk([i]) for i in a[s:s + per] + b[s:s + per]]
+        aux, ov, oiv, orv = build_targets(
+            rows, lambda k: np.stack([draw_anchor_states(rng, 1) for _ in range(k)]), 1)
+        bt = pack_batch(rows, target_B=len(rows), target_max_tokens=9,
+                        target_max_n_instrs=1, out_values=ov, in_role_values=oiv,
+                        out_regs_valid=orv, aux_payload=aux)
+        dt = {'rf_wo_free': torch.float32, 'rf_pos': torch.int32, 'rf_wo': torch.int32}
+        D = register_distance_targets(*[torch.from_numpy(getattr(bt, k)).to(dt.get(k, torch.int64))
+                                        for k in ('rf_pos', 'rf_pos_zero', 'rf_pos_one', 'rf_wo',
+                                                  'rf_wo_zero', 'rf_wo_one', 'rf_wo_free', 'n_wo')])
+        n = len(rows) // 2
+        chords.append(torch.sqrt(2.0 * torch.stack([D[i, n + i] for i in range(n)])))
+    return float(torch.cat(chords).mean())
 
 
 def pairs():

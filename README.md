@@ -41,10 +41,10 @@ PC, or dead and same-value writes (PC is not an output) — and the binding is a
 graph from external registers through operation roles to results.
 
 The code grades the essence in the **register frame**: value prediction reads
-the essence, recovering each written output's value from the essence, a
-pointer naming which of the chunk's outputs is asked about, and the values of
-the registers the output depends on, with no input or output numbered by the
-order the instructions are written in or by register number; each input
+the essence, recovering every written output's value at once, as a set, from
+the essence and the values of the chunk's input registers, with no input or
+output numbered by the order the instructions are written in or by register
+number; each input
 register is identified by its structural colour in the chunk's dataflow
 graph, with every operand role ordered — the encoder is told nothing about
 which operations commute; and the essence is the pool over the written slots
@@ -146,13 +146,13 @@ the encoder ever sees a register value, so the essence describes functions
 rather than holding numbers. The input states are drawn
 afresh for every chunk, with structure, and the score is taken at a fixed set
 no model trains on: a readout trained on one fixed set stores answers at it
-instead of evaluating. **At one instruction it holds exactly**: T1's emitted
-wiring matches the oracle on every instruction and its essence is evaluated
-exactly at 2.46 million unseen input values. **At two instructions
-it holds to 99.7857%** — 10,355 failures in 4.83 million scored values, every
-output register of 38,400 held-out chunks at 64 input states — after 1M
+instead of evaluating. **At one instruction it holds**: T1's emitted wiring
+matches the oracle on every instruction and its essence is evaluated exactly
+at all but 5 of 2.46 million unseen input values. **At two instructions it
+holds to 99.8965%** — 5,006 failures in 4.84 million scored values, every
+output register of 38,400 held-out chunks at 64 input states — after 3M
 training steps, one seed, a twelve-layer residual readout; outputs that depend
-on three inputs carry the residual at 89.6%. Beyond two instructions it is
+on three inputs carry the residual at 96.1%. Beyond two instructions it is
 untested.
 
 *Equivalence.* Two instruction sequences that compute the same function must
@@ -162,20 +162,24 @@ dataflow graph unchanged does, exactly and by construction: a register rename,
 reordered independent instructions, an inserted dead instruction. Everything
 that needs the op-cell to compute does not emerge by itself — a commutative
 swap among them — since value prediction alone is satisfied by any essence it
-can read. The pressure is a pairwise behavioral distance: every two chunks'
-essences are held as far apart as their outputs differ at shared inputs, so
-equivalent spellings meet and near-misses stay near. At one instruction it
-collapses every spelling group tried — copies, zero, doubling, the sign test,
-constants — to within 0.11 of a point while unrelated instructions keep their
-spread, and with its training input states aimed where each instruction's
-output changes, it still evaluates every held-out value exactly. At two
-instructions, with inputs matched by the role each plays in the function
-rather than by how the chunk is written, training pairs drawn from
-every rewrite in every operand context, and equivalent pairs given their own
-share of the loss, the same term collapses every class tried — folds of two
-literals, cancelling pairs, reassociations, respellings, identity writes and
-commutative swaps on shared or composed operands — while value prediction
-holds at 99.79%.
+can read. The pressure is a pairwise behavioral distance:
+every two chunks' essences are held as far apart as their register files
+differ after them at shared inputs, so equivalent spellings meet and
+near-misses stay near. At one instruction it collapses every spelling group
+tried — copies, zero, doubling, the sign test, constants — to within 0.11 of a
+point while unrelated instructions keep their spread, and with its training
+input states aimed where each instruction's output changes, it still evaluates
+every held-out value exactly. At two instructions the best T2 is trained on
+two kinds of equivalent pair: named rewrites (commutative swaps,
+respellings, folds, cancellations, reassociations, identity writes), and pairs
+found by searching every single ALU instruction for one that computes what a
+two-instruction chain computes, each proved equal on every input. It
+collapses every class tried, named or found — folds of `ANDI`, `ORI` and
+shift chains, a negation flip, doubling twice, cancellations — to within
+0.05, against 1.25 for unrelated chunks, while value prediction holds at
+99.90%. An operation family whose pairs are kept out of training does not
+collapse: collapse follows from the function within the families the pairs
+reach, and does not transfer to another.
 
 Beyond both lies T3, the first tier that must *compose* bindings rather than
 merely emit them.

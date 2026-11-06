@@ -59,12 +59,11 @@ python -m datagen --gen-count 0`.)
 Generation flags are first-class — there is no `--` separator.
 
 Two cells are the whole catalogue: the T2 cell below ("Current T2 config") and
-the T1 cell after it ("T1 config"). Both run generation LOCALLY, and at len=2
-local generation keeps the GPU saturated (see "Multinode / remote generation").
-When a cell outruns the local cores, front the trainer with `multinode_gen.sh`
-instead so generation lands on odin — same generation flags as env vars, same
-`| trainer` tail: swap `python -m datagen … --count N` for
-`<env-knobs> ./multinode_gen.sh N`. `--count N` emits exactly N batches, then
+the T1 cell after it ("T1 config"). T1 generates locally. T2's searched
+partner pairs need more CPU than the local cores have, so its cell fronts the
+trainer with `multinode_gen.sh`, which generates on odin and locally at once
+(see "Multinode / remote generation"); it takes the generation flags as env
+vars, with the same `| trainer` tail. `--count N` emits exactly N batches, then
 closes stdout and reaps the whole worker pool.
 
 `--n-steps` only shapes the cosine-LR schedule and the ETA display — it is NOT a
@@ -79,25 +78,27 @@ prediction reads the essence, at every tier (RISCV_DESIGN, "Value prediction
 reads the essence").
 
 ```bash
-python -m datagen --rule "cap=$LEN" --batch-size 384 --n-states 8 \
-    --config configs/instr_alu_writers_chain010_rewrites050_aim050.json \
-    --gen-count 26 --count "$STEPS" \
-  | python scripts/train_t2_encoder.py --t1-model runs/t1_distance_cosbal_500k/encoder.pt \
+RULE="cap=$LEN" CONFIG=configs/instr_alu_writers_chain010_rewrites025_minedlive025_aim050.json \
+    REMOTE_GEN=56 LOCAL_GEN=5 ./multinode_gen.sh "$STEPS" \
+  | python scripts/train_t2_encoder.py --t1-model runs/t1_setvp_500k/encoder.pt \
     --d-out 512 --d-event 16 --op-cell-depth 4 --vp-head-depth 12 \
     --n-pool-heads 16 --route binding --distance-weight 1.0 \
     --n-steps "$STEPS" --out-dir "$OUT"
 ```
 
-T2 trains at `LEN=2`, `STEPS=1000000` on the chain-rate-0.10 corpus with half
-of every batch rewrite partner pairs and aimed anchors, with the behavioral
-distance term (EXPERIMENT_LOG, "The register frame", finding 50), and a
-twelve-layer vp head (every vp head is a residual stack with LayerNorm; a
+T2 trains at `LEN=2`, `STEPS=3000000` on the chain-rate-0.10 corpus with half
+of every batch partner pairs — half of those rewrites, half searched for and
+proved fresh, each drawn at most twice — and aimed anchors, with the
+behavioral distance term (EXPERIMENT_LOG, "The register frame", finding 61),
+and a twelve-layer vp head (every vp head is a residual stack with LayerNorm; a
 plain Linear+ReLU stack cannot evaluate a composed chunk exactly even from a
 perfect description, EXPERIMENT_LOG, "T2 faithfulness", finding 34). The
-chain rate is necessary for the composed slots (finding 30). A 1M cell takes
-~5.5 h at ~20 ms/step with the distance term (finding 44); 10M steps cut the
-failing triples a further two orders of magnitude in the first-read frame
-(finding 35) and is not needed to judge a configuration. It is graded on the
+chain rate is necessary for the composed slots (finding 30). Mining is
+CPU-heavy, so generation runs on odin (`REMOTE_GEN=56`, past which its rate
+falls) with 5 local workers; the cell is GPU-bound at about 28 ms/step, about
+24 h for 3M steps. At 1M steps the same cell fails about four times as many
+held-out triples as at 3M (findings 60 and 61), so compare cells at equal
+steps. It is graded on the
 unmodified `instr_alu_writers.json`, the population the model will actually
 meet.
 
@@ -119,6 +120,12 @@ anchors, and the emitted binding exact per chunk. The directory ends in the
 config's name with the `instr_` prefix dropped (`…_dist1.0_alu_writers`), so
 two corpus arms of one configuration cannot collide; `TAG=<name>` additionally
 suffixes it so a re-run of an already-recorded cell does not overwrite it.
+With `REMOTE_GEN=N` it generates on odin through `multinode_gen.sh` instead
+(`LOCAL_GEN` local workers beside it, `PORT` the link). Before training it
+writes `code.patch` (the tree's diff against HEAD) and `code_untracked.tgz`
+into the run directory, so a run can be scored or resumed after the tree
+moves on: a scorer that loads a checkpoint into a later tree fails at load
+when the model's parameters changed in between.
 Prefer it to typing the pipeline by hand — but **never edit it while a copy is
 running**: bash reads a script incrementally, so an edit shifts the file offsets
 under the running shell. The symptoms are a spurious `syntax error near 'fi'`,
@@ -143,8 +150,9 @@ exists reads a partial model.
 command below differs from the T2 cell only in its ingestion front-end and its
 hparams. Its corpus is the writers corpus with partner pairs and half of every
 row's anchor states aimed where its output changes (EXPERIMENT_LOG, "The
-register frame", findings 41–43 and 50). The frozen T1 is
-`runs/t1_distance_cosbal_500k`. Its vp head has three hidden layers (the
+register frame", findings 41–43, 50, 54 and 59). The frozen T1 is
+`runs/t1_setvp_500k`; the T1s of findings 50 and 54 do not load into the
+current core, whose pool and evaluator differ from theirs. Its vp head has three hidden layers (the
 trainer's default) of the residual-with-LayerNorm form every vp head takes, the
 smallest depth with which T1 reaches exact vp at held-out anchors, and that
 takes the 500k-step schedule (EXPERIMENT_LOG, "T2 faithfulness", finding 33).
@@ -157,13 +165,15 @@ python -m datagen --rule single --batch-size 384 --n-states 8 \
     --n-steps 500000 --out-dir "$OUT"
 ```
 
-It runs at 7–8 ms/step, GPU at 98–99%: datagen ships each output's values at
-64 shared witness states (`out_witness`), and the trainer builds the 384×384
-distance target from them before each step, replayed as one CUDA graph of its
-own (`GraphedDistanceTargets`, `compressor/train.py`). Both trainers take
-`--distance-weight` (default 0, off); between two chunks the target is the
-root-mean-square over their outputs in canonical order, an output one chunk
-has and the other lacks scoring 1 (`chunk_distance_targets`).
+datagen ships each row's register file after the chunk at 64 shared witness
+states, under every placement of its canonical inputs (`rf_pos`, `rf_wo`),
+and the trainer builds the 384×384 distance target from them before each step,
+as two fused kernels replayed as one CUDA graph of its own
+(`GraphedDistanceTargets`, `compressor/train.py`). Both trainers take
+`--distance-weight` (default 0, off); between two chunks the target is
+tanh of the root-sum-square of their per-register distances, minimised over
+the second row's placements (`register_distance_targets`; RISCV_DESIGN,
+"Collapse"). With it T1 runs at about 4 ms/step alone on the GPU.
 
 Both trainers expose the same model hparams — `--d-event`, `--op-cell-depth`,
 `--vp-head-depth`, `--n-pool-heads` — since T1 and T2 run the same core
@@ -175,9 +185,10 @@ there is no way to run the two tiers on different versions of it.
 `load_frozen_encoder` and `load_t2` (`scripts/_common.py`) call a strict
 `load_state_dict` with no remapping, and the core has no branch for an
 alternative slot seeding, pool channel, read pulse or vp-head form. A
-checkpoint lacking the pointer projection (`pool_ptr`), carrying the
-content-hash pointer buffers (`P_content`, `u_order`), or whose vp head is a
-plain ReLU stack rather than `VPHead` fails at load. A change to the core's
+checkpoint carrying a pointer projection (`pool_ptr`), lacking the pool's
+self-colour projection (`pool_self`), whose vp head emits one prediction
+rather than a set, or whose vp head is a plain ReLU stack rather than
+`VPHead` fails at load. A change to the core's
 parameters therefore needs a check against the frozen T1 checkpoint, not just
 the test suite (CLAUDE.md, "When making a refactor or vectorize change").
 
@@ -265,28 +276,35 @@ by cmdline).
   **dtype signature** (`BinaryFormat`'s prefix read): a body-field change shifts
   the signature and readers raise `Dtype mismatch`.
 - **No stream header — every batch is self-describing** (4-byte magic `RVT\x00` +
-  dtype signature, then a 6-uint32 dimension header, then the body). This is the
+  dtype signature, then an 8-uint32 dimension header, then a uint64 length
+  and the zlib-compressed body). This is the
   load-bearing property: **RVT streams concatenate with `cat`.**
   - Combine corpora: `cat a.rvt b.rvt > both.rvt`
   - **Second epoch = `cat corpus.rvt corpus.rvt | trainer`.** There is no built-in
     repeat; epochs are shell-level `cat`.
-- Header fields: `B, max_tokens, max_n_instrs, n_anchors, OB, max_out_inputs`
+- Header fields: `B, max_tokens, max_n_instrs, n_anchors, OB, n_places,
+  n_positions`
   (`RVT_FORMAT`, `datagen/batch.py`). `OB` is the value-target row count —
   `B` in practice, always, since `build_targets` returns one row per row; the
   format still permits 0. A batch carries only what value prediction reads of
   each row's execution: per output slot at each anchor, the output's value
-  (`out_values`, `OB, n_anchors, max_n_instrs`) and its input values in
-  `out_inputs` order (`out_input_values`, `OB, n_anchors, max_n_instrs,
-  max_out_inputs`, where `max_out_inputs = max_n_instrs + 1` is the most
-  inputs one output of such a chunk can read). The trainer feeds those to the
+  (`out_values`, `OB, n_anchors, max_n_instrs`), and the chunk's input
+  registers in canonical role order (`in_roles`, `B, n_positions`) with their
+  values at each anchor (`in_role_values`, `OB, n_anchors, n_positions`). The trainer feeds those to the
   vp head (INVARIANT 1); the 32-register files a row executes from never leave
-  the generator. `out_witness` (`B, max_n_instrs, 64`) is each output at the
-  shared witness states, inputs placed by canonical role and outputs sorted
-  by the raw bytes of their witness values — not aligned with `out_slot_regs`;
-  `out_known_zero` / `out_known_one` (`B, max_n_instrs`) are its known bits, in
-  the same order, the bits forced to 0 or 1 whatever the inputs
-  (`datagen/knownbits.py`); `n_witness` (`B`) is how many of those positions
-  hold an output (the chunk's outputs less its same-value writes). The
+  the generator. The behavioral distance's fields: a row of a
+  K-instruction corpus has its canonical inputs (`datagen/roles.py`) placed on
+  `n_positions = 2K` register positions, under each of `n_places`
+  placements — every permutation up to 4 positions (24 at K = 2), only the
+  canonical one beyond — at the 64 shared witness states. `rf_pos` (`B,
+  n_places, n_positions, 64`) is the final value on each position (the new
+  value of a register the chunk wrote, the placed value otherwise); `rf_wo`
+  (`B, n_places, max_n_instrs, 64`) the final value of each register written
+  but not read, `n_wo` (`B`) how many; `rf_pos_zero/one`, `rf_wo_zero/one`
+  the bits each column never changes across the 1,024-state bound family;
+  `rf_wo_free` (`B, max_n_instrs`) each written-only register's squared
+  distance from its old value. Uncompressed, a len-2 batch is about 15 MB and a len-1 batch
+  about 1 MB. The
   behavioral distance is built from these (INVARIANT 7). Body field list +
   dtypes are the `BodyField(...)` list in `RVT_FORMAT`; the per-field header
   sanity bounds are its `header_bounds={...}`, enforced on every read by
@@ -306,7 +324,7 @@ corpus"). Validation: `validate_distribution` (`datagen/generate.py`); the
 accepted non-opcode keys are `_CONFIG_EXTRA_KEYS` and an unknown key is a hard
 error.
 
-Four configs exist. Add one when a run needs a corpus none of them describes,
+Five configs exist. Add one when a run needs a corpus none of them describes,
 and delete it once nothing runs it — an unused config is a corpus nobody can
 attribute a result to.
 
@@ -327,8 +345,8 @@ attribute a result to.
   where the row's output changes (`datagen/aim.py`); without it the distance
   term's T1 fails comparisons near their immediate (finding 42). A scoring
   corpus (`--heldout-anchors`) is never aimed.
-- `instr_alu_writers_chain010_rewrites050_aim050.json` — **T2's training
-  corpus.** The writers corpus plus three blocks. `chain: {rate: 0.10}`: a
+- `instr_alu_writers_chain010_rewrites050_aim050.json` — **T2's rewrite-only
+  corpus**, finding 50's. The writers corpus plus three blocks. `chain: {rate: 0.10}`: a
   uniform register draw leaves only ~4.7% of two-instruction chunks with the
   second reading the first's result, and that scarcity — not any architectural
   limit — is what held the composed-slot value prediction down (EXPERIMENT_LOG,
@@ -342,6 +360,14 @@ attribute a result to.
   its absence) embedded in random context; a partner mix that leaves a rewrite
   out lets its collapse lapse (finding 47). `aim: {fraction: 0.5}`: half of
   every row's anchor states aimed, as for T1.
+- `instr_alu_writers_chain010_rewrites025_minedlive025_aim050.json` — **T2's
+  training corpus** (finding 61). The same mix with every mined pair searched
+  for and proved fresh (`partners.mined`;
+  `datagen.mine.sample_pooled_pair`), each drawn `reuse: 2` times from a
+  rolling 64-pair pool taken in turn, renamed each draw, so no batch repeats a
+  pair. A mined pair costs about 21 ms on an idle core; odin's pool at 56
+  workers and 5 local workers keep the GPU fed at about 28 ms/step. Mining needs
+  z3-solver in the venv on every generating host (odin's included).
 - `instr_alu_writers_chain100.json` — **a scoring corpus for composed slots,
   never trained on.** The writers corpus at `chain.rate` 1.0, so every
   two-instruction chunk's second instruction reads the first's result. A
@@ -413,21 +439,38 @@ by its directory name.
   as a floor check, and re-measure both whenever the cell's configuration
   changes — a figure from one configuration says nothing about another.
 
-  **A batch is 66 KB lz4-compressed at len=1 (T1's aimed corpus) and 154 KB
-  at len=2 (T2's corpus)**, 384 rows at 8 anchor states. Odin's default 96
-  workers deliver at least 450 batches/s at len=1 and 290 at len=2 through
-  `multinode_gen.sh` (wall time of 30,000 and 20,000 batches, startup
-  included), about 30 and 45 MB/s on the link — several times what T1 (8
-  ms/step) and T2 (~14 ms/step) consume. One core generates a 384-row batch
-  in about 66 ms at len=1, 100 at len=2, 190 at len=4 and 400 at len=8; the
-  canonical roles of the witness placement (`datagen/roles.py`) are a
-  third to two fifths of that. Local generation also keeps up at
-  len=2: `python -m datagen … --gen-count 26` piped straight to the trainer is
-  what `scripts/run_t2.sh` does. Check GPU utilisation either way, right after
+  **A batch is about 85 KB at len=1 and 0.8 MB at len=2 on the wire**, 384
+  rows at 8 anchor states: the body is zlib-compressed, about 18x at len=2,
+  where the distance fields' 24 placements (`rf_pos`, `rf_wo`) are 15 MB
+  uncompressed. Both fit the odin link (111 MB/s) at the trainers' rates, so
+  generation can run on odin through `multinode_gen.sh` or locally,
+  `python -m datagen … --gen-count 26` piped straight to the trainer, as
+  `scripts/run_t2.sh` does. One core generates a len-2 batch in about 0.3 s
+  (the placements' executions and the compression), so a len-2 cell needs
+  20–30 cores of generation. Check GPU utilisation either way, right after
   launch: sustained utilisation below about 90% is a bottleneck to fix before
   the run continues, not one to note for later. A trainer pegged on CPU with
   idle generators is dispatch-bound; an idle trainer with pegged generators is
   data-starved.
+
+  **Mining partner pairs online is memory-bandwidth-bound on odin.** One
+  mined pair takes about 21 ms on an idle core; odin's total rate rises
+  linearly to about 32 concurrent workers, peaks near 1,340 pairs/s at 48–64,
+  and falls beyond (about 1,130 at 120): past the peak each extra worker
+  slows every other. A mined corpus runs with `REMOTE_GEN` near 56, not 124.
+
+  **Local and remote workers draw disjoint seeds.** Worker i of a pool
+  draws `seed + i`; the remote pool starts at `GEN_SEED` and the local pool
+  at `GEN_SEED + REMOTE_GEN` (`multinode_gen.sh`). With both started at
+  `GEN_SEED`, local worker i repeats remote worker i batch for batch — a
+  stream from 16 remote and 8 local workers held 49 duplicated batches in
+  300. No recorded result used both pools at once.
+
+  **The fifo mux is fair per source, not per worker.** Each input — every
+  local worker, and the whole remote pool as one `nc` stream — is one source
+  of a shared queue; when the trainer is the bottleneck each source gets
+  about an equal share of reads, so many local workers leave the remote pool
+  backpressured and idle. Keep `LOCAL_GEN` small beside a remote pool.
 
   **Adding remote workers does not raise a rate the GPU is already setting.**
   At `REMOTE_GEN=120`, odin sat at a load average of ~11 out of its 128 cores
@@ -441,7 +484,7 @@ by its directory name.
   ```bash
   RULE="cap=2" CONFIG=configs/instr_alu_writers_chain010_rewrites050_aim050.json \
     ./multinode_gen.sh 1000000 \
-    | python scripts/train_t2_encoder.py --t1-model runs/t1_distance_cosbal_500k/encoder.pt \
+    | python scripts/train_t2_encoder.py --t1-model runs/t1_setvp_500k/encoder.pt \
       --d-out 512 --d-event 16 --op-cell-depth 4 --vp-head-depth 12 \
       --n-pool-heads 16 --route binding --distance-weight 1.0 \
       --n-steps 1000000 --out-dir "$OUT"
@@ -528,7 +571,7 @@ Remote operational facts:
 ## Where things live / what's tracked
 
 - `runs/<name>/` — checkpoints + hparams.json + losses.json + corpus.json
-  (gitignored). `runs/t1_distance_cosbal_500k` is the frozen T1;
+  (gitignored). `runs/t1_setvp_500k` is the frozen T1;
   `runs/eval/` holds the shared held-out scoring corpora `run_t2.sh` writes.
   `.rvt` files are large binary; keep them out of commits.
 - Pipeline regression tests: `scripts/tests/test_pipeline.py` (covers rule

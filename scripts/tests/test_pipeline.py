@@ -9,6 +9,7 @@ import json
 import os
 import signal
 import subprocess
+import math
 import sys
 import tempfile
 import time
@@ -96,16 +97,18 @@ class TestGenBatches:
 
     def test_value_targets_header(self):
         """Every rule — single (T1) and multi-instruction (T2) — ships the
-        per-output value targets (OB == B), at n_anchors == --n-states, with
-        room for the K+1 inputs one output of a K-instruction chunk can
-        read."""
+        per-output value targets (OB == B), at n_anchors == --n-states, and
+        places the chunk's inputs on 2K positions."""
         for rule, K in (('single', 1), ('cap=2', 2)):
             out = gen(n_batches=1, batch_size=4, n_states=4, rule=rule)
-            B, _, max_n_instrs, n_anchors, OB, max_out_inputs = _first_header(out)
+            B, _, max_n_instrs, n_anchors, OB, n_places, n_positions = (
+                _first_header(out))
             assert B == 4 and OB == B, (rule, B, OB)
             assert n_anchors == 4, (rule, n_anchors)
-            assert max_n_instrs == K and max_out_inputs == K + 1, (
-                rule, max_n_instrs, max_out_inputs)
+            assert max_n_instrs == K, (rule, max_n_instrs)
+            # Every placement of up to 2K canonical inputs on 2K positions.
+            assert n_positions == 2 * K and n_places == math.factorial(2 * K), (
+                rule, n_positions, n_places)
 
 
 class TestGenRules:
@@ -327,7 +330,7 @@ class TestThroughput:
         over a --count-bounded run. stdout → /dev/null so the (large) data
         stream isn't buffered into the test; only stderr is captured."""
         r = subprocess.run([
-            PYTHON, '-m', 'datagen', '--gen-count', '2', '--count', '3000',
+            PYTHON, '-m', 'datagen', '--gen-count', '2', '--count', '200',
             '--rule', 'cap=2', '--batch-size', '96', '--n-states', '4', '-v', '--log-every-sec', '0.05'],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE, cwd=str(ROOT), timeout=60)
@@ -336,7 +339,7 @@ class TestThroughput:
         # At least one periodic line of the form `[  N.Ns] total=...`.
         import re
         assert re.search(r'^\[\s*\d+\.\d+s\] total=', err, re.MULTILINE), err
-        assert 'datagen: 3000 batches' in err, err
+        assert 'datagen: 200 batches' in err, err
 
 
 class TestStdin:

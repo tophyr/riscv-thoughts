@@ -48,12 +48,15 @@ def _relabel(keys):
     return {i: order.index(k) for i, k in keys.items()}
 
 
-def canonical_inputs(inputs, run, rank):
+def canonical_inputs(inputs, run, rank, own):
     """The inputs the function depends on, in canonical order.
 
     inputs: candidate input registers; run(regs (n, 32) int32) -> (n, outs)
     int64 executes the chunk; rank(r) is a rename-invariant key (the leaf's
-    colour) that chooses which member of a tied class is singled out."""
+    colour) that chooses which member of a tied class is singled out.
+    own(regs) -> (n, 32) is the register file after the chunk: an input's own
+    register's final value joins its fingerprint, so an input the chunk
+    overwrites is told from one it leaves in place."""
     F = _family()
     T = F.shape[0]
 
@@ -66,8 +69,10 @@ def canonical_inputs(inputs, run, rank):
     for a, assign in enumerate(assigns):
         for r, col in assign.items():
             regs[a, :, r] = F[:, col]
-    outs = run(regs.reshape(-1, 32)).reshape(len(assigns), T, -1)
+    flat = regs.reshape(-1, 32)
+    outs = run(flat).reshape(len(assigns), T, -1)
     n = len(inputs)
+    mine = (own(flat)[:, inputs].astype(np.int64) & _M).reshape(len(assigns), T, n)
     base = outs[0]
     U = dict(zip(inputs, outs[1:1 + n]))
     Q = dict(zip(inputs, outs[1 + n:1 + 2 * n]))
@@ -77,8 +82,13 @@ def canonical_inputs(inputs, run, rank):
     keep = [i for i in inputs
             if not (np.array_equal(U[i], base)
                     and all(np.array_equal(P[(i, j)], Q[j]) for j in inputs if j != i))]
-    U = {i: _key(U[i]) for i in keep}
-    P = {(i, j): _key(P[(i, j)]) for i in keep for j in keep if i != j}
+    idx = {r: k for k, r in enumerate(inputs)}
+    self_key = lambda a, i: mine[a, :, idx[i]].tobytes()
+    U = {i: (_key(U[i]), self_key(1 + idx[i], i)) for i in keep}
+    pair_at = {(i, j): 1 + 2 * n + k for k, (i, j) in enumerate(
+        (i, j) for i in inputs for j in inputs if i != j)}
+    P = {(i, j): (_key(P[(i, j)]), self_key(pair_at[(i, j)], i))
+         for i in keep for j in keep if i != j}
 
     def refine(cls):
         while True:

@@ -23,13 +23,21 @@ anchors. A T2 at len=2 over it, trained on partner chunk pairs drawing every
 rewrite with the distance target's chord √(2d) and equivalent pairs averaged
 apart from the rest, collapses every equivalence class tried at vp 99.79%,
 one seed (finding 50); a collapse holds only while its pairs stay in the
-training mix (finding 47). Open: whether the decisions behind that collapse
-hold up — the balanced loss, the order outputs are paired in, the pointer
-order — a second seed, rewrites never trained, the composed slots' residual,
-the binding's wire format, and the learned replacement for the colouring.
+training mix (finding 47), and reaches no equivalence class the mix does not
+draw (finding 53). That target departed from the behaviour it stands for —
+the order outputs were paired in, same-value writes, a spelling-dependent
+bound — and the encoder could not tell an in-place write from a copy
+(finding 51); the code trains toward a target that tracks the ideal
+distance d\* (finding 52), and partner pairs come from the rewrites and from a
+library found by search and proved: the T2 record on it collapses every class
+the probes build, named or not, at vp 99.80% (finding 57), and a family whose
+pairs are held out of the search does not collapse (finding 56). Open:
+equivalences with no single-instruction form, the looser collapse of the
+rewrite classes, a second seed, the binding's wire format, and the learned
+replacement for the colouring.
 
-Of the runs named below only `runs/t1_distance_cosbal_500k` and finding 50's
-T2 are kept, and of the corpus configs only those still in `configs/`; a
+Of the runs named below only `runs/t1_distance_cosbal_500k`, finding 50's T2,
+and the runs of findings 54, 56 and 57 are kept, and of the corpus configs only those still in `configs/`; a
 deleted name is the record of what was measured, not a loadable artifact.
 `runs/eval/` holds the latest regeneration of the held-out corpora; a finding
 that cites them scored the regeneration current at the time.
@@ -790,6 +798,378 @@ trained against, while chunks consisting of identities collapse with one
 another and an identity inside a chunk collapses with its absence. The vp
 difference is 0.056 points, over a different T1 and on one seed each.
 
+**51. The distance target and the encoder disagree with register-file
+behaviour in three places, each shown by a single constructed case.** A
+chunk's behaviour is its map on the register file up to a rename, so a write
+that leaves its register unchanged is no output and a copy into another
+register is one (RISCV_DESIGN, "Collapse", "The behaviour the distance
+measures").
+
+- *The bound depends on the spelling.* `ADDI x5,x0,0` and `SUB x5,x6,x6`
+  always write 0. Known bits prove the first constant and leave every bit of
+  the second unknown, so against the constant 1 (`ADDI x5,x0,1`) the first
+  pair's `max_dist` is 1 and the second's 2³¹, and the per-state distances are
+  1.0 and 0.169 (`datagen.knownbits.output_distance`).
+- *The same-value test misses rare changes.* In `SLTIU x6,x5,1 ; ADD x7,x7,x6`
+  x7 gains 1 only when x5 is 0, which none of the 16 uniform states holds, so
+  `precompute_chunk` drops x7 as a same-value write; the chunk's witness
+  outputs equal those of `SLTIU x6,x5,1` alone, a distance target of 0 between
+  two inequivalent chunks.
+- *The essence cannot see a self-loop.* On finding 50's T2, chord distances
+  between unit-normalized essences:
+
+  | `ADDI x4,x3,42` followed by | nothing | `ADDI x7,x7,0` | `ADDI x8,x7,0` | `ADDI x7,x7,1` | `ADDI x8,x7,1` |
+  |---|---|---|---|---|---|
+  | distance from `ADDI x4,x3,42` alone | 0 | 0.0345 | 0.0345 | 0.7115 | 0.7115 |
+
+  Each in-place write and its copy into x8 have bit-identical essences. The
+  pool reads value channels and pointers only, and a written slot's value is
+  the same description whichever register holds it; the colour channel, which
+  is nonzero on a written slot exactly when that register was also a live
+  input, never reaches the pool. The trained identity rewrite pulls the copy to
+  the chunk alone with the identity write, and `x7 += 1` sits as far from it as
+  `x8 = x7 + 1`.
+
+On naturally drawn chunks the departures are rare at len=2.
+`probes/target_vs_ideal.py` compares the target the trainer builds against the
+reference d\* (`datagen/ideal.py`: exact over renames, 256 states with each
+state's registers shuffled) on len-2 chunks of the T2 training corpus's
+natural stream, 1,000 pairs per population:
+
+| population | target 0 / d\* 0 | target 0, d\* > 0 | target > 0, d\* = 0 | Spearman over pairs both > 0 |
+|---|---|---|---|---|
+| unrelated chunks | 0.1% / 0.1% | 0 | 0 | 0.708 |
+| near-misses: one immediate moved by 1 or by 2–511, or one R-type opcode changed | 12.2% / 11.5% | 10 (d\* median 0.004) | 3 (target 0.011) | 0.711 |
+| partner pairs | 100% / 100% | 0 | 0 | — |
+
+The two zero-mismatch columns are the two state sets' own blind spots: each
+holds a few one-state differences the other misses. The correlation is not
+1 partly by construction — the target is a root-mean-square over outputs
+divided by the larger output count, d\* a root-sum-square over registers. The
+departures that matter sit in the tail: near-misses with d\* in (0.05, 0.2]
+have targets at 0.058 / 0.120 / 0.643 (5th / 50th / 95th percentile, n = 75).
+The one pair of 600 with a target above 3× its d\*,
+`XORI x10,x20,-312 ; ANDI x19,x13,1349` against the same with 1348 (d\* 0.116,
+target 0.786), is the output byte-sort: the changed bit reorders the two
+outputs, so each is compared with the other chunk's unrelated output.
+
+**52. The register-file target tracks d\* on near-misses, where the
+output-sort target jumped.** The target the trainer builds is the
+register-file distance of RISCV_DESIGN, "Collapse": each row's register file
+after the chunk at the 64 witness states under every placement of its
+canonical inputs, an unchanged register no output, bounds read from the bits a
+column never changes across 1,024 states, the second row's placement and the
+written-only registers' matching chosen to minimise, symmetrised, tanh
+(`register_distance_targets`). `probes/target_vs_ideal.py` against d\*, same
+populations as finding 51, 1,000 pairs each:
+
+| population | target 0, d\* > 0 | target > 0, d\* = 0 | Spearman | targets at d\* in (0.05, 0.2], p5 / p50 / p95 |
+|---|---|---|---|---|
+| unrelated chunks | 0 | 0 | 0.720 (0.708) | — |
+| near-misses | 8 (d\* median 0.004) | 2 (target 0.023) | **0.980** (0.711) | 0.077 / 0.162 / 0.179 (0.058 / 0.120 / 0.643) |
+| partner pairs | 0 | 0 | — | — |
+
+(the output-sort target of finding 51 in parentheses.) The zero mismatches are
+the two state sets' blind spots, as there. Unrelated pairs fall in a narrow
+band of d\* (0.5–1.3), where both state sets' sampling noise decides most of
+the ranking. On the constructed cases of finding 51 the target is tanh(d\*) to
+within 0.02: the identity write against its absence 0, the copy 0.707, `x7 +=
+1` and an immediate moved by one both 0.168, the two spellings of zero both
+0.762 from the constant 1, the byte-sort pair 0.117 (d\* 0.116)
+(`compressor/tests/test_train.py::test_register_distance_targets_track_the_reference_distance`).
+A len-2 batch carries 24 placements and is 15 MB; the trainer builds the
+target as two fused kernels.
+
+**53. Finding 50's T2 collapses the equivalences its partner rewrites draw
+and none outside them: its collapse is of the trained edits, not of the
+function.** `probes/novel_equivalences.py` builds seven classes of equivalent
+two-instruction chunks that no rewrite in the training mix produces, each
+against a near-miss (the second spelling with one immediate moved or its
+operation changed), every pair checked on the emulator; chord distances
+between unit-normalized essences of finding 50's T2, 1,000 pairs per class,
+against 1.211 for unrelated chunks:
+
+| class | equivalent | near-miss |
+|---|---|---|
+| `ANDI t,a,k1 ; ANDI t,t,k2` vs `ANDI t,a,k1&k2` | 1.035 | 0.404 |
+| `ORI` likewise | 1.118 | 0.487 |
+| `SLLI t,a,s1 ; SLLI t,t,s2` vs `SLLI t,a,s1+s2` | 1.271 | 1.119 |
+| `SRLI` likewise | 1.186 | 1.017 |
+| `SUB t,a,b ; SUB t,x0,t` vs `SUB t,b,a` | 1.041 | 1.286 |
+| `ADD t,a,a ; ADD t,t,t` vs `SLLI t,a,2` | 1.224 | 1.076 |
+| `ADD t,a,b ; SUB t,t,b` vs `ADDI t,a,0` | 0.060 | 1.071 |
+
+Six classes sit at the distance of unrelated chunks — the AND and OR folds
+further apart than their near-misses — and the one that collapses is the
+`ADD`/`SUB` form of the cancellation the mix trains in its `ADDI`/`XORI`
+forms. The same T2 collapses the trained `ADDI` and `XORI` folds to 0.016
+(finding 50). So the distance term pulls together the pairs it is shown, and
+the op-cell has not learned a description of the function that makes an
+untrained equivalent meet: finding 47's lapse, where a collapse is held only
+while its pairs stay in the mix, is the same fact.
+
+**54. A T1 trained on the register-file target, with the pool reading each
+written slot's colour, keeps value prediction and its wiring and collapses
+its partner groups at least as tightly; 2 of 2.46M held-out values fail.**
+`runs/t1_regfile_500k`: finding 50's T1 configuration
+(`configs/instr_alu_writers_partners025_aim050.json`, 500k steps) under the
+target of finding 52 and the Sammon-weighted loss, generation on odin, 4–7
+ms/step. Scored on the held-out corpus regenerated in the register-file
+format (`runs/eval/t1_heldout64_single_regfile.rvt`, the same 38,400
+instructions), `probes/frame_scorecard.py` and `probes/near_miss.py`:
+
+| | `runs/t1_regfile_500k` | finding 50's T1 |
+|---|---|---|
+| vp exact at held-out anchors | 99.9999% (2 of 2,457,600, both `ADDI`) | 100% |
+| leak check | 11.85% | — |
+| wiring exact | 100% of 38,400 | 100% |
+| partner groups equivalent (copy / zero / double / sign / constant) | 0.0021 / 0.0006 / 0.0030 / 0.0002 / 0.0091 | 0.0001–0.0068 |
+| their contrasts | 0.85 / 1.22 / 1.12 / 0.42 / 1.16 | 0.48–1.30 |
+| aliasing control / unrelated instructions | 1.085 / 1.120 | 1.088 / 1.213 |
+| `ADDI` k vs k+1 / k vs k+512 / `ADD` vs `SUB` / `SLLI 3` vs `4` | 0.442 / 0.688 / 1.095 / 0.973 | — |
+| — their targets (chord) | 0.579 / 1.060 / 1.126 / 1.145 | — |
+
+The grading holds, below its targets at the far end as in finding 41. One
+seed; whether the two `ADDI` failures are the target's or the draw's is
+unmeasured.
+
+**55. Of the pairs a training batch gives target 0, every partner pair and
+99.4% of the rest are equivalent; the rest are comparisons whose thresholds
+no witness state separates.** Ten batches of
+`configs/instr_alu_writers_chain010_rewrites025_mined025_aim050.json` at
+len=2 (384 rows each), every pair whose register-file target
+(`register_distance_targets`) is 0, proved with z3 under the rename that
+minimises d\* (`datagen/prove.py`, `datagen/ideal.py`):
+
+| | proved equivalent | not equivalent |
+|---|---|---|
+| partner pairs (rewrites and mined) | 996 | 0 |
+| every other pair in the batch | 5,946 | 41 |
+
+The other equivalent pairs, about 600 per batch, are naturally drawn chunks
+computing one function on different registers — two copies, two constant
+writes, two comparisons that are constant over every input. Each of the 41 is
+a pair of comparisons against thresholds no witness state falls between
+(`AND x6,x21,x18 ; SLTI x31,x26,-1208` against the same shape with -1360), or
+a comparison almost never true (`XORI x25,x18,-1267 ; SLTIU x25,x25,851`)
+against a constant 0: near-misses whose true distance is small and nonzero,
+given 0 and the largest weight the loss gives.
+
+**56. A T2 trained on the register-file target with half its partner pairs
+mined by search collapses every equivalence class the search covers, at
+finding 50's vp, and none in the operation family held out of the search.**
+The cell is finding 50's (len=2, `d_out` 512, op-cell depth 4, twelve-layer
+residual vp head, 16 pool heads, 1M steps, one seed) over finding 54's T1,
+on the register-file target and the Sammon-weighted loss, with half of every
+batch partner pairs, half of those from the rewrites and half drawn from
+400,008 pairs proved equivalent (`scripts/mine_partners.py`: a
+two-instruction chain writing one register, every single ALU instruction
+computing the same register from the chain's inputs, proved with z3), no
+shift operation in any mined pair
+(`configs/instr_alu_writers_chain010_rewrites025_mined025_aim050.json`,
+`runs/mined/noshift_400k.txt`;
+`runs/t2_len2_d512_s1000000_dep4_vp12_pool16_dist1.0_regfile_alu_writers_chain010_rewrites025_mined025_aim050`,
+34 ms/step). Scored on the held-out corpus regenerated in the register-file
+format, same 38,400 chunks:
+
+| | this T2 | finding 50 |
+|---|---|---|
+| vp exact at held-out anchors | 99.7890% (10,198 of 4,833,600 failing) | 99.7857% |
+| — outputs depending on 3 / 2 / 1 inputs | 89.2 / 99.77 / 99.97% | 89.6 / 99.78 / 99.95% |
+| binding exact per chunk | 100% | 100% |
+| rename / reorder / dead code | ≤ 3.5e-6 | 0 |
+| commutative swap of two leaves (fresh operands or an aliased destination) | 0.016 (max 0.54; 1,791/2,000 at 0) | 0 |
+| scorecard's shared-operand swap / aliasing control / unrelated | 0.045 / 0.909 / 1.258 | 0.014 / 0.907 / 1.253 |
+
+`probes/novel_equivalences.py` (finding 53's classes; equivalent / near-miss,
+unrelated chunks 1.206):
+
+| class | in the mined pairs | this T2 | finding 50 |
+|---|---|---|---|
+| `ANDI` fold | yes | **0.022** / 0.430 | 1.035 / 0.404 |
+| `ORI` fold | yes | **0.025** / 0.392 | 1.118 / 0.487 |
+| negation flip through `SUB` from x0 | yes | **0.016** / 1.137 | 1.041 / 1.286 |
+| `ADD`/`SUB` cancellation | yes | **0.001** / 0.580 | 0.060 / 1.071 |
+| `SLLI` fold | held out | 1.166 / 1.017 | 1.271 / 1.119 |
+| `SRLI` fold | held out | 1.096 / 0.891 | 1.186 / 1.017 |
+| `ADD t,a,a ; ADD t,t,t` vs `SLLI t,a,2` | held out | 1.098 / 0.856 | 1.224 / 1.076 |
+
+At 100k steps the same classes read 0.09–0.18 and 0.90–1.11. `probes/partner_chunks.py`
+(equivalent / near-miss; finding 50 in parentheses): swap 0.010 / 0.949,
+respelling 0.002 / 0.808 (0.003 / 0.89), fold 0.050 / 0.530 (0.016 / 0.57),
+cancellation 0.002 / 0.580 (0.003 / 1.07), reassociation 0.0003 / 1.146
+(0.0001 / 1.26), identity write 0.070 / 0.893 (0.027 / 1.03); natural swaps
+on a shared input 0.000 / 0.021 with one and two outputs, on an operand that
+is a result 0.148 / 0.091 (0.080 / 0.034), on a result read 0.007 / 0.013.
+
+The search makes collapse follow from the function over the space it
+searches — whatever single instruction a chain reduces to, named or not — and
+a family no training pair ever draws stays apart: collapse transfers across
+spellings within the families the pairs reach, not across operation families.
+The rewrite classes collapse 2–3× less tightly than in finding 50, with a
+quarter of each batch rewrite pairs against half there and the loss weighting
+equivalent pairs by 1/ε (about 15% of the gradient on these batches) against
+half there; this run does not separate the two. A commutative swap whose
+destination is one of the swapped operands is not equivalent by
+construction: the pool reads the overwritten leaf's colour, which names the
+operand role, so the swap changes it and the op-cell has to learn that the
+two describe one function, as it does for a swap on a shared operand.
+
+**57. With every operation in the mined pairs, the T2 collapses all seven of
+finding 53's untrained-by-rewrite classes, shift folds included, at vp
+99.7975%.** Finding 56's cell with the library mined over every ALU operation
+(`configs/instr_alu_writers_chain010_rewrites025_minedall025_aim050.json`,
+`runs/mined/all_400k.txt`: 400,008 proved pairs, 227,154 involving a shift;
+`runs/t2_len2_d512_s1000000_dep4_vp12_pool16_dist1.0_regfile_alu_writers_chain010_rewrites025_minedall025_aim050`,
+34 ms/step), scored as finding 56:
+
+| | this T2 | finding 56 (shifts held out) | finding 50 |
+|---|---|---|---|
+| vp exact at held-out anchors | **99.7975%** (9,787 of 4,833,600 failing) | 99.7890% | 99.7857% |
+| — outputs depending on 3 / 2 / 1 inputs | 90.1 / 99.77 / 99.97% | 89.2 / 99.77 / 99.97% | 89.6 / 99.78 / 99.95% |
+| binding exact per chunk | 100% | 100% | 100% |
+| commutative swap of two leaves / on a shared operand | 0.003 / 0.050 | 0.016 / 0.045 | 0 / 0.014 |
+| aliasing control / unrelated | 0.872 / 1.257 | 0.909 / 1.258 | 0.907 / 1.253 |
+
+`probes/novel_equivalences.py`, equivalent / near-miss (unrelated 1.208):
+
+| class | this T2 | finding 56 | finding 50 |
+|---|---|---|---|
+| `ANDI` fold | 0.035 / 0.427 | 0.022 / 0.430 | 1.035 / 0.404 |
+| `ORI` fold | 0.037 / 0.415 | 0.025 / 0.392 | 1.118 / 0.487 |
+| `SLLI` fold | **0.043** / 1.070 | 1.166 / 1.017 | 1.271 / 1.119 |
+| `SRLI` fold | **0.029** / 0.978 | 1.096 / 0.891 | 1.186 / 1.017 |
+| negation flip | 0.033 / 1.137 | 0.016 / 1.137 | 1.041 / 1.286 |
+| doubling twice vs `SLLI 2` | **0.041** / 0.876 | 1.098 / 0.856 | 1.224 / 1.076 |
+| `ADD`/`SUB` cancellation | 0.002 / 0.580 | 0.001 / 0.580 | 0.060 / 1.071 |
+
+At 100k steps the shift classes already read 0.14–0.17, where finding 56's
+read 0.90–1.11. `probes/partner_chunks.py`: swap 0.013 / 0.930, respelling
+0.001 / 0.786, fold 0.056 / 0.513, cancellation 0.002 / 0.580,
+reassociation 0.0004 / 1.164, identity write 0.072 / 0.893; natural swaps on
+an operand that is a result 0.162 / 0.096 with one and two outputs — finding
+56's levels, 2–3× looser than finding 50's on folds, identities and composed
+swaps. A family enters the collapse when its pairs enter the search; with
+every ALU operation searched, every two-to-one equivalence the probes build
+collapses, and the shared vp is unchanged.
+
+**58. On the record T2 the description-ordered pointer agrees on equivalent
+pairs, and is a discontinuity on near-misses: a small change that swaps two
+outputs' ranks moves the essence about 0.3 further from its target.** Each
+written register's pointer is its rank when the chunk's outputs are ordered
+by a fixed projection of their descriptions (`RegisterStateMachine._pointer`)
+— a canonical order of a set, like the output byte-sort finding 51 measured in
+the target. `probes/pointer_order.py` on finding 57's T2, two-output len-2
+chunks, 2,000 pairs per row:
+
+| pairs | pointers differ | essence chord |
+|---|---|---|
+| a commutative swap in a natural chunk (equivalent) | 0.8% | 0.352 where they differ, 0.008 where they agree |
+| partner rewrites (equivalent) | 1.2% | 0.265 / 0.011 |
+
+| near-misses: one immediate moved | ranks swap | chord − target chord, ranks swap / ranks kept |
+|---|---|---|
+| by 1 | 6.2% | +0.134 / −0.175 (targets 0.676 / 0.616) |
+| by 2–64 | 8.3% | −0.075 / −0.364 (targets 0.961 / 0.935) |
+
+Finding 46 measured 15–18% of swaps flipping before the op-cell described
+the two spellings alike; with collapse trained, the order agrees, and a flip
+is where a collapse failed. Among near-misses whose targets are alike, those
+whose ranks swap sit about 0.3 further from their targets. A pair whose
+descriptions move most is also the likeliest to swap, so the split is
+correlational; the mechanism — the pointer enters the pool's attention key, so
+a swap refiles both outputs — predicts a jump of this kind.
+
+**59. A T1 whose evaluator predicts its output as a set, with no pointer in
+the pool, scores as finding 54's.** `runs/t1_setvp_500k`: finding 54's
+configuration with the pool keyed on descriptions alone and the evaluator
+reading the essence and the instruction's inputs in canonical role order
+(`vp_loss`, `compressor/train.py`), 4–12 ms/step. Scored on the held-out corpus
+regenerated with role-ordered inputs (`runs/eval/t1_heldout64_single.rvt`,
+the same 38,400 instructions):
+
+| | `runs/t1_setvp_500k` | finding 54 |
+|---|---|---|
+| vp exact at held-out anchors | 99.9998% (5 of 2,457,600: `ADDI` 3, `SLTIU` 1, `ANDI` 1) | 99.9999% (2) |
+| leak check | 10.74% | 11.85% |
+| wiring exact | 100% | 100% |
+| partner groups equivalent (copy / zero / double / sign / constant) | 0.0024 / 0.0002 / 0.0025 / 0.0001 / 0.0103 | 0.0021 / 0.0006 / 0.0030 / 0.0002 / 0.0091 |
+| aliasing control / unrelated instructions | 1.086 / 1.120 | 1.085 / 1.120 |
+| `ADDI` k vs k+1 / k+512 / `ADD` vs `SUB` / `SLLI 3` vs `4` | 0.468 / 0.658 / 1.095 / 0.964 | 0.442 / 0.688 / 1.095 / 0.973 |
+
+One seed each; 5 failures against 2 is unresolved.
+
+**60. With no pointer and the evaluator predicting a set, the essence's
+near-miss discontinuity shrinks 4–5×, and value prediction fails 2.2× as
+often.** Finding 57's cell over finding 59's T1, the pool keyed on
+descriptions alone and the evaluator reading the essence and the chunk's
+role-ordered inputs, predicting every output at once, matched by least loss
+(`runs/t2_len2_d512_s1000000_dep4_vp12_pool16_dist1.0_setvp_alu_writers_chain010_rewrites025_minedall025_aim050`,
+28 ms/step), scored as finding 57 on the held-out corpus regenerated with
+role-ordered inputs (the same 38,400 chunks):
+
+| | set evaluator | finding 57 (pointer) |
+|---|---|---|
+| vp exact at held-out anchors | 99.5605% (21,248 of 4,835,008 failing) | 99.7975% (9,787) |
+| — outputs depending on 3 / 2 / 1 / 0 inputs | 89.18 / 99.49 / 99.80 / 99.997% | 90.09 / 99.77 / 99.97 / 100% |
+| — lowest writers | `SUB` 97.40%, `ADD` 99.04%, `SLTU` 99.50% | `SUB` 99.04%, `ADD` 99.38%, `SLL` 99.59% |
+| binding exact per chunk | 100% | 100% |
+| commutative swap of two leaves / on a shared operand | 0.013 / 0.109 | 0.003 / 0.050 |
+| aliasing control / unrelated | 0.811 / 1.254 | 0.872 / 1.257 |
+| finding 53's classes, equivalent | 0.002–0.089 | 0.002–0.043 |
+| partner rewrites, equivalent | 0.0006–0.065 | 0.0004–0.072 |
+
+`probes/pointer_order.py`, the description rank computed from each model's
+value channels (finding 58's split):
+
+| near-misses | ranks swap | chord − target chord, ranks swap / kept | finding 58 |
+|---|---|---|---|
+| immediate by 1 | 7.7% | −0.162 / −0.239 (gap 0.077) | +0.134 / −0.175 (gap 0.309) |
+| immediate by 2–64 | 13.0% | −0.293 / −0.347 (gap 0.055) | −0.075 / −0.364 (gap 0.289) |
+
+Equivalent two-output pairs whose ranks differ sit 0.13–0.16 apart, against
+0.27–0.35 under the pointer. The remaining gap is of the size the selection
+the split carries — a pair whose descriptions move most is likeliest to swap
+— would leave. The vp loss is spread over every input count, worst on
+`SUB`: handed the essence and all of the chunk's inputs, the evaluator has to
+work out which inputs each output reads, which the pointer and each output's
+own input list told it. One seed each, over T1s that differ only in their
+pools and evaluators.
+
+**61. The set evaluator trained 3M steps on freshly mined pairs fails half as
+often as finding 57's pointer model and collapses every class tighter, the
+near-miss discontinuity staying small.** Finding 60's cell, 3M steps (cosine
+over 3M), with every mined pair searched and proved fresh and drawn twice from
+a rolling pool, renamed each draw
+(`configs/instr_alu_writers_chain010_rewrites025_minedlive025_aim050.json`,
+`partners.mined.reuse` 2; `runs/t2_len2_d512_s3000000_dep4_vp12_pool16_dist1.0_setvp_alu_writers_chain010_rewrites025_minedlive025_aim050`,
+generation on odin's pool of 56 workers and 5 local, 28 ms/step; the trainer
+hung at step 2,901,400 and the run resumed from its step-2,900,000 checkpoint
+on a stream drawn with another seed, `resume.txt` in the run directory).
+Scored on the same held-out corpus as finding 60:
+
+| | this T2 | finding 57 (pointer, 1M) | finding 60 (set, 1M) |
+|---|---|---|---|
+| vp exact at held-out anchors | **99.8965%** (5,006 of 4,835,008 failing) | 99.7975% (9,787) | 99.5605% (21,248) |
+| — outputs depending on 3 / 2 / 1 / 0 inputs | 96.07 / 99.92 / 99.94 / 100% | 90.09 / 99.77 / 99.97 / 100% | 89.18 / 99.49 / 99.80 / 99.997% |
+| — lowest writers | `SUB` 99.52%, `ADD` 99.76%, `SLL` 99.84% | `SUB` 99.04%, `ADD` 99.38% | `SUB` 97.40%, `ADD` 99.04% |
+| binding exact per chunk | 100% | 100% | 100% |
+| rename / reorder / dead code | ≤ 6.2e-6 (dead code under 1e-6 on 900 of 2,000) | ≤ 1.9e-6 | ≤ 4.3e-6 |
+| commutative swap of two leaves / on a shared operand | 0.007 / 0.031 | 0.003 / 0.050 | 0.013 / 0.109 |
+| aliasing control / unrelated | 0.825 / 1.255 | 0.872 / 1.257 | 0.811 / 1.254 |
+| finding 53's classes, equivalent | 0.002–0.035 | 0.002–0.043 | 0.002–0.089 |
+| partner rewrites, equivalent (fold / identity write) | 0.0002–0.046 (0.031 / 0.046) | 0.0004–0.072 (0.056 / 0.072) | 0.0006–0.065 |
+| natural swap on an operand that is a result, 1 / 2 outputs | 0.187 / 0.048 | 0.162 / 0.096 | 0.194 / 0.075 |
+| near-misses: chord − target, ranks swap / kept, by 1 / by 2–64 | −0.153 / −0.188; −0.167 / −0.270 | gap 0.31 / 0.29 (finding 58) | −0.162 / −0.239; −0.293 / −0.347 |
+
+The novel classes over training (finding 53's probe, equivalent): 0.012–0.173
+at 500k, 0.007–0.100 at 1M, 0.006–0.074 at 2M, 0.002–0.035 at 3M; the
+training vp loss passed finding 57's final 0.0012 near 1.9M steps. One seed;
+against finding 57 it changes the evaluator, the step budget and fresh
+against frozen pairs together, so it ranks the configurations and attributes
+nothing to one change. The dead-code and rename rows carry float noise up to
+6e-6 where finding 57's stayed under 2e-6; both are zero by construction.
+
 ## Decisions taken
 
 - **The essence is graded in the register frame** — colour-identified leaves,
@@ -827,19 +1207,38 @@ difference is 0.056 points, over a different T1 and on one seed each.
   (finding 42), so value prediction sees the inputs where functions the
   distance term places close together differ.
 - **Distance targets place inputs by canonical role** (finding 43), never by
-  the graph's colour order.
+  the graph's colour order, and take the minimum over every placement of the
+  second row's inputs where a batch can carry them (len 2; finding 52).
+- **The distance target is the register-file distance** (findings 51 and 52):
+  a register the chunk leaves unchanged is no output, a written register is
+  compared with the other row's register or with its own old value, bounds are
+  read from the bits a column never changes across a fixed state family, the
+  combination is a root-sum-square mapped by tanh.
+- **The pool reads each written slot's colour** (finding 51), so an output that
+  overwrites an input is told from a copy.
+- **Equivalent pairs used as training labels are proved** on every register
+  file (`datagen/prove.py`), never accepted from sampled states.
 - **The evaluator takes inputs in canonical role order** (finding 43), ties
   between interchangeable inputs by colour.
-- **The frozen T1 is `runs/t1_distance_cosbal_500k`** (finding 50): the
-  √(2d) balanced distance term on canonical-role targets, the evaluator in
-  canonical role order, no immediate head, aimed anchors.
-- **The distance term matches the chord to √(2d) and averages equivalent
-  pairs apart from the rest** (findings 48–50).
-- **The T2 record is finding 50's cell**, trained on rewrite partner pairs
-  drawing every rewrite.
+- **The frozen T1 is `runs/t1_regfile_500k`** (finding 54): the
+  register-file distance target with Sammon weighting, the evaluator in
+  canonical role order, no immediate head, aimed anchors, the pool reading
+  each written slot's colour.
+- **The distance term matches the chord to √(2d)** (findings 48–50), each
+  pair's error weighted by 1 / (target chord + ε), ε the chord of the smallest
+  nonzero target — continuous in the target, where findings 49–50 averaged the
+  equivalent pairs apart from the rest.
+- **The T2 record is finding 61's cell**: the set evaluator with no pointer,
+  half of every batch partner pairs — half of those rewrites, half searched
+  and proved fresh, each drawn at most twice — 3M steps (findings 56, 57, 60
+  and 61).
+- **The evaluator predicts a set and nothing ranks the outputs** (findings 58,
+  60 and 61): the discontinuity a rank put in the essence is gone, and with
+  3M steps value prediction exceeds the pointer model's.
+- **Mined pairs are searched and proved per draw**, never taken from a fixed
+  library (finding 61).
 - **T2 trains with the distance term on every row and partner chunk pairs**
-  (findings 44 and 46): outputs in canonical order, combined by
-  root-mean-square, same-value writes not counted.
+  (findings 44 and 46).
 - **Pointers are ordered by a fixed projection of each output's description**
   (finding 46), not by a hash of its spelling.
 - **The partner mix covers every equivalence at once** (finding 47): a

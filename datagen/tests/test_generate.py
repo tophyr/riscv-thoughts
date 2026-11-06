@@ -254,3 +254,59 @@ def test_every_rewrite_keeps_its_chunk_equivalent():
                     s = s.copy(); s[0] = 0
                     assert np.array_equal(emu_run(x, s.copy())[0].regs,
                                           emu_run(y, s.copy())[0].regs), (name, x, y)
+
+
+def test_the_proof_separates_a_sampled_match_from_an_equivalence():
+    """`single_equivalents` filters by sampled states only. `(x & -996) <u 203`
+    holds exactly when x <u 1024, so SLTIU x,1024 is equivalent, while 512, a
+    match at every search state, is not; the proof keeps only the first."""
+    from datagen.mine import single_equivalents
+    from datagen.prove import equivalent
+    chain = [Instruction('ANDI', 27, 13, -996), Instruction('SLTIU', 27, 27, 203)]
+    cands = {c.args[2]: c for c in single_equivalents(chain, 27) if c.opcode == 'SLTIU'}
+    assert 512 in cands and 1024 in cands
+    assert equivalent(chain, [cands[1024]]) is True
+    assert equivalent(chain, [cands[512]]) is False
+
+
+def test_searched_pairs_are_fresh_proven_and_respect_the_exclusion():
+    """Each draw is a new chain and a single instruction proved equal on every
+    register file; an excluded opcode appears in neither."""
+    from datagen.mine import sample_mined_pair
+    from datagen.prove import equivalent
+    rng = np.random.default_rng(4)
+    shifts = {'SLL', 'SRL', 'SRA', 'SLLI', 'SRLI', 'SRAI'}
+    seen = set()
+    for _ in range(30):
+        a, b = sample_mined_pair(rng, exclude=frozenset(shifts))
+        assert len(a) == 2 and len(b) == 1
+        assert equivalent(a, b) is True, (a, b)
+        assert not {i.opcode for i in a + b} & shifts, (a, b)
+        seen.add(str((a, b)))
+    assert len(seen) == 30
+
+
+def test_a_pooled_pair_is_drawn_at_most_reuse_times_and_stays_proven(monkeypatch):
+    """Each mined pair leaves the pool after `reuse` draws, so the search runs
+    once per `reuse` draws once the pool is full; any POOL_SIZE consecutive
+    draws are distinct; every draw, renamed afresh, is still proved
+    equivalent."""
+    import collections
+    import datagen.mine as mine
+    from datagen.prove import equivalent
+    rng = np.random.default_rng(9)
+    mine._POOLS.clear()
+    for a, b in (mine.sample_pooled_pair(rng, reuse=3) for _ in range(40)):
+        assert equivalent(a, b) is True, (a, b)
+    mine._POOLS.clear()
+    made = iter(range(10 ** 6))
+    monkeypatch.setattr(mine, 'sample_mined_pair', lambda rng, exclude: (
+        [Instruction('ADDI', 5, 6, next(made) % 2000)], [Instruction('ADDI', 5, 6, 0)]))
+    draws = [mine.sample_pooled_pair(rng, reuse=3) for _ in range(3000)]
+    ids = [a[0].args[2] for a, _ in draws]
+    assert max(collections.Counter(ids).values()) <= 3
+    # Any POOL_SIZE consecutive draws are distinct pairs, so no batch repeats one.
+    assert all(len(set(ids[i:i + mine.POOL_SIZE])) == mine.POOL_SIZE
+               for i in range(len(ids) - mine.POOL_SIZE))
+    mined = next(made)
+    assert abs(mined - (mine.POOL_SIZE + 3000 / 3)) < 60, mined

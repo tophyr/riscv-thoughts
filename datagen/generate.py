@@ -156,7 +156,7 @@ _CATEGORY_OPS = {
 _CONFIG_EXTRA_KEYS = {'invalidity', 'exclude_x0_dest', 'chain', 'partners',
                       'aim'}
 _AIM_KEYS = {'fraction'}
-_PARTNERS_KEYS = {'rate', 'rewrites'}
+_PARTNERS_KEYS = {'rate', 'rewrites', 'mined'}
 _CHAIN_KEYS = {'rate'}
 _INVALIDITY_KEYS = {'rate', 'types'}
 
@@ -167,9 +167,14 @@ def validate_distribution(dist):
     Required: opcode-category keys with weights summing to 1.0.
     Optional: 'invalidity' sub-dict {'rate': float, 'types': {name: w}}
               for invalid-window injection.
-    Optional: 'partners' sub-dict {'rate': float, 'rewrites': [str]}: the
-              fraction of each batch made of equivalent pairs, and for chunks
-              the rewrites drawn from (`_REWRITES`; all of them when absent).
+    Optional: 'partners' sub-dict {'rate': float, 'rewrites': [str],
+              'mined': {'fraction': float, 'exclude': [str], 'reuse': int}}:
+              the fraction of each batch made of equivalent pairs; for chunks
+              the rewrites drawn from (`_REWRITES`; all of them when absent),
+              and the fraction of pairs found instead by search and proved —
+              each mined fresh and drawn at most `reuse` times from a rolling
+              pool, renamed per draw (`datagen.mine.sample_pooled_pair`), no
+              opcode of `exclude` in it.
     Optional: 'aim' sub-dict {'fraction': float}: the fraction of each
               row's anchor states aimed at its boundaries (`datagen.aim`).
     """
@@ -204,6 +209,15 @@ def validate_distribution(dist):
         bad = set(pa.get('rewrites', [])) - set(_REWRITES)
         if bad:
             raise ValueError(f'Unknown partner rewrites: {bad}')
+        mi = pa.get('mined')
+        if mi is not None:
+            if not isinstance(mi, dict) or set(mi) - {'fraction', 'exclude', 'reuse'}:
+                raise ValueError("partners.mined must be {'fraction': float, "
+                                 "'exclude': [opcode], 'reuse': int}")
+            if int(mi.get('reuse', 1)) < 1:
+                raise ValueError(f"partners.mined.reuse must be >= 1, got {mi['reuse']}")
+            if not 0 <= mi.get('fraction', 1.0) <= 1:
+                raise ValueError(f"partners.mined.fraction must be in [0,1], got {mi['fraction']}")
     if 'aim' in dist:
         am = dist['aim']
         if not isinstance(am, dict):
@@ -771,15 +785,21 @@ def _rewrite_pair(rng, max_len, pool, rewrites):
     return prefix + x + suffix, prefix + y + suffix
 
 
-def sample_chunk_partner_pair(rng, max_len, dest_regs=None, rewrites=None):
+def sample_chunk_partner_pair(rng, max_len, dest_regs=None, rewrites=None, mined=None):
     """Two different spellings of one register function, each a chunk of at
     most `max_len` instructions: (list[Instruction], list[Instruction]). At
-    max_len 1 it is `sample_partner_pair`; otherwise one rewrite of
-    `rewrites` (default every one of `_REWRITES`) embedded in random context
-    (`_rewrite_pair`)."""
+    max_len 1 it is `sample_partner_pair`; otherwise, with probability
+    mined['fraction'], a pair found by search and proved
+    (`datagen.mine.sample_pooled_pair`),
+    else one rewrite of `rewrites` (default every one of `_REWRITES`)
+    embedded in random context (`_rewrite_pair`)."""
     if max_len == 1:
         x, y = sample_partner_pair(rng, dest_regs)
         return [x], [y]
+    if mined is not None and max_len >= 2 and rng.random() < mined.get('fraction', 1.0):
+        from .mine import sample_pooled_pair
+        return sample_pooled_pair(rng, frozenset(mined.get('exclude', ())),
+                                  int(mined.get('reuse', 1)))
     pool = list(dest_regs) if dest_regs is not None else list(range(1, 32))
     return _rewrite_pair(rng, max_len, pool, rewrites or _REWRITES)
 
